@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,11 +19,11 @@ import protocols as P
 
 XRAY_BIN = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
 XRAY_CONFIG = Path(os.environ.get("XRAY_CONFIG", "/etc/xray/config.json"))
+XRAY_CONFIG_PREV = XRAY_CONFIG.with_name(XRAY_CONFIG.name + ".prev")
 XRAY_API = os.environ.get("XRAY_API", "127.0.0.1:10085")
 XRAY_LOG_DIR = Path(os.environ.get("XRAY_LOG_DIR", "/var/log/xray"))
 GB = 1024 ** 3
 IPLIMIT_CHAIN = "L2X_IPLIMIT"
-
 
 def public_host() -> str:
     return os.environ.get("L2XPANEL_PUBLIC_HOST", "127.0.0.1")
@@ -898,14 +899,53 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
 
 
 def test_config(cfg: dict) -> dict:
+    """Validate cfg with `xray run -test`. Writes a temp file next to the live config.
+
+    Mandatory for every apply — there is no setting/env/API flag that skips this.
+    """
     XRAY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    if not Path(XRAY_BIN).is_file():
+        return {"ok": False, "tmp": None, "error": f"xray binary not found: {XRAY_BIN}"}
     tmp = XRAY_CONFIG.parent / (XRAY_CONFIG.stem + ".tmp.json")
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     test = _run([XRAY_BIN, "run", "-test", "-config", str(tmp)])
     return {"ok": test["exit_code"] == 0, "tmp": tmp, "error": test["stderr"] or test["stdout"]}
 
 
+def _xray_active() -> bool:
+    return (_run(["systemctl", "is-active", "xray"])["stdout"] or "").strip() == "active"
+
+
+def _restart_xray() -> dict:
+    _run(["systemctl", "enable", "xray"])
+    return _run(["systemctl", "restart", "xray"], timeout=30)
+
+
+def _restore_prev_config() -> str:
+    """Restore the last known-good config and restart. Returns error text (empty if OK)."""
+    if not XRAY_CONFIG_PREV.is_file():
+        return "previous config missing; cannot roll back"
+    try:
+        shutil.copy2(XRAY_CONFIG_PREV, XRAY_CONFIG)
+        os.chmod(XRAY_CONFIG, 0o644)
+    except OSError as exc:
+        return f"rollback copy failed: {exc}"
+    restart = _restart_xray()
+    if _xray_active():
+        return ""
+    return restart["stderr"] or restart["stdout"] or "xray still inactive after rollback"
+
+
 def apply_config(store: dict) -> dict:
+    """Build, verify, then atomically install Xray config. Never skips verification.
+
+    Flow (hardcoded, not configurable):
+      1. build JSON
+      2. `xray run -test` — reject without touching the live file
+      3. keep a copy of the previous live config
+      4. replace live config + restart
+      5. if Xray is not active — restore previous config and restart again
+    """
     try:
         harvest_traffic(store)
         enforce_quotas(store)
@@ -917,23 +957,56 @@ def apply_config(store: dict) -> dict:
     cfg = build_config(store)
     if (store.get("xray_settings") or {}).get("access_log"):
         XRAY_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
     t = test_config(cfg)
     if not t["ok"]:
+        if t.get("tmp"):
+            try:
+                t["tmp"].unlink()
+            except OSError:
+                pass
+        return {"ok": False, "error": t["error"] or "xray config test failed", "verified": False}
+
+    # Snapshot the currently running config before we touch it.
+    if XRAY_CONFIG.is_file():
         try:
-            t["tmp"].unlink()
-        except OSError:
-            pass
-        return {"ok": False, "error": t["error"] or "xray config test failed"}
+            shutil.copy2(XRAY_CONFIG, XRAY_CONFIG_PREV)
+        except OSError as exc:
+            try:
+                t["tmp"].unlink()
+            except OSError:
+                pass
+            return {"ok": False, "error": f"cannot backup current config: {exc}", "verified": False}
+
     os.replace(t["tmp"], XRAY_CONFIG)
     try:
         os.chmod(XRAY_CONFIG, 0o644)
     except OSError:
         pass
-    _run(["systemctl", "enable", "xray"])
-    restart = _run(["systemctl", "restart", "xray"], timeout=30)
-    ok = (_run(["systemctl", "is-active", "xray"])["stdout"] or "").strip() == "active"
-    open_inbound_ports(store)
-    return {"ok": ok, "error": "" if ok else (restart["stderr"] or restart["stdout"] or "xray not active"), "config": cfg}
+
+    restart = _restart_xray()
+    if _xray_active():
+        open_inbound_ports(store)
+        return {"ok": True, "error": "", "config": cfg, "verified": True}
+
+    # New config passed -test but broke the running service — roll back.
+    rb = _restore_prev_config()
+    detail = restart["stderr"] or restart["stdout"] or "xray not active after restart"
+    if rb:
+        return {
+            "ok": False,
+            "error": f"{detail}; rollback failed: {rb}",
+            "config": cfg,
+            "verified": True,
+            "rolled_back": False,
+        }
+    return {
+        "ok": False,
+        "error": f"{detail}; previous config restored",
+        "config": cfg,
+        "verified": True,
+        "rolled_back": True,
+    }
 
 
 def open_inbound_ports(store: dict) -> None:

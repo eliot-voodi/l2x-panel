@@ -2364,10 +2364,7 @@ async def xray_settings_save(request: Request):
             flash(request, f"Ошибка: {exc}", "error")
             return go(f"/xray?tab={section}")
     if section != "geo_custom":
-        test = xray.test_config(xray.build_config(_load_store()))
-        if not test["ok"]:
-            flash(request, f"Сохранено, но конфиг не прошёл проверку: {test['error'][:500]}", "error")
-            return go(f"/xray?tab={section}")
+        # apply_config always runs xray -test + live restart check; rejects/rolls back on failure
         xr = _apply_xray(_load_store())
         flash(request, *_ok_msg("Настройки Xray применены", xr))
     else:
