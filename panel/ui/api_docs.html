@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}API · {{ app_name }}{% endblock %}
+{% block page_title %}REST API{% endblock %}
+{% block page_sub %}<a href="{{ bp }}/settings?tab=api">← токены</a>{% endblock %}
+{% block content %}
+<div class="card">
+  <h3>Аутентификация</h3>
+  <div class="small">Заголовок <code>Authorization: Bearer l2x_…</code> или <code>X-API-Key: l2x_…</code> (также работает сессия панели). База: <code>http://{{ public_host }}/panel/api/</code> — не зависит от секретного пути панели.</div>
+  <div class="small mt">Ответ: <code>{"success": true, "msg": "", "obj": …}</code>; ошибка — <code>{"success": false, "msg": "…"}</code> с кодом 4xx.</div>
+<pre class="mt">curl -s -H "Authorization: Bearer $TOKEN" http://{{ public_host }}/panel/api/clients/list
+
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"email":"alice","limit_gb":50,"expire_at":"2026-12-31","outbound":"lb_least_ping","limit_ip":2}' \
+  http://{{ public_host }}/panel/api/clients/add</pre>
+</div>
+<div class="card" style="padding:0">
+  <table>
+    <thead><tr><th>Метод</th><th>Путь</th><th>Описание</th></tr></thead>
+    <tbody>
+    {% for m_, path, desc in [
+      ('GET', 'server/status', 'CPU, RAM, диск, сеть, версия/состояние Xray, онлайн'),
+      ('GET', 'inbounds/list', 'Все inbounds с трафиком'),
+      ('GET', 'inbounds/get/{id}', 'Один inbound'),
+      ('GET', 'inbounds/onlines', 'Онлайн-клиенты: {email: [ip, …]}'),
+      ('GET', 'clients/list', 'Все клиенты (статус, трафик, лимиты, ссылка подписки)'),
+      ('GET', 'clients/get/{email}', 'Один клиент'),
+      ('POST', 'clients/add', 'Создать: email (обязательно), uuid, outbound, enabled, limit_gb, expire_at, limit_ip, limit_hwid, comment, tg_id, inbounds[], reset_period, renew_on_reset, start_on_first_use, duration_days, allowed_tags[], outbound_limits{tag: gb}, sub_enabled'),
+      ('POST', 'clients/update/{email}', 'Изменить любые из полей выше'),
+      ('POST|DELETE', 'clients/delete/{email}', 'Удалить клиента'),
+      ('POST', 'clients/reset/{email}', 'Сбросить трафик клиента'),
+      ('POST', 'clients/resetAll', 'Сбросить трафик всех'),
+      ('GET', 'clients/{email}/hwids', 'HWID-устройства клиента'),
+      ('DELETE', 'clients/{email}/hwids', 'Сбросить HWID-устройства клиента'),
+      ('GET', 'l2tp/list', 'L2TP-туннели и их статусы'),
+      ('GET', 'outbounds/list', 'Теги outbounds и их трафик'),
+      ('POST', 'xray/restart', 'Перезапустить Xray'),
+      ('GET', 'xray/config', 'Итоговый config.json'),
+      ('GET', 'backup', 'Скачать zip-бэкап'),
+    ] %}
+      <tr><td><span class="badge {% if m_ == 'GET' %}accent{% else %}warn{% endif %}">{{ m_ }}</span></td><td class="mono">/panel/api/{{ path }}</td><td class="small">{{ desc }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

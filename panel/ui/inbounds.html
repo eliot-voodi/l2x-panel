@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Inbounds · {{ app_name }}{% endblock %}
+{% block page_title %}Inbounds{% endblock %}
+{% block page_sub %}Точки входа Xray: протокол, транспорт, TLS/Reality, fallbacks{% endblock %}
+{% block top_actions %}
+<form class="actions" method="get" action="{{ bp }}/inbounds/new">
+  <select name="protocol" class="w-auto">
+    {% for p in P.ALL_PROTOCOLS %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+  </select>
+  <button class="btn">{{ ic.icon('plus') }}{{ t('Новый inbound') }}</button>
+</form>
+{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th></th><th>Remark / tag</th><th>Протокол</th><th>Порт</th><th>Транспорт</th><th>Клиенты</th><th>{{ t('Трафик') }}</th><th>{{ t('Срок') }}</th><th>Outbound</th><th class="right">{{ t('Действия') }}</th>
+    </tr></thead>
+    <tbody>
+    {% for ib in items %}
+      <tr>
+        <td><span class="dot {% if ib.enabled and ib.ok %}on{% endif %}" title="{{ 'включён' if ib.enabled else 'выключен' }}"></span></td>
+        <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit"><b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div></td>
+        <td><span class="badge accent">{{ ib.protocol }}</span></td>
+        <td class="mono">{{ ib.listen if ib.listen not in ('0.0.0.0', '') else '' }}{% if ib.listen not in ('0.0.0.0', '') %}:{% endif %}{{ ib.port }}</td>
+        <td>
+          {% if ib.protocol in P.USER_PROTOCOLS %}
+          <span class="badge">{{ ib.stream.network }}</span>
+          {% if ib.stream.security == 'reality' %}<span class="badge ok">reality</span>{% elif ib.stream.security == 'tls' %}<span class="badge ok">tls</span>{% endif %}
+          {% if ib.fallbacks %}<span class="badge">fallback×{{ ib.fallbacks|length }}</span>{% endif %}
+          {% else %}<span class="dim">—</span>{% endif %}
+        </td>
+        <td>{{ ib.n_clients if ib.protocol not in ('dokodemo-door',) else '—' }}</td>
+        <td class="nowrap">{{ format_traffic(ib.used) }}{% if ib.total_gb %} <span class="dim">/ {{ ib.total_gb }} GB</span>{{ m.progress(ib.used, gb_to_bytes(ib.total_gb)) }}{% endif %}
+          <div class="dim small">↑{{ format_traffic(ib.traffic.up) }} ↓{{ format_traffic(ib.traffic.down) }}</div></td>
+        <td class="small">{{ fmt_dt(ib.expire_at, False) if ib.expire_at else '∞' }}{% if not ib.ok %} <span class="badge err">блок</span>{% endif %}</td>
+        <td class="small">{{ outbound_label(store, ib.outbound) if store is defined else ib.outbound }}</td>
+        <td>
+          <div class="actions" style="justify-content:flex-end">
+            <a class="btn ghost icon" title="{{ t('Изменить') }}" href="{{ bp }}/inbounds/{{ ib.id }}/edit">{{ ic.icon('edit') }}</a>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/clone"><button class="btn ghost icon" title="Клонировать">{{ ic.icon('copy') }}</button></form>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/reset" onsubmit="return confirm('Сбросить трафик inbound?')"><button class="btn ghost icon" title="{{ t('Сбросить трафик') }}">{{ ic.icon('refresh') }}</button></form>
+            <a class="btn ghost icon" title="Xray JSON" href="{{ bp }}/inbounds/{{ ib.id }}/export" target="_blank">{}</a>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/delete" onsubmit="return confirm('Удалить inbound {{ ib.tag }}?')"><button class="btn danger icon" title="{{ t('Удалить') }}">{{ ic.icon('trash') }}</button></form>
+          </div>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="10" class="empty">Нет inbounds</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+<div class="hint">Один клиент может работать сразу в нескольких inbounds — выбор в карточке клиента. Для socks/http/dokodemo трафик идёт в outbound inbound'а.</div>
+{% endblock %}

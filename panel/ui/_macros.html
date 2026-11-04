@@ -1,0 +1,35 @@
+{% macro status_badge(status) -%}
+{%- if status == 'active' -%}<span class="badge ok">активен</span>
+{%- elif status == 'expired' -%}<span class="badge err">истёк</span>
+{%- elif status == 'limited' -%}<span class="badge warn">лимит</span>
+{%- elif status == 'disabled' -%}<span class="badge">выключен</span>
+{%- elif status == 'connected' -%}<span class="badge ok">connected</span>
+{%- elif status == 'error' -%}<span class="badge err">error</span>
+{%- elif status == 'disconnected' -%}<span class="badge">disconnected</span>
+{%- else -%}<span class="badge">{{ status }}</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro progress(used, limit) -%}
+{%- if limit -%}
+{%- set pct = [100, (100 * used / limit)|int]|min -%}
+<div class="bar {% if pct >= 100 %}danger{% elif pct >= 80 %}warn{% endif %}"><span style="width:{{ pct }}%"></span></div>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro copy_field(id, value) -%}
+<div class="copy">
+  <input id="{{ id }}" value="{{ value }}" readonly onclick="this.select()">
+  <button type="button" class="btn ghost sm" onclick="copyText('{{ id }}', this)">Копировать</button>
+</div>
+{%- endmacro %}
+
+{% macro post_btn(action, label, cls='ghost sm', confirm='') -%}
+<form method="post" action="{{ action }}" {% if confirm %}onsubmit="return confirm('{{ confirm }}')"{% endif %}>
+  <button class="btn {{ cls }}">{{ label }}</button>
+</form>
+{%- endmacro %}
+
+{% macro check(name, checked, label, value='1') -%}
+<label class="check"><input type="checkbox" name="{{ name }}" value="{{ value }}" {% if checked %}checked{% endif %}> {{ label }}</label>
+{%- endmacro %}

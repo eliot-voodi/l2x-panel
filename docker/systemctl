@@ -1,0 +1,31 @@
+#!/bin/sh
+# Minimal systemctl shim for the container: maps units to supervisord programs.
+action="$1"; shift
+[ "$action" = "--no-pager" ] && { action="$1"; shift; }
+map() {
+  case "$1" in
+    xray|xray.service) echo xray ;;
+    xl2tpd|xl2tpd.service) echo xl2tpd ;;
+    strongswan-starter|strongswan|ipsec|strongswan-starter.service) echo ipsec ;;
+    l2xpanel|l2xpanel.service) echo l2xpanel ;;
+    cron) echo cron ;;
+    *) echo "" ;;
+  esac
+}
+rc=0
+for unit in "$@"; do
+  prog=$(map "$unit")
+  case "$action" in
+    is-active)
+      if [ -n "$prog" ] && supervisorctl status "$prog" 2>/dev/null | grep -q RUNNING; then echo active; else echo inactive; rc=3; fi ;;
+    start|stop|restart)
+      [ -n "$prog" ] && { supervisorctl "$action" "$prog" >/dev/null || rc=1; } ;;
+    reload|reload-or-restart|try-restart)
+      [ -n "$prog" ] && { supervisorctl restart "$prog" >/dev/null || rc=1; } ;;
+    status)
+      [ -n "$prog" ] && supervisorctl status "$prog" ;;
+    enable|disable|daemon-reload|mask|unmask) : ;;
+    *) : ;;
+  esac
+done
+exit $rc

@@ -1,0 +1,20 @@
+{% if jobs %}
+<div class="card">
+  <div class="card-head"><h3>Фоновые задачи</h3><a class="btn ghost sm" href="">Обновить</a></div>
+  {% for jid, j in jobs %}
+  <details {% if loop.first %}open{% endif %} style="border-bottom:1px solid var(--border);padding:.45rem 0">
+    <summary class="flex" style="cursor:pointer">
+      <span class="badge {% if j.status == 'done' %}ok{% elif j.status == 'failed' %}err{% else %}warn{% endif %}" data-job="{{ jid }}">{{ j.status }}</span>
+      <b>{{ j.name }}</b> <span class="dim small mono">{{ jid }}</span>
+    </summary>
+    <pre style="max-height:260px;margin-top:.5rem">{{ j.log or '…' }}</pre>
+  </details>
+  {% endfor %}
+</div>
+<script>
+  (function () {
+    if (!document.querySelector('[data-job]') || ![].some.call(document.querySelectorAll('[data-job]'), function (b) { return b.textContent === 'running'; })) return;
+    setTimeout(function () { location.reload(); }, 5000);
+  })();
+</script>
+{% endif %}

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Minimal journalctl shim: reads supervisord program logs.
+unit=""; lines=200; grep_pat=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u) unit="$2"; shift ;;
+    -n) lines="$2"; shift ;;
+    -g|--grep) grep_pat="$2"; shift ;;
+    --since|-o) shift ;;
+  esac
+  shift
+done
+case "$unit" in
+  strongswan*|ipsec) unit=ipsec ;;
+  *.service) unit=${unit%.service} ;;
+esac
+f="/var/log/supervisor/${unit:-supervisord}.log"
+[ -f "$f" ] || { echo "-- нет журнала $f --"; exit 0; }
+if [ -n "$grep_pat" ]; then grep -- "$grep_pat" "$f" | tail -n "$lines"; else tail -n "$lines" "$f"; fi

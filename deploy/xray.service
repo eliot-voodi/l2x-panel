@@ -1,0 +1,17 @@
+[Unit]
+Description=Xray-core (managed by L2X Panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root is required to bind privileged ports and to use sockopt.interface on l2x-* PPP interfaces
+User=root
+Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=L2X Panel (Xray + multi-L2TP control panel)
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/l2xpanel
+EnvironmentFile=/etc/l2xpanel/panel.env
+# acme.sh and other tools expect a real HOME
+Environment=HOME=/root
+ExecStart=/bin/sh -c 'exec /opt/l2xpanel/.venv/bin/uvicorn app:app --host "${HOST:-127.0.0.1}" --port "${PORT:-8090}" --proxy-headers --forwarded-allow-ips 127.0.0.1'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

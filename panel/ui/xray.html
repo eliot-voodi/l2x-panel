@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% set xs_ = store.xray_settings %}{% set dns = store.dns %}
+{% block title %}Xray · {{ app_name }}{% endblock %}
+{% block page_title %}Xray{% endblock %}
+{% block page_sub %}Ядро {{ xs.version or '?' }} · {{ xs.state }}{% endblock %}
+{% block top_actions %}
+<div class="actions">
+  <span class="badge {% if xs.active %}ok{% else %}err{% endif %}"><span class="dot {% if xs.active %}on{% endif %}"></span> {{ xs.state }}</span>
+  <form method="post" action="{{ bp }}/xray/control/restart?next=/xray?tab={{ tab }}"><button class="btn ghost sm">{{ ic.icon('refresh') }}{{ t('Перезапустить') }}</button></form>
+  {% if xs.active %}<form method="post" action="{{ bp }}/xray/control/stop?next=/xray?tab={{ tab }}" onsubmit="return confirm('Остановить Xray?')"><button class="btn danger sm">{{ t('Остановить') }}</button></form>
+  {% else %}<form method="post" action="{{ bp }}/xray/control/start?next=/xray?tab={{ tab }}"><button class="btn sm">{{ t('Запустить') }}</button></form>{% endif %}
+  <form method="post" action="{{ bp }}/xray/apply"><button class="btn sm">{{ t('Применить') }} конфиг</button></form>
+</div>
+{% endblock %}
+{% block content %}
+<div class="tabs">
+  {% for k, l in [('general', 'Общие'), ('dns', 'DNS'), ('reverse', 'Reverse'), ('template', t('Шаблон')), ('geo', 'Geo'), ('core', t('Ядро'))] %}
+  <a href="?tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
+  {% endfor %}
+</div>
+
+{% if tab == 'general' %}
+<form class="card" method="post" action="{{ bp }}/xray/settings" style="max-width:640px">
+  <input type="hidden" name="section" value="general">
+  <label class="f">Уровень логов</label>
+  <select name="log_level">{% for l in ('debug', 'info', 'warning', 'error', 'none') %}<option {% if xs_.log_level == l %}selected{% endif %}>{{ l }}</option>{% endfor %}</select>
+  <div class="mt">{{ m.check('access_log', xs_.access_log, 'Access log (/var/log/xray/access.log) — нужен для просмотра посещений') }}</div>
+  <div>{{ m.check('dns_log', xs_.dns_log, 'DNS log') }}</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'dns' %}
+<form class="card" method="post" action="{{ bp }}/xray/settings">
+  <input type="hidden" name="section" value="dns">
+  {{ m.check('enabled', dns.enabled, 'Встроенный DNS Xray') }}
+  <div class="row">
+    <div><label class="f">Серверы (по строке)</label><textarea name="servers" class="mono" rows="5" placeholder="https+local://1.1.1.1/dns-query&#10;8.8.8.8&#10;localhost">{{ dns.servers|join('\n') }}</textarea></div>
+    <div><label class="f">Hosts (domain = ip)</label><textarea name="hosts" class="mono" rows="5" placeholder="domain:example.com = 1.2.3.4">{% for k, v in dns.hosts.items() %}{{ k }} = {{ v }}
+{% endfor %}</textarea></div>
+  </div>
+  <div class="row">
+    <div><label class="f">queryStrategy</label><select name="query_strategy">{% for q in ('UseIP', 'UseIPv4', 'UseIPv6') %}<option {% if dns.query_strategy == q %}selected{% endif %}>{{ q }}</option>{% endfor %}</select></div>
+    <div>{{ m.check('disable_cache', dns.disable_cache, 'disableCache') }}</div>
+  </div>
+  <h3 class="mt">FakeDNS</h3>
+  {{ m.check('fakedns', dns.fakedns.enabled, 'Включить FakeDNS') }}
+  <div class="row">
+    <div><label class="f">Пул</label><input name="fake_pool" value="{{ dns.fakedns.pool }}"></div>
+    <div><label class="f">Размер</label><input name="fake_size" type="number" value="{{ dns.fakedns.size }}"></div>
+  </div>
+  <div class="hint">Для FakeDNS включите sniffing «fakedns» в нужных inbounds.</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'reverse' %}
+<form class="card" method="post" action="{{ bp }}/xray/settings">
+  <input type="hidden" name="section" value="reverse">
+  <div class="row">
+    <div><label class="f">Bridges (tag | domain)</label><textarea name="bridges" class="mono" rows="4">{% for b in store.reverse.bridges %}{{ b.tag }} | {{ b.domain }}
+{% endfor %}</textarea></div>
+    <div><label class="f">Portals (tag | domain)</label><textarea name="portals" class="mono" rows="4">{% for b in store.reverse.portals %}{{ b.tag }} | {{ b.domain }}
+{% endfor %}</textarea></div>
+  </div>
+  <div class="hint">Reverse proxy Xray: portal на этом сервере принимает соединения bridge с сервера за NAT. Tag portal'а становится доступен как outbound в маршрутизации.</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'template' %}
+<div class="grid g2">
+  <form class="card" method="post" action="{{ bp }}/xray/settings">
+    <input type="hidden" name="section" value="template">
+    <h3>Patch конфигурации</h3>
+    <textarea name="patch" class="mono" rows="22" spellcheck="false" placeholder='{"policy": {"levels": {"0": {"connIdle": 600}}}}'>{{ xs_.template_patch|tojson(indent=2) if xs_.template_patch else '' }}</textarea>
+    <div class="hint">JSON глубоко сливается поверх сгенерированного конфига (списки заменяются целиком). Перед применением конфиг проверяется <code>xray -test</code>.</div>
+    <div class="actions mt"><button class="btn">{{ t('Сохранить') }} и проверить</button></div>
+  </form>
+  <div class="card">
+    <h3>Итоговый config.json</h3>
+    <pre style="max-height:640px">{{ final }}</pre>
+  </div>
+</div>
+
+{% elif tab == 'geo' %}
+<div class="grid g2">
+  <div class="card">
+    <div class="card-head"><h3>Geo-файлы</h3>
+      <form method="post" action="{{ bp }}/xray/geo/update"><button class="btn sm">{{ ic.icon('download') }}{{ t('Обновить') }}</button></form></div>
+    <table><tbody>
+      {% for g in geo %}<tr><td class="mono">{{ g.name }}</td><td class="small">{{ format_traffic(g.size) }}</td><td class="small dim">{{ fmt_ts(g.mtime) }}</td></tr>
+      {% else %}<tr><td class="empty">Файлов нет</td></tr>{% endfor %}
+    </tbody></table>
+    <div class="hint">geoip.dat / geosite.dat — Loyalsoldier (v2ray-rules-dat), плюс свои файлы ниже. Использование: <code>ext:file.dat:tag</code>.</div>
+  </div>
+  <form class="card" method="post" action="{{ bp }}/xray/settings">
+    <input type="hidden" name="section" value="geo_custom">
+    <h3>Свои geo-файлы</h3>
+    <textarea name="geo_custom" class="mono" rows="6" placeholder="geoip_RU.dat | https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat">{% for g in store.settings.geo_custom %}{{ g.name }} | {{ g.url }}
+{% endfor %}</textarea>
+    <div class="hint">name | url — по строке. Скачиваются вместе с основными.</div>
+    <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+  </form>
+</div>
+{% include "_jobs.html" %}
+
+{% elif tab == 'core' %}
+<div class="grid g2">
+  <form class="card" method="post" action="{{ bp }}/xray/install" onsubmit="return confirm('Установить выбранную версию Xray? Текущий бинарник будет сохранён как .bak')">
+    <h3>Версия Xray-core</h3>
+    <div class="small muted">Установлена: <b>{{ xs.version or '?' }}</b></div>
+    <label class="f">Версия из GitHub releases</label>
+    <select name="version">
+      {% for v in releases %}<option {% if v.lstrip('v') == xs.version %}selected{% endif %}>{{ v }}</option>{% else %}<option value="">не удалось получить список</option>{% endfor %}
+    </select>
+    <div class="actions mt"><button class="btn">Установить</button></div>
+    <div class="hint">Бинарник проверяется <code>xray version</code> перед заменой; при ошибке остаётся старый.</div>
+  </form>
+  <div>{% include "_jobs.html" %}</div>
+</div>
+{% endif %}
+{% endblock %}

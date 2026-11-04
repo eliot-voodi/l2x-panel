@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% set st = ib.stream %}{% set s = ib.settings %}
+{% block title %}Inbound {{ ib.tag }} · {{ app_name }}{% endblock %}
+{% block page_title %}{% if is_new %}{{ t('Новый inbound') }}{% else %}Inbound · {{ ib.remark or ib.tag }}{% endif %}{% endblock %}
+{% block page_sub %}<a href="{{ bp }}/inbounds">← все inbounds</a>{% endblock %}
+{% block content %}
+<form method="post" action="{{ bp }}/inbounds/save" id="ibform">
+<input type="hidden" name="id" value="{{ ib.id if not is_new else '' }}">
+<div class="grid g2">
+  <div class="card">
+    <h3>Основное</h3>
+    <div class="row">
+      <div><label class="f">Протокол</label>
+        <select name="protocol" id="protocol">
+          {% for p in P.ALL_PROTOCOLS %}<option value="{{ p }}" {% if p == ib.protocol %}selected{% endif %}>{{ p }}</option>{% endfor %}
+        </select>
+        {% if not is_new %}<div class="hint">Смена протокола сбросит его параметры</div>{% endif %}
+      </div>
+      <div><label class="f">Tag</label><input name="tag" value="{{ ib.tag }}" required pattern="[A-Za-z0-9._-]+"></div>
+    </div>
+    <label class="f">Remark (имя в подписке)</label><input name="remark" value="{{ ib.remark }}">
+    <div class="row">
+      <div><label class="f">Listen</label><input name="listen" value="{{ ib.listen }}"></div>
+      <div><label class="f">Порт</label><input name="port" type="number" min="1" max="65535" value="{{ ib.port }}" required></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Лимит трафика inbound, GB</label><input name="total_gb" type="number" step="0.01" min="0" value="{{ ib.total_gb or '' }}" placeholder="∞"></div>
+      <div><label class="f">Срок действия</label><input name="expire_at" type="datetime-local" value="{{ dt_input(ib.expire_at) }}"></div>
+    </div>
+    <label class="f">Адрес в ссылках (share host)</label>
+    <input name="share_host" value="{{ ib.share_host }}" placeholder="{{ public_host }} (по умолчанию)">
+    <label class="f">Outbound по умолчанию</label>
+    <select name="outbound">
+      {% for tag in outbounds %}<option value="{{ tag }}" {% if tag == ib.outbound %}selected{% endif %}>{{ outbound_label(store, tag) }}</option>{% endfor %}
+    </select>
+    <div class="hint">Для vless/vmess/trojan/ss — только если у клиента не задан свой outbound. Для socks/http/dokodemo/wireguard — весь трафик inbound.</div>
+    <div class="mt">{{ m.check('enabled', ib.enabled, t('Включён')) }}</div>
+  </div>
+
+  <div class="card">
+    <h3>Параметры протокола</h3>
+    <div data-proto="vless">
+      <label class="f">Flow</label>
+      <select name="flow">
+        <option value="" {% if not s.flow %}selected{% endif %}>нет</option>
+        <option value="xtls-rprx-vision" {% if s.flow == 'xtls-rprx-vision' %}selected{% endif %}>xtls-rprx-vision (только raw + tls/reality)</option>
+      </select>
+    </div>
+    <div data-proto="shadowsocks">
+      <label class="f">Метод</label>
+      <select name="ss_method">{% for mth in P.SS_METHODS %}<option {% if mth == s.method %}selected{% endif %}>{{ mth }}</option>{% endfor %}</select>
+      <label class="f">Сеть</label>
+      <select name="ss_network">{% for n in ('tcp,udp', 'tcp', 'udp') %}<option {% if n == s.network %}selected{% endif %}>{{ n }}</option>{% endfor %}</select>
+      <label class="f">Серверный ключ</label><input value="{{ s.password }}" readonly class="mono">
+      {{ m.check('ss_regen', False, 'Сгенерировать новый ключ') }}
+      <div class="hint">У каждого клиента свой ключ (SS2022 multi-user), выводится из его UUID.</div>
+    </div>
+    <div data-proto="wireguard">
+      <div class="row">
+        <div><label class="f">MTU</label><input name="wg_mtu" type="number" value="{{ s.mtu }}"></div>
+        <div><label class="f">Пул адресов клиентов</label><input name="wg_pool" value="{{ s.address_pool }}"></div>
+      </div>
+      <label class="f">Публичный ключ сервера</label><input value="{{ s.public_key }}" readonly class="mono">
+      {{ m.check('wg_regen', False, 'Перегенерировать ключи сервера') }}
+    </div>
+    <div data-proto="socks http">
+      <label class="f">Аутентификация</label>
+      <select name="auth">
+        <option value="password" {% if s.auth != 'noauth' %}selected{% endif %}>логин/пароль клиентов</option>
+        <option value="noauth" {% if s.auth == 'noauth' %}selected{% endif %}>без пароля (опасно на 0.0.0.0)</option>
+      </select>
+      <div data-proto="socks">{{ m.check('udp', s.udp, 'UDP') }}</div>
+    </div>
+    <div data-proto="dokodemo-door">
+      <div class="row">
+        <div><label class="f">Адрес назначения</label><input name="dk_address" value="{{ s.address }}"></div>
+        <div><label class="f">Порт назначения</label><input name="dk_port" type="number" value="{{ s.port }}"></div>
+      </div>
+      <label class="f">Сеть</label>
+      <select name="dk_network">{% for n in ('tcp,udp', 'tcp', 'udp') %}<option {% if n == s.network %}selected{% endif %}>{{ n }}</option>{% endfor %}</select>
+      {{ m.check('dk_follow', s.follow_redirect, 'followRedirect (tproxy)') }}
+    </div>
+    <div data-proto="vmess trojan hysteria"><div class="hint">Клиенты добавляются в разделе «Клиенты»; у каждого свой UUID / пароль.</div></div>
+    <div data-proto="hysteria">
+      <div class="hint">Hysteria2 (нативный Xray). Нужен TLS-сертификат. TUIC в Xray не поддерживается.</div>
+      <div class="row">
+        <div><label class="f">UDP idle, с</label><input name="hy_idle" type="number" min="2" max="600" value="{{ s.udp_idle or 60 }}"></div>
+        <div><label class="f">Brutal up</label><input name="hy_up" value="{{ s.brutal_up or '100mbps' }}"></div>
+        <div><label class="f">Brutal down</label><input name="hy_down" value="{{ s.brutal_down or '300mbps' }}"></div>
+      </div>
+      <label class="f">Masquerade</label>
+      <select name="hy_mask">
+        {% for x in ('string', 'proxy', 'file') %}<option value="{{ x }}" {% if (s.masquerade_type or 'string') == x %}selected{% endif %}>{{ x }}</option>{% endfor %}
+      </select>
+      <label class="f">Masquerade content / URL / dir</label>
+      <input name="hy_mask_content" value="{{ s.masquerade_content or 'OK' }}" placeholder="текст ответа">
+      <input name="hy_mask_url" value="{{ s.masquerade_url or '' }}" placeholder="https://… для proxy">
+      <input name="hy_mask_dir" value="{{ s.masquerade_dir or '' }}" placeholder="/var/www для file">
+    </div>
+
+    <h3 class="mt">Sniffing</h3>
+    {{ m.check('sniff', ib.sniffing.enabled, 'Включить') }}
+    <div>{% for d in ('http', 'tls', 'quic', 'fakedns') %}{{ m.check('sniff_' ~ d, d in ib.sniffing.dest, d) }}{% endfor %}</div>
+    <div>{{ m.check('sniff_route_only', ib.sniffing.route_only, 'routeOnly') }}{{ m.check('sniff_meta', ib.sniffing.metadata_only, 'metadataOnly') }}</div>
+  </div>
+</div>
+
+<div class="card" data-proto="vless vmess trojan shadowsocks">
+  <h3>Транспорт</h3>
+  <div class="row">
+    <div><label class="f">Network</label>
+      <select name="network" id="network">{% for n in P.NETWORKS %}<option value="{{ n }}" {% if n == st.network %}selected{% endif %}>{{ n }}{% if n == 'raw' %} (tcp){% endif %}</option>{% endfor %}</select>
+    </div>
+    <div data-proto="vless vmess trojan"><label class="f">Security</label>
+      <select name="security" id="security">{% for x in P.SECURITIES %}<option value="{{ x }}" {% if x == st.security %}selected{% endif %}>{{ x }}</option>{% endfor %}</select>
+    </div>
+  </div>
+  <div data-net="raw" class="row">
+    <div><label class="f">Header</label><select name="raw_header"><option value="none">none</option><option value="http" {% if st.raw.header == 'http' %}selected{% endif %}>http (obfs)</option></select></div>
+    <div><label class="f">HTTP Host</label><input name="raw_host" value="{{ st.raw.http_host }}"></div>
+    <div><label class="f">HTTP Path</label><input name="raw_path" value="{{ st.raw.http_path }}"></div>
+  </div>
+  <div data-net="ws" class="row">
+    <div><label class="f">Path</label><input name="ws_path" value="{{ st.ws.path }}"></div>
+    <div><label class="f">Host</label><input name="ws_host" value="{{ st.ws.host }}"></div>
+  </div>
+  <div data-net="grpc" class="row">
+    <div><label class="f">serviceName</label><input name="grpc_service" value="{{ st.grpc.service_name }}"></div>
+    <div>{{ m.check('grpc_multi', st.grpc.multi_mode, 'multiMode') }}</div>
+  </div>
+  <div data-net="httpupgrade" class="row">
+    <div><label class="f">Path</label><input name="hu_path" value="{{ st.httpupgrade.path }}"></div>
+    <div><label class="f">Host</label><input name="hu_host" value="{{ st.httpupgrade.host }}"></div>
+  </div>
+  <div data-net="xhttp" class="row">
+    <div><label class="f">Path</label><input name="xh_path" value="{{ st.xhttp.path }}"></div>
+    <div><label class="f">Host</label><input name="xh_host" value="{{ st.xhttp.host }}"></div>
+    <div><label class="f">Mode</label><select name="xh_mode">{% for x in ('auto', 'packet-up', 'stream-up', 'stream-one') %}<option {% if x == st.xhttp.mode %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div>
+  </div>
+  <div data-net="kcp" class="row">
+    <div><label class="f">MTU</label><input name="kcp_mtu" type="number" value="{{ st.kcp.mtu }}"></div>
+    <div><label class="f">TTI</label><input name="kcp_tti" type="number" value="{{ st.kcp.tti }}"></div>
+    <div><label class="f">Uplink MB/s</label><input name="kcp_up" type="number" value="{{ st.kcp.uplink }}"></div>
+    <div><label class="f">Downlink MB/s</label><input name="kcp_down" type="number" value="{{ st.kcp.downlink }}"></div>
+    <div>{{ m.check('kcp_congestion', st.kcp.congestion, 'congestion') }}</div>
+  </div>
+</div>
+
+<div class="card" data-sec="tls" data-proto="vless vmess trojan hysteria">
+  <h3>TLS</h3>
+  <div class="row">
+    <div><label class="f">SNI (serverName)</label><input name="tls_sni" value="{{ st.tls.server_name }}"></div>
+    <div><label class="f">ALPN</label><input name="tls_alpn" value="{{ st.tls.alpn|join(',') }}"></div>
+    <div><label class="f">Fingerprint</label><select name="tls_fp">{% for f in P.FINGERPRINTS %}<option {% if f == st.tls.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
+    <div><label class="f">Min TLS</label><select name="tls_min">{% for v in ('1.2', '1.3') %}<option {% if v == st.tls.min_version %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Сертификат (fullchain)</label><input name="tls_cert" id="tls_cert" value="{{ st.tls.cert_file }}" placeholder="/etc/l2xpanel/certs/domain.crt"></div>
+    <div><label class="f">Ключ</label><input name="tls_key" id="tls_key" value="{{ st.tls.key_file }}"></div>
+  </div>
+  {% if certs %}
+  <div class="hint">Выпущенные сертификаты:
+    {% for c in certs %}<a href="#" onclick="document.getElementById('tls_cert').value='{{ c.cert_file }}';document.getElementById('tls_key').value='{{ c.key_file }}';document.getElementsByName('tls_sni')[0].value='{{ c.domain }}';return false">{{ c.domain }}</a> {% endfor %}
+  </div>
+  {% else %}<div class="hint">Сертификат можно выпустить в Настройки → Сертификаты (Let's Encrypt).</div>{% endif %}
+  {{ m.check('tls_insecure', st.tls.allow_insecure, 'allowInsecure в ссылках') }}
+</div>
+
+<div class="card" data-sec="reality" data-proto="vless trojan">
+  <h3>Reality</h3>
+  <div class="row">
+    <div><label class="f">Dest (target)</label><input name="r_dest" value="{{ st.reality.dest }}"></div>
+    <div><label class="f">Server names</label><input name="r_names" value="{{ st.reality.server_names|join(',') }}"></div>
+    <div><label class="f">Fingerprint</label><select name="r_fp">{% for f in P.FINGERPRINTS %}<option {% if f == st.reality.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Short IDs</label><input name="r_sids" value="{{ st.reality.short_ids|join(',') }}"></div>
+    <div><label class="f">SpiderX</label><input name="r_spx" value="{{ st.reality.spider_x }}"></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Private key</label><input name="r_priv" value="{{ st.reality.private_key }}" class="mono"></div>
+    <div><label class="f">Public key</label><input name="r_pub" value="{{ st.reality.public_key }}" class="mono"></div>
+  </div>
+  {{ m.check('r_regen', False, 'Сгенерировать новую пару ключей (старые ссылки перестанут работать)') }}
+</div>
+
+<div class="card" data-proto="vless trojan">
+  <h3>Fallbacks</h3>
+  <textarea name="fallbacks" class="mono" placeholder="name | alpn | path | dest | xver&#10;| | /ws | 127.0.0.1:8001 | 0&#10;| | | 8080 | 0">{% for f in ib.fallbacks %}{{ f.name }} | {{ f.alpn }} | {{ f.path }} | {{ f.dest }} | {{ f.xver }}
+{% endfor %}</textarea>
+  <div class="hint">По одной строке: <code>name | alpn | path | dest | xver</code>. Работает только с raw + tls (без Reality).</div>
+</div>
+
+<div class="actions">
+  <button class="btn">{{ t('Сохранить') }} и применить</button>
+  <a class="btn ghost" href="{{ bp }}/inbounds">{{ t('Отмена') }}</a>
+  {% if not is_new %}<a class="btn ghost" href="{{ bp }}/inbounds/{{ ib.id }}/export" target="_blank">Xray JSON</a>{% endif %}
+</div>
+</form>
+{% endblock %}
+{% block scripts %}
+<script>
+  function sync() {
+    var p = document.getElementById('protocol').value;
+    var n = document.getElementById('network').value;
+    var sec = document.getElementById('security').value;
+    var userProto = ['vless', 'vmess', 'trojan', 'shadowsocks'].indexOf(p) >= 0;
+    document.querySelectorAll('[data-proto]').forEach(function (el) { el.hidden = el.dataset.proto.split(' ').indexOf(p) < 0; });
+    document.querySelectorAll('[data-net]').forEach(function (el) { el.hidden = el.dataset.net !== n; });
+    document.querySelectorAll('[data-sec]').forEach(function (el) {
+      if (el.dataset.proto && el.dataset.proto.split(' ').indexOf(p) < 0) { el.hidden = true; return; }
+      if (p === 'hysteria') { el.hidden = el.dataset.sec !== 'tls'; return; }
+      el.hidden = !userProto || p === 'shadowsocks' || el.dataset.sec !== sec;
+    });
+    var transport = document.querySelector('.card[data-proto="vless vmess trojan shadowsocks"]');
+    if (transport) transport.hidden = !userProto;
+  }
+  ['protocol', 'network', 'security'].forEach(function (id) { document.getElementById(id).addEventListener('change', sync); });
+  sync();
+</script>
+{% endblock %}

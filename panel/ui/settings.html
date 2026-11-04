@@ -1,0 +1,269 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ t('Настройки') }} · {{ app_name }}{% endblock %}
+{% block page_title %}{{ t('Настройки') }}{% endblock %}
+{% block page_sub %}Панель, подписки, Telegram, безопасность, API, сертификаты, бэкапы{% endblock %}
+{% macro cert_picker(cert_id, key_id) -%}
+{% if certs %}<div class="hint">Сертификаты:
+  {% for c in certs %}<a href="#" onclick="document.getElementById('{{ cert_id }}').value='{{ c.cert_file }}';document.getElementById('{{ key_id }}').value='{{ c.key_file }}';return false">{{ c.domain }}</a> {% endfor %}</div>{% endif %}
+{%- endmacro %}
+{% block content %}
+<div class="tabs">
+  {% for k, l in [('panel', t('Панель')), ('sub', t('Подписки')), ('tg', 'Telegram'), ('webhooks', 'Webhooks'), ('nodes', 'Nodes agent'), ('security', t('Безопасность')), ('api', 'API'), ('certs', t('Сертификаты')), ('backup', t('Бэкап')), ('system', t('Система')), ('iplimit', 'IP limit')] %}
+  <a href="?tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
+  {% endfor %}
+</div>
+
+{% if tab == 'panel' %}{% set p = s.panel %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
+  <input type="hidden" name="section" value="panel">
+  <div class="row">
+    <div><label class="f">Название панели</label><input name="title" value="{{ p.title }}"></div>
+    <div><label class="f">Публичный адрес (IP/домен для ссылок)</label><input name="public_host" value="{{ p.public_host }}" placeholder="{{ public_host }}"></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Язык</label><select name="lang"><option value="ru">Русский</option><option value="en" {% if p.lang == 'en' %}selected{% endif %}>English</option></select></div>
+    <div><label class="f">Тема по умолчанию</label><select name="theme"><option value="dark">Тёмная</option><option value="light" {% if p.theme == 'light' %}selected{% endif %}>Светлая</option></select></div>
+    <div><label class="f">Часовой пояс</label><input name="timezone" value="{{ p.timezone }}" list="tzs"></div>
+    <div><label class="f">Сессия, часов</label><input name="session_hours" type="number" step="0.5" min="0.5" value="{{ p.session_hours }}"></div>
+  </div>
+  <datalist id="tzs">{% for z in ('Europe/Moscow', 'UTC', 'Europe/Berlin', 'Europe/Kiev', 'Asia/Tehran', 'Asia/Almaty', 'Asia/Yekaterinburg', 'Asia/Novosibirsk', 'Asia/Vladivostok') %}<option>{{ z }}</option>{% endfor %}</datalist>
+  <label class="f">Секретный путь панели (base path)</label>
+  <input name="base_path" value="{{ p.base_path }}" placeholder="например x7Kq2m — панель будет по /x7Kq2m/">
+  <div class="hint">После сохранения панель доступна только по <code>http://{{ public_host }}/{{ p.base_path or '…' }}/</code>. Подписки /sub/ и REST API остаются на корне. Сбросить: CLI <code>l2x</code> → «Сбросить base path».</div>
+
+  <h3 class="mt">Дополнительный HTTPS-порт панели</h3>
+  {{ m.check('extra_enabled', p.extra_listen.enabled, 'Слушать панель напрямую по HTTPS') }}
+  {% if panel_tls_running %}<span class="badge ok">работает</span>{% elif panel_tls_error %}<span class="badge err">{{ panel_tls_error }}</span>{% endif %}
+  <div class="row">
+    <div style="max-width:120px"><label class="f">Порт</label><input name="extra_port" type="number" value="{{ p.extra_listen.port }}"></div>
+    <div><label class="f">Сертификат</label><input name="extra_cert" id="extra_cert" value="{{ p.extra_listen.cert_file }}"></div>
+    <div><label class="f">Ключ</label><input name="extra_key" id="extra_key" value="{{ p.extra_listen.key_file }}"></div>
+  </div>
+  {{ cert_picker('extra_cert', 'extra_key') }}
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'sub' %}{% set sb = s.sub %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
+  <input type="hidden" name="section" value="sub">
+  {{ m.check('enabled', sb.enabled, 'Подписки включены') }}
+  {{ m.check('show_page', sb.show_page, 'Страница подписки в браузере') }}
+  <div class="row">
+    <div><label class="f">Название профиля (profile-title)</label><input name="title" value="{{ sb.title }}" placeholder="{{ app_name }} · email"></div>
+    <div style="max-width:160px"><label class="f">Интервал обновления, ч</label><input name="update_hours" type="number" min="1" value="{{ sb.update_hours }}"></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Ссылка поддержки</label><input name="support_url" value="{{ sb.support_url }}" placeholder="https://t.me/…"></div>
+    <div><label class="f">Домен в ссылках</label><input name="domain" value="{{ sb.domain }}" placeholder="{{ public_host }}"></div>
+  </div>
+  <label class="f">Объявление (announce)</label><input name="announce" value="{{ sb.announce }}">
+
+  <h3 class="mt">Отдельный сервер подписок</h3>
+  {{ m.check('server_enabled', sb.server_enabled, 'Запустить отдельный listener') }}
+  {% if sub_running %}<span class="badge ok">работает</span>{% elif sub_error %}<span class="badge err">{{ sub_error }}</span>{% endif %}
+  <div class="row">
+    <div><label class="f">Listen</label><input name="listen" value="{{ sb.listen }}"></div>
+    <div style="max-width:120px"><label class="f">Порт</label><input name="port" type="number" value="{{ sb.port }}"></div>
+    <div><label class="f">Путь</label><input name="path" value="{{ sb.path }}"></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Сертификат</label><input name="cert_file" id="sub_cert" value="{{ sb.cert_file }}"></div>
+    <div><label class="f">Ключ</label><input name="key_file" id="sub_key" value="{{ sb.key_file }}"></div>
+  </div>
+  {{ cert_picker('sub_cert', 'sub_key') }}
+  <div class="hint">Без отдельного сервера подписки отдаются панелью: <code>http://{{ public_host }}/sub/&lt;token&gt;</code>. Форматы: base64 (по умолчанию), <code>?format=plain|json|clash|singbox|html</code>; Clash/sing-box определяются по User-Agent.</div>
+
+  <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
+  <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. Пусто = не трогать.</div>
+  <label class="f">Fragment JSON</label>
+  <textarea name="json_fragment" class="mono" rows="4" placeholder='{"packets":"tlshello","length":"100-200","interval":"10-20"}'>{{ sb.json_fragment }}</textarea>
+  <label class="f">Noise / finalmask.udp JSON</label>
+  <textarea name="json_noise" class="mono" rows="3" placeholder='[{"type":"rand","packet":"100-200","delay":"10-20"}]'>{{ sb.json_noise }}</textarea>
+  <label class="f">Mux JSON</label>
+  <textarea name="json_mux" class="mono" rows="2" placeholder='{"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}'>{{ sb.json_mux }}</textarea>
+
+  <h3 class="mt">HWID и смена адреса (Happ)</h3>
+  {{ m.check('hwid_required', sb.hwid_required, 'Обязательный HWID: без заголовка X-HWID подписка не выдаётся') }}
+  <div class="hint">Клиент получает 404 с <code>X-Hwid-Not-Supported</code>, пока не включит отправку HWID. Happ дополнительно получает <code>subscription-always-hwid-enable: 1</code> и не даст отключить HWID (нужен Provider ID). Устройства видны в карточке клиента.</div>
+  {{ m.check('migrate_url', sb.migrate_url, 'Переносить клиентов на текущий адрес подписки при следующем обновлении (new-url)') }}
+  <div class="hint">Если клиент обновляет подписку по старому адресу (другой домен, порт или http), в ответе уходит <code>new-url</code> с актуальной ссылкой: домен/порт/путь из настроек выше. Старый адрес должен продолжать открываться, пока клиенты не обновятся. Работает в Happ при заданном Provider ID.</div>
+  <label class="f">Happ Provider ID</label>
+  <input name="happ_provider_id" value="{{ sb.happ_provider_id }}" placeholder="из личного кабинета happ-proxy.com" style="max-width:360px">
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'webhooks' %}{% set wh = s.webhooks %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
+  <input type="hidden" name="section" value="webhooks">
+  {{ m.check('enabled', wh.enabled, 'Webhooks включены') }}
+  <label class="f">URL (по одному на строку)</label>
+  <textarea name="urls" class="mono" rows="4" placeholder="https://example.com/hook">{{ wh.urls|join('\n') }}</textarea>
+  <label class="f">Секрет (заголовок X-L2X-Secret)</label>
+  <input name="secret" value="{{ wh.secret }}" class="mono">
+  <h3 class="mt">События</h3>
+  {% for e in ['client.created','client.updated','client.deleted','client.expired','client.limited','client.hwid_full','tunnel.down','tunnel.up','login','backup','node.sync'] %}
+  <label class="check"><input type="checkbox" name="ev_{{ e }}" value="1" {% if e in wh.events %}checked{% endif %}> {{ e }}</label>
+  {% endfor %}
+  <div class="hint">POST JSON: <code>{"event","ts","data"}</code>. Отправка асинхронная, без ретраев.</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'nodes' %}{% set ns = s.nodes %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
+  <input type="hidden" name="section" value="nodes">
+  {{ m.check('agent_enabled', ns.agent_enabled, 'Режим агента: принимать конфиг с мастер-панели') }}
+  <label class="f">Agent token</label>
+  <input value="{{ ns.agent_token }}" class="mono" readonly>
+  {{ m.check('regen_token', False, 'Сгенерировать новый token') }}
+  <div class="hint">На мастер-панели: страница Nodes → добавить эту ноду с URL <code>http://{{ public_host }}</code> и этим token. Эндпоинт: <code>POST /agent/apply</code>.</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'tg' %}{% set tg = s.tg %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
+  <input type="hidden" name="section" value="tg">
+  {{ m.check('enabled', tg.enabled, 'Telegram-бот включён') }}
+  <div class="row">
+    <div><label class="f">Токен бота</label><input name="token" value="{{ tg.token }}" type="password" autocomplete="off" placeholder="123456:ABC…"></div>
+    <div><label class="f">Chat ID администраторов</label><input name="admin_ids" value="{{ tg.admin_ids|join(', ') }}" placeholder="узнать: /id в боте"></div>
+  </div>
+  <h3 class="mt">Уведомления</h3>
+  {{ m.check('notify_login', tg.notify_login, 'Входы в панель') }}
+  {{ m.check('notify_quota', tg.notify_quota, 'Истечение срока / исчерпание трафика / авто-сброс') }}
+  {{ m.check('notify_iplimit', tg.notify_iplimit, 'Блокировки по лимиту IP') }}
+  {{ m.check('notify_tunnel', tg.notify_tunnel, 'Падение L2TP-туннелей') }}
+  <div class="row">
+    <div><label class="f">Предупреждать об истечении за, дн</label><input name="notify_expire_days" type="number" step="0.5" value="{{ tg.notify_expire_days }}"></div>
+    <div><label class="f">Порог CPU, %</label><input name="cpu_threshold" type="number" value="{{ tg.cpu_threshold }}"></div>
+    <div><label class="f">Отчёт каждые, ч (0 — нет)</label><input name="report_hours" type="number" step="0.5" value="{{ tg.report_hours }}"></div>
+    <div><label class="f">Бэкап каждые, ч (0 — нет)</label><input name="backup_hours" type="number" step="0.5" value="{{ tg.backup_hours }}"></div>
+  </div>
+  <div class="hint">Команды: /status /report /online /clients /tunnels /usage &lt;email&gt; /backup /restart_xray. Клиент с указанным Telegram ID видит в боте свой трафик и срок.</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
+{% elif tab == 'security' %}
+<div class="grid g2">
+  <form class="card" method="post" action="{{ bp }}/settings/account">
+    <h3>Учётная запись</h3>
+    <label class="f">{{ t('Логин') }}</label><input name="username" value="{{ admin.username }}" required>
+    <label class="f">Новый пароль (пусто — не менять)</label><input name="new_password" type="password" minlength="8" autocomplete="new-password">
+    <label class="f">Текущий пароль</label><input name="current" type="password" required autocomplete="current-password">
+    <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+  </form>
+  <div class="card">
+    <h3>Двухфакторная аутентификация</h3>
+    {% if s.security.totp_enabled %}
+      <span class="badge ok">2FA включена</span>
+      <form method="post" action="{{ bp }}/settings/totp/disable" class="mt">
+        <label class="f">Код из приложения для отключения</label>
+        <div class="flex"><input name="code" inputmode="numeric" maxlength="6" required><button class="btn danger">Отключить</button></div>
+      </form>
+    {% else %}
+      <div class="small muted">Отсканируйте QR в Google Authenticator / Aegis / 1Password и введите код.</div>
+      <div class="flex mt" style="align-items:flex-start">
+        <div class="qr">{{ totp_qr|safe }}</div>
+        <div style="flex:1;min-width:0"><label class="f">Секрет</label><input value="{{ totp_secret }}" readonly class="mono">
+          <form method="post" action="{{ bp }}/settings/totp/enable">
+            <label class="f">Код</label>
+            <div class="flex"><input name="code" inputmode="numeric" maxlength="6" required><button class="btn">Включить</button></div>
+          </form>
+        </div>
+      </div>
+    {% endif %}
+    <div class="hint mt">Если потеряли доступ к 2FA — CLI на сервере: <code>l2x</code> → «Отключить 2FA».</div>
+  </div>
+</div>
+
+{% elif tab == 'api' %}
+<div class="card">
+  <div class="card-head"><h3>API-токены</h3><a class="btn ghost sm" href="{{ bp }}/api-docs">Документация API</a></div>
+  {% if new_token %}
+  <div class="card" style="background:var(--ok-soft);border-color:var(--ok)">
+    <b>Новый токен — сохраните сейчас, больше он не будет показан:</b>
+    <div class="mt">{{ m.copy_field('newtok', new_token) }}</div>
+  </div>
+  {% endif %}
+  <table>
+    <thead><tr><th>Имя</th><th>Токен</th><th>Создан</th><th></th></tr></thead>
+    <tbody>
+    {% for tk in s.api_tokens %}
+      <tr><td>{{ tk.name }}</td><td class="mono">l2x_…{{ tk.last4 }}</td><td class="small">{{ fmt_dt(tk.created) }}</td>
+        <td class="right"><form method="post" action="{{ bp }}/settings/api-token/delete" onsubmit="return confirm('Отозвать токен?')"><input type="hidden" name="token_id" value="{{ tk.id }}"><button class="btn danger sm">Отозвать</button></form></td></tr>
+    {% else %}<tr><td colspan="4" class="empty">Токенов нет</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="{{ bp }}/settings/api-token/create" class="flex mt">
+    <input name="name" placeholder="имя (например, billing-bot)" style="max-width:320px"><button class="btn">Создать токен</button>
+  </form>
+</div>
+
+{% elif tab == 'certs' %}
+<div class="grid g2">
+  <form class="card" method="post" action="{{ bp }}/settings/cert">
+    <h3>Выпустить сертификат Let's Encrypt</h3>
+    <label class="f">Домен или IP сервера</label>
+    <div class="row" style="align-items:center">
+      <div><input name="domain" id="acme_domain" required placeholder="vpn.example.com или {{ public_host }}"></div>
+      <div style="flex:0 0 auto"><button type="button" class="btn ghost" onclick="document.getElementById('acme_domain').value='{{ public_host }}'">IP сервера</button></div>
+    </div>
+    <label class="f">Email</label><input name="email" type="email">
+    <div class="hint">acme.sh через nginx (webroot): проверка идёт без остановки панели. Без nginx — standalone, веб-сервер на :80 останавливается на время проверки. Сертификаты: /etc/l2xpanel/certs, автопродление acme.sh.</div>
+    <div class="hint">Для IP домен не нужен: Let's Encrypt выдаёт сертификат на 6 дней (профиль shortlived), acme.sh продлевает его каждые ~3 дня автоматически. Порт 80 должен быть открыт снаружи.</div>
+    <div class="actions mt"><button class="btn">Выпустить</button></div>
+  </form>
+  <div class="card">
+    <h3>Сертификаты</h3>
+    <table><tbody>
+    {% for c in certs %}<tr><td><b>{{ c.domain }}</b><div class="mono small dim">{{ c.cert_file }}</div></td><td class="small">{{ c.expires }}</td></tr>
+    {% else %}<tr><td class="empty">Нет сертификатов</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</div>
+{% include "_jobs.html" %}
+
+{% elif tab == 'backup' %}
+<div class="grid g2">
+  <div class="card">
+    <h3>Создать бэкап</h3>
+    <div class="small muted">Архив: store.json (клиенты, inbounds, настройки), админ, ключи, зашифрованные секреты L2TP, история.</div>
+    <div class="actions mt">
+      <a class="btn" href="{{ bp }}/backup/download">{{ ic.icon('download') }}Скачать .zip</a>
+      <form method="post" action="{{ bp }}/backup/telegram"><button class="btn ghost" {% if not s.tg.enabled %}disabled title="Telegram-бот выключен"{% endif %}>Отправить в Telegram</button></form>
+    </div>
+  </div>
+  <form class="card" method="post" action="{{ bp }}/backup/restore" enctype="multipart/form-data" onsubmit="return confirm('Восстановить из бэкапа? Текущие данные будут заменены (копия сохранится).')">
+    <h3>Восстановить</h3>
+    <input type="file" name="file" accept=".zip" required>
+    <div class="hint">Перед восстановлением создаётся страховочная копия pre-restore-*.zip в каталоге данных.</div>
+    <div class="actions mt"><button class="btn danger">Восстановить</button></div>
+  </form>
+</div>
+
+{% elif tab == 'system' %}
+<div class="grid g2">
+  <div class="card">
+    <h3>TCP BBR</h3>
+    <div class="small">Congestion: <b>{{ bbr.congestion }}</b> · qdisc: <b>{{ bbr.qdisc }}</b></div>
+    <form method="post" action="{{ bp }}/settings/bbr" class="actions mt">
+      {% if bbr.enabled %}<button class="btn ghost" name="enable" value="0">Выключить BBR</button>{% else %}<button class="btn" name="enable" value="1">Включить BBR</button>{% endif %}
+    </form>
+  </div>
+  <div class="card">
+    <h3>Speedtest</h3>
+    <div class="small muted">Скачивание 25 МБ с Cloudflare через основной интерфейс.</div>
+    <form method="post" action="{{ bp }}/settings/speedtest" class="actions mt"><button class="btn ghost">Запустить</button></form>
+  </div>
+</div>
+
+{% elif tab == 'iplimit' %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:640px">
+  <input type="hidden" name="section" value="iplimit">
+  <label class="f">Блокировка лишних IP, минут</label><input name="ban_minutes" type="number" min="1" value="{{ s.iplimit.ban_minutes }}">
+  <div class="hint">Если у клиента задан лимит IP, а онлайн больше адресов, самые новые IP блокируются iptables-цепочкой L2X_IPLIMIT на это время. Список и разблокировка — в карточке клиента.</div>
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+{% endif %}
+{% endblock %}

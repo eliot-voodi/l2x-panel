@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.env
+!deploy/panel.env.example
+initial_credentials.txt
+**/initial_credentials.txt
+admin.json
+**/admin.json
+secret_key
+**/secret_key
+
+# runtime data (docker-compose volumes)
+/data/
+/certs/
+/xray/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

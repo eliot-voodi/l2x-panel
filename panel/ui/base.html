@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}" data-theme="{{ theme }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <script>
+    (function () {
+      var t = localStorage.getItem('l2x-theme');
+      if (t) document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <style>
+    :root, [data-theme="dark"] {
+      --bg: #0a0d14; --bg-2: #0e131d; --surface: #121927; --surface-2: #182132; --surface-3: #1e2a3f;
+      --border: #222d42; --border-2: #2d3a55; --text: #e6ecf5; --muted: #8592a8; --dim: #5d6a80;
+      --accent: #22d3ee; --accent-2: #818cf8; --accent-soft: rgba(34, 211, 238, .12);
+      --ok: #34d399; --ok-soft: rgba(52, 211, 153, .12); --warn: #fbbf24; --warn-soft: rgba(251, 191, 36, .12);
+      --danger: #f87171; --danger-soft: rgba(248, 113, 113, .12); --shadow: 0 10px 30px rgba(0, 0, 0, .35);
+      --code: #0b111c;
+    }
+    [data-theme="light"] {
+      --bg: #f3f6fb; --bg-2: #eef2f8; --surface: #ffffff; --surface-2: #f6f8fc; --surface-3: #eceff6;
+      --border: #e1e6ef; --border-2: #d3dae6; --text: #0f172a; --muted: #5b6b82; --dim: #8a97ab;
+      --accent: #0891b2; --accent-2: #4f46e5; --accent-soft: rgba(8, 145, 178, .1);
+      --ok: #059669; --ok-soft: rgba(5, 150, 105, .1); --warn: #b45309; --warn-soft: rgba(180, 83, 9, .1);
+      --danger: #dc2626; --danger-soft: rgba(220, 38, 38, .1); --shadow: 0 8px 24px rgba(15, 23, 42, .08);
+      --code: #f1f4f9;
+    }
+    * { box-sizing: border-box }
+    [hidden] { display: none !important }
+    html, body { margin: 0; height: 100% }
+    body { font: 14px/1.5 Inter, "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+    a { color: var(--accent); text-decoration: none }
+    code, pre, .mono { font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace; font-size: .82em }
+    pre { background: var(--code); border: 1px solid var(--border); border-radius: 10px; padding: .8rem; overflow: auto; max-height: 70vh; white-space: pre-wrap; word-break: break-all }
+
+    .layout { display: flex; min-height: 100vh }
+    .sidebar { width: 248px; flex-shrink: 0; background: var(--bg-2); border-right: 1px solid var(--border); padding: 1rem .75rem;
+      position: sticky; top: 0; height: 100vh; overflow-y: auto; display: flex; flex-direction: column; gap: .2rem }
+    .brand { display: flex; align-items: center; gap: .6rem; padding: .35rem .6rem 1.1rem; font-weight: 700; font-size: 1.05rem; letter-spacing: .2px }
+    .brand .logo { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: grid; place-items: center; color: #06121b; font-weight: 800; font-size: .85rem; box-shadow: 0 0 22px rgba(34, 211, 238, .35) }
+    .nav-group { font-size: .68rem; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); padding: .9rem .7rem .3rem }
+    .nav-link { display: flex; align-items: center; gap: .65rem; padding: .52rem .7rem; border-radius: 10px; color: var(--muted); font-weight: 500 }
+    .nav-link svg { width: 18px; height: 18px; flex-shrink: 0 }
+    .nav-link:hover { background: var(--surface); color: var(--text) }
+    .nav-link.active { background: var(--accent-soft); color: var(--accent) }
+    .nav-link .pill { margin-left: auto; font-size: .7rem; padding: 0 .45rem; border-radius: 999px; background: var(--ok-soft); color: var(--ok) }
+    .sidebar-footer { margin-top: auto; padding-top: 1rem; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: .4rem }
+
+    .main { flex: 1; min-width: 0; display: flex; flex-direction: column }
+    .topbar { display: flex; align-items: center; gap: 1rem; padding: 1.1rem 1.75rem; border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(8px); position: sticky; top: 0; z-index: 5 }
+    .topbar h1 { margin: 0; font-size: 1.25rem; font-weight: 650 }
+    .topbar .sub { color: var(--muted); font-size: .85rem }
+    .topbar .spacer { flex: 1 }
+    .content { padding: 1.5rem 1.75rem 3rem; max-width: 1480px; width: 100% }
+
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.15rem 1.25rem; margin-bottom: 1rem }
+    .card h2, .card h3 { margin: 0 0 .85rem; font-size: 1rem; font-weight: 650 }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .85rem }
+    .card-head h2, .card-head h3 { margin: 0 }
+    .grid { display: grid; gap: 1rem }
+    .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)) } .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)) }
+    .g4 { grid-template-columns: repeat(4, minmax(0, 1fr)) }
+    @media (max-width: 1100px) { .g4 { grid-template-columns: repeat(2, 1fr) } .g3 { grid-template-columns: 1fr 1fr } }
+    @media (max-width: 760px) { .sidebar { display: none } .g2, .g3, .g4 { grid-template-columns: 1fr } .content { padding: 1rem } }
+
+    .stat { position: relative; overflow: hidden }
+    .stat .label { color: var(--muted); font-size: .8rem; display: flex; align-items: center; gap: .45rem }
+    .stat .value { font-size: 1.65rem; font-weight: 700; margin-top: .25rem; letter-spacing: -.5px }
+    .stat .hint { color: var(--dim); font-size: .78rem; margin-top: .15rem }
+    .stat .icon { position: absolute; right: 1rem; top: 1rem; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
+      background: var(--accent-soft); color: var(--accent) }
+    .stat .icon svg { width: 18px; height: 18px }
+
+    .bar { height: 6px; border-radius: 999px; background: var(--surface-3); overflow: hidden; margin-top: .55rem }
+    .bar > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)) }
+    .bar.warn > span { background: var(--warn) } .bar.danger > span { background: var(--danger) }
+
+    table { width: 100%; border-collapse: collapse }
+    th { text-align: left; font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600;
+      padding: .55rem .65rem; border-bottom: 1px solid var(--border) }
+    td { padding: .65rem; border-bottom: 1px solid var(--border); vertical-align: middle }
+    tr:last-child td { border-bottom: 0 }
+    tbody tr:hover { background: var(--surface-2) }
+    .table-wrap { overflow-x: auto }
+
+    .badge { display: inline-flex; align-items: center; gap: .3rem; padding: .12rem .55rem; border-radius: 999px; font-size: .72rem; font-weight: 600;
+      background: var(--surface-3); color: var(--muted); white-space: nowrap }
+    .badge.ok { background: var(--ok-soft); color: var(--ok) } .badge.warn { background: var(--warn-soft); color: var(--warn) }
+    .badge.err { background: var(--danger-soft); color: var(--danger) } .badge.accent { background: var(--accent-soft); color: var(--accent) }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block }
+    .dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft) }
+
+    label.f { display: block; font-size: .78rem; color: var(--muted); margin: .7rem 0 .3rem; font-weight: 500 }
+    input, select, textarea { font: inherit; color: var(--text); background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 9px;
+      padding: .5rem .7rem; width: 100%; outline: none; transition: border-color .15s, box-shadow .15s }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft) }
+    input[type=checkbox], input[type=radio] { width: auto; accent-color: var(--accent) }
+    textarea { min-height: 5rem; resize: vertical }
+    .check { display: inline-flex; align-items: center; gap: .45rem; cursor: pointer; color: var(--text); margin: .3rem 1rem .3rem 0 }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: flex-start } .row > * { flex: 1; min-width: 140px }
+    .hint { color: var(--dim); font-size: .76rem; margin-top: .25rem }
+
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; font: inherit; font-weight: 600; font-size: .85rem;
+      padding: .5rem .9rem; border-radius: 9px; border: 1px solid transparent; cursor: pointer; color: #06121b; white-space: nowrap;
+      background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 60%, var(--accent-2))) }
+    .btn:hover { filter: brightness(1.08) }
+    .btn svg { width: 16px; height: 16px }
+    .btn.ghost { background: var(--surface-2); border-color: var(--border-2); color: var(--text) }
+    .btn.ghost:hover { background: var(--surface-3) }
+    .btn.danger { background: var(--danger-soft); color: var(--danger); border-color: transparent }
+    .btn.sm { padding: .3rem .6rem; font-size: .78rem; border-radius: 8px }
+    .btn.icon { padding: .38rem; width: 32px; height: 32px }
+    .actions { display: flex; gap: .35rem; flex-wrap: wrap; align-items: center } .actions form { margin: 0 }
+
+    .tabs { display: flex; gap: .25rem; border-bottom: 1px solid var(--border); margin-bottom: 1.1rem; overflow-x: auto }
+    .tabs a { padding: .6rem .95rem; color: var(--muted); border-bottom: 2px solid transparent; font-weight: 500; white-space: nowrap }
+    .tabs a.active { color: var(--accent); border-color: var(--accent) }
+
+    .toast { position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 50; max-width: 460px; padding: .85rem 1rem; border-radius: 12px;
+      background: var(--surface-2); border: 1px solid var(--border-2); box-shadow: var(--shadow); display: flex; gap: .6rem; animation: slide .25s ease }
+    .toast.error { border-color: var(--danger) } .toast.info { border-color: var(--ok) }
+    @keyframes slide { from { transform: translateY(12px); opacity: 0 } }
+
+    dialog { background: var(--surface); color: var(--text); border: 1px solid var(--border-2); border-radius: 16px; padding: 1.25rem; max-width: 640px;
+      width: calc(100% - 2rem); box-shadow: var(--shadow) }
+    dialog::backdrop { background: rgba(4, 7, 12, .6); backdrop-filter: blur(3px) }
+    .qr { background: #fff; border-radius: 12px; padding: .5rem; display: inline-block; line-height: 0 }
+    .copy { display: flex; gap: .4rem } .copy input { font-size: .78rem; font-family: Consolas, monospace }
+    .muted { color: var(--muted) } .dim { color: var(--dim) } .small { font-size: .8rem } .nowrap { white-space: nowrap }
+    .right { text-align: right } .flex { display: flex; align-items: center; gap: .5rem } .between { justify-content: space-between }
+    .mt { margin-top: 1rem } .mb0 { margin-bottom: 0 } .w-auto { width: auto }
+    .empty { text-align: center; color: var(--dim); padding: 2.2rem 1rem }
+    .chart { width: 100%; height: 170px }
+    .seg { display: inline-flex; background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 2px }
+    .seg a { padding: .3rem .7rem; border-radius: 7px; color: var(--muted); font-size: .8rem; font-weight: 500 }
+    .seg a.active { background: var(--surface-3); color: var(--text) }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+{% import "_icons.html" as ic %}
+{% if user %}
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">L2X</div>{{ app_name }}</div>
+    <div class="nav-group">{{ t('Обзор') }}</div>
+    <a class="nav-link {% if active=='dashboard' %}active{% endif %}" href="{{ bp }}/">{{ ic.icon('grid') }}{{ t('Дашборд') }}</a>
+    <div class="nav-group">{{ t('Пользователи') }}</div>
+    <a class="nav-link {% if active=='clients' %}active{% endif %}" href="{{ bp }}/clients">{{ ic.icon('users') }}{{ t('Клиенты') }}</a>
+    <a class="nav-link {% if active=='inbounds' %}active{% endif %}" href="{{ bp }}/inbounds">{{ ic.icon('inbox') }}{{ t('Inbounds') }}</a>
+    <div class="nav-group">{{ t('Сеть') }}</div>
+    <a class="nav-link {% if active=='l2tp' %}active{% endif %}" href="{{ bp }}/l2tp">{{ ic.icon('globe') }}{{ t('L2TP') }}</a>
+    <a class="nav-link {% if active=='outbounds' %}active{% endif %}" href="{{ bp }}/outbounds">{{ ic.icon('send') }}{{ t('Outbounds') }}</a>
+    <a class="nav-link {% if active=='balancers' %}active{% endif %}" href="{{ bp }}/balancers">{{ ic.icon('scale') }}{{ t('Балансировщики') }}</a>
+    <a class="nav-link {% if active=='routing' %}active{% endif %}" href="{{ bp }}/routing">{{ ic.icon('route') }}{{ t('Маршрутизация') }}</a>
+    <a class="nav-link {% if active=='nodes' %}active{% endif %}" href="{{ bp }}/nodes">{{ ic.icon('globe') }}Nodes</a>
+    <div class="nav-group">{{ t('Система') }}</div>
+    <a class="nav-link {% if active=='xray' %}active{% endif %}" href="{{ bp }}/xray">{{ ic.icon('cpu') }}{{ t('Xray') }}</a>
+    <a class="nav-link {% if active=='logs' %}active{% endif %}" href="{{ bp }}/logs">{{ ic.icon('file') }}{{ t('Логи') }}</a>
+    <a class="nav-link {% if active=='settings' %}active{% endif %}" href="{{ bp }}/settings">{{ ic.icon('gear') }}{{ t('Настройки') }}</a>
+    <div class="sidebar-footer">
+      <div class="flex between small muted" style="padding:0 .7rem">
+        <span>{{ user }}</span>
+        <button class="btn ghost sm" type="button" onclick="toggleTheme()" title="Тема">{{ ic.icon('moon') }}</button>
+      </div>
+      <form method="post" action="{{ bp }}/logout"><button class="nav-link" style="width:100%;background:none;border:0;cursor:pointer;font:inherit">{{ ic.icon('logout') }}{{ t('Выход') }}</button></form>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1>{% block page_title %}{% endblock %}</h1>
+        <div class="sub">{% block page_sub %}{% endblock %}</div>
+      </div>
+      <div class="spacer"></div>
+      {% block top_actions %}{% endblock %}
+    </div>
+    <div class="content">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+{% else %}
+  {% block bare %}{% endblock %}
+{% endif %}
+{% if flash %}
+<div class="toast {{ flash.level }}" id="toast">
+  <span>{{ flash.message }}</span>
+  <button class="btn ghost sm" onclick="this.parentElement.remove()">✕</button>
+</div>
+<script>setTimeout(function () { var t = document.getElementById('toast'); if (t) t.remove(); }, 7000);</script>
+{% endif %}
+<script>
+  function toggleTheme() {
+    var cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', cur);
+    localStorage.setItem('l2x-theme', cur);
+  }
+  function copyText(id, btn) {
+    var el = document.getElementById(id);
+    var val = el.value !== undefined ? el.value : el.textContent;
+    var done = function () { var t = btn.innerHTML; btn.innerHTML = '✓'; setTimeout(function () { btn.innerHTML = t; }, 1100); };
+    if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(val).then(done); }
+    else { var ta = document.createElement('textarea'); ta.value = val; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); done(); }
+  }
+  function openDlg(id) { document.getElementById(id).showModal(); }
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,537 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Outbounds · {{ app_name }}{% endblock %}
+{% block page_title %}Outbounds{% endblock %}
+{% block page_sub %}Выходы трафика: direct, L2TP-туннели, свои прокси, WARP, NordVPN{% endblock %}
+{% block top_actions %}<button class="btn" type="button" onclick="obOpen()">{{ ic.icon('plus') }}{{ t('Добавить') }}</button>{% endblock %}
+{% block head %}
+<style>
+  #dlg-add { max-width: 860px }
+  #dlg-add .sec { border: 1px solid var(--border); border-radius: 12px; padding: .2rem 1rem .9rem; margin-top: .9rem }
+  #dlg-add .sec-h { display: flex; align-items: center; justify-content: space-between; margin: .7rem 0 0; font-weight: 600; font-size: .86rem }
+  #dlg-add .row > * { min-width: 120px }
+  #dlg-add .import { display: flex; gap: .4rem; align-items: center }
+  #dlg-add .import input { flex: 1 }
+  #ob-json { min-height: 24rem; font-size: .8rem }
+  #ob-err { color: var(--danger); font-size: .8rem; margin-top: .4rem }
+</style>
+{% endblock %}
+{% block content %}
+<div class="card" style="padding:0">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Outbound</th><th>Тип</th><th>{{ t('Статус') }}</th><th>Инфо</th><th>{{ t('Трафик') }}</th><th>Тест</th><th class="right">{{ t('Действия') }}</th></tr></thead>
+    <tbody>
+    {% for o in items %}
+      <tr>
+        <td><b>{{ o.label }}</b><div class="dim small mono">{{ o.tag }}</div></td>
+        <td><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.in_sub %} <span class="badge" title="показывается в подписках">в подписке</span>{% endif %}</td>
+        <td>{{ m.status_badge(o.status if o.status else 'active') }}</td>
+        <td class="small mono">{{ o.info or '' }}</td>
+        <td class="small nowrap">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</td>
+        <td class="small">{% if o.last_test %}{% if o.last_test.ok %}<span class="badge ok">{{ o.last_test.ms }} мс</span>{% else %}<span class="badge err">ошибка</span>{% endif %}<div class="dim">{{ ago(o.last_test.at) }}</div>{% endif %}</td>
+        <td>
+          <div class="actions" style="justify-content:flex-end">
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm" title="Проверить через временный Xray">{{ t('Тест') }}</button></form>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reset"><button class="btn ghost icon" title="{{ t('Сбросить трафик') }}">{{ ic.icon('refresh') }}</button></form>
+            {% if o.custom %}
+            <button type="button" class="btn ghost icon" title="Редактировать" data-tag="{{ o.tag }}" onclick="obOpen(this.dataset.tag)">{{ ic.icon('edit') }}</button>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/sub"><button class="btn ghost icon" title="Показывать в подписках">{{ ic.icon('link') }}</button></form>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/delete" onsubmit="return confirm('Удалить {{ o.tag }}?')"><button class="btn danger icon">{{ ic.icon('trash') }}</button></form>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+<div class="hint">Свои outbounds можно выбрать у клиента, в правилах маршрутизации и в балансировщиках. Тест поднимает временный Xray и замеряет запрос к generate_204.</div>
+
+<dialog id="dlg-add">
+  <div class="card-head"><h3 id="ob-title">Новый outbound</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+  <div class="tabs" id="otabs">
+    <a href="#" data-mode="form" class="active">Форма</a><a href="#" data-mode="json">JSON</a>
+    <a href="#" data-mode="warp" data-new>Cloudflare WARP</a><a href="#" data-mode="nord" data-new>NordVPN</a>
+  </div>
+  <form method="post" action="{{ bp }}/outbounds/add" id="ob-form">
+    <input type="hidden" name="mode" id="mode" value="form">
+    <input type="hidden" name="edit_tag" id="edit_tag" value="">
+    <input type="hidden" name="json" id="ob-json-out">
+
+    <div class="row">
+      <div><label class="f">Tag</label><input name="tag" id="f-tag" pattern="[A-Za-z0-9._-]*" placeholder="my-proxy (для WARP/Nord — авто)"></div>
+      <div><label class="f">Название</label><input name="remark" id="f-remark"></div>
+      <div style="max-width:100px"><label class="f">Страна</label><input name="country" id="f-country" maxlength="2" style="text-transform:uppercase" placeholder="DE"></div>
+    </div>
+
+    <div data-m="form">
+      <label class="f">Импорт из ссылки</label>
+      <div class="import">
+        <input id="f-link" placeholder="vless:// vmess:// trojan:// ss:// socks:// http:// wireguard://">
+        <button type="button" class="btn ghost" onclick="obImport()">Преобразовать</button>
+      </div>
+
+      <div class="row">
+        <div><label class="f">Протокол</label>
+          <select id="protocol">
+            {% for p in ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'freedom', 'blackhole', 'dns'] %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+          </select></div>
+        <div><label class="f">Send Through (исходящий IP)</label><input id="send_through" placeholder="авто"></div>
+      </div>
+
+      <div class="sec" data-show="protocol:vless,vmess,trojan,shadowsocks,socks,http">
+        <div class="sec-h">Сервер</div>
+        <div class="row">
+          <div style="flex:2"><label class="f">Адрес</label><input id="address" placeholder="example.com"></div>
+          <div><label class="f">Порт</label><input id="port" type="number" min="1" max="65535" value="443"></div>
+        </div>
+        <div class="row" data-show="protocol:vless,vmess">
+          <div style="flex:2"><label class="f">ID (UUID)</label><input id="uuid" class="mono"></div>
+          <div data-show="protocol:vless"><label class="f">Flow</label>
+            <select id="flow"><option value="">нет</option><option>xtls-rprx-vision</option><option>xtls-rprx-vision-udp443</option></select></div>
+          <div data-show="protocol:vless"><label class="f">Encryption</label><input id="vl_enc" value="none"></div>
+          <div data-show="protocol:vmess"><label class="f">Security</label>
+            <select id="vm_sec">{% for s in ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none', 'zero'] %}<option>{{ s }}</option>{% endfor %}</select></div>
+        </div>
+        <div class="row" data-show="protocol:trojan,shadowsocks">
+          <div style="flex:2"><label class="f">Пароль</label><input id="password" class="mono"></div>
+          <div data-show="protocol:shadowsocks"><label class="f">Метод</label>
+            <select id="ss_method">{% for s in ss_methods %}<option>{{ s }}</option>{% endfor %}<option>none</option></select></div>
+          <div data-show="protocol:shadowsocks" style="flex:0 0 auto"><label class="f">&nbsp;</label><label class="check"><input type="checkbox" id="ss_uot"> UDP over TCP</label></div>
+        </div>
+        <div class="row" data-show="protocol:socks,http">
+          <div><label class="f">Пользователь</label><input id="user" placeholder="без авторизации"></div>
+          <div><label class="f">Пароль</label><input id="pass"></div>
+        </div>
+      </div>
+
+      <div class="sec" data-show="protocol:wireguard">
+        <div class="sec-h">WireGuard</div>
+        <div class="row">
+          <div style="flex:2"><label class="f">Private key</label>
+            <div class="import"><input id="wg_secret" class="mono" placeholder="ваш секретный ключ">
+              <button type="button" class="btn ghost" onclick="wgGen()">Сгенерировать</button></div>
+            <div class="hint">Public key ниже — отправьте его удалённому peer. Peer public key — ключ сервера.</div></div>
+          <div><label class="f">Адреса (через запятую)</label><input id="wg_addr" value="172.16.0.2/32"></div>
+        </div>
+        <div class="row">
+          <div style="flex:2"><label class="f">Public key (ваш)</label>
+            <div class="import"><input id="wg_local_pub" class="mono" readonly placeholder="появится после генерации">
+              <button type="button" class="btn ghost sm" onclick="copyText('wg_local_pub', this)" title="Копировать">{{ ic.icon('copy') }}</button></div></div>
+          <div><label class="f">MTU</label><input id="wg_mtu" type="number" value="1420"></div>
+          <div><label class="f">Reserved</label><input id="wg_reserved" placeholder="0,0,0"></div>
+          <div><label class="f">Domain strategy</label>
+            <select id="wg_ds">{% for s in ['ForceIP', 'ForceIPv4', 'ForceIPv6', 'ForceIPv4v6', 'ForceIPv6v4'] %}<option>{{ s }}</option>{% endfor %}</select></div>
+        </div>
+        <div class="sec-h">Peer</div>
+        <div class="row">
+          <div style="flex:2"><label class="f">Peer public key</label><input id="wg_pub" class="mono" placeholder="ключ удалённого сервера"></div>
+          <div style="flex:2"><label class="f">Pre-shared key</label><input id="wg_psk" class="mono" placeholder="необязательно"></div>
+        </div>
+        <div class="row">
+          <div style="flex:2"><label class="f">Endpoint</label><input id="wg_endpoint" placeholder="engage.cloudflareclient.com:2408"></div>
+          <div style="flex:2"><label class="f">Allowed IPs</label><input id="wg_allowed" value="0.0.0.0/0, ::/0"></div>
+          <div><label class="f">Keepalive, с</label><input id="wg_keepalive" type="number" min="0" placeholder="0"></div>
+        </div>
+      </div>
+
+      <div class="sec" data-show="protocol:freedom">
+        <div class="sec-h">Freedom</div>
+        <div class="row">
+          <div><label class="f">Domain strategy</label>
+            <select id="fr_ds">{% for s in ['AsIs', 'UseIP', 'UseIPv4', 'UseIPv6', 'UseIPv4v6', 'UseIPv6v4', 'ForceIP', 'ForceIPv4', 'ForceIPv6', 'ForceIPv4v6', 'ForceIPv6v4'] %}<option>{{ s }}</option>{% endfor %}</select></div>
+          <div style="flex:2"><label class="f">Redirect</label><input id="fr_redirect" placeholder="127.0.0.1:3366"></div>
+        </div>
+        <label class="check"><input type="checkbox" id="fr_frag"> Fragment (обход DPI)</label>
+        <div class="row" data-show="fr_frag:on">
+          <div><label class="f">Packets</label><input id="fr_packets" value="tlshello"></div>
+          <div><label class="f">Length</label><input id="fr_length" value="100-200"></div>
+          <div><label class="f">Interval</label><input id="fr_interval" value="10-20"></div>
+        </div>
+      </div>
+
+      <div class="sec" data-show="protocol:blackhole">
+        <div class="sec-h">Blackhole</div>
+        <label class="f">Ответ</label><select id="bh_type"><option value="none">none — молча закрыть</option><option value="http">http — 403</option></select>
+      </div>
+
+      <div class="sec" data-show="protocol:dns">
+        <div class="sec-h">DNS</div>
+        <div class="row">
+          <div><label class="f">Сеть</label><select id="dns_net"><option value="">как в запросе</option><option>udp</option><option>tcp</option></select></div>
+          <div><label class="f">Адрес</label><input id="dns_addr" placeholder="1.1.1.1"></div>
+          <div><label class="f">Порт</label><input id="dns_port" type="number" placeholder="53"></div>
+        </div>
+      </div>
+
+      <div class="sec" data-show="protocol:vless,vmess,trojan,shadowsocks,socks,http">
+        <div class="sec-h">Транспорт</div>
+        <div class="row">
+          <div><label class="f">Network</label>
+            <select id="net">{% for n in ['raw', 'ws', 'grpc', 'httpupgrade', 'xhttp', 'kcp'] %}<option>{{ n }}</option>{% endfor %}</select></div>
+          <div data-show="net:raw"><label class="f">Header</label><select id="raw_header"><option value="none">none</option><option value="http">http</option></select></div>
+          <div data-show="net:xhttp"><label class="f">Mode</label>
+            <select id="xh_mode">{% for x in ['auto', 'packet-up', 'stream-up', 'stream-one'] %}<option>{{ x }}</option>{% endfor %}</select></div>
+          <div data-show="net:grpc" style="flex:0 0 auto"><label class="f">&nbsp;</label><label class="check"><input type="checkbox" id="grpc_multi"> multiMode</label></div>
+        </div>
+        <div class="row" data-show="net:ws,httpupgrade,xhttp,raw">
+          <div data-show-raw><label class="f">Path</label><input id="path" placeholder="/"></div>
+          <div data-show-raw><label class="f">Host</label><input id="host"></div>
+        </div>
+        <div class="row" data-show="net:grpc">
+          <div><label class="f">Service name</label><input id="grpc_service"></div>
+          <div><label class="f">Authority</label><input id="grpc_authority"></div>
+        </div>
+        <div class="row" data-show="net:kcp">
+          <div><label class="f">MTU</label><input id="kcp_mtu" type="number" value="1350"></div>
+          <div><label class="f">TTI</label><input id="kcp_tti" type="number" value="20"></div>
+          <div><label class="f">Uplink, MB/s</label><input id="kcp_up" type="number" value="5"></div>
+          <div><label class="f">Downlink, MB/s</label><input id="kcp_down" type="number" value="20"></div>
+          <div style="flex:0 0 auto"><label class="f">&nbsp;</label><label class="check"><input type="checkbox" id="kcp_cong"> congestion</label></div>
+        </div>
+
+        <div class="sec-h">Безопасность</div>
+        <div class="row">
+          <div><label class="f">Security</label><select id="sec"><option>none</option><option>tls</option><option>reality</option></select></div>
+          <div data-show="sec:tls,reality"><label class="f">SNI</label><input id="sni"></div>
+          <div data-show="sec:tls,reality"><label class="f">Fingerprint</label>
+            <select id="fp"><option value="">нет</option>{% for f in fingerprints %}<option>{{ f }}</option>{% endfor %}</select></div>
+        </div>
+        <div class="row" data-show="sec:tls">
+          <div><label class="f">ALPN</label><input id="alpn" placeholder="h2,http/1.1"></div>
+          <div style="flex:0 0 auto"><label class="f">&nbsp;</label><label class="check"><input type="checkbox" id="insecure"> allowInsecure</label></div>
+        </div>
+        <div class="row" data-show="sec:reality">
+          <div style="flex:2"><label class="f">Public key</label><input id="pbk" class="mono"></div>
+          <div><label class="f">Short ID</label><input id="sid" class="mono"></div>
+          <div><label class="f">SpiderX</label><input id="spx" placeholder="/"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-h"><span>Sockopt</span><label class="check" style="margin:0"><input type="checkbox" id="so_on"> включить</label></div>
+        <div data-show="so_on:on">
+          <div class="row">
+            <div><label class="f">Dialer proxy (цепочка)</label>
+              <select id="so_dialer"><option value="">нет</option>{% for tg in dialer_tags %}<option>{{ tg }}</option>{% endfor %}</select></div>
+            <div><label class="f">Interface</label><input id="so_iface" placeholder="eth0 / l2x-..."></div>
+            <div><label class="f">Mark</label><input id="so_mark" type="number" min="0"></div>
+          </div>
+          <div class="row">
+            <div><label class="f">Domain strategy</label>
+              <select id="so_ds"><option value="">AsIs</option>{% for s in ['UseIP', 'UseIPv4', 'UseIPv6', 'UseIPv4v6', 'UseIPv6v4', 'ForceIP', 'ForceIPv4', 'ForceIPv6'] %}<option>{{ s }}</option>{% endfor %}</select></div>
+            <div><label class="f">TCP keepalive, с</label><input id="so_keepalive" type="number" min="0"></div>
+            <div style="flex:0 0 auto"><label class="f">&nbsp;</label><label class="check"><input type="checkbox" id="so_tfo"> TCP Fast Open</label></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec" data-show="protocol:vless,vmess,trojan,shadowsocks,socks,http">
+        <div class="sec-h"><span>Mux</span><label class="check" style="margin:0"><input type="checkbox" id="mux_on"> включить</label></div>
+        <div class="row" data-show="mux_on:on">
+          <div><label class="f">Concurrency</label><input id="mux_conc" type="number" value="8" min="-1"></div>
+          <div><label class="f">xudpConcurrency</label><input id="mux_xudp" type="number" value="16" min="-1"></div>
+          <div><label class="f">xudpProxyUDP443</label><select id="mux_udp443"><option>reject</option><option>allow</option><option>skip</option></select></div>
+        </div>
+        <div class="hint" data-show="mux_on:on">С Flow xtls-rprx-vision Mux не используется — Xray его игнорирует.</div>
+      </div>
+    </div>
+
+    <div data-m="json" hidden>
+      <label class="f">Xray outbound JSON — изменения применяются к форме при переключении на вкладку «Форма»</label>
+      <textarea id="ob-json" class="mono" spellcheck="false"></textarea>
+    </div>
+    <div data-m="warp" hidden><div class="hint">Будет зарегистрировано новое устройство WARP (бесплатный аккаунт) и создан WireGuard outbound.</div></div>
+    <div data-m="nord" hidden>
+      <label class="f">Access token NordVPN</label><input name="nord_token" type="password" placeholder="из личного кабинета Nord Account → Manual setup">
+      <label class="f">Страна</label>
+      <select name="nord_country" id="nord_country"><option value="">рекомендованный сервер</option></select>
+    </div>
+    <div id="ob-err" hidden></div>
+    <div class="actions mt"><button class="btn" id="ob-submit">{{ t('Добавить') }}</button>
+      <button type="button" class="btn ghost" onclick="this.closest('dialog').close()">{{ t('Отмена') }}</button></div>
+  </form>
+</dialog>
+{% endblock %}
+{% block scripts %}
+<script>
+  var BP = {{ bp|tojson }}, CUSTOM = {{ custom|tojson }}, nordLoaded = false, curMode = 'form';
+  var form = document.getElementById('ob-form');
+  var $ = function (id) { return document.getElementById(id); };
+  var v = function (id) { var el = $(id); return el.type === 'checkbox' ? el.checked : el.value.trim(); };
+  var sv = function (id, val) { var el = $(id); if (el.type === 'checkbox') el.checked = !!val; else el.value = val == null ? '' : val; };
+  var num = function (id) { var n = parseInt(v(id), 10); return isNaN(n) ? null : n; };
+  var list = function (s) { return String(s || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); };
+  var STREAM = ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http'];
+  var DEFAULTS = {};
+  form.querySelectorAll('[data-m="form"] input[id], [data-m="form"] select[id]').forEach(function (el) {
+    DEFAULTS[el.id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+
+  function refresh() {
+    form.querySelectorAll('[data-show]').forEach(function (el) {
+      var ok = el.dataset.show.split(';').every(function (cond) {
+        var p = cond.split(':'), src = $(p[0]);
+        var val = src.type === 'checkbox' ? (src.checked ? 'on' : 'off') : src.value;
+        return p[1].split(',').indexOf(val) >= 0;
+      });
+      el.hidden = !ok;
+    });
+    var rawHttp = v('net') !== 'raw' || v('raw_header') === 'http';
+    form.querySelectorAll('[data-show-raw]').forEach(function (el) { el.hidden = !rawHttp; });
+  }
+
+  function buildStream() {
+    var net = v('net'), sec = v('sec'), st = { network: net };
+    if (sec !== 'none') st.security = sec;
+    var withHost = function (o) { if (v('host')) o.host = v('host'); return o; };
+    if (net === 'raw' && v('raw_header') === 'http') {
+      st.rawSettings = { header: { type: 'http', request: { path: [v('path') || '/'], headers: v('host') ? { Host: list(v('host')) } : {} } } };
+    } else if (net === 'ws') st.wsSettings = withHost({ path: v('path') || '/' });
+    else if (net === 'httpupgrade') st.httpupgradeSettings = withHost({ path: v('path') || '/' });
+    else if (net === 'xhttp') st.xhttpSettings = withHost({ path: v('path') || '/', mode: v('xh_mode') });
+    else if (net === 'grpc') {
+      st.grpcSettings = { serviceName: v('grpc_service'), multiMode: v('grpc_multi') };
+      if (v('grpc_authority')) st.grpcSettings.authority = v('grpc_authority');
+    } else if (net === 'kcp') {
+      st.kcpSettings = { mtu: num('kcp_mtu') || 1350, tti: num('kcp_tti') || 20, uplinkCapacity: num('kcp_up') || 5,
+        downlinkCapacity: num('kcp_down') || 20, congestion: v('kcp_cong') };
+    }
+    if (sec === 'tls') {
+      var tls = { serverName: v('sni') || v('address') };
+      if (v('fp')) tls.fingerprint = v('fp');
+      if (v('alpn')) tls.alpn = list(v('alpn'));
+      if (v('insecure')) tls.allowInsecure = true;
+      st.tlsSettings = tls;
+    } else if (sec === 'reality') {
+      st.realitySettings = { serverName: v('sni'), fingerprint: v('fp') || 'chrome', publicKey: v('pbk'), shortId: v('sid'), spiderX: v('spx') || '/' };
+    }
+    return st;
+  }
+
+  function buildOb() {
+    var p = v('protocol'), o = { protocol: p }, s = {};
+    if (v('f-tag')) o.tag = v('f-tag');
+    if (v('send_through')) o.sendThrough = v('send_through');
+    var addr = v('address'), port = num('port') || 443;
+    if (p === 'vless') {
+      var u = { id: v('uuid'), encryption: v('vl_enc') || 'none' };
+      if (v('flow')) u.flow = v('flow');
+      s.vnext = [{ address: addr, port: port, users: [u] }];
+    } else if (p === 'vmess') {
+      s.vnext = [{ address: addr, port: port, users: [{ id: v('uuid'), security: v('vm_sec') }] }];
+    } else if (p === 'trojan') {
+      s.servers = [{ address: addr, port: port, password: v('password') }];
+    } else if (p === 'shadowsocks') {
+      var ss = { address: addr, port: port, method: v('ss_method'), password: v('password') };
+      if (v('ss_uot')) ss.uot = true;
+      s.servers = [ss];
+    } else if (p === 'socks' || p === 'http') {
+      var srv = { address: addr, port: port };
+      if (v('user')) srv.users = [{ user: v('user'), pass: v('pass') }];
+      s.servers = [srv];
+    } else if (p === 'wireguard') {
+      var peer = { publicKey: v('wg_pub'), endpoint: v('wg_endpoint'), allowedIPs: list(v('wg_allowed')) };
+      if (v('wg_psk')) peer.preSharedKey = v('wg_psk');
+      if (num('wg_keepalive')) peer.keepAlive = num('wg_keepalive');
+      s = { secretKey: v('wg_secret'), address: list(v('wg_addr')), peers: [peer], mtu: num('wg_mtu') || 1420, domainStrategy: v('wg_ds') };
+      if (v('wg_reserved')) s.reserved = list(v('wg_reserved')).map(Number);
+    } else if (p === 'freedom') {
+      if (v('fr_ds') !== 'AsIs') s.domainStrategy = v('fr_ds');
+      if (v('fr_redirect')) s.redirect = v('fr_redirect');
+      if (v('fr_frag')) s.fragment = { packets: v('fr_packets') || 'tlshello', length: v('fr_length') || '100-200', interval: v('fr_interval') || '10-20' };
+    } else if (p === 'blackhole') {
+      if (v('bh_type') === 'http') s.response = { type: 'http' };
+    } else if (p === 'dns') {
+      if (v('dns_net')) s.network = v('dns_net');
+      if (v('dns_addr')) s.address = v('dns_addr');
+      if (num('dns_port')) s.port = num('dns_port');
+    }
+    o.settings = s;
+    var st = STREAM.indexOf(p) >= 0 ? buildStream() : {};
+    if (v('so_on')) {
+      var so = {};
+      if (v('so_dialer')) so.dialerProxy = v('so_dialer');
+      if (v('so_iface')) so.interface = v('so_iface');
+      if (num('so_mark')) so.mark = num('so_mark');
+      if (v('so_ds')) so.domainStrategy = v('so_ds');
+      if (num('so_keepalive')) so.tcpKeepAliveInterval = num('so_keepalive');
+      if (v('so_tfo')) so.tcpFastOpen = true;
+      st.sockopt = so;
+    }
+    if (Object.keys(st).length) o.streamSettings = st;
+    if (STREAM.indexOf(p) >= 0 && v('mux_on')) {
+      o.mux = { enabled: true, concurrency: num('mux_conc') == null ? 8 : num('mux_conc'),
+        xudpConcurrency: num('mux_xudp') == null ? 16 : num('mux_xudp'), xudpProxyUDP443: v('mux_udp443') };
+    }
+    return o;
+  }
+
+  function resetForm() {
+    Object.keys(DEFAULTS).forEach(function (id) { sv(id, DEFAULTS[id]); });
+  }
+
+  function loadOb(o) {
+    resetForm();
+    o = o || {};
+    var p = o.protocol || 'vless', s = o.settings || {}, st = o.streamSettings || {};
+    sv('protocol', p);
+    sv('send_through', o.sendThrough || '');
+    if (o.tag && !v('f-tag')) sv('f-tag', o.tag);
+    var srv = (s.vnext || s.servers || [])[0] || (s.address ? s : null);
+    if (srv && p !== 'dns') { sv('address', srv.address || ''); sv('port', srv.port || 443); }
+    var user = (srv && (srv.users || [])[0]) || (s.id ? s : null) || {};
+    if (p === 'vless') { sv('uuid', user.id); sv('flow', user.flow || ''); sv('vl_enc', user.encryption || 'none'); }
+    if (p === 'vmess') { sv('uuid', user.id); sv('vm_sec', user.security || 'auto'); }
+    if (p === 'trojan' || p === 'shadowsocks') sv('password', (srv || {}).password || '');
+    if (p === 'shadowsocks') { sv('ss_method', (srv || {}).method || DEFAULTS.ss_method); sv('ss_uot', (srv || {}).uot); }
+    if (p === 'socks' || p === 'http') { sv('user', user.user || ''); sv('pass', user.pass || ''); }
+    if (p === 'wireguard') {
+      var peer = (s.peers || [])[0] || {};
+      sv('wg_secret', s.secretKey || ''); sv('wg_addr', (s.address || []).join(', ') || DEFAULTS.wg_addr); sv('wg_mtu', s.mtu || 1420);
+      sv('wg_reserved', (s.reserved || []).join(',')); sv('wg_ds', s.domainStrategy || 'ForceIP');
+      sv('wg_pub', peer.publicKey || ''); sv('wg_psk', peer.preSharedKey || ''); sv('wg_endpoint', peer.endpoint || '');
+      sv('wg_allowed', (peer.allowedIPs || ['0.0.0.0/0', '::/0']).join(', ')); sv('wg_keepalive', peer.keepAlive || '');
+      wgFillLocal('');
+      if (s.secretKey) setTimeout(wgDerive, 0);
+    } else {
+      wgFillLocal('');
+    }
+    if (p === 'freedom') {
+      sv('fr_ds', s.domainStrategy || 'AsIs'); sv('fr_redirect', s.redirect || '');
+      sv('fr_frag', !!s.fragment);
+      if (s.fragment) { sv('fr_packets', s.fragment.packets); sv('fr_length', s.fragment.length); sv('fr_interval', s.fragment.interval); }
+    }
+    if (p === 'blackhole') sv('bh_type', (s.response || {}).type === 'http' ? 'http' : 'none');
+    if (p === 'dns') { sv('dns_net', s.network || ''); sv('dns_addr', s.address || ''); sv('dns_port', s.port || ''); }
+
+    var net = st.network || 'raw';
+    if (net === 'tcp') net = 'raw';
+    sv('net', net);
+    var raw = st.rawSettings || st.tcpSettings;
+    if (raw && raw.header && raw.header.type === 'http') {
+      var rq = raw.header.request || {};
+      sv('raw_header', 'http'); sv('path', (rq.path || ['/'])[0]); sv('host', ((rq.headers || {}).Host || []).join(','));
+    }
+    var hs = st.wsSettings || st.httpupgradeSettings || st.xhttpSettings || st.splithttpSettings;
+    if (hs) { sv('path', hs.path || ''); sv('host', hs.host || (hs.headers || {}).Host || ''); if (hs.mode) sv('xh_mode', hs.mode); }
+    if (st.grpcSettings) { sv('grpc_service', st.grpcSettings.serviceName || ''); sv('grpc_authority', st.grpcSettings.authority || ''); sv('grpc_multi', st.grpcSettings.multiMode); }
+    if (st.kcpSettings) {
+      var k = st.kcpSettings;
+      sv('kcp_mtu', k.mtu || 1350); sv('kcp_tti', k.tti || 20); sv('kcp_up', k.uplinkCapacity || 5); sv('kcp_down', k.downlinkCapacity || 20); sv('kcp_cong', k.congestion);
+    }
+    sv('sec', st.security || 'none');
+    var t = st.tlsSettings || st.realitySettings || {};
+    sv('sni', t.serverName || ''); sv('fp', t.fingerprint || '');
+    sv('alpn', (t.alpn || []).join(',')); sv('insecure', t.allowInsecure);
+    sv('pbk', t.publicKey || t.password || ''); sv('sid', t.shortId || ''); sv('spx', t.spiderX || '');
+    var so = st.sockopt;
+    sv('so_on', !!so);
+    if (so) {
+      sv('so_dialer', so.dialerProxy || ''); sv('so_iface', so.interface || ''); sv('so_mark', so.mark || '');
+      sv('so_ds', so.domainStrategy || ''); sv('so_keepalive', so.tcpKeepAliveInterval || ''); sv('so_tfo', so.tcpFastOpen);
+    }
+    var mx = o.mux;
+    sv('mux_on', !!(mx && mx.enabled));
+    if (mx) { sv('mux_conc', mx.concurrency); sv('mux_xudp', mx.xudpConcurrency); sv('mux_udp443', mx.xudpProxyUDP443 || 'reject'); }
+    refresh();
+  }
+
+  function showErr(msg) { var e = $('ob-err'); e.textContent = msg || ''; e.hidden = !msg; }
+
+  function setMode(mode) {
+    if (curMode === 'json' && mode === 'form') {
+      try { loadOb(JSON.parse($('ob-json').value || '{}')); showErr(''); }
+      catch (err) { showErr('JSON с ошибкой: ' + err.message); return; }
+    }
+    if (mode === 'json' && curMode === 'form') {
+      var o = buildOb(); delete o.tag;
+      $('ob-json').value = JSON.stringify(o, null, 2);
+    }
+    curMode = mode;
+    $('mode').value = mode;
+    document.querySelectorAll('#otabs a').forEach(function (x) { x.classList.toggle('active', x.dataset.mode === mode); });
+    document.querySelectorAll('[data-m]').forEach(function (x) { x.hidden = x.dataset.m !== mode; });
+    if (mode === 'nord' && !nordLoaded) {
+      nordLoaded = true;
+      fetch(BP + '/outbounds/nord/countries').then(function (r) { return r.json(); }).then(function (items) {
+        var sel = $('nord_country');
+        items.forEach(function (c) { var op = document.createElement('option'); op.value = c.id; op.textContent = c.name + ' (' + c.code + ')'; sel.appendChild(op); });
+      });
+    }
+  }
+
+  window.obOpen = function (tag) {
+    var item = tag ? CUSTOM[tag] : null;
+    showErr('');
+    sv('f-tag', tag || ''); sv('f-remark', item ? item.remark : ''); sv('f-country', item ? item.country : ''); sv('f-link', '');
+    $('f-tag').readOnly = !!tag;
+    $('edit_tag').value = tag || '';
+    $('ob-title').textContent = tag ? 'Редактировать ' + tag : 'Новый outbound';
+    $('ob-submit').textContent = tag ? 'Сохранить' : 'Добавить';
+    document.querySelectorAll('#otabs [data-new]').forEach(function (a) { a.hidden = !!tag; });
+    curMode = 'form';
+    loadOb(item ? item.config : { protocol: 'vless' });
+    setMode('form');
+    openDlg('dlg-add');
+  };
+
+  window.obImport = function () {
+    var link = v('f-link');
+    if (!link) return;
+    var fd = new FormData(); fd.append('link', link);
+    fetch(BP + '/outbounds/parse', { method: 'POST', body: fd, credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) { showErr(d.error || 'Не удалось разобрать ссылку'); return; }
+        showErr('');
+        loadOb(d.config);
+        if (!v('f-remark') && d.remark) sv('f-remark', d.remark);
+      })
+      .catch(function () { showErr('Ошибка запроса'); });
+  };
+
+  function wgFillLocal(pub) { sv('wg_local_pub', pub || ''); }
+  function wgDerive() {
+    var priv = v('wg_secret');
+    if (!priv) { wgFillLocal(''); return; }
+    fetch(BP + '/api/keys/wg?private=' + encodeURIComponent(priv), { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { wgFillLocal(d.ok ? d.public_key : ''); if (!d.ok) showErr(d.error || 'не удалось получить public key'); })
+      .catch(function () { wgFillLocal(''); });
+  }
+  window.wgGen = function () {
+    showErr('');
+    fetch(BP + '/api/keys/wg', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) { showErr(d.error || 'генерация ключей не удалась'); return; }
+        sv('wg_secret', d.private_key);
+        wgFillLocal(d.public_key);
+      })
+      .catch(function () { showErr('Ошибка запроса генерации ключей'); });
+  };
+  $('wg_secret').addEventListener('change', wgDerive);
+  $('wg_secret').addEventListener('blur', wgDerive);
+
+  document.querySelectorAll('#otabs a').forEach(function (a) {
+    a.addEventListener('click', function (e) { e.preventDefault(); setMode(a.dataset.mode); });
+  });
+  form.addEventListener('change', refresh);
+  form.addEventListener('submit', function (e) {
+    showErr('');
+    if (curMode === 'form') {
+      $('ob-json-out').value = JSON.stringify(buildOb());
+    } else if (curMode === 'json') {
+      try { JSON.parse($('ob-json').value); } catch (err) { e.preventDefault(); showErr('JSON с ошибкой: ' + err.message); return; }
+      $('ob-json-out').value = $('ob-json').value;
+    }
+    if ((curMode === 'form' || curMode === 'json') && !v('f-tag')) { e.preventDefault(); showErr('Укажите Tag'); }
+  });
+  refresh();
+</script>
+{% endblock %}

@@ -1,0 +1,266 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ c.email or t('Новый клиент') }} · {{ app_name }}{% endblock %}
+{% block page_title %}{% if is_new %}{{ t('Новый клиент') }}{% else %}{{ c.email }}{% endif %}{% endblock %}
+{% block page_sub %}<a href="{{ bp }}/clients">← все клиенты</a>{% if row %} · {{ m.status_badge(row.status) }}{% if row.online_ips %} <span class="badge ok">онлайн</span>{% endif %}{% endif %}{% endblock %}
+{% block top_actions %}
+{% if not is_new %}
+<div class="actions">
+  {{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/toggle', 'Выключить' if c.enabled else 'Включить') }}
+  {{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/reset', t('Сбросить трафик'), 'ghost sm', 'Сбросить трафик?') }}
+  {{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/delete', t('Удалить'), 'danger sm', 'Удалить клиента?') }}
+</div>
+{% endif %}
+{% endblock %}
+{% block content %}
+<div class="grid" style="grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr)">
+<form method="post" action="{{ bp }}/clients/save">
+  <input type="hidden" name="original_email" value="{{ '' if is_new else c.email }}">
+  <div class="card">
+    <h3>Профиль</h3>
+    <div class="row">
+      <div><label class="f">Email / имя</label><input name="email" value="{{ c.email }}" required pattern="[^\s~]+" autofocus></div>
+      <div><label class="f">Telegram ID</label><input name="tg_id" value="{{ c.tg_id }}" placeholder="для бота и уведомлений"></div>
+    </div>
+    <label class="f">Комментарий</label><input name="comment" value="{{ c.comment }}">
+    <label class="f">Outbound по умолчанию (основная ссылка)</label>
+    <select name="outbound">
+      <option value="direct" {% if c.outbound == 'direct' %}selected{% endif %}>🏠 Direct</option>
+      {% for tg in tags %}<option value="{{ tg.tag }}" {% if tg.tag == c.outbound %}selected{% endif %}>{{ tg.label }}{% if tg.status and tg.status not in ('connected', 'enabled') %} ({{ tg.status }}){% endif %}</option>{% endfor %}
+    </select>
+    <div class="mt">
+      <input type="hidden" name="enabled" value="0">{{ m.check('enabled', c.enabled, t('Включён')) }}
+      <input type="hidden" name="sub_enabled" value="0">{{ m.check('sub_enabled', c.sub_enabled, 'Подписка доступна') }}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Лимиты и срок</h3>
+    <div class="row">
+      <div><label class="f">Общий лимит трафика, GB</label><input name="limit_gb" type="number" step="0.01" min="0" value="{{ c.limit_gb or '' }}" placeholder="∞"></div>
+      <div><label class="f">Лимит одновременных IP</label><input name="limit_ip" type="number" min="0" value="{{ c.limit_ip or '' }}" placeholder="∞"></div>
+      <div><label class="f">Лимит устройств HWID</label><input name="limit_hwid" type="number" min="0" value="{{ c.limit_hwid or '' }}" placeholder="∞">
+        <div class="hint">0 = без лимита. Клиенты Happ / v2RayTun шлют заголовок X-HWID при обновлении подписки.</div></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Действует до</label><input name="expire_at" id="expire_at" type="datetime-local" value="{{ dt_input(c.expire_at) }}"></div>
+      <div><label class="f">Быстро</label>
+        <div class="actions">{% for d in (7, 30, 90, 365) %}<button type="button" class="btn ghost sm" onclick="addDays({{ d }})">+{{ d }} дн</button>{% endfor %}
+          <button type="button" class="btn ghost sm" onclick="document.getElementById('expire_at').value=''">∞</button></div>
+      </div>
+    </div>
+    <div class="row">
+      <div>{{ m.check('start_on_first_use', c.start_on_first_use, 'Отложенный старт: срок с первого подключения') }}</div>
+      <div><label class="f">Длительность, дней</label><input name="duration_days" type="number" min="0" value="{{ c.duration_days or '' }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Авто-сброс трафика</label>
+        <select name="reset_period">
+          {% for k, l in [('', 'нет'), ('daily', 'ежедневно'), ('weekly', 'еженедельно'), ('monthly', 'ежемесячно')] %}<option value="{{ k }}" {% if c.reset_period == k %}selected{% endif %}>{{ l }}</option>{% endfor %}
+        </select>
+        {% if c.next_reset %}<div class="hint">следующий: {{ fmt_dt(c.next_reset) }}</div>{% endif %}
+      </div>
+      <div>{{ m.check('renew_on_reset', c.renew_on_reset, 'При сбросе продлевать срок на период') }}</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Inbounds</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if not c.inbounds %}checked{% endif %}> все</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="select" {% if c.inbounds %}checked{% endif %}> выбранные</label></div>
+    </div>
+    <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
+      <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
+      <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
+    </div>
+    {% for ib in inbounds %}
+      <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if not c.inbounds or ib.tag in c.inbounds %}checked{% endif %}>
+        <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }} <span class="dim small">:{{ ib.port }}</span></label><br>
+    {% else %}<div class="dim">Нет inbounds для клиентов</div>{% endfor %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Подключения в подписке и лимиты по ним</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if not c.allowed_tags %}checked{% endif %}> все</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if c.allowed_tags %}checked{% endif %}> выбранные</label></div>
+    </div>
+    <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
+      <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
+      <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
+    </div>
+    <table>
+      <thead><tr><th><input type="checkbox" data-master="allowed_tags" data-mode="select_mode" title="Выделить все / снять все"></th><th>Подключение</th>{% if not is_new %}<th>Потрачено</th>{% endif %}<th style="width:140px">Лимит, GB</th></tr></thead>
+      <tbody>
+      {% for tg in tags %}
+        <tr>
+          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if not c.allowed_tags or tg.tag in c.allowed_tags %}checked{% endif %}></td>
+          <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
+          {% if not is_new %}<td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>{% endif %}
+          <td><input name="limit_{{ tg.tag }}" type="number" step="0.01" min="0" value="{{ tg.limit if tg.limit is defined else (c.outbound_limits.get(tg.tag) or '') }}" placeholder="∞"></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="hint">Лимит по подключению считается отдельно от общего; в подписке строка показывает «потрачено / осталось».</div>
+  </div>
+
+  <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/clients">{{ t('Отмена') }}</a></div>
+</form>
+
+<div>
+{% if not is_new %}
+  <div class="card">
+    <h3>{{ t('Трафик') }}</h3>
+    <div class="flex between"><div class="stat"><div class="value">{{ format_traffic(row.used) }}</div>
+      <div class="hint">↑{{ format_traffic(c.traffic.up) }} ↓{{ format_traffic(c.traffic.down) }}{% if c.limit_gb %} · лимит {{ c.limit_gb }} GB{% endif %}</div></div>
+      <div class="right small">
+        <div>{% if c.expire_at %}до {{ fmt_dt(c.expire_at) }}{% elif c.start_on_first_use %}{{ c.duration_days }} дн с 1-го подключения{% else %}бессрочно{% endif %}</div>
+        <div class="dim">создан {{ fmt_dt(c.created_at, False) }}</div>
+      </div>
+    </div>
+    {{ m.progress(row.used, row.limit_bytes) }}
+    <div class="mt small"><b>Онлайн:</b> {% if row.online_ips %}<span class="mono">{{ row.online_ips|join(', ') }}</span>{% else %}нет · был {{ ago(c.last_online) }}{% endif %}</div>
+  </div>
+
+  <div class="card">
+    <h3>{{ t('Подписка') }}</h3>
+    <div class="flex" style="align-items:flex-start;gap:1rem">
+      <div class="qr">{{ qr_svg(row.sub_url, 3)|safe }}</div>
+      <div style="flex:1;min-width:0">
+        {{ m.copy_field('suburl', row.sub_url) }}
+        <div class="actions mt">
+          {% for f, l in [('', 'base64'), ('plain', 'plain'), ('clash', 'Clash/Mihomo'), ('singbox', 'sing-box'), ('json', 'Xray JSON'), ('html', 'страница')] %}
+          <a class="btn ghost sm" target="_blank" href="{{ row.sub_url }}{% if f %}?format={{ f }}{% endif %}">{{ l }}</a>
+          {% endfor %}
+        </div>
+        <div class="actions mt">
+          {{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/regen_sub', 'Новая ссылка подписки', 'ghost sm', 'Старая ссылка подписки перестанет работать. Продолжить?') }}
+          {{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/regen_uuid', 'Новый UUID/пароль', 'ghost sm', 'Все текущие конфиги клиента перестанут работать. Продолжить?') }}
+        </div>
+      </div>
+    </div>
+    <div class="hint mt mono">UUID {{ c.uuid }}</div>
+  </div>
+
+  <div class="card">
+    <h3>Конфигурации ({{ links|length }})</h3>
+    {% for e, link in links %}
+      <div style="padding:.5rem 0;border-bottom:1px solid var(--border)">
+        <div class="flex between"><span class="small"><span class="badge accent">{{ e.protocol }}</span> {{ e.remark }}</span>
+          <span class="actions">
+            <button type="button" class="btn ghost icon" onclick="copyText('lnk{{ loop.index }}', this)" title="Копировать">{{ ic.icon('copy') }}</button>
+            <button type="button" class="btn ghost icon" onclick="showQr({{ e.remark|tojson }}, 'lnk{{ loop.index }}')" title="QR">{{ ic.icon('qr') }}</button>
+          </span></div>
+        <input id="lnk{{ loop.index }}" value="{{ link }}" readonly class="mono small" style="margin-top:.3rem">
+      </div>
+    {% else %}<div class="dim">Нет активных конфигураций (клиент выключен, истёк или нет подключённых туннелей)</div>{% endfor %}
+    {% if wg_confs %}<div class="mt"><a class="btn ghost sm" href="{{ bp }}/clients/{{ c.email }}/wg.conf">{{ ic.icon('download') }}WireGuard .conf</a></div>{% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>HWID устройства</h3>{% if hwids %}{{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/clear_hwids', 'Очистить') }}{% endif %}</div>
+    {% if c.limit_hwid %}<div class="hint mb0">лимит {{ c.limit_hwid }} · зарегистрировано {{ hwids|length }}</div>{% endif %}
+    {% if hwids %}
+    <table><thead><tr><th>FP</th><th>OS / модель</th><th>Первый</th><th>Последний</th></tr></thead><tbody>
+      {% for d in hwids %}
+      <tr><td class="mono small">{{ d.fp }}</td><td class="small">{{ d.os }} {{ d.os_ver }} {% if d.model %}· {{ d.model }}{% endif %}<div class="dim">{{ d.ua[:80] }}</div></td>
+        <td class="small dim">{{ fmt_dt(d.first_seen) }}</td><td class="small dim">{{ fmt_dt(d.last_seen) }}</td></tr>
+      {% endfor %}
+    </tbody></table>
+    {% else %}<div class="dim small">Пока нет зарегистрированных устройств</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>IP-адреса</h3>{% if c.ips %}{{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/clear_ips', 'Очистить') }}{% endif %}</div>
+    {% if c.ips %}
+    <table><tbody>
+      {% for ip, seen in c.ips|dictsort(by='value', reverse=true) %}
+      <tr><td class="mono small">{{ ip }}</td><td class="small dim">{{ fmt_dt(seen) }}</td><td>{% if ip in row.online_ips %}<span class="badge ok">онлайн</span>{% endif %}</td></tr>
+      {% endfor %}
+    </tbody></table>
+    {% else %}<div class="dim small">Пока нет данных</div>{% endif %}
+    {% if bans %}
+    <h3 class="mt">Заблокированные IP (limitIp)</h3>
+    <table><tbody>
+      {% for b in bans %}
+      <tr><td class="mono small">{{ b.ip }}</td><td class="small dim">до {{ fmt_dt(b.until) }}</td>
+        <td class="right">{{ m.post_btn(bp ~ '/ipban/' ~ b.ip ~ '/unban?next=/clients/' ~ c.email ~ '/edit', 'Разблокировать') }}</td></tr>
+      {% endfor %}
+    </tbody></table>
+    {% endif %}
+  </div>
+{% else %}
+  <div class="card"><h3>Подсказка</h3><div class="muted small">После сохранения здесь появятся ссылка подписки, QR-коды, конфигурации для каждого подключения и журнал IP.</div></div>
+{% endif %}
+</div>
+</div>
+
+<dialog id="dlg-qr">
+  <div class="card-head"><h3 id="qr-title">QR</h3><button class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+  <div style="text-align:center"><div class="qr"><img id="qr-img" width="320" height="320" alt="QR"></div></div>
+</dialog>
+{% endblock %}
+{% block scripts %}
+<script>
+  var BP = {{ bp|tojson }};
+  function addDays(d) {
+    var el = document.getElementById('expire_at');
+    var base = el.value ? new Date(el.value) : new Date();
+    if (base < new Date()) base = new Date();
+    base.setDate(base.getDate() + d);
+    var p = function (n) { return String(n).padStart(2, '0'); };
+    el.value = base.getFullYear() + '-' + p(base.getMonth() + 1) + '-' + p(base.getDate()) + 'T' + p(base.getHours()) + ':' + p(base.getMinutes());
+  }
+  function showQr(title, inputId) {
+    document.getElementById('qr-title').textContent = title;
+    document.getElementById('qr-img').src = BP + '/clients/{{ c.email|urlencode }}/qr?text=' + encodeURIComponent(document.getElementById(inputId).value);
+    openDlg('dlg-qr');
+  }
+  (function () {
+    var form = document.querySelector('form[action$="/clients/save"]');
+    var boxes = function (name) { return Array.prototype.slice.call(form.querySelectorAll('input[type=checkbox][name="' + name + '"]')); };
+    var setMode = function (mode, value) {
+      var r = form.querySelector('input[name="' + mode + '"][value="' + value + '"]');
+      if (r) r.checked = true;
+    };
+    var syncMaster = function (name) {
+      var m = form.querySelector('[data-master="' + name + '"]');
+      if (!m) return;
+      var b = boxes(name), on = b.filter(function (x) { return x.checked; }).length;
+      m.checked = b.length > 0 && on === b.length;
+      m.indeterminate = on > 0 && on < b.length;
+    };
+    var setAll = function (name, mode, value) {
+      boxes(name).forEach(function (x) { x.checked = value; });
+      setMode(mode, 'select');
+      syncMaster(name);
+    };
+    form.querySelectorAll('[data-check-all]').forEach(function (b) {
+      b.addEventListener('click', function () { setAll(b.dataset.checkAll, b.dataset.mode, true); });
+    });
+    form.querySelectorAll('[data-uncheck-all]').forEach(function (b) {
+      b.addEventListener('click', function () { setAll(b.dataset.uncheckAll, b.dataset.mode, false); });
+    });
+    form.querySelectorAll('[data-master]').forEach(function (m) {
+      m.addEventListener('change', function () { setAll(m.dataset.master, m.dataset.mode, m.checked); });
+      boxes(m.dataset.master).forEach(function (x) {
+        x.addEventListener('change', function () { setMode(m.dataset.mode, 'select'); syncMaster(m.dataset.master); });
+      });
+      syncMaster(m.dataset.master);
+    });
+    boxes('inbounds').forEach(function (x) { x.addEventListener('change', function () { setMode('ib_mode', 'select'); }); });
+    form.addEventListener('submit', function (e) {
+      var checks = [['allowed_tags', 'select_mode', 'подключение'], ['inbounds', 'ib_mode', 'inbound']];
+      for (var i = 0; i < checks.length; i++) {
+        var c = checks[i], sel = form.querySelector('input[name="' + c[1] + '"][value="select"]');
+        if (sel && sel.checked && boxes(c[0]).length && !boxes(c[0]).some(function (x) { return x.checked; })) {
+          e.preventDefault();
+          alert('Отметьте хотя бы одно ' + c[2] + ' или выберите режим «все»');
+          return;
+        }
+      }
+    });
+  })();
+</script>
+{% endblock %}

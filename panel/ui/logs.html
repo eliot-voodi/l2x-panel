@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ t('Логи') }} · {{ app_name }}{% endblock %}
+{% block page_title %}{{ t('Логи') }}{% endblock %}
+{% block page_sub %}journalctl и access log Xray{% endblock %}
+{% block content %}
+<form class="flex" method="get" style="flex-wrap:wrap;margin-bottom:1rem">
+  <div class="seg">
+    {% for k, l in [('xray', 'Xray'), ('access', 'Access log'), ('panel', 'Панель'), ('l2tp', 'xl2tpd')] %}
+    <a href="?src={{ k }}&n={{ n }}&q={{ q|urlencode }}" class="{% if src == k %}active{% endif %}">{{ l }}</a>
+    {% endfor %}
+  </div>
+  <input type="hidden" name="src" value="{{ src }}">
+  <select name="n" class="w-auto">{% for x in (100, 300, 1000, 3000) %}<option {% if n == x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select>
+  <input name="q" value="{{ q }}" placeholder="фильтр (email, IP, домен…)" style="width:260px">
+  <button class="btn ghost">{{ ic.icon('refresh') }}{{ t('Обновить') }}</button>
+  <label class="check small"><input type="checkbox" id="auto"> авто 5 с</label>
+</form>
+<div class="card" style="padding:.5rem">
+  <pre id="log" style="max-height:calc(100vh - 230px);margin:0;border:0">{{ text or 'пусто' }}</pre>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  var pre = document.getElementById('log'); pre.scrollTop = pre.scrollHeight;
+  var auto = document.getElementById('auto');
+  auto.checked = sessionStorage.getItem('l2x-log-auto') === '1';
+  auto.addEventListener('change', function () { sessionStorage.setItem('l2x-log-auto', auto.checked ? '1' : '0'); });
+  setInterval(function () { if (auto.checked) location.reload(); }, 5000);
+</script>
+{% endblock %}

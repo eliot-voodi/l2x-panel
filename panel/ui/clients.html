@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ t('Клиенты') }} · {{ app_name }}{% endblock %}
+{% block page_title %}{{ t('Клиенты') }}{% endblock %}
+{% block page_sub %}{{ items|length }} из {{ total }}{% endblock %}
+{% block top_actions %}
+<div class="actions">
+  <button class="btn ghost" type="button" onclick="openDlg('dlg-bulk')">{{ ic.icon('users') }}Массово</button>
+  <a class="btn" href="{{ bp }}/clients/new">{{ ic.icon('plus') }}{{ t('Новый клиент') }}</a>
+</div>
+{% endblock %}
+{% block content %}
+<div class="flex between mb0" style="flex-wrap:wrap;margin-bottom:1rem">
+  <div class="seg">
+    {% for key, label in [('', t('Все')), ('online', t('Онлайн')), ('active', t('Активные')), ('expired', t('Истёкшие')), ('limited', t('Исчерпан')), ('disabled', t('Отключённые'))] %}
+    <a href="?status={{ key }}&q={{ q }}" class="{% if status == key %}active{% endif %}">{{ label }}</a>
+    {% endfor %}
+  </div>
+  <form method="get" class="flex">
+    <input type="hidden" name="status" value="{{ status }}">
+    <input name="q" value="{{ q }}" placeholder="{{ t('Поиск') }}: email, комментарий, uuid" style="width:280px">
+  </form>
+</div>
+
+<form method="post" action="{{ bp }}/clients/bulk" id="bulkform">
+<div class="card" style="padding:0">
+  <div class="flex" id="bulkbar" hidden style="padding:.7rem 1rem;border-bottom:1px solid var(--border);background:var(--accent-soft)">
+    <b id="selcount">0</b> выбрано
+    <button class="btn ghost sm" name="action" value="enable">Включить</button>
+    <button class="btn ghost sm" name="action" value="disable">Выключить</button>
+    <button class="btn ghost sm" name="action" value="reset" onclick="return confirm('Сбросить трафик выбранных?')">Сбросить трафик</button>
+    <button class="btn danger sm" name="action" value="delete" onclick="return confirm('Удалить выбранных клиентов?')">Удалить</button>
+  </div>
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th style="width:32px"><input type="checkbox" id="selall"></th>
+      <th>Клиент</th><th>{{ t('Статус') }}</th><th>{{ t('Трафик') }}</th><th>{{ t('Срок') }}</th><th>Inbounds / outbound</th><th class="right">{{ t('Действия') }}</th>
+    </tr></thead>
+    <tbody>
+    {% for c in items %}
+      <tr>
+        <td><input type="checkbox" name="sel" value="{{ c.email }}" class="sel"></td>
+        <td>
+          <div class="flex"><span class="dot {% if c.online_ips %}on{% endif %}" title="{{ c.online_ips|join(', ') if c.online_ips else 'был: ' ~ ago(c.last_online) }}"></span>
+            <a href="{{ bp }}/clients/{{ c.email }}/edit"><b>{{ c.email }}</b></a></div>
+          <div class="dim small">{% if c.comment %}{{ c.comment }} · {% endif %}{% if c.online_ips %}{{ c.online_ips|length }} IP онлайн{% else %}{{ ago(c.last_online) }}{% endif %}{% if c.limit_ip %} · IP ≤ {{ c.limit_ip }}{% endif %}{% if c.tg_id %} · tg{% endif %}</div>
+        </td>
+        <td>{{ m.status_badge(c.status) }}{% if c.reset_period %} <span class="badge" title="авто-сброс">↻ {{ c.reset_period }}</span>{% endif %}</td>
+        <td style="min-width:170px">
+          <div class="small nowrap">{{ format_traffic(c.used) }} <span class="dim">/ {{ (c.limit_gb|string ~ ' GB') if c.limit_gb else '∞' }}</span></div>
+          {{ m.progress(c.used, c.limit_bytes) }}
+          {% if c.outbound_limits %}<div class="dim small">+ лимитов по подключениям: {{ c.outbound_limits|length }}</div>{% endif %}
+        </td>
+        <td class="small nowrap">
+          {% if c.expire_at %}{{ fmt_dt(c.expire_at, False) }}
+            {% if c.days_left is not none %}<div class="dim">{% if c.days_left > 0 %}{{ '%.0f'|format(c.days_left) }} дн{% else %}истёк{% endif %}</div>{% endif %}
+          {% elif c.start_on_first_use %}<span class="badge accent">{{ c.duration_days }} дн с 1-го подкл.</span>
+          {% else %}∞{% endif %}
+        </td>
+        <td class="small">
+          <div>{% if c.inbounds %}{{ c.inbound_tags|join(', ') }}{% else %}<span class="dim">все ({{ c.inbound_tags|length }})</span>{% endif %}</div>
+          <div class="dim">{{ outbound_label(store, c.outbound) }}</div>
+        </td>
+        <td>
+          <div class="actions" style="justify-content:flex-end">
+            <input type="hidden" id="sub-{{ loop.index }}" value="{{ c.sub_url }}">
+            <button type="button" class="btn ghost icon" title="Скопировать подписку" onclick="copyText('sub-{{ loop.index }}', this)">{{ ic.icon('link') }}</button>
+            <button type="button" class="btn ghost icon" title="QR подписки" onclick="showQr('{{ c.email }}', '{{ c.sub_url }}')">{{ ic.icon('qr') }}</button>
+            <button type="submit" class="btn ghost icon" title="Вкл/выкл" formaction="{{ bp }}/clients/{{ c.email }}/toggle?next=/clients">{{ ic.icon('power') }}</button>
+            <button type="submit" class="btn ghost icon" title="{{ t('Сбросить трафик') }}" formaction="{{ bp }}/clients/{{ c.email }}/reset?next=/clients" onclick="return confirm('Сбросить трафик {{ c.email }}?')">{{ ic.icon('refresh') }}</button>
+            <a class="btn ghost icon" title="{{ t('Изменить') }}" href="{{ bp }}/clients/{{ c.email }}/edit">{{ ic.icon('edit') }}</a>
+            <button type="submit" class="btn danger icon" title="{{ t('Удалить') }}" formaction="{{ bp }}/clients/{{ c.email }}/delete" onclick="return confirm('Удалить {{ c.email }}?')">{{ ic.icon('trash') }}</button>
+          </div>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="empty">Нет клиентов{% if q or status %} по фильтру{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+</form>
+
+<div class="actions">
+  <form method="post" action="{{ bp }}/clients/bulk" onsubmit="return confirm('Сбросить трафик ВСЕХ клиентов?')"><button class="btn ghost sm" name="action" value="reset_all">Сбросить трафик всех</button></form>
+  <form method="post" action="{{ bp }}/clients/bulk" onsubmit="return confirm('Удалить всех истёкших и исчерпавших лимит?')"><button class="btn danger sm" name="action" value="delete_depleted">Удалить исчерпанных</button></form>
+</div>
+
+<dialog id="dlg-qr">
+  <div class="card-head"><h3 id="qr-title">QR</h3><button class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+  <div style="text-align:center"><div class="qr"><img id="qr-img" width="300" height="300" alt="QR"></div></div>
+  <div class="copy mt"><input id="qr-url" readonly><button class="btn ghost sm" onclick="copyText('qr-url', this)">Копировать</button></div>
+</dialog>
+
+<dialog id="dlg-bulk">
+  <form method="post" action="{{ bp }}/clients/bulk">
+    <input type="hidden" name="action" value="add">
+    <div class="card-head"><h3>Массовое создание клиентов</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+    <div class="row">
+      <div><label class="f">Префикс email</label><input name="prefix" value="user"></div>
+      <div><label class="f">Начать с номера</label><input name="start" type="number" value="1"></div>
+      <div><label class="f">Количество</label><input name="count" type="number" value="10" min="1" max="500"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Лимит, GB</label><input name="limit_gb" type="number" step="0.01" min="0" placeholder="∞"></div>
+      <div><label class="f">Срок, дней</label><input name="days" type="number" min="0" placeholder="∞"></div>
+    </div>
+    {{ m.check('first_use', False, 'Отсчёт срока с первого подключения') }}
+    <label class="f">Outbound</label>
+    <select name="outbound">
+      <option value="direct">🏠 Direct</option>
+      {% for b in store.balancers.values() if b.enabled %}<option value="{{ b.tag }}">{{ outbound_label(store, b.tag) }}</option>{% endfor %}
+      {% for x in store.l2tp %}{% set tg = x.outbound or ('l2tp_' ~ x.name) %}<option value="{{ tg }}">{{ outbound_label(store, tg) }}</option>{% endfor %}
+      {% for o in store.outbounds_custom %}<option value="{{ o.tag }}">{{ outbound_label(store, o.tag) }}</option>{% endfor %}
+    </select>
+    <div class="actions mt"><button class="btn">Создать</button></div>
+  </form>
+</dialog>
+{% endblock %}
+{% block scripts %}
+<script>
+  var BP = {{ bp|tojson }};
+  function showQr(email, url) {
+    document.getElementById('qr-title').textContent = 'Подписка · ' + email;
+    document.getElementById('qr-img').src = BP + '/clients/' + encodeURIComponent(email) + '/qr';
+    document.getElementById('qr-url').value = url;
+    openDlg('dlg-qr');
+  }
+  var boxes = document.querySelectorAll('.sel');
+  function upd() {
+    var n = document.querySelectorAll('.sel:checked').length;
+    document.getElementById('selcount').textContent = n;
+    document.getElementById('bulkbar').hidden = n === 0;
+  }
+  boxes.forEach(function (b) { b.addEventListener('change', upd); });
+  document.getElementById('selall').addEventListener('change', function () { var v = this.checked; boxes.forEach(function (b) { b.checked = v; }); upd(); });
+</script>
+{% endblock %}

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ client.email }} · {{ app_name }}{% endblock %}
+{% block head %}
+<meta name="robots" content="noindex">
+<style>
+  .sub { max-width: 760px; margin: 0 auto; padding: 2rem 1rem 3rem }
+  .sub .brand { padding: 0 0 1.25rem }
+  .hero { display: flex; gap: 1.25rem; align-items: center; flex-wrap: wrap }
+  .apps a { display: inline-flex }
+  .cfg { padding: .65rem 0; border-bottom: 1px solid var(--border) }
+  .cfg:last-child { border-bottom: 0 }
+</style>
+{% endblock %}
+{% block bare %}
+{% set limit = (client.limit_gb or 0) * 1073741824 %}
+<div class="sub">
+  <div class="brand"><div class="logo">L2X</div>{{ app_name }}</div>
+  {% if settings.announce %}<div class="card" style="border-color:var(--accent)">📣 {{ settings.announce }}</div>{% endif %}
+  <div class="card">
+    <div class="hero">
+      <div style="flex:1;min-width:220px">
+        <div class="muted small">Подписка</div>
+        <div style="font-size:1.4rem;font-weight:700">{{ client.email }}</div>
+        <div class="mt">
+          {% if status == 'active' %}<span class="badge ok">активна</span>{% elif status == 'expired' %}<span class="badge err">срок истёк</span>
+          {% elif status == 'limited' %}<span class="badge warn">трафик исчерпан</span>{% else %}<span class="badge">отключена</span>{% endif %}
+        </div>
+      </div>
+      <div class="grid g2" style="flex:1.4;min-width:280px">
+        <div><div class="muted small">Трафик</div><div style="font-weight:650">{{ format_traffic(used) }} <span class="dim">/ {{ (client.limit_gb|string ~ ' GB') if client.limit_gb else '∞' }}</span></div>
+          {% if limit %}{% set pct = [100, (100 * used / limit)|int]|min %}<div class="bar {% if pct >= 90 %}danger{% elif pct >= 75 %}warn{% endif %}"><span style="width:{{ pct }}%"></span></div>{% endif %}</div>
+        <div><div class="muted small">Действует до</div><div style="font-weight:650">{% if client.expire_at %}{{ fmt_dt(client.expire_at, False) }}{% elif client.start_on_first_use %}{{ client.duration_days }} дн с 1-го подключения{% else %}бессрочно{% endif %}</div>
+          {% if days_left is not none and days_left > 0 %}<div class="dim small">осталось {{ '%.0f'|format(days_left) }} дн</div>{% endif %}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Добавить в приложение</h3>
+    <div class="flex" style="align-items:flex-start;gap:1.25rem;flex-wrap:wrap">
+      <div class="qr">{{ qr_svg(sub_link, 4)|safe }}</div>
+      <div style="flex:1;min-width:240px">
+        <div class="copy"><input id="sublink" value="{{ sub_link }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('sublink', this)">Копировать</button></div>
+        <div class="actions mt apps">
+          <a class="btn ghost sm" href="v2raytun://import/{{ sub_link }}">v2RayTun</a>
+          <a class="btn ghost sm" href="happ://add/{{ sub_link }}">Happ</a>
+          <a class="btn ghost sm" href="hiddify://import/{{ sub_link }}">Hiddify</a>
+          <a class="btn ghost sm" href="streisand://import/{{ sub_link }}">Streisand</a>
+          <a class="btn ghost sm" href="clash://install-config?url={{ (sub_link ~ '?format=clash')|urlencode }}">Clash / Mihomo</a>
+          <a class="btn ghost sm" href="sing-box://import-remote-profile?url={{ (sub_link ~ '?format=singbox')|urlencode }}#{{ client.email }}">sing-box</a>
+        </div>
+        <div class="hint mt">Android/Windows: v2RayTun, Hiddify, Happ, Clash Verge. iOS/macOS: Happ, Streisand, v2RayTun, sing-box.</div>
+      </div>
+    </div>
+  </div>
+
+  {% if links %}
+  <div class="card">
+    <h3>Конфигурации ({{ links|length }})</h3>
+    {% for e, link in links %}
+    <div class="cfg">
+      <div class="flex between"><span class="small"><span class="badge accent">{{ e.protocol }}</span> {{ e.remark }}</span>
+        <button class="btn ghost sm" onclick="copyText('l{{ loop.index }}', this)">Копировать</button></div>
+      <input id="l{{ loop.index }}" type="hidden" value="{{ link }}">
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if settings.support_url %}<div class="actions" style="justify-content:center"><a class="btn ghost" href="{{ settings.support_url }}" target="_blank" rel="noopener">Поддержка</a></div>{% endif %}
+  <div class="flex mt" style="justify-content:center"><button class="btn ghost sm" onclick="toggleTheme()">{{ ic.icon('moon') }}Тема</button></div>
+</div>
+{% endblock %}

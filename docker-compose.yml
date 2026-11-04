@@ -1,0 +1,21 @@
+services:
+  l2xpanel:
+    build: .
+    image: l2xpanel:latest
+    container_name: l2xpanel
+    # host networking + privileged are required for L2TP/IPsec (PPP devices, xfrm) and Xray ports
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    environment:
+      PANEL_PORT: "2053"
+      PANEL_ADMIN_USER: admin
+      # Leave PANEL_ADMIN_PASSWORD unset: a random password is generated on first start
+      # and printed to the container log /var/lib/l2xpanel/initial_credentials.txt
+      L2XPANEL_PUBLIC_HOST: ""
+      TZ: Europe/Moscow
+    volumes:
+      - ./data:/var/lib/l2xpanel
+      - ./certs:/etc/l2xpanel/certs
+      - ./xray:/etc/xray
+      - /lib/modules:/lib/modules:ro

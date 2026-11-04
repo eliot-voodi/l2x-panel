@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}L2TP · {{ app_name }}{% endblock %}
+{% block page_title %}L2TP туннели{% endblock %}
+{% block page_sub %}{{ items|selectattr('status', 'equalto', 'connected')|list|length }} из {{ items|length }} подключено · каждый туннель — свой интерфейс (strongSwan + xl2tpd){% endblock %}
+{% block top_actions %}
+<div class="actions">
+  <a class="btn ghost" href="{{ bp }}/l2tp">{{ ic.icon('refresh') }}{{ t('Обновить') }}</a>
+  <button class="btn" type="button" onclick="openDlg('dlg-add')">{{ ic.icon('plus') }}{{ t('Добавить') }}</button>
+</div>
+{% endblock %}
+{% block head %}
+<style>
+  .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem }
+  .node { margin: 0; display: flex; flex-direction: column; gap: .6rem }
+  .node.up { border-color: color-mix(in srgb, var(--ok) 35%, var(--border)) }
+  .node .top { display: flex; align-items: center; gap: .7rem }
+  .node .flag { width: 34px; height: 25px; border-radius: 5px; object-fit: cover; box-shadow: 0 0 0 1px var(--border) }
+  .node .name { font-weight: 650; font-size: 1rem }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: .2rem .8rem; font-size: .8rem }
+  .kv dt { color: var(--dim) } .kv dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+  .country-in { width: 3.2rem; padding: .2rem .35rem; font-size: .75rem; text-transform: uppercase }
+</style>
+{% endblock %}
+{% block content %}
+<div class="nodes">
+{% for i in items %}
+  {% set cc = country_code(i) %}{% set up = i.status == 'connected' %}
+  <div class="card node {% if up %}up{% endif %}">
+    <div class="top">
+      {% if cc %}<img class="flag" src="https://flagcdn.com/48x36/{{ cc|lower }}.png" alt="{{ flag_emoji(cc) }}" title="{{ cc }}">{% else %}<span style="font-size:1.5rem">🌐</span>{% endif %}
+      <div style="flex:1;min-width:0">
+        <div class="name">{{ i.name|replace('_', ' ') }}</div>
+        <div class="dim small mono">{{ i.server_host }}</div>
+      </div>
+      {{ m.status_badge(i.status) }}
+    </div>
+    <dl class="kv">
+      <dt>Egress IP</dt><dd class="mono">{{ i.public_ip or '—' }}</dd>
+      <dt>Интерфейс</dt><dd class="mono">{{ i.ifname or ('l2x-' ~ i.name) }}{% if i.local_ip %} · {{ i.local_ip }} → {{ i.peer_ip }}{% endif %}</dd>
+      <dt>Outbound</dt><dd class="mono">{{ i.bindings.outbound }}</dd>
+      <dt>{{ t('Трафик') }}</dt><dd>↑{{ format_traffic(i.traffic.up or 0) }} ↓{{ format_traffic(i.traffic.down or 0) }}</dd>
+      <dt>Логин</dt><dd>{{ i.username }}</dd>
+      {% if i.bindings.clients or i.bindings.routes or i.bindings.inbounds %}
+      <dt>Привязки</dt><dd title="{{ (i.bindings.clients + i.bindings.routes + i.bindings.inbounds)|join(', ') }}">
+        {% if i.bindings.clients %}клиенты {{ i.bindings.clients|length }}{% endif %}
+        {% if i.bindings.routes %} · правила {{ i.bindings.routes|length }}{% endif %}
+        {% if i.bindings.inbounds %} · inbounds {{ i.bindings.inbounds|length }}{% endif %}</dd>
+      {% endif %}
+    </dl>
+    {% if i.last_error %}<div class="small" style="color:var(--danger)">{{ i.last_error }}</div>{% endif %}
+    <div class="actions" style="margin-top:auto">
+      {% if up %}
+      <form method="post" action="{{ bp }}/l2tp/{{ i.name }}/disconnect"><button class="btn ghost sm">{{ ic.icon('stop') }}Отключить</button></form>
+      {% else %}
+      <form method="post" action="{{ bp }}/l2tp/{{ i.name }}/connect"><button class="btn sm">{{ ic.icon('play') }}Подключить</button></form>
+      {% endif %}
+      <form method="post" action="{{ bp }}/l2tp/{{ i.name }}/country" class="flex" style="gap:.3rem">
+        <input class="country-in" name="country" value="{{ i.country or '' }}" placeholder="{{ cc or '??' }}" maxlength="2" title="ISO-код страны (пусто = авто)" onchange="this.form.submit()">
+      </form>
+      <span style="flex:1"></span>
+      {% if i.bindings.blocked %}
+      <button class="btn danger icon" disabled title="Сначала снимите привязки к клиентам/правилам/inbounds" style="opacity:.4">{{ ic.icon('trash') }}</button>
+      {% else %}
+      <form method="post" action="{{ bp }}/l2tp/{{ i.name }}/delete" onsubmit="return confirm('Удалить {{ i.name }}?')"><button class="btn danger icon">{{ ic.icon('trash') }}</button></form>
+      {% endif %}
+    </div>
+  </div>
+{% else %}
+  <div class="card empty">Туннелей пока нет — добавьте первый.</div>
+{% endfor %}
+</div>
+<div class="hint mt">Watchdog проверяет туннели и при обрыве помечает их как error и убирает из балансировщиков и подписок. Удаление запрещено, пока туннель привязан к клиентам, правилам или inbounds.</div>
+
+<dialog id="dlg-add">
+  <form method="post" action="{{ bp }}/l2tp">
+    <div class="card-head"><h3>Новый L2TP туннель</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+    <div class="row">
+      <div><label class="f">Имя (slug)</label><input name="name" required placeholder="Germany" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,31}"></div>
+      <div style="max-width:110px"><label class="f">Страна</label><input name="country" maxlength="2" placeholder="DE" pattern="[A-Za-z]{2}" style="text-transform:uppercase"></div>
+    </div>
+    <label class="f">Сервер</label><input name="server_host" required placeholder="de.example.com">
+    <div class="row">
+      <div><label class="f">Логин</label><input name="username" required></div>
+      <div><label class="f">Пароль</label><input name="password" type="password" required></div>
+    </div>
+    <label class="f">PSK (IPsec)</label><input name="psk" type="password" placeholder="если требуется">
+    <div class="hint">Секреты хранятся зашифрованными. Outbound будет <code>l2tp_имя</code>, интерфейс <code>l2x-имя</code>.</div>
+    <div class="actions mt"><button class="btn">{{ t('Добавить') }}</button></div>
+  </form>
+</dialog>
+{% endblock %}
+{% block scripts %}
+<script>
+  setInterval(function () {
+    if (document.visibilityState === 'visible' && !document.querySelector('dialog[open]') && document.activeElement.tagName !== 'INPUT') location.reload();
+  }, 30000);
+</script>
+{% endblock %}

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ t('Балансировщики') }} · {{ app_name }}{% endblock %}
+{% block page_title %}{{ t('Балансировщики') }}{% endblock %}
+{% block page_sub %}Автовыбор лучшего выхода через Observatory · watchdog каждые {{ watchdog_sec }} с{% endblock %}
+{% block top_actions %}<form method="post" action="{{ bp }}/xray/apply"><button class="btn ghost">{{ ic.icon('refresh') }}{{ t('Применить') }} Xray</button></form>{% endblock %}
+{% block content %}
+<div class="grid g2">
+{% for key, b in balancers.items() %}
+  {% set act = active_members.get(key) or [] %}
+  <form class="card" method="post" action="{{ bp }}/balancers/{{ key }}">
+    <div class="card-head">
+      <h3>{{ outbound_label(store, b.tag) }}</h3>
+      <span class="badge {% if b.enabled %}ok{% endif %}">{{ 'включён' if b.enabled else 'выключен' }}</span>
+    </div>
+    <div class="small muted">strategy <code>{{ b.strategy }}</code> · tag <code>{{ b.tag }}</code> · в пуле сейчас: <b>{{ act|length }}</b></div>
+    {% if act %}<div class="mt">{% for tg in act %}<span class="badge accent" style="margin:0 .25rem .25rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}</div>
+    {% else %}<div class="hint">Нет активных участников — трафик идёт в fallback.</div>{% endif %}
+
+    <div class="mt">{{ m.check('enabled', b.enabled, t('Включён')) }}</div>
+    <div class="row">
+      <div><label class="f">Probe URL</label><input name="probe_url" value="{{ b.probe_url }}"></div>
+      <div style="max-width:140px"><label class="f">Интервал</label><input name="probe_interval" value="{{ b.probe_interval }}"></div>
+    </div>
+    {% if key == 'least_load' %}
+    <div class="row">
+      <div><label class="f">expected (лучших нод)</label><input name="expected" type="number" min="1" max="10" value="{{ b.expected or 1 }}"></div>
+      <div><label class="f">max RTT</label><input name="max_rtt" value="{{ b.max_rtt or '1s' }}"></div>
+      <div><label class="f">tolerance</label><input name="tolerance" type="number" step="0.01" min="0" max="1" value="{{ b.tolerance or 0.15 }}"></div>
+    </div>
+    {% endif %}
+    <label class="f">Fallback (если все участники недоступны)</label>
+    <select name="fallback">
+      <option value="direct" {% if b.fallback == 'direct' %}selected{% endif %}>🏠 Direct</option>
+      {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}<option value="{{ ob }}" {% if b.fallback == ob %}selected{% endif %}>{{ outbound_label(store, ob) }} ({{ l.status }})</option>{% endfor %}
+      {% for o in custom %}<option value="{{ o.tag }}" {% if b.fallback == o.tag %}selected{% endif %}>{{ outbound_label(store, o.tag) }}</option>{% endfor %}
+    </select>
+    <label class="f">Участники (ничего не отмечено или отмечены все L2TP = все подключённые L2TP)</label>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.1rem .5rem">
+      {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}
+        <label class="check small"><input type="checkbox" name="members" value="{{ ob }}" {% if not b.members or ob in b.members %}checked{% endif %}>
+          {{ outbound_label(store, ob) }} {% if l.status != 'connected' %}<span class="dim">({{ l.status }})</span>{% endif %}</label>
+      {% endfor %}
+      {% for o in custom %}
+        <label class="check small"><input type="checkbox" name="members" value="{{ o.tag }}" {% if o.tag in b.members %}checked{% endif %}>{{ outbound_label(store, o.tag) }}</label>
+      {% endfor %}
+    </div>
+    <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+  </form>
+{% endfor %}
+</div>
+<div class="hint">Клиент выбирает балансировщик как outbound (или получает его строкой в подписке). Observatory регулярно проверяет участников; упавший выпадает из пула, трафик уходит на следующий лучший.</div>
+{% endblock %}
