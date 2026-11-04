@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
 {% import "_icons.html" as ic %}
-{% set st = ib.stream %}{% set s = ib.settings %}
+{% set st = ib.stream %}{% set s = ib.settings %}{% set so = st.sockopt or {} %}{% set r = st.reality or {} %}{% set tls = st.tls or {} %}
 {% block title %}Inbound {{ ib.tag }} · {{ app_name }}{% endblock %}
 {% block page_title %}{% if is_new %}{{ t('Новый inbound') }}{% else %}Inbound · {{ ib.remark or ib.tag }}{% endif %}{% endblock %}
 {% block page_sub %}<a href="{{ bp }}/inbounds">← все inbounds</a>{% endblock %}
@@ -29,8 +29,16 @@
       <div><label class="f">Лимит трафика inbound, GB</label><input name="total_gb" type="number" step="0.01" min="0" value="{{ ib.total_gb or '' }}" placeholder="∞"></div>
       <div><label class="f">Срок действия</label><input name="expire_at" type="datetime-local" value="{{ dt_input(ib.expire_at) }}"></div>
     </div>
-    <label class="f">Адрес в ссылках (share host)</label>
-    <input name="share_host" value="{{ ib.share_host }}" placeholder="{{ public_host }} (по умолчанию)">
+    <div class="row">
+      <div><label class="f">Сброс трафика</label>
+        <select name="traffic_reset">
+          {% for x in P.TRAFFIC_RESETS %}<option value="{{ x }}" {% if (ib.traffic_reset or 'never') == x %}selected{% endif %}>{{ x }}</option>{% endfor %}
+        </select>
+      </div>
+      <div><label class="f">Адрес в ссылках (share host)</label>
+        <input name="share_host" value="{{ ib.share_host }}" placeholder="{{ public_host }} (по умолчанию)">
+      </div>
+    </div>
     <label class="f">Outbound по умолчанию</label>
     <select name="outbound">
       {% for tag in outbounds %}<option value="{{ tag }}" {% if tag == ib.outbound %}selected{% endif %}>{{ outbound_label(store, tag) }}</option>{% endfor %}
@@ -47,6 +55,22 @@
         <option value="" {% if not s.flow %}selected{% endif %}>нет</option>
         <option value="xtls-rprx-vision" {% if s.flow == 'xtls-rprx-vision' %}selected{% endif %}>xtls-rprx-vision (только raw + tls/reality)</option>
       </select>
+      <div id="vless-enc" class="mt">
+        <label class="f">Authentication (encryption)</label>
+        <select id="vless_auth" name="vless_auth">
+          <option value="none">None</option>
+          <option value="x25519">X25519 (not Post-Quantum)</option>
+          <option value="mlkem768">ML-KEM-768 (Post-Quantum)</option>
+          <option value="custom">Custom</option>
+        </select>
+        <label class="f">decryption</label><input name="vless_decryption" id="vless_decryption" value="{{ s.decryption or 'none' }}" class="mono">
+        <label class="f">encryption</label><input name="vless_encryption" id="vless_encryption" value="{{ s.encryption or 'none' }}" class="mono">
+        <div class="flex mt gap">
+          <button type="button" class="btn sm" id="btn_vlessenc">Сгенерировать ключи</button>
+          {{ m.check('vless_enc_clear', False, 'Очистить') }}
+        </div>
+        <div class="hint">Для Reality обычно оставляют <code>none</code>. Ключи нужны для VLESS encryption без Reality.</div>
+      </div>
     </div>
     <div data-proto="shadowsocks">
       <label class="f">Метод</label>
@@ -111,12 +135,13 @@
   <h3>Транспорт</h3>
   <div class="row">
     <div><label class="f">Network</label>
-      <select name="network" id="network">{% for n in P.NETWORKS %}<option value="{{ n }}" {% if n == st.network %}selected{% endif %}>{{ n }}{% if n == 'raw' %} (tcp){% endif %}</option>{% endfor %}</select>
+      <select name="network" id="network">{% for n in P.NETWORKS if n != 'hysteria' %}<option value="{{ n }}" {% if n == st.network %}selected{% endif %}>{{ n }}{% if n == 'raw' %} (tcp){% endif %}</option>{% endfor %}</select>
     </div>
     <div data-proto="vless vmess trojan"><label class="f">Security</label>
       <select name="security" id="security">{% for x in P.SECURITIES %}<option value="{{ x }}" {% if x == st.security %}selected{% endif %}>{{ x }}</option>{% endfor %}</select>
     </div>
   </div>
+  {{ m.check('accept_proxy', st.accept_proxy_protocol or (st.raw and st.raw.accept_proxy_protocol), 'acceptProxyProtocol') }}
   <div data-net="raw" class="row">
     <div><label class="f">Header</label><select name="raw_header"><option value="none">none</option><option value="http" {% if st.raw.header == 'http' %}selected{% endif %}>http (obfs)</option></select></div>
     <div><label class="f">HTTP Host</label><input name="raw_host" value="{{ st.raw.http_host }}"></div>
@@ -128,69 +153,144 @@
   </div>
   <div data-net="grpc" class="row">
     <div><label class="f">serviceName</label><input name="grpc_service" value="{{ st.grpc.service_name }}"></div>
+    <div><label class="f">Authority</label><input name="grpc_authority" value="{{ st.grpc.authority or '' }}"></div>
     <div>{{ m.check('grpc_multi', st.grpc.multi_mode, 'multiMode') }}</div>
   </div>
   <div data-net="httpupgrade" class="row">
     <div><label class="f">Path</label><input name="hu_path" value="{{ st.httpupgrade.path }}"></div>
     <div><label class="f">Host</label><input name="hu_host" value="{{ st.httpupgrade.host }}"></div>
   </div>
-  <div data-net="xhttp" class="row">
-    <div><label class="f">Path</label><input name="xh_path" value="{{ st.xhttp.path }}"></div>
-    <div><label class="f">Host</label><input name="xh_host" value="{{ st.xhttp.host }}"></div>
-    <div><label class="f">Mode</label><select name="xh_mode">{% for x in ('auto', 'packet-up', 'stream-up', 'stream-one') %}<option {% if x == st.xhttp.mode %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div>
+  <div data-net="xhttp">
+    <div class="row">
+      <div><label class="f">Path</label><input name="xh_path" value="{{ st.xhttp.path }}"></div>
+      <div><label class="f">Host</label><input name="xh_host" value="{{ st.xhttp.host }}"></div>
+      <div><label class="f">Mode</label><select name="xh_mode">{% for x in ('auto', 'packet-up', 'stream-up', 'stream-one') %}<option {% if x == st.xhttp.mode %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div>
+    </div>
+    <label class="f">Extra (JSON)</label>
+    <textarea name="xh_extra" class="mono" rows="3" placeholder='{"headers":{}}'>{{ st.xhttp.extra or '' }}</textarea>
   </div>
-  <div data-net="kcp" class="row">
-    <div><label class="f">MTU</label><input name="kcp_mtu" type="number" value="{{ st.kcp.mtu }}"></div>
-    <div><label class="f">TTI</label><input name="kcp_tti" type="number" value="{{ st.kcp.tti }}"></div>
-    <div><label class="f">Uplink MB/s</label><input name="kcp_up" type="number" value="{{ st.kcp.uplink }}"></div>
-    <div><label class="f">Downlink MB/s</label><input name="kcp_down" type="number" value="{{ st.kcp.downlink }}"></div>
-    <div>{{ m.check('kcp_congestion', st.kcp.congestion, 'congestion') }}</div>
+  <div data-net="kcp">
+    <div class="row">
+      <div><label class="f">MTU</label><input name="kcp_mtu" type="number" value="{{ st.kcp.mtu }}"></div>
+      <div><label class="f">TTI</label><input name="kcp_tti" type="number" value="{{ st.kcp.tti }}"></div>
+      <div><label class="f">Uplink MB/s</label><input name="kcp_up" type="number" value="{{ st.kcp.uplink }}"></div>
+      <div><label class="f">Downlink MB/s</label><input name="kcp_down" type="number" value="{{ st.kcp.downlink }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Header type</label>
+        <select name="kcp_header">{% for h in P.KCP_HEADERS %}<option {% if (st.kcp.header or 'none') == h %}selected{% endif %}>{{ h }}</option>{% endfor %}</select>
+      </div>
+      <div><label class="f">Seed</label><input name="kcp_seed" value="{{ st.kcp.seed or '' }}" class="mono"></div>
+      <div>{{ m.check('kcp_congestion', st.kcp.congestion, 'congestion') }}</div>
+    </div>
   </div>
 </div>
 
 <div class="card" data-sec="tls" data-proto="vless vmess trojan hysteria">
   <h3>TLS</h3>
   <div class="row">
-    <div><label class="f">SNI (serverName)</label><input name="tls_sni" value="{{ st.tls.server_name }}"></div>
-    <div><label class="f">ALPN</label><input name="tls_alpn" value="{{ st.tls.alpn|join(',') }}"></div>
-    <div><label class="f">Fingerprint</label><select name="tls_fp">{% for f in P.FINGERPRINTS %}<option {% if f == st.tls.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
-    <div><label class="f">Min TLS</label><select name="tls_min">{% for v in ('1.2', '1.3') %}<option {% if v == st.tls.min_version %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
+    <div><label class="f">SNI (serverName)</label><input name="tls_sni" value="{{ tls.server_name }}"></div>
+    <div><label class="f">ALPN</label><input name="tls_alpn" value="{{ tls.alpn|join(',') }}"></div>
+    <div><label class="f">Fingerprint</label><select name="tls_fp">{% for f in P.FINGERPRINTS %}<option {% if f == tls.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
+    <div><label class="f">Min TLS</label><select name="tls_min">{% for v in ('1.2', '1.3') %}<option {% if v == tls.min_version %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
   </div>
   <div class="row">
-    <div><label class="f">Сертификат (fullchain)</label><input name="tls_cert" id="tls_cert" value="{{ st.tls.cert_file }}" placeholder="/etc/l2xpanel/certs/domain.crt"></div>
-    <div><label class="f">Ключ</label><input name="tls_key" id="tls_key" value="{{ st.tls.key_file }}"></div>
+    <div><label class="f">Сертификат (fullchain)</label><input name="tls_cert" id="tls_cert" value="{{ tls.cert_file }}" placeholder="/etc/l2xpanel/certs/domain.crt"></div>
+    <div><label class="f">Ключ</label><input name="tls_key" id="tls_key" value="{{ tls.key_file }}"></div>
   </div>
+  <label class="f">ECH server keys</label>
+  <textarea name="tls_ech" class="mono" rows="2" placeholder="опционально">{{ tls.ech_server_keys or '' }}</textarea>
   {% if certs %}
   <div class="hint">Выпущенные сертификаты:
     {% for c in certs %}<a href="#" onclick="document.getElementById('tls_cert').value='{{ c.cert_file }}';document.getElementById('tls_key').value='{{ c.key_file }}';document.getElementsByName('tls_sni')[0].value='{{ c.domain }}';return false">{{ c.domain }}</a> {% endfor %}
   </div>
   {% else %}<div class="hint">Сертификат можно выпустить в Настройки → Сертификаты (Let's Encrypt).</div>{% endif %}
-  {{ m.check('tls_insecure', st.tls.allow_insecure, 'allowInsecure в ссылках') }}
+  <div class="mt">
+    {{ m.check('tls_insecure', tls.allow_insecure, 'allowInsecure в ссылках') }}
+    {{ m.check('tls_reject_sni', tls.reject_unknown_sni, 'rejectUnknownSni') }}
+  </div>
 </div>
 
 <div class="card" data-sec="reality" data-proto="vless trojan">
   <h3>Reality</h3>
   <div class="row">
-    <div><label class="f">Dest (target)</label><input name="r_dest" value="{{ st.reality.dest }}"></div>
-    <div><label class="f">Server names</label><input name="r_names" value="{{ st.reality.server_names|join(',') }}"></div>
-    <div><label class="f">Fingerprint</label><select name="r_fp">{% for f in P.FINGERPRINTS %}<option {% if f == st.reality.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
+    <div><label class="f">Dest (target)</label><input name="r_dest" id="r_dest" value="{{ r.dest }}"></div>
+    <div><label class="f">Server names</label><input name="r_names" id="r_names" value="{{ r.server_names|join(',') }}"></div>
+    <div><label class="f">Fingerprint (uTLS)</label><select name="r_fp">{% for f in P.FINGERPRINTS %}<option {% if f == r.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
   </div>
   <div class="row">
-    <div><label class="f">Short IDs</label><input name="r_sids" value="{{ st.reality.short_ids|join(',') }}"></div>
-    <div><label class="f">SpiderX</label><input name="r_spx" value="{{ st.reality.spider_x }}"></div>
+    <div><label class="f">Xver</label><input name="r_xver" type="number" min="0" max="2" value="{{ r.xver or 0 }}"></div>
+    <div><label class="f">Max Time Diff (ms)</label><input name="r_max_diff" type="number" min="0" value="{{ r.max_time_diff or 0 }}"></div>
+    <div>{{ m.check('r_show', r.show, 'Show (отладка)') }}</div>
   </div>
   <div class="row">
-    <div><label class="f">Private key</label><input name="r_priv" value="{{ st.reality.private_key }}" class="mono"></div>
-    <div><label class="f">Public key</label><input name="r_pub" value="{{ st.reality.public_key }}" class="mono"></div>
+    <div><label class="f">Min Client Ver</label><input name="r_min_ver" value="{{ r.min_client_ver or '' }}" placeholder="25.9.11"></div>
+    <div><label class="f">Max Client Ver</label><input name="r_max_ver" value="{{ r.max_client_ver or '' }}" placeholder="25.9.11"></div>
+    <div><label class="f">SpiderX</label><input name="r_spx" value="{{ r.spider_x }}"></div>
   </div>
-  {{ m.check('r_regen', False, 'Сгенерировать новую пару ключей (старые ссылки перестанут работать)') }}
+  <label class="f">Short IDs</label>
+  <div class="flex gap">
+    <input name="r_sids" id="r_sids" value="{{ r.short_ids|join(',') }}" class="mono" style="flex:1">
+    <button type="button" class="btn sm ghost" id="btn_sids">Случайные</button>
+  </div>
+  {{ m.check('r_regen_sids', False, 'Перегенерировать Short IDs при сохранении') }}
+  <div class="row mt">
+    <div><label class="f">Private key</label><input name="r_priv" id="r_priv" value="{{ r.private_key }}" class="mono"></div>
+    <div><label class="f">Public key</label><input name="r_pub" id="r_pub" value="{{ r.public_key }}" class="mono"></div>
+  </div>
+  <div class="flex gap mt">
+    <button type="button" class="btn sm" id="btn_reality">Сгенерировать пару ключей</button>
+    {{ m.check('r_regen', False, 'Сгенерировать при сохранении (старые ссылки перестанут работать)') }}
+  </div>
+  <h4 class="mt">ML-DSA-65 (Post-Quantum)</h4>
+  <label class="f">mldsa65 Seed</label><textarea name="r_mldsa_seed" id="r_mldsa_seed" class="mono" rows="2">{{ r.mldsa65_seed or '' }}</textarea>
+  <label class="f">mldsa65 Verify</label><textarea name="r_mldsa_verify" id="r_mldsa_verify" class="mono" rows="2">{{ r.mldsa65_verify or '' }}</textarea>
+  <div class="flex gap mt">
+    <button type="button" class="btn sm" id="btn_mldsa">Сгенерировать Seed</button>
+    {{ m.check('r_mldsa_clear', False, 'Очистить') }}
+  </div>
+</div>
+
+<div class="card" data-proto="vless vmess trojan shadowsocks">
+  <h3>Sockopt</h3>
+  {{ m.check('sockopt_on', so.enabled, 'Включить sockopt') }}
+  <div id="sockopt_fields">
+    <div class="row">
+      <div><label class="f">TCP Keep Alive Interval</label><input name="so_kai" type="number" min="0" value="{{ so.tcp_keep_alive_interval or 0 }}"></div>
+      <div><label class="f">TCP Keep Alive Idle</label><input name="so_kaidle" type="number" min="0" value="{{ so.tcp_keep_alive_idle or 0 }}"></div>
+      <div><label class="f">TCP User Timeout</label><input name="so_uto" type="number" min="0" value="{{ so.tcp_user_timeout or 0 }}"></div>
+      <div><label class="f">Mark</label><input name="so_mark" type="number" min="0" value="{{ so.mark or 0 }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">TProxy</label>
+        <select name="so_tproxy">{% for x in P.TPROXY_MODES %}<option value="{{ x }}" {% if (so.tproxy or '') == x %}selected{% endif %}>{{ x or '—' }}</option>{% endfor %}</select>
+      </div>
+      <div><label class="f">Domain strategy</label>
+        <select name="so_ds">{% for x in P.SOCKOPT_DOMAIN %}<option {% if (so.domain_strategy or 'AsIs') == x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select>
+      </div>
+      <div><label class="f">Dialer proxy (tag)</label><input name="so_dialer" value="{{ so.dialer_proxy or '' }}" class="mono"></div>
+    </div>
+    <div class="mt">
+      {{ m.check('so_tfo', so.tcp_fast_open, 'tcpFastOpen') }}
+      {{ m.check('so_penetrate', so.penetrate, 'penetrate') }}
+      {{ m.check('so_mptcp', so.tcp_mptcp, 'tcpMptcp') }}
+      {{ m.check('so_nodelay', so.tcp_no_delay, 'tcpNoDelay') }}
+    </div>
+  </div>
 </div>
 
 <div class="card" data-proto="vless trojan">
   <h3>Fallbacks</h3>
-  <textarea name="fallbacks" class="mono" placeholder="name | alpn | path | dest | xver&#10;| | /ws | 127.0.0.1:8001 | 0&#10;| | | 8080 | 0">{% for f in ib.fallbacks %}{{ f.name }} | {{ f.alpn }} | {{ f.path }} | {{ f.dest }} | {{ f.xver }}
+  <textarea name="fallbacks" class="mono" rows="4" placeholder="name | alpn | path | dest | xver&#10;| | /ws | 127.0.0.1:8001 | 0&#10;| | | 8080 | 0">{% for f in ib.fallbacks %}{{ f.name }} | {{ f.alpn }} | {{ f.path }} | {{ f.dest }} | {{ f.xver }}
 {% endfor %}</textarea>
   <div class="hint">По одной строке: <code>name | alpn | path | dest | xver</code>. Работает только с raw + tls (без Reality).</div>
+</div>
+
+<div class="card" data-proto="vless vmess trojan shadowsocks hysteria">
+  <h3>External Proxies (адреса в ссылках)</h3>
+  <textarea name="external_proxies" class="mono" rows="3" placeholder="address | port | forceTls(same|tls|reality) | remark&#10;cdn.example.com | 443 | same | via-cdn">{% for p in ib.external_proxies or [] %}{{ p.address }} | {{ p.port or '' }} | {{ p.force_tls or 'same' }} | {{ p.remark or '' }}
+{% endfor %}</textarea>
+  <div class="hint">Если задано — в подписку попадут эти адреса вместо listen/share host. Формат: <code>address | port | forceTls | remark</code>.</div>
 </div>
 
 <div class="actions">
@@ -202,6 +302,7 @@
 {% endblock %}
 {% block scripts %}
 <script>
+  var BP = {{ bp|tojson }};
   function sync() {
     var p = document.getElementById('protocol').value;
     var n = document.getElementById('network').value;
@@ -216,8 +317,64 @@
     });
     var transport = document.querySelector('.card[data-proto="vless vmess trojan shadowsocks"]');
     if (transport) transport.hidden = !userProto;
+    var enc = document.getElementById('vless-enc');
+    if (enc) enc.hidden = p !== 'vless' || sec === 'reality';
+    syncAuthSelect();
+  }
+  function syncAuthSelect() {
+    var dec = (document.getElementById('vless_decryption') || {}).value || 'none';
+    var enc = (document.getElementById('vless_encryption') || {}).value || 'none';
+    var sel = document.getElementById('vless_auth');
+    if (!sel) return;
+    if (dec === 'none' && enc === 'none') sel.value = 'none';
+    else if (dec.indexOf('mlkem') >= 0 || enc.indexOf('mlkem') >= 0) sel.value = 'mlkem768';
+    else if (dec !== 'none' || enc !== 'none') sel.value = (dec.indexOf('x25519') >= 0 || enc.length > 20) ? 'x25519' : 'custom';
   }
   ['protocol', 'network', 'security'].forEach(function (id) { document.getElementById(id).addEventListener('change', sync); });
   sync();
+
+  function getJson(url) {
+    return fetch(BP + url, { credentials: 'same-origin' }).then(function (r) { return r.json(); });
+  }
+  document.getElementById('btn_reality').addEventListener('click', function () {
+    getJson('/api/keys/reality').then(function (d) {
+      if (!d.ok) { alert(d.error || 'ошибка'); return; }
+      document.getElementById('r_priv').value = d.private_key;
+      document.getElementById('r_pub').value = d.public_key;
+    });
+  });
+  document.getElementById('btn_sids').addEventListener('click', function () {
+    getJson('/api/keys/shortids').then(function (d) {
+      if (!d.ok) { alert(d.error || 'ошибка'); return; }
+      document.getElementById('r_sids').value = (d.short_ids || []).join(',');
+    });
+  });
+  document.getElementById('btn_mldsa').addEventListener('click', function () {
+    getJson('/api/keys/mldsa65').then(function (d) {
+      if (!d.ok) { alert(d.error || 'ошибка (нужен свежий Xray)'); return; }
+      document.getElementById('r_mldsa_seed').value = d.seed || '';
+      document.getElementById('r_mldsa_verify').value = d.verify || '';
+    });
+  });
+  document.getElementById('btn_vlessenc').addEventListener('click', function () {
+    var kind = document.getElementById('vless_auth').value;
+    getJson('/api/keys/vlessenc').then(function (d) {
+      if (!d.ok) { alert(d.error || 'ошибка (нужен свежий Xray)'); return; }
+      var want = kind === 'mlkem768' ? 'mlkem' : 'x25519';
+      var block = (d.auths || []).find(function (a) { return (a.id || '').indexOf(want) >= 0 || (a.label || '').toLowerCase().indexOf(want) >= 0; }) || (d.auths || [])[0];
+      if (!block) return;
+      document.getElementById('vless_decryption').value = block.decryption || 'none';
+      document.getElementById('vless_encryption').value = block.encryption || 'none';
+      syncAuthSelect();
+    });
+  });
+  document.getElementById('vless_auth').addEventListener('change', function () {
+    if (this.value === 'none') {
+      document.getElementById('vless_decryption').value = 'none';
+      document.getElementById('vless_encryption').value = 'none';
+    } else if (this.value === 'x25519' || this.value === 'mlkem768') {
+      document.getElementById('btn_vlessenc').click();
+    }
+  });
 </script>
 {% endblock %}

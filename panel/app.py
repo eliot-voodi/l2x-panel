@@ -1249,9 +1249,31 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["total_gb"] = _float(form.get("total_gb"))
     ib["expire_at"] = local_to_iso(str(form.get("expire_at") or ""))
     ib["outbound"] = str(form.get("outbound") or "direct")
+    reset = str(form.get("traffic_reset") or "never")
+    ib["traffic_reset"] = reset if reset in P.TRAFFIC_RESETS else "never"
+    ext = []
+    for line in str(form.get("external_proxies") or "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if not any(parts):
+            continue
+        parts += [""] * (4 - len(parts))
+        addr, port_s, force, remark = parts[0], parts[1], parts[2], parts[3]
+        if not addr:
+            continue
+        ext.append({
+            "address": addr,
+            "port": _int(port_s, 0) or None,
+            "force_tls": force or "",
+            "remark": remark,
+        })
+    ib["external_proxies"] = ext
     s = ib["settings"]
     if proto == "vless":
         s["flow"] = str(form.get("flow") or "")
+        s["decryption"] = str(form.get("vless_decryption") or "none").strip() or "none"
+        s["encryption"] = str(form.get("vless_encryption") or "none").strip() or "none"
+        if form.get("vless_enc_clear") == "1":
+            s["decryption"] = s["encryption"] = "none"
     elif proto == "shadowsocks":
         method = str(form.get("ss_method") or s.get("method"))
         if method != s.get("method") or form.get("ss_regen") == "1" or not s.get("password"):
@@ -1288,32 +1310,88 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         st["security"] = "none" if proto not in ("vmess",) else "tls"
     if st["network"] not in P.NETWORKS:
         st["network"] = "raw"
-    st["raw"].update({"header": str(form.get("raw_header") or "none"), "http_host": str(form.get("raw_host") or ""),
-                      "http_path": str(form.get("raw_path") or "/")})
-    st["ws"].update({"path": str(form.get("ws_path") or "/"), "host": str(form.get("ws_host") or "")})
-    st["grpc"].update({"service_name": str(form.get("grpc_service") or "grpc"), "multi_mode": form.get("grpc_multi") == "1"})
-    st["httpupgrade"].update({"path": str(form.get("hu_path") or "/"), "host": str(form.get("hu_host") or "")})
-    st["xhttp"].update({"path": str(form.get("xh_path") or "/"), "host": str(form.get("xh_host") or ""),
-                        "mode": str(form.get("xh_mode") or "auto")})
-    st["kcp"].update({"mtu": _int(form.get("kcp_mtu"), 1350), "tti": _int(form.get("kcp_tti"), 20),
-                      "uplink": _int(form.get("kcp_up"), 5), "downlink": _int(form.get("kcp_down"), 20),
-                      "congestion": form.get("kcp_congestion") == "1"})
+    st["accept_proxy_protocol"] = form.get("accept_proxy") == "1"
+    st["raw"].update({
+        "header": str(form.get("raw_header") or "none"),
+        "http_host": str(form.get("raw_host") or ""),
+        "http_path": str(form.get("raw_path") or "/"),
+        "accept_proxy_protocol": form.get("accept_proxy") == "1",
+    })
+    st["ws"].update({
+        "path": str(form.get("ws_path") or "/"), "host": str(form.get("ws_host") or ""),
+        "accept_proxy_protocol": form.get("accept_proxy") == "1",
+    })
+    st["grpc"].update({
+        "service_name": str(form.get("grpc_service") or "grpc"),
+        "multi_mode": form.get("grpc_multi") == "1",
+        "authority": str(form.get("grpc_authority") or ""),
+    })
+    st["httpupgrade"].update({
+        "path": str(form.get("hu_path") or "/"), "host": str(form.get("hu_host") or ""),
+        "accept_proxy_protocol": form.get("accept_proxy") == "1",
+    })
+    st["xhttp"].update({
+        "path": str(form.get("xh_path") or "/"), "host": str(form.get("xh_host") or ""),
+        "mode": str(form.get("xh_mode") or "auto"),
+        "extra": str(form.get("xh_extra") or "").strip(),
+    })
+    st["kcp"].update({
+        "mtu": _int(form.get("kcp_mtu"), 1350), "tti": _int(form.get("kcp_tti"), 20),
+        "uplink": _int(form.get("kcp_up"), 5), "downlink": _int(form.get("kcp_down"), 20),
+        "congestion": form.get("kcp_congestion") == "1",
+        "header": str(form.get("kcp_header") or "none"),
+        "seed": str(form.get("kcp_seed") or ""),
+    })
     st["tls"].update({
         "server_name": str(form.get("tls_sni") or ""), "cert_file": str(form.get("tls_cert") or ""),
         "key_file": str(form.get("tls_key") or ""), "alpn": _split_lines(str(form.get("tls_alpn") or "h2,http/1.1")),
         "fingerprint": str(form.get("tls_fp") or "chrome"), "min_version": str(form.get("tls_min") or "1.2"),
         "allow_insecure": form.get("tls_insecure") == "1",
+        "reject_unknown_sni": form.get("tls_reject_sni") == "1",
+        "ech_server_keys": str(form.get("tls_ech") or "").strip(),
     })
     r = st["reality"]
+    if form.get("r_regen_sids") == "1":
+        short_ids = xray.generate_short_ids()
+    else:
+        short_ids = [x for x in str(form.get("r_sids") or "").replace(",", " ").split() if x]
+        if not short_ids:
+            short_ids = [xray.generate_short_id()]
     r.update({
+        "show": form.get("r_show") == "1",
         "dest": str(form.get("r_dest") or "www.cloudflare.com:443"),
+        "xver": _int(form.get("r_xver"), 0),
         "server_names": _split_lines(str(form.get("r_names") or "")) or ["www.cloudflare.com"],
-        "fingerprint": str(form.get("r_fp") or "chrome"), "spider_x": str(form.get("r_spx") or "/"),
-        "short_ids": [x for x in str(form.get("r_sids") or "").replace(",", " ").split() if x] or [xray.generate_short_id()],
-        "private_key": str(form.get("r_priv") or "").strip(), "public_key": str(form.get("r_pub") or "").strip(),
+        "fingerprint": str(form.get("r_fp") or "chrome"),
+        "spider_x": str(form.get("r_spx") or "/"),
+        "short_ids": short_ids,
+        "private_key": str(form.get("r_priv") or "").strip(),
+        "public_key": str(form.get("r_pub") or "").strip(),
+        "max_time_diff": _int(form.get("r_max_diff"), 0),
+        "min_client_ver": str(form.get("r_min_ver") or "").strip(),
+        "max_client_ver": str(form.get("r_max_ver") or "").strip(),
+        "mldsa65_seed": str(form.get("r_mldsa_seed") or "").strip(),
+        "mldsa65_verify": str(form.get("r_mldsa_verify") or "").strip(),
     })
     if form.get("r_regen") == "1":
         r["private_key"] = r["public_key"] = ""
+    if form.get("r_mldsa_clear") == "1":
+        r["mldsa65_seed"] = r["mldsa65_verify"] = ""
+    so = st.setdefault("sockopt", {})
+    so.update({
+        "enabled": form.get("sockopt_on") == "1",
+        "tcp_fast_open": form.get("so_tfo") == "1",
+        "tcp_keep_alive_interval": _int(form.get("so_kai"), 0),
+        "tcp_keep_alive_idle": _int(form.get("so_kaidle"), 0),
+        "tcp_user_timeout": _int(form.get("so_uto"), 0),
+        "mark": _int(form.get("so_mark"), 0),
+        "tproxy": str(form.get("so_tproxy") or ""),
+        "domain_strategy": str(form.get("so_ds") or "AsIs"),
+        "dialer_proxy": str(form.get("so_dialer") or "").strip(),
+        "penetrate": form.get("so_penetrate") == "1",
+        "tcp_mptcp": form.get("so_mptcp") == "1",
+        "tcp_no_delay": form.get("so_nodelay") == "1",
+    })
     ib["sniffing"] = {
         "enabled": form.get("sniff") == "1",
         "dest": [d for d in ("http", "tls", "quic", "fakedns") if form.get(f"sniff_{d}") == "1"] or ["http", "tls", "quic"],
@@ -2031,6 +2109,34 @@ def api_wg_keys(request: Request):
     if priv:
         return xray.wg_public_from_private(priv)
     return xray.generate_wg_keys()
+
+
+@app.get("/api/keys/reality")
+def api_reality_keys(request: Request):
+    if not _user(request):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    return xray.generate_reality_keys()
+
+
+@app.get("/api/keys/shortids")
+def api_short_ids(request: Request):
+    if not _user(request):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    return {"ok": True, "short_ids": xray.generate_short_ids()}
+
+
+@app.get("/api/keys/mldsa65")
+def api_mldsa65(request: Request):
+    if not _user(request):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    return xray.generate_mldsa65()
+
+
+@app.get("/api/keys/vlessenc")
+def api_vlessenc(request: Request):
+    if not _user(request):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    return xray.generate_vless_encryption()
 
 
 @app.post("/outbounds/{tag}/{action}")

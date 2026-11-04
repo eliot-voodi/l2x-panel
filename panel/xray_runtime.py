@@ -145,6 +145,54 @@ def generate_short_id(nbytes: int = 4) -> str:
     return secrets.token_hex(nbytes)
 
 
+def generate_short_ids(count: int = 8) -> list[str]:
+    """Mixed-length shortIds like common panel UIs (0..16 hex chars)."""
+    lengths = (0, 2, 4, 6, 8, 10, 12, 14, 16)
+    out = [""]
+    for i in range(max(1, count) - 1):
+        out.append(secrets.token_hex(lengths[(i % (len(lengths) - 1)) + 1] // 2))
+    return out
+
+
+def generate_mldsa65() -> dict:
+    r = _run([XRAY_BIN, "mldsa65"])
+    text = f"{r['stdout']}\n{r['stderr']}"
+    seed = verify = ""
+    for line in text.splitlines():
+        low = line.lower()
+        if "seed" in low and ":" in line:
+            seed = line.split(":", 1)[1].strip()
+        elif ("verify" in low or "public" in low) and ":" in line:
+            verify = line.split(":", 1)[1].strip()
+    if not seed:
+        return {"ok": False, "error": text or "mldsa65 failed"}
+    return {"ok": True, "seed": seed, "verify": verify}
+
+
+def generate_vless_encryption() -> dict:
+    """Return X25519 and ML-KEM-768 auth pairs from `xray vlessenc`."""
+    r = _run([XRAY_BIN, "vlessenc"])
+    text = f"{r['stdout']}\n{r['stderr']}"
+    pairs: list[dict] = []
+    cur: dict = {}
+    for line in text.splitlines():
+        low = line.lower().strip()
+        if "authentication" in low or "ml-kem" in low or "x25519" in low:
+            if cur.get("decryption"):
+                pairs.append(cur)
+            label = "mlkem768" if "ml-kem" in low or "mlkem" in low else "x25519"
+            cur = {"id": label, "label": line.strip()}
+        elif "decryption:" in low:
+            cur["decryption"] = line.split(":", 1)[1].strip()
+        elif "encryption:" in low:
+            cur["encryption"] = line.split(":", 1)[1].strip()
+    if cur.get("decryption"):
+        pairs.append(cur)
+    if not pairs:
+        return {"ok": False, "error": text or "vlessenc failed"}
+    return {"ok": True, "auths": pairs}
+
+
 # ---------------------------------------------------------------- countries / flags
 
 COUNTRY_BY_NAME = {
@@ -594,7 +642,7 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, ident['tag'])}"
             ep = P.endpoint_for(ib, ident, host, remark)
             if ep:
-                eps.append(ep)
+                eps.extend(P._apply_external_proxy(ep, ib))
     return eps
 
 

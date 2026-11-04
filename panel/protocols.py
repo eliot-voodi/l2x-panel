@@ -31,15 +31,21 @@ SS_METHODS = (
     "aes-128-gcm",
     "chacha20-poly1305",
 )
-FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "random", "randomized")
+FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized")
+KCP_HEADERS = ("none", "srtp", "utp", "wechat-video", "dtls", "wireguard")
+TRAFFIC_RESETS = ("never", "daily", "weekly", "monthly")
+SOCKOPT_DOMAIN = ("AsIs", "UseIP", "UseIPv4", "UseIPv6")
+TPROXY_MODES = ("", "redirect", "tproxy", "off")
 
 
 # ---------------------------------------------------------------- defaults
+
 
 def default_stream(security: str = "reality") -> dict:
     return {
         "network": "raw",
         "security": security,
+        "accept_proxy_protocol": False,
         "tls": {
             "server_name": "",
             "cert_file": "",
@@ -48,28 +54,54 @@ def default_stream(security: str = "reality") -> dict:
             "fingerprint": "chrome",
             "min_version": "1.2",
             "allow_insecure": False,
+            "reject_unknown_sni": False,
+            "ech_server_keys": "",
         },
         "reality": {
+            "show": False,
             "dest": "www.cloudflare.com:443",
+            "xver": 0,
             "server_names": ["www.cloudflare.com"],
             "private_key": "",
             "public_key": "",
             "short_ids": [secrets.token_hex(4)],
             "fingerprint": "chrome",
             "spider_x": "/",
+            "max_time_diff": 0,
+            "min_client_ver": "",
+            "max_client_ver": "",
+            "mldsa65_seed": "",
+            "mldsa65_verify": "",
         },
-        "raw": {"header": "none", "http_host": "", "http_path": "/"},
-        "ws": {"path": "/ws", "host": ""},
-        "grpc": {"service_name": "grpc", "multi_mode": False},
-        "httpupgrade": {"path": "/up", "host": ""},
-        "xhttp": {"path": "/xh", "host": "", "mode": "auto"},
-        "kcp": {"mtu": 1350, "tti": 20, "uplink": 5, "downlink": 20, "congestion": False},
+        "raw": {"header": "none", "http_host": "", "http_path": "/", "accept_proxy_protocol": False},
+        "ws": {"path": "/ws", "host": "", "accept_proxy_protocol": False},
+        "grpc": {"service_name": "grpc", "multi_mode": False, "authority": ""},
+        "httpupgrade": {"path": "/up", "host": "", "accept_proxy_protocol": False},
+        "xhttp": {"path": "/xh", "host": "", "mode": "auto", "extra": ""},
+        "kcp": {
+            "mtu": 1350, "tti": 20, "uplink": 5, "downlink": 20, "congestion": False,
+            "header": "none", "seed": "",
+        },
+        "sockopt": {
+            "enabled": False,
+            "tcp_fast_open": False,
+            "tcp_keep_alive_interval": 0,
+            "tcp_keep_alive_idle": 0,
+            "tcp_user_timeout": 0,
+            "mark": 0,
+            "tproxy": "",
+            "domain_strategy": "AsIs",
+            "dialer_proxy": "",
+            "penetrate": False,
+            "tcp_mptcp": False,
+            "tcp_no_delay": False,
+        },
     }
 
 
 def default_settings(protocol: str) -> dict:
     if protocol == "vless":
-        return {"flow": "xtls-rprx-vision"}
+        return {"flow": "xtls-rprx-vision", "decryption": "none", "encryption": "none"}
     if protocol == "shadowsocks":
         return {"method": "2022-blake3-aes-256-gcm", "password": ss_server_key("2022-blake3-aes-256-gcm"), "network": "tcp,udp"}
     if protocol == "hysteria":
@@ -105,8 +137,10 @@ def default_inbound(protocol: str = "vless", port: int = 443, tag: str = "vless-
         "fallbacks": [],
         "outbound": "direct",
         "share_host": "",
+        "external_proxies": [],
         "total_gb": 0,
         "expire_at": "",
+        "traffic_reset": "never",
         "traffic": {"up": 0, "down": 0, "last_up": 0, "last_down": 0},
     }
 
@@ -171,61 +205,123 @@ def build_stream_settings(stream: dict) -> dict:
     out: dict[str, Any] = {"network": net, "security": sec}
     if net == "raw":
         raw = stream.get("raw") or {}
+        raw_settings: dict[str, Any] = {}
         if raw.get("header") == "http":
-            out["rawSettings"] = {
-                "header": {
-                    "type": "http",
-                    "request": {
-                        "path": [raw.get("http_path") or "/"],
-                        "headers": {"Host": [h.strip() for h in (raw.get("http_host") or "").split(",") if h.strip()]},
-                    },
-                }
+            raw_settings["header"] = {
+                "type": "http",
+                "request": {
+                    "path": [raw.get("http_path") or "/"],
+                    "headers": {"Host": [h.strip() for h in (raw.get("http_host") or "").split(",") if h.strip()]},
+                },
             }
+        if raw.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
+            raw_settings["acceptProxyProtocol"] = True
+        if raw_settings:
+            out["rawSettings"] = raw_settings
     elif net == "ws":
         ws = stream.get("ws") or {}
-        out["wsSettings"] = {"path": ws.get("path") or "/", **({"host": ws["host"]} if ws.get("host") else {})}
+        ws_settings: dict[str, Any] = {"path": ws.get("path") or "/", **({"host": ws["host"]} if ws.get("host") else {})}
+        if ws.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
+            ws_settings["acceptProxyProtocol"] = True
+        out["wsSettings"] = ws_settings
     elif net == "grpc":
         g = stream.get("grpc") or {}
-        out["grpcSettings"] = {"serviceName": g.get("service_name") or "grpc", "multiMode": bool(g.get("multi_mode"))}
+        grpc: dict[str, Any] = {"serviceName": g.get("service_name") or "grpc", "multiMode": bool(g.get("multi_mode"))}
+        if g.get("authority"):
+            grpc["authority"] = g["authority"]
+        out["grpcSettings"] = grpc
     elif net == "httpupgrade":
         h = stream.get("httpupgrade") or {}
-        out["httpupgradeSettings"] = {"path": h.get("path") or "/", **({"host": h["host"]} if h.get("host") else {})}
+        hu: dict[str, Any] = {"path": h.get("path") or "/", **({"host": h["host"]} if h.get("host") else {})}
+        if h.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
+            hu["acceptProxyProtocol"] = True
+        out["httpupgradeSettings"] = hu
     elif net == "xhttp":
         x = stream.get("xhttp") or {}
-        out["xhttpSettings"] = {
+        xh: dict[str, Any] = {
             "path": x.get("path") or "/",
             "mode": x.get("mode") or "auto",
             **({"host": x["host"]} if x.get("host") else {}),
         }
+        extra = str(x.get("extra") or "").strip()
+        if extra:
+            try:
+                xh["extra"] = json.loads(extra)
+            except ValueError:
+                xh["extra"] = extra
+        out["xhttpSettings"] = xh
     elif net == "kcp":
         k = stream.get("kcp") or {}
-        out["kcpSettings"] = {
+        kcp: dict[str, Any] = {
             "mtu": int(k.get("mtu") or 1350),
             "tti": int(k.get("tti") or 20),
             "uplinkCapacity": int(k.get("uplink") or 5),
             "downlinkCapacity": int(k.get("downlink") or 20),
             "congestion": bool(k.get("congestion")),
+            "header": {"type": k.get("header") or "none"},
         }
+        if k.get("seed"):
+            kcp["seed"] = k["seed"]
+        out["kcpSettings"] = kcp
     if sec == "tls":
         t = stream.get("tls") or {}
         tls: dict[str, Any] = {
             "serverName": t.get("server_name") or "",
             "alpn": t.get("alpn") or ["h2", "http/1.1"],
             "minVersion": t.get("min_version") or "1.2",
+            "rejectUnknownSni": bool(t.get("reject_unknown_sni")),
         }
         if t.get("cert_file") and t.get("key_file"):
             tls["certificates"] = [{"certificateFile": t["cert_file"], "keyFile": t["key_file"]}]
+        if t.get("ech_server_keys"):
+            tls["echServerKeys"] = t["ech_server_keys"]
         out["tlsSettings"] = tls
     elif sec == "reality":
         r = stream.get("reality") or {}
-        out["realitySettings"] = {
-            "show": False,
+        reality: dict[str, Any] = {
+            "show": bool(r.get("show")),
             "dest": r.get("dest") or "www.cloudflare.com:443",
-            "xver": 0,
+            "xver": int(r.get("xver") or 0),
             "serverNames": r.get("server_names") or ["www.cloudflare.com"],
             "privateKey": r.get("private_key") or "",
             "shortIds": r.get("short_ids") or [""],
         }
+        if r.get("max_time_diff"):
+            reality["maxTimeDiff"] = int(r["max_time_diff"])
+        if r.get("min_client_ver"):
+            reality["minClientVer"] = r["min_client_ver"]
+        if r.get("max_client_ver"):
+            reality["maxClientVer"] = r["max_client_ver"]
+        if r.get("mldsa65_seed"):
+            reality["mldsa65Seed"] = r["mldsa65_seed"]
+        out["realitySettings"] = reality
+    so = stream.get("sockopt") or {}
+    if so.get("enabled"):
+        sock: dict[str, Any] = {}
+        if so.get("tcp_fast_open"):
+            sock["tcpFastOpen"] = True
+        if so.get("tcp_keep_alive_interval"):
+            sock["tcpKeepAliveInterval"] = int(so["tcp_keep_alive_interval"])
+        if so.get("tcp_keep_alive_idle"):
+            sock["tcpKeepAliveIdle"] = int(so["tcp_keep_alive_idle"])
+        if so.get("tcp_user_timeout"):
+            sock["tcpUserTimeout"] = int(so["tcp_user_timeout"])
+        if so.get("mark"):
+            sock["mark"] = int(so["mark"])
+        if so.get("tproxy"):
+            sock["tproxy"] = so["tproxy"]
+        if so.get("domain_strategy") and so["domain_strategy"] != "AsIs":
+            sock["domainStrategy"] = so["domain_strategy"]
+        if so.get("dialer_proxy"):
+            sock["dialerProxy"] = so["dialer_proxy"]
+        if so.get("penetrate"):
+            sock["penetrate"] = True
+        if so.get("tcp_mptcp"):
+            sock["tcpMptcp"] = True
+        if so.get("tcp_no_delay"):
+            sock["tcpNoDelay"] = True
+        if sock:
+            out["sockopt"] = sock
     return out
 
 
@@ -259,7 +355,7 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
         flow = s.get("flow") if supports_flow(ib) else ""
         settings = {
             "clients": [{"id": i["uuid"], "email": i["email"], **({"flow": flow} if flow else {})} for i in identities],
-            "decryption": "none",
+            "decryption": s.get("decryption") or "none",
         }
         if fb := _fallbacks(ib):
             settings["fallbacks"] = fb
@@ -373,6 +469,31 @@ def _hysteria_stream(ib: dict) -> dict:
 
 # ---------------------------------------------------------------- endpoints
 
+def _apply_external_proxy(ep: dict, ib: dict) -> list[dict]:
+    """Return one endpoint per external proxy; if none configured, just the direct ep."""
+    proxies = [p for p in (ib.get("external_proxies") or []) if (p.get("address") or p.get("dest"))]
+    if not proxies:
+        return [ep]
+    out = []
+    for i, p in enumerate(proxies):
+        item = dict(ep)
+        addr = str(p.get("address") or p.get("dest") or "").strip()
+        if addr:
+            item["address"] = addr
+        if p.get("port"):
+            item["port"] = int(p["port"])
+        force = str(p.get("force_tls") or p.get("forceTls") or "").lower()
+        if force in ("tls", "reality"):
+            item["security"] = force
+        remark = str(p.get("remark") or "").strip()
+        if remark:
+            item["remark"] = remark
+        elif len(proxies) > 1:
+            item["remark"] = f"{ep.get('remark') or ib.get('remark') or ib.get('tag')}-{i + 1}"
+        out.append(item)
+    return out
+
+
 def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
     proto = ib["protocol"]
     if proto not in USER_PROTOCOLS + ("wireguard", "socks", "http"):
@@ -390,8 +511,16 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
     }
     if proto in ("vless", "vmess"):
         ep["uuid"] = ident["uuid"]
-    if proto == "vless" and supports_flow(ib):
-        ep["flow"] = (ib.get("settings") or {}).get("flow") or ""
+    if proto == "vless":
+        s = ib.get("settings") or {}
+        if supports_flow(ib):
+            ep["flow"] = s.get("flow") or ""
+        enc = s.get("encryption") or "none"
+        if enc and enc != "none":
+            ep["encryption"] = enc
+        r = st.get("reality") or {}
+        if sec == "reality" and r.get("mldsa65_verify"):
+            ep["pqv"] = r["mldsa65_verify"]
     if proto == "trojan":
         ep["password"] = ident["password"]
     if proto == "shadowsocks":
@@ -522,7 +651,9 @@ def endpoint_to_link(ep: dict) -> str:
         return "vmess://" + base64.b64encode(json.dumps(data, ensure_ascii=False).encode()).decode()
     params = _stream_params(ep)
     if proto == "vless":
-        params = {"encryption": "none", **params}
+        params = {"encryption": ep.get("encryption") or "none", **params}
+        if ep.get("pqv"):
+            params["pqv"] = ep["pqv"]
         if ep.get("flow"):
             params["flow"] = ep["flow"]
         cred = ep["uuid"]
@@ -687,7 +818,7 @@ def endpoint_to_xray_outbound(ep: dict, tag: str = "proxy") -> dict:
     proto = ep["protocol"]
     out: dict[str, Any] = {"tag": tag, "protocol": proto}
     if proto == "vless":
-        user = {"id": ep["uuid"], "encryption": "none"}
+        user = {"id": ep["uuid"], "encryption": ep.get("encryption") or "none"}
         if ep.get("flow"):
             user["flow"] = ep["flow"]
         out["settings"] = {"vnext": [{"address": ep["address"], "port": ep["port"], "users": [user]}]}
