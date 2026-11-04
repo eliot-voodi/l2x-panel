@@ -356,24 +356,33 @@
       document.getElementById('r_mldsa_verify').value = d.verify || '';
     });
   });
+  function applyVlessEnc(kind) {
+    return getJson('/api/keys/vlessenc').then(function (d) {
+      if (!d.ok) { alert(d.error || 'ошибка генерации (нужен свежий Xray)'); return; }
+      var want = kind === 'mlkem768' ? 'mlkem768' : 'x25519';
+      var block = (d.auths || []).find(function (a) { return a.id === want; })
+        || (d.auths || []).find(function (a) { return (a.label || '').toLowerCase().indexOf(kind === 'mlkem768' ? 'ml-kem' : 'x25519') >= 0; })
+        || (d.auths || [])[0];
+      if (!block || !block.decryption || !block.encryption) {
+        alert('Xray не вернул пару decryption/encryption');
+        return;
+      }
+      document.getElementById('vless_decryption').value = block.decryption;
+      document.getElementById('vless_encryption').value = block.encryption;
+      document.getElementById('vless_auth').value = block.id === 'mlkem768' ? 'mlkem768' : (block.id === 'x25519' ? 'x25519' : 'custom');
+    }).catch(function (e) { alert('запрос не удался: ' + e); });
+  }
   document.getElementById('btn_vlessenc').addEventListener('click', function () {
     var kind = document.getElementById('vless_auth').value;
-    getJson('/api/keys/vlessenc').then(function (d) {
-      if (!d.ok) { alert(d.error || 'ошибка (нужен свежий Xray)'); return; }
-      var want = kind === 'mlkem768' ? 'mlkem' : 'x25519';
-      var block = (d.auths || []).find(function (a) { return (a.id || '').indexOf(want) >= 0 || (a.label || '').toLowerCase().indexOf(want) >= 0; }) || (d.auths || [])[0];
-      if (!block) return;
-      document.getElementById('vless_decryption').value = block.decryption || 'none';
-      document.getElementById('vless_encryption').value = block.encryption || 'none';
-      syncAuthSelect();
-    });
+    if (kind === 'none' || kind === 'custom') kind = 'x25519';
+    applyVlessEnc(kind);
   });
   document.getElementById('vless_auth').addEventListener('change', function () {
     if (this.value === 'none') {
       document.getElementById('vless_decryption').value = 'none';
       document.getElementById('vless_encryption').value = 'none';
     } else if (this.value === 'x25519' || this.value === 'mlkem768') {
-      document.getElementById('btn_vlessenc').click();
+      applyVlessEnc(this.value);
     }
   });
 </script>

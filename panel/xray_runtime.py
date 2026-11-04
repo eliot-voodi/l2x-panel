@@ -175,21 +175,39 @@ def generate_vless_encryption() -> dict:
     text = f"{r['stdout']}\n{r['stderr']}"
     pairs: list[dict] = []
     cur: dict = {}
+
+    def _kv(line: str) -> tuple[str, str] | None:
+        # accepts: decryption: value  OR  "decryption": "value"
+        raw = line.strip().strip(",").strip()
+        if ":" not in raw:
+            return None
+        key, _, val = raw.partition(":")
+        key = key.strip().strip('"').strip("'").lower()
+        val = val.strip().strip(",").strip().strip('"').strip("'")
+        return (key, val) if key and val else None
+
     for line in text.splitlines():
-        low = line.lower().strip()
-        if "authentication" in low or "ml-kem" in low or "x25519" in low:
-            if cur.get("decryption"):
+        stripped = line.strip()
+        low = stripped.lower()
+        # Only section headers — do NOT match key values that contain "x25519"/"mlkem"
+        if low.startswith("authentication:") or low.startswith("authentication "):
+            if cur.get("decryption") and cur.get("encryption"):
                 pairs.append(cur)
-            label = "mlkem768" if "ml-kem" in low or "mlkem" in low else "x25519"
-            cur = {"id": label, "label": line.strip()}
-        elif "decryption:" in low:
-            cur["decryption"] = line.split(":", 1)[1].strip()
-        elif "encryption:" in low:
-            cur["encryption"] = line.split(":", 1)[1].strip()
-    if cur.get("decryption"):
+            label = "mlkem768" if ("ml-kem" in low or "mlkem" in low or "post-quantum" in low) else "x25519"
+            if "x25519" in low and "ml-kem" not in low and "mlkem" not in low:
+                label = "x25519"
+            cur = {"id": label, "label": stripped}
+            continue
+        parsed = _kv(stripped)
+        if not parsed or not cur:
+            continue
+        key, val = parsed
+        if key in ("decryption", "encryption"):
+            cur[key] = val
+    if cur.get("decryption") and cur.get("encryption"):
         pairs.append(cur)
     if not pairs:
-        return {"ok": False, "error": text or "vlessenc failed"}
+        return {"ok": False, "error": "не удалось разобрать вывод xray vlessenc"}
     return {"ok": True, "auths": pairs}
 
 
