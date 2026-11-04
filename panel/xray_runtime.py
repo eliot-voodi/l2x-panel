@@ -1128,6 +1128,18 @@ def enforce_quotas(store: dict) -> bool:
                 if hit:
                     events.append({"type": "tag_exceeded", "email": client["email"], "tag": tag})
     for ib in ensure_inbounds(store):
+        period = ib.get("traffic_reset") or "never"
+        if period and period != "never":
+            nxt = parse_expire_at(ib.get("next_reset"))
+            if not nxt:
+                ib["next_reset"] = _period_delta(period, now).isoformat(timespec="seconds")
+                changed = True
+            elif now >= nxt:
+                t = ib.setdefault("traffic", {})
+                t["up"] = t["down"] = 0
+                ib["next_reset"] = _period_delta(period, now).isoformat(timespec="seconds")
+                events.append({"type": "inbound_reset", "tag": ib.get("tag")})
+                changed = True
         ok = inbound_access_ok(ib)
         if bool(ib.get("_blocked")) == ok:
             ib["_blocked"] = not ok
