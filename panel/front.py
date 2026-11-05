@@ -209,7 +209,7 @@ CAMOUFLAGE_URL = "https://ya.ru/"
 
 
 def _panel_locations(store: dict | None = None) -> list[str]:
-    """Public HTTPS site: correct links work; bare / and unknown paths go to ya.ru."""
+    """Public HTTPS site: correct links work; bare / goes to ya.ru, unknown paths are 404."""
     common = (
         "        proxy_http_version 1.1;\n"
         "        proxy_set_header Host $host;\n"
@@ -237,11 +237,11 @@ def _panel_locations(store: dict | None = None) -> list[str]:
     if base:
         out.append(f"    location = /{base} {{\n        return 302 https://$host/{base}/;\n    }}")
         out.append(f"    location ^~ /{base}/ {{\n{proxy}    }}")
-        out.append(f"    location / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
+        out.append("    location / {\n        return 404;\n    }")
     else:
         # No secret path yet: only bare / is camouflaged; /login and the rest still reach the panel
         out.append(f"    location / {{\n{proxy}    }}")
-    # Visitors without a real link land on Yandex; kept as the last block of the server
+    # The only camouflage redirect in the whole config; kept as the last block of the server
     out.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
     return out
 
@@ -297,8 +297,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         if domain == pub:
             body.extend(_panel_locations(store))
         else:
-            body.append(f"    location / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
-            body.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
+            body.append("    location / {\n        return 404;\n    }")
         blocks.append("server {\n" + "\n".join(body) + "\n}")
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
 
