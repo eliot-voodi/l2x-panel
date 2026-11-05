@@ -282,6 +282,33 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             if isinstance(parsed, dict) and err:
                 parsed = {**parsed, "error": err}
             return parsed if isinstance(parsed, dict) else {"ok": ok}
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        err = str(parsed.get("error") or body or exc)
+        try:
+            from xray_runtime import clean_xray_error
+            err = clean_xray_error(err) or err
+        except Exception:
+            pass
+        # Prefer explicit agent errors over opaque "HTTP Error 403"
+        if exc.code == 403 and "agent" in err.lower():
+            err = err
+        elif body and "error" in (parsed or {}):
+            err = str(parsed.get("error"))
+        else:
+            err = f"HTTP {exc.code}: {err}"
+        node["last_sync"] = now_iso()
+        node["last_ok"] = False
+        node["last_error"] = err
+        return {"ok": False, "error": err}
     except Exception as exc:  # noqa: BLE001
         node["last_sync"] = now_iso()
         node["last_ok"] = False
@@ -504,9 +531,12 @@ panel["public_host"] = DOMAIN
 existing_bp = (panel.get("base_path") or "").strip().strip("/")
 panel["base_path"] = existing_bp or PATH_NEW
 store_path.parent.mkdir(parents=True, exist_ok=True)
-store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+# atomic replace avoids partial reads by a racing panel process
+tmp = store_path.with_suffix(".tmp")
+tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+tmp.replace(store_path)
 bp = panel["base_path"]
-print("agent_ok", TOKEN[:8], bp)
+print("agent_ok", TOKEN[:8], bp, "enabled", ns["agent_enabled"])
 try:
     import front
     staged = front.stage(store)
@@ -536,17 +566,38 @@ except Exception as exc:
         if not _ssh_run(client, "test -f /opt/l2xpanel/app.py")["ok"]:
             return {"ok": False, "error": "установка на ноде не удалась", "log": "\n".join(log), "node": node}
 
+        # Stop panel before writing store so a live process cannot overwrite agent flags,
+        # then start, wait for health, re-apply agent once more (beats delayed acme restarts),
+        # and verify /agent/apply is not "agent disabled".
         r2 = _ssh_run(
             client,
             "set -a; . /etc/l2xpanel/panel.env; set +a; "
             "export L2X_FORCE_AGENT=1; "
+            "systemctl stop l2xpanel || true; "
             "cd /opt/l2xpanel; PYTHONPATH=/opt/l2xpanel .venv/bin/python /tmp/l2x_agent_setup.py; "
             "ec=$?; "
-            "systemctl restart l2xpanel; sleep 2; curl -s http://127.0.0.1:8090/health || true; "
-            "rm -f /tmp/l2x_agent_setup.py; exit $ec",
-            timeout=90,
+            "systemctl start l2xpanel; "
+            "for i in 1 2 3 4 5 6 7 8 9 10; do "
+            "  sleep 1; curl -sf http://127.0.0.1:8090/health >/dev/null && break; "
+            "done; "
+            # acme may schedule restart +5s — rewrite agent flags again after settle
+            "sleep 6; "
+            "systemctl stop l2xpanel || true; "
+            "PYTHONPATH=/opt/l2xpanel .venv/bin/python /tmp/l2x_agent_setup.py; "
+            "systemctl start l2xpanel; "
+            "sleep 2; "
+            "curl -s http://127.0.0.1:8090/health || true; echo; "
+            # verify agent endpoint (wrong token → 401 means agent is ON; 403 = disabled)
+            "bp=$(python3 -c \"import json;from pathlib import Path;s=json.loads(Path('/var/lib/l2xpanel/store.json').read_text());print((s.get('settings') or {}).get('panel',{}).get('base_path') or '')\"); "
+            "code=$(curl -s -o /tmp/l2x_agent_probe.json -w '%{http_code}' -X POST "
+            "  -H 'Content-Type: application/json' -H 'Authorization: Bearer probe' "
+            "  -d '{}' \"http://127.0.0.1:8090/${bp}/agent/apply\"); "
+            "echo agent_probe $code $(cat /tmp/l2x_agent_probe.json 2>/dev/null); "
+            "rm -f /tmp/l2x_agent_setup.py /tmp/l2x_agent_probe.json; "
+            "test \"$code\" = \"401\" || test \"$code\" = \"200\"; exit $?",
+            timeout=120,
         )
-        log.append(r2["stdout"][-1200:])
+        log.append(r2["stdout"][-1500:])
         if "refuse_demote_master" in (r2["stdout"] or ""):
             return {
                 "ok": False,
@@ -554,10 +605,10 @@ except Exception as exc:
                 "log": "\n".join(log),
                 "node": node,
             }
-        if not r2.get("ok"):
+        if "agent disabled" in (r2["stdout"] or "") or not r2.get("ok"):
             return {
                 "ok": False,
-                "error": f"agent setup exit={r2.get('code')}",
+                "error": "agent не включился на ноде (403 agent disabled) — повторите provision",
                 "log": "\n".join(log),
                 "node": node,
             }

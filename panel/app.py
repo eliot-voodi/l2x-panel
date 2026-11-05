@@ -3072,6 +3072,11 @@ async def settings_save(request: Request):
         elif section == "nodes":
             ns = s.setdefault("nodes", {})
             ns["agent_enabled"] = form.get("agent_enabled") == "1"
+            # Keep role in sync with the checkbox so is_master() / agent apply stay consistent
+            if ns["agent_enabled"]:
+                ns["role"] = "agent"
+            elif (ns.get("role") or "") == "agent":
+                ns["role"] = "master"
             if form.get("regen_token") == "1" or not ns.get("agent_token"):
                 ns["agent_token"] = secrets.token_urlsafe(32)
         elif section == "tg":
@@ -3403,16 +3408,22 @@ async def nodes_add(request: Request):
         flash(request, "URL ноды должен начинаться с http", "error")
         return go("/nodes")
     from urllib.parse import urlparse
-    host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    # URL may include secret path: https://node.example.com/AbCdEfGh/
+    path_parts = [p for p in (parsed.path or "").split("/") if p]
+    base_path = path_parts[0] if path_parts else ""
+    origin = f"{parsed.scheme}://{parsed.netloc}"
     self_err = nodes_mod.same_host_as_master(host, public_host()) if host else ""
     if self_err:
         flash(request, self_err, "error")
         return go("/nodes")
     with mutate() as store:
         node = {
-            "id": str(uuid.uuid4()), "name": name, "url": url, "token": token, "enabled": True,
+            "id": str(uuid.uuid4()), "name": name, "url": origin, "token": token, "enabled": True,
             "sync_clients": form.get("sync_clients") == "1", "sync_inbounds": form.get("sync_inbounds") == "1",
-            "as_outbound": form.get("as_outbound") == "1", "domain": "", "ssh_user": "", "ssh_port": 22,
+            "as_outbound": form.get("as_outbound") == "1", "domain": host, "base_path": base_path,
+            "ssh_user": "", "ssh_port": 22,
             "last_sync": "", "last_error": "", "last_ok": False, "role": "agent",
         }
         if node["as_outbound"]:
