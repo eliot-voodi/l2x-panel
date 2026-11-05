@@ -55,12 +55,11 @@ public_ip() {
 }
 
 panel_url() {
-  local bp port=""
+  local bp h scheme=https
   bp=$(store_get settings.panel.base_path 2>/dev/null)
-  if grep -q '^HOST=0.0.0.0' "$ENV_FILE" 2>/dev/null; then
-    port=":$(sed -n 's/^PORT=//p' "$ENV_FILE")"
-  fi
-  echo "http://$(public_ip)${port}/${bp:+$bp/}"
+  h=$(public_ip)
+  [[ $h =~ ^[0-9.]+$ || $h == *:* ]] && scheme=http
+  echo "$scheme://$h/${bp:+$bp/}"
 }
 
 run_installer() {
@@ -100,7 +99,9 @@ disable_2fa() {
 }
 
 reset_base_path() {
-  store_set settings.panel.base_path "" && systemctl restart l2xpanel && c_ok "Секретный путь сброшен: $(panel_url)"
+  local bp
+  bp=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+  store_set settings.panel.base_path "$bp" && systemctl restart l2xpanel && sleep 3 && c_ok "Новый секретный путь: $(panel_url)"
 }
 
 issue_ssl() {
@@ -192,7 +193,7 @@ menu() {
    4) Показать адрес панели
    5) Сбросить логин/пароль админа
    6) Отключить 2FA
-   7) Сбросить секретный путь панели
+   7) Новый секретный путь панели
    8) Выпустить SSL (Let's Encrypt)
    9) Вкл/выкл BBR
   10) Firewall: открыть порт

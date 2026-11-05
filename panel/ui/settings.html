@@ -30,9 +30,9 @@
     <div><label class="f">Сессия, часов</label><input name="session_hours" type="number" step="0.5" min="0.5" value="{{ p.session_hours }}"></div>
   </div>
   <datalist id="tzs">{% for z in ('Europe/Moscow', 'UTC', 'Europe/Berlin', 'Europe/Kiev', 'Asia/Tehran', 'Asia/Almaty', 'Asia/Yekaterinburg', 'Asia/Novosibirsk', 'Asia/Vladivostok') %}<option>{{ z }}</option>{% endfor %}</datalist>
-  <label class="f">Секретный путь панели (base path)</label>
-  <input name="base_path" value="{{ p.base_path }}" placeholder="например x7Kq2m — панель будет по /x7Kq2m/">
-  <div class="hint">После сохранения: <code>https://{{ public_host or 'домен' }}/{{ p.base_path or '…' }}/</code>. Подписки <code>/sub/</code> и API остаются на корне. Сбросить путь: CLI <code>l2x</code>.</div>
+  <label class="f">Секретный путь панели (обязателен)</label>
+  <input name="base_path" value="{{ p.base_path }}" pattern="[A-Za-z0-9_-]+" placeholder="латиница, цифры, _ и -">
+  <div class="hint">Панель: <code>https://{{ public_host or 'домен' }}/{{ p.base_path }}/</code>. Всё остальное на домене (кроме подписок <code>/sub/</code>) уводит на ya.ru. Пустое поле — путь не меняется. Новый случайный путь и текущий адрес: CLI <code>l2x reset-path</code> / <code>l2x url</code>.</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 

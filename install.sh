@@ -387,10 +387,10 @@ configure() {
   ask ADMIN_USER "Логин администратора" "${L2X_ADMIN:-admin}"
   ask ADMIN_PASSWORD "Пароль администратора" "${L2X_PASSWORD:-$(rand 16)}"
   [ ${#ADMIN_PASSWORD} -ge 8 ] || die "Пароль должен быть не короче 8 символов"
-  ask PANEL_PATH "Секретный путь панели (- = без пути)" "${L2X_PATH:-$(rand 12)}"
+  ask PANEL_PATH "Секретный путь панели" "${L2X_PATH:-$(rand 12)}"
   PANEL_PATH=${PANEL_PATH#/}; PANEL_PATH=${PANEL_PATH%/}
-  [ "$PANEL_PATH" = - ] && PANEL_PATH=""
-  [[ -z $PANEL_PATH || $PANEL_PATH =~ ^[A-Za-z0-9_-]+$ ]] || die "Путь: только латиница, цифры, _ и -"
+  [ -n "$PANEL_PATH" ] || PANEL_PATH=$(rand 12)
+  [[ $PANEL_PATH =~ ^[A-Za-z0-9_-]+$ ]] || die "Путь: только латиница, цифры, _ и -"
 
   local m=1
   [ "${L2X_MODE:-nginx}" = direct ] && m=2
@@ -439,23 +439,16 @@ configure() {
 }
 
 summary() {
-  local base="http://$PUBLIC_HOST" path=${PANEL_PATH:+/$PANEL_PATH}
-  [ "$MODE" = direct ] && base="http://$PUBLIC_HOST:$PANEL_PORT"
+  local base="https://$PUBLIC_HOST" path=/$PANEL_PATH
+  is_ip "$PUBLIC_HOST" && base="http://$PUBLIC_HOST"
   printf '\n%s  ════════════════════ L2X Panel установлена ════════════════════%s\n\n' "$G" "$N"
-  printf '  Панель:   %s%s%s/%s\n' "$W" "$base" "$path" "$N"
-  if [ "$SSL" != none ] && [ "$MODE" = nginx ]; then
-    printf '  HTTPS:    %shttps://%s:%s%s/%s\n' "$W" "$PUBLIC_HOST" "$PANEL_TLS_PORT" "$path" "$N"
-  fi
+  printf '  Панель:   %s%s%s/%s   (корень сайта и прочие пути уводят на ya.ru)\n' "$W" "$base" "$path" "$N"
   printf '  Логин:    %s%s%s\n  Пароль:   %s%s%s\n' "$W" "$ADMIN_USER" "$N" "$W" "$ADMIN_PASSWORD" "$N"
-  if [ "$SSL" != none ]; then
-    printf '  Подписки: https://%s:%s/sub/<token>\n' "$PUBLIC_HOST" "$SUB_PORT"
-  fi
+  printf '  Подписки: %s/sub/<token>\n' "$base"
   printf '\n  Меню управления на сервере: %sl2x%s\n' "$W" "$N"
   printf '  Сохраните пароль — он больше не будет показан (сброс: l2x reset-password).\n\n'
   printf '  Inbounds доступны только через nginx :443 (Xray слушает 127.0.0.1, порты inbounds закрыты iptables).\n'
-  printf '  Откройте в файрволе: %s%s.\n\n' \
-    "$([ "$MODE" = nginx ] && echo '80/tcp, 443/tcp' || echo "80/tcp, 443/tcp, $PANEL_PORT/tcp")" \
-    "$([ "$SSL" != none ] && echo ", $SUB_PORT/tcp$([ "$MODE" = nginx ] && echo ", $PANEL_TLS_PORT/tcp")")"
+  printf '  Откройте в файрволе: 80/tcp, 443/tcp.\n\n'
 }
 
 # ---------------------------------------------------------------- main

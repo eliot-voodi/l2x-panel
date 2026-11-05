@@ -264,6 +264,28 @@ def base_path() -> str:
     return f"/{bp}" if bp else ""
 
 
+# Public site root and these prefixes belong to nginx / subscriptions, never to the panel
+BASE_PATH_RESERVED = {"sub", "panel", "health", "static", "login", "logout", "well-known"}
+
+
+def _clean_base_path(value: str) -> str:
+    bp = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))
+    return "" if bp.lower() in BASE_PATH_RESERVED else bp
+
+
+def _new_base_path() -> str:
+    return secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+
+
+def _ensure_base_path() -> None:
+    """The panel is only ever served under a secret prefix; `/` of the public site is camouflage."""
+    with mutate() as store:
+        p = store["settings"].setdefault("panel", {})
+        bp = _clean_base_path(p.get("base_path") or "")
+        if bp != p.get("base_path") or not bp:
+            p["base_path"] = bp or _new_base_path()
+
+
 def app_title() -> str:
     return (SETTINGS_CACHE.get("panel") or {}).get("title") or APP_NAME_DEFAULT
 
@@ -959,6 +981,7 @@ def _sync_xray_config() -> None:
 @app.on_event("startup")
 def _startup():
     _admin()
+    _ensure_base_path()
     _refresh_settings_cache()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop):
         threading.Thread(target=target, daemon=True).start()
@@ -2514,8 +2537,7 @@ async def settings_save(request: Request):
             p["timezone"] = str(form.get("timezone") or "UTC")
             p["lang"] = "en" if form.get("lang") == "en" else "ru"
             p["theme"] = "light" if form.get("theme") == "light" else "dark"
-            bp = re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("base_path") or ""))
-            p["base_path"] = bp
+            p["base_path"] = _clean_base_path(form.get("base_path") or "") or p.get("base_path") or _new_base_path()
             host = front.normalize_host(str(form.get("public_host") or ""))
             if host and not (front.is_domain(host) or front._is_ip(host)):
                 flash(request, "Публичный домен: укажите домен (рекомендуется) или IP", "error")

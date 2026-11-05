@@ -211,7 +211,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         f"    location = /health {{\n{proxy}    }}",
     ]
     if base:
-        out.append(f"    location = /{base} {{\n        return 302 /{base}/;\n    }}")
+        out.append(f"    location = /{base} {{\n        return 302 https://$host/{base}/;\n    }}")
         out.append(f"    location ^~ /{base}/ {{\n{proxy}    }}")
         out.append(f"    location / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
     else:
