@@ -1126,7 +1126,9 @@ def query_online() -> dict[str, dict[str, int]]:
         name = name.replace("user>>>", "").replace(">>>online", "")
         ips = u.get("ips") or u.get("ip_list") or u.get("ipList") or {}
         if isinstance(ips, list):
-            ips = {str(i.get("ip") if isinstance(i, dict) else i): int((i.get("time") or i.get("last_seen") or 0) if isinstance(i, dict) else 0) for i in ips}
+            ips = {str(i.get("ip") if isinstance(i, dict) else i):
+                   int((i.get("lastSeen") or i.get("time") or i.get("last_seen") or 0) if isinstance(i, dict) else 0)
+                   for i in ips}
         if name:
             out[name] = {str(k): int(v or 0) for k, v in dict(ips).items()}
     return out
@@ -1345,12 +1347,43 @@ def enforce_ip_limits(store: dict, online_by_client: dict[str, list[str]], ban_m
             bans.append(item)
             new.append(item)
             banned.add(ip)
+            _record_ban(store, ip, client["email"], now.isoformat())
     return new
+
+
+def _record_ban(store: dict, ip: str, email: str, when: str) -> None:
+    """Lifetime per-IP ban counter (survives unban and expiry)."""
+    st = store.setdefault("ip_ban_stats", {}).setdefault(ip, {"count": 0, "first": when, "emails": []})
+    st["count"] = int(st.get("count") or 0) + 1
+    st["last"] = when
+    if email and email not in st["emails"]:
+        st["emails"].append(email)
 
 
 def unban_ip(store: dict, ip: str) -> None:
     _run(["iptables", "-D", IPLIMIT_CHAIN, "-s", ip, "-j", "DROP"])
     store["ip_bans"] = [b for b in store.get("ip_bans") or [] if b.get("ip") != ip]
+
+
+def forget_ip(store: dict, ip: str) -> None:
+    """Reset the ban counter of an IP (does not unban it)."""
+    (store.get("ip_ban_stats") or {}).pop(ip, None)
+
+
+def ban_overview(store: dict) -> tuple[list[dict], list[dict]]:
+    """(active bans with counters, history of every IP ever banned — most banned first)."""
+    stats = store.get("ip_ban_stats") or {}
+    now = now_utc()
+    active = []
+    for b in store.get("ip_bans") or []:
+        until = parse_expire_at(b.get("until"))
+        active.append({**b, "count": int((stats.get(b["ip"]) or {}).get("count") or 1),
+                       "left_min": max(0, int(((until or now) - now).total_seconds() // 60))})
+    active.sort(key=lambda b: b.get("since") or "", reverse=True)
+    banned = {b["ip"] for b in active}
+    history = [{"ip": ip, **v, "active": ip in banned} for ip, v in stats.items()]
+    history.sort(key=lambda h: (-int(h.get("count") or 0), h.get("last") or ""))
+    return active, history
 
 
 # ---------------------------------------------------------------- outbound test

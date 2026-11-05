@@ -484,6 +484,9 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
             for key in ("wsSettings", "httpupgradeSettings", "xhttpSettings"):
                 out["streamSettings"].get(key, {}).pop("host", None)
             out["streamSettings"].get("grpcSettings", {}).pop("authority", None)
+            # Every request arrives from nginx (127.0.0.1); the real client IP is in the header nginx sets.
+            # Without it online-IP stats stay empty (Xray skips localhost) and IP limits never fire.
+            out["streamSettings"].setdefault("sockopt", {})["trustedXForwardedFor"] = ["X-Forwarded-For", "X-Real-IP"]
     sn = ib.get("sniffing") or {}
     if sn.get("enabled"):
         out["sniffing"] = {

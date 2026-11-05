@@ -247,7 +247,7 @@
 <form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:640px">
   <input type="hidden" name="section" value="iplimit">
   <label class="f">Блокировка лишних IP, минут</label><input name="ban_minutes" type="number" min="1" value="{{ s.iplimit.ban_minutes }}">
-  <div class="hint">Если у клиента задан лимит IP, а онлайн больше адресов, самые новые IP блокируются iptables-цепочкой L2X_IPLIMIT на это время. Список и разблокировка — в карточке клиента.</div>
+  <div class="hint">Если у клиента задан лимит IP, а онлайн больше адресов, самые новые IP блокируются iptables-цепочкой L2X_IPLIMIT на это время. Список, разбан и статистика — на странице <a href="{{ bp }}/bans">Баны IP</a> и в карточке клиента.</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 {% endif %}

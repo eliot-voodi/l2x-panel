@@ -164,7 +164,8 @@ def _load_store() -> dict:
             data = json.loads(STORE.read_text(encoding="utf-8"))
         except ValueError:
             data = {}
-    for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", [])):
+    for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
+                         ("ip_ban_stats", {})):
         data.setdefault(key, default)
     data.setdefault("reverse", {"bridges": [], "portals": []})
     xray.ensure_balancers(data)
@@ -1111,7 +1112,7 @@ def _sub_response(request: Request, token: str) -> Response:
                 c["hwids"] = client.get("hwids") or []
                 _save_store(st)
         return PlainTextResponse("", status_code=404, headers=headers)
-    if gate["reason"] == "ok":
+    if gate.get("recorded"):
         with STORE_LOCK:
             st = _load_store()
             c = _find_by_token(st, token)
@@ -1900,6 +1901,16 @@ def client_action(email: str, action: str, request: Request):
     return go(nxt or f"/clients/{email}/edit")
 
 
+@app.get("/bans", response_class=HTMLResponse)
+def bans_page(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    active, history = xray.ban_overview(store)
+    ban_min = _int(store["settings"]["iplimit"].get("ban_minutes"), 30)
+    return page(request, "bans.html", active="bans", bans=active, history=history, ban_minutes=ban_min)
+
+
 @app.post("/ipban/{ip}/unban")
 def ip_unban(ip: str, request: Request):
     if redir := _require(request):
@@ -1907,7 +1918,17 @@ def ip_unban(ip: str, request: Request):
     with mutate() as store:
         xray.unban_ip(store, ip)
     flash(request, f"{ip} разблокирован", "info")
-    return go(request.query_params.get("next") or "/clients")
+    return go(request.query_params.get("next") or "/bans")
+
+
+@app.post("/ipban/{ip}/forget")
+def ip_forget(ip: str, request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        xray.forget_ip(store, ip)
+    flash(request, f"{ip}: счётчик банов сброшен", "info")
+    return go("/bans")
 
 
 @app.get("/clients/{email}/qr")

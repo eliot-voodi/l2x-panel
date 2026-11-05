@@ -92,31 +92,39 @@ def gate(client: dict, request_headers: dict[str, str], *, register: bool = True
     required=True rejects requests without X-HWID even when the client has no device limit
     (a fallback fingerprint never satisfies it).
     fallback: off | device | ua — how to count apps that send no X-HWID (see module doc).
-    Returns {allowed, reason, headers, limit, registered, kind}.
+    Without a limit and without `required` nothing is blocked, but devices are still recorded
+    (reason "inactive", recorded=True) so the admin sees them before setting a limit.
+    Returns {allowed, reason, headers, limit, registered, kind, recorded}.
     reason: ok | inactive | missing | short | full
     """
     request_headers = {k.lower(): v for k, v in request_headers.items()}
     ensure(client)
     limit = int(client.get("limit_hwid") or 0)
-    headers = {"X-Hwid-Active": "true" if limit > 0 or required else "false"}
-    if limit <= 0 and not required:
-        return {"allowed": True, "reason": "inactive", "headers": headers, "limit": 0,
-                "registered": len(client.get("hwids") or []), "kind": ""}
+    active = limit > 0 or required
+    headers = {"X-Hwid-Active": "true" if active else "false"}
+
+    def result(allowed: bool, reason: str, kind: str = "", recorded: bool = False) -> dict[str, Any]:
+        return {"allowed": allowed, "reason": reason, "headers": headers, "limit": limit,
+                "registered": len(client["hwids"]), "kind": kind, "recorded": recorded}
 
     raw = (request_headers.get("x-hwid") or "").strip()
     kind = "hwid"
     if limit > 0:
         headers["X-Hwid-Limit"] = str(limit)
     if raw and len(raw) < 6:
-        headers["X-Hwid-Not-Supported"] = "true"
-        return {"allowed": False, "reason": "short", "headers": headers, "limit": limit,
-                "registered": len(client["hwids"]), "kind": ""}
+        if active:
+            headers["X-Hwid-Not-Supported"] = "true"
+            return result(False, "short")
+        raw = ""
     if not raw and not required:
-        raw, kind = fallback_fingerprint(request_headers, fallback)
+        # Without a limit we only observe, so even an app-only fingerprint is worth listing
+        raw, kind = fallback_fingerprint(request_headers, fallback if active else "ua")
     if not raw:
+        if not active:
+            return result(True, "inactive")
         headers["X-Hwid-Not-Supported"] = "true"
-        return {"allowed": False, "reason": "missing", "headers": headers, "limit": limit,
-                "registered": len(client["hwids"]), "kind": ""}
+        return result(False, "missing")
+    ok_reason = "ok" if active else "inactive"
 
     digest = hash_hwid(raw)
     now = now_iso()
@@ -133,14 +141,12 @@ def gate(client: dict, request_headers: dict[str, str], *, register: bool = True
                 for k, v in meta.items():
                     if v:
                         d[k] = v
-            return {"allowed": True, "reason": "ok", "headers": headers, "limit": limit,
-                    "registered": len(client["hwids"]), "kind": kind}
+            return result(True, ok_reason, kind, recorded=register)
 
     if limit > 0 and len(client["hwids"]) >= limit:
         headers["X-Hwid-Max-Devices-Reached"] = "true"
         headers["X-Hwid-Limit"] = "true"
-        return {"allowed": False, "reason": "full", "headers": headers, "limit": limit,
-                "registered": len(client["hwids"]), "kind": kind}
+        return result(False, "full", kind)
 
     if register:
         client["hwids"].append({
@@ -150,8 +156,7 @@ def gate(client: dict, request_headers: dict[str, str], *, register: bool = True
         })
         if limit <= 0 and len(client["hwids"]) > 50:
             client["hwids"] = sorted(client["hwids"], key=lambda d: d.get("last_seen") or "")[-50:]
-    return {"allowed": True, "reason": "ok", "headers": headers, "limit": limit,
-            "registered": len(client["hwids"]), "kind": kind}
+    return result(True, ok_reason, kind, recorded=register)
 
 
 def public_list(client: dict) -> list[dict]:

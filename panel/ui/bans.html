@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Баны IP · {{ app_name }}{% endblock %}
+{% block page_title %}Баны IP{% endblock %}
+{% block page_sub %}{{ bans|length }} заблокировано сейчас · лимит одновременных IP, бан на {{ ban_minutes }} мин{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head"><h3>Заблокированы сейчас</h3><a class="btn ghost sm" href="{{ bp }}/bans">{{ ic.icon('refresh') }}{{ t('Обновить') }}</a></div>
+  {% if bans %}
+  <table><thead><tr><th>IP</th><th>Клиент</th><th>Заблокирован</th><th>До</th><th>Банов всего</th><th></th></tr></thead><tbody>
+    {% for b in bans %}
+    <tr>
+      <td class="mono">{{ b.ip }}</td>
+      <td><a href="{{ bp }}/clients/{{ b.email }}/edit">{{ b.email }}</a></td>
+      <td class="small dim">{{ fmt_dt(b.since) }}</td>
+      <td class="small">{{ fmt_dt(b.until) }} <span class="dim">· ещё {{ b.left_min }} мин</span></td>
+      <td><span class="badge {% if b.count >= 5 %}err{% elif b.count >= 2 %}warn{% endif %}">{{ b.count }}</span></td>
+      <td class="right">{{ m.post_btn(bp ~ '/ipban/' ~ b.ip ~ '/unban', 'Разбанить', 'sm') }}</td>
+    </tr>
+    {% endfor %}
+  </tbody></table>
+  {% else %}<div class="dim">Сейчас никто не заблокирован</div>{% endif %}
+</div>
+
+<div class="card">
+  <div class="card-head"><h3>Статистика банов</h3></div>
+  <div class="hint">Сколько раз каждый IP попадал в бан за всё время. Счётчик не сбрасывается при разбане и окончании бана.</div>
+  {% if history %}
+  <table><thead><tr><th>IP</th><th>Банов</th><th>Клиенты</th><th>Первый бан</th><th>Последний бан</th><th>Статус</th><th></th></tr></thead><tbody>
+    {% for h in history %}
+    <tr>
+      <td class="mono">{{ h.ip }}</td>
+      <td><span class="badge {% if h.count >= 5 %}err{% elif h.count >= 2 %}warn{% endif %}">{{ h.count }}</span></td>
+      <td class="small">{% for e in h.emails %}<a href="{{ bp }}/clients/{{ e }}/edit">{{ e }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</td>
+      <td class="small dim">{{ fmt_dt(h.first) }}</td>
+      <td class="small dim">{{ fmt_dt(h.last) }}</td>
+      <td>{% if h.active %}<span class="badge err">в бане</span>{% else %}<span class="dim small">свободен</span>{% endif %}</td>
+      <td class="right"><div class="actions">
+        {% if h.active %}{{ m.post_btn(bp ~ '/ipban/' ~ h.ip ~ '/unban', 'Разбанить', 'sm') }}{% endif %}
+        {{ m.post_btn(bp ~ '/ipban/' ~ h.ip ~ '/forget', 'Сбросить счётчик', 'ghost sm', 'Сбросить счётчик банов для ' ~ h.ip ~ '?') }}
+      </div></td>
+    </tr>
+    {% endfor %}
+  </tbody></table>
+  {% else %}<div class="dim">Банов ещё не было</div>{% endif %}
+</div>
+{% endblock %}
