@@ -39,7 +39,7 @@
         </select>
       </div>
       <div><label class="f">URL share (домен)</label>
-        <input name="share_host" id="share_host" value="{{ ib.share_host }}" placeholder="vpn.example.com">
+        <input name="share_host" id="share_host" value="{{ ib.share_host }}" placeholder="{{ public_host }} (публичный домен)">
       </div>
     </div>
     <div class="hint" id="front_hint"></div>
@@ -342,9 +342,9 @@
     if (!front) {
       hint.textContent = 'Этот протокол не публикуется через nginx :443 — доступен только локально.';
     } else if (sec === 'reality' || sec === 'tls') {
-      hint.textContent = 'nginx :443 пробрасывает TLS по SNI (' + (sec === 'reality' ? 'Reality serverNames' : 'TLS server name') + ') прямо в Xray. Ссылка: ' + (dom || 'IP сервера') + ':443.';
+      hint.textContent = 'Клиенты подключаются только на :443. В ссылке адрес = URL share или публичный домен; SNI Reality/TLS — отдельно. nginx пробрасывает по SNI в Xray.';
     } else if (http) {
-      hint.innerHTML = 'nginx завершает TLS для домена и проксирует путь в Xray. Домен обязателен: <code>' + (dom || 'vpn.example.com') + '</code> → ссылка <code>' + (dom || 'домен') + ':443</code>, сертификат Let\'s Encrypt выпускается автоматически (A-запись должна указывать на сервер).';
+      hint.innerHTML = 'Клиенты только на <code>:443</code>. Пустое URL share → публичный домен из Настроек. Сертификат Let\'s Encrypt выпускается автоматически.';
     } else {
       hint.textContent = 'raw без TLS не публикуется через nginx — выберите ws/grpc/httpupgrade/xhttp, TLS или Reality.';
     }

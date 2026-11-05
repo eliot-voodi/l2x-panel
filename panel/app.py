@@ -245,7 +245,18 @@ def _refresh_settings_cache() -> dict:
 
 
 def public_host() -> str:
-    return (SETTINGS_CACHE.get("panel") or {}).get("public_host") or PUBLIC_HOST_ENV
+    """Public hostname for links: changeable domain (preferred) or env/IP fallback."""
+    store_host = (SETTINGS_CACHE.get("panel") or {}).get("public_host") or ""
+    host = front.normalize_host(store_host) or front.normalize_host(PUBLIC_HOST_ENV)
+    return host or PUBLIC_HOST_ENV
+
+
+def public_https_base() -> str:
+    """Canonical client-facing base URL — always HTTPS on :443 when a domain is configured."""
+    host = public_host()
+    if front.is_domain(host):
+        return f"https://{host}"
+    return f"http://{host}"
 
 
 def base_path() -> str:
@@ -915,13 +926,9 @@ sub_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def _sync_servers() -> None:
-    s = _refresh_settings_cache()
-    sub = s["sub"]
-    SUB_SERVER.ensure(sub_app, bool(sub.get("server_enabled")), sub.get("listen") or "0.0.0.0",
-                      _int(sub.get("port"), 2096), sub.get("cert_file") or "", sub.get("key_file") or "")
-    ex = s["panel"]["extra_listen"]
-    PANEL_TLS.ensure(app, bool(ex.get("enabled")), "0.0.0.0", _int(ex.get("port"), 2053),
-                     ex.get("cert_file") or "", ex.get("key_file") or "")
+    # Clients only use :443 via nginx. Dedicated :2096 / :2053 listeners stay off.
+    SUB_SERVER.ensure(sub_app, False, "127.0.0.1", 2096, "", "")
+    PANEL_TLS.ensure(app, False, "127.0.0.1", 2053, "", "")
 
 
 def _sync_xray_config() -> None:
@@ -970,16 +977,11 @@ def _shutdown():
 # ================================================================ subscriptions
 
 def sub_url(client: dict) -> str:
+    """Subscription link — always on the public domain over HTTPS :443 (no other port)."""
     s = SETTINGS_CACHE.get("sub") or {}
     token = client.get("sub_token", "")
-    if s.get("server_enabled"):
-        scheme = "https" if s.get("cert_file") else "http"
-        host = s.get("domain") or public_host()
-        port = _int(s.get("port"), 2096)
-        default = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
-        path = (s.get("path") or "sub").strip("/")
-        return f"{scheme}://{host}{'' if default else f':{port}'}/{path}/{token}"
-    return f"http://{public_host()}/sub/{token}"
+    path = (s.get("path") or "sub").strip("/") or "sub"
+    return f"{public_https_base()}/{path}/{token}"
 
 
 def _netloc(scheme: str, netloc: str) -> str:
@@ -1461,8 +1463,9 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["fallbacks"] = fbs
     xray.ensure_inbound_keys(ib)
     mode = P.front_mode(ib)
-    if mode == "http" and not front.is_domain(ib["share_host"]):
-        return f"Для {st['network']} через nginx :443 укажите домен в поле URL share (A-запись на этот сервер)"
+    share = ib["share_host"] or front.public_domain({"settings": SETTINGS_CACHE}) or public_host()
+    if mode == "http" and not front.is_domain(share):
+        return f"Для {st['network']} задайте публичный домен в Настройках или URL share"
     if mode == "http" and not front.PATH_RE.match(P.front_http_path(ib)):
         return "Путь/serviceName: только латиница, цифры и /_.~-"
     return None
@@ -2513,17 +2516,23 @@ async def settings_save(request: Request):
             p["theme"] = "light" if form.get("theme") == "light" else "dark"
             bp = re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("base_path") or ""))
             p["base_path"] = bp
-            p["public_host"] = str(form.get("public_host") or "").strip()
-            p["extra_listen"] = {"enabled": form.get("extra_enabled") == "1", "port": _int(form.get("extra_port"), 2053),
-                                 "cert_file": str(form.get("extra_cert") or ""), "key_file": str(form.get("extra_key") or "")}
+            host = front.normalize_host(str(form.get("public_host") or ""))
+            if host and not (front.is_domain(host) or front._is_ip(host)):
+                flash(request, "Публичный домен: укажите домен (рекомендуется) или IP", "error")
+                return go("/settings?tab=panel")
+            p["public_host"] = host
+            # Dedicated panel TLS port is unused — everything is on nginx :443
+            p["extra_listen"] = {"enabled": False, "port": 2053, "cert_file": "", "key_file": ""}
+            s["sub"]["domain"] = host if front.is_domain(host) else s["sub"].get("domain", "")
+            s["sub"]["server_enabled"] = False
         elif section == "sub":
             sub = s["sub"]
             sub.update({
-                "enabled": form.get("enabled") == "1", "server_enabled": form.get("server_enabled") == "1",
-                "listen": str(form.get("listen") or "0.0.0.0"), "port": _int(form.get("port"), 2096),
+                "enabled": form.get("enabled") == "1", "server_enabled": False,
+                "listen": "127.0.0.1", "port": 2096,
                 "path": re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("path") or "sub")) or "sub",
-                "domain": str(form.get("domain") or "").strip(), "cert_file": str(form.get("cert_file") or ""),
-                "key_file": str(form.get("key_file") or ""), "update_hours": _int(form.get("update_hours"), 1),
+                "domain": front.public_domain({"settings": s}) or front.normalize_host(str(form.get("domain") or "")),
+                "cert_file": "", "key_file": "", "update_hours": _int(form.get("update_hours"), 1),
                 "title": str(form.get("title") or ""), "support_url": str(form.get("support_url") or ""),
                 "announce": str(form.get("announce") or ""), "show_page": form.get("show_page") == "1",
                 "json_fragment": str(form.get("json_fragment") or "").strip(),
@@ -2556,10 +2565,14 @@ async def settings_save(request: Request):
             })
         elif section == "iplimit":
             s["iplimit"]["ban_minutes"] = _int(form.get("ban_minutes"), 30)
+    _refresh_settings_cache()
     _sync_servers()
     if section == "tg":
         BOT.start()
-    flash(request, "Настройки сохранены", "info")
+    if section == "panel":
+        flash(request, *_ok_msg("Настройки сохранены, HTTPS :443 обновлён", _apply_xray(_load_store())))
+    else:
+        flash(request, "Настройки сохранены", "info")
     return go(f"/settings?tab={section}")
 
 

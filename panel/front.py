@@ -1,9 +1,11 @@
-"""nginx front: the only public entry for inbounds.
+"""nginx front: the only public entry (panel, subscriptions, inbounds) — clients only need :443.
 
     client ──:443──> nginx stream (ssl_preread)
                        ├─ SNI of a Reality / Xray-TLS inbound ──PROXY──> Xray 127.0.0.1:<port>
-                       └─ anything else ──PROXY──> nginx https 127.0.0.1:7443
-                                                    └─ share domain + path ──> Xray 127.0.0.1:<port> (ws/grpc/httpupgrade/xhttp)
+                       └─ public domain (and other HTTPS) ──PROXY──> nginx https 127.0.0.1:7443
+                            ├─ /sub/…  → panel (subscriptions)
+                            ├─ /       → panel
+                            └─ path    → Xray (ws/grpc/httpupgrade/xhttp)
 
 Generated files are verified with `nginx -t` before nginx ever loads them; a failed test or a failed
 reload restores the previous files. There is no switch to skip that.
@@ -28,6 +30,7 @@ HTTP_CONF = FRONT_DIR / "http.conf"
 HTTP_INCLUDE = Path("/etc/nginx/conf.d/l2x-front.conf")
 CERT_DIR = Path(os.environ.get("L2XPANEL_CERT_DIR", "/etc/l2xpanel/certs"))
 SELF_SIGNED_DIR = CERT_DIR / "self-signed"
+PANEL_UPSTREAM = "127.0.0.1:8090"
 MARK = "# managed by l2x-panel — generated, edits are overwritten"
 STREAM_INCLUDE_LINE = f"include {STREAM_CONF};"
 
@@ -59,6 +62,23 @@ def is_domain(value: str) -> bool:
     return not _is_ip(value or "") and bool(HOST_RE.match(value or ""))
 
 
+def normalize_host(value: str) -> str:
+    v = (value or "").strip().lower()
+    v = re.sub(r"^[a-z][a-z0-9+.-]*://", "", v)
+    return v.split("/", 1)[0].split(":", 1)[0].strip("[]")
+
+
+def public_domain(store: dict) -> str:
+    """Single changeable HTTPS domain for panel, subscriptions and share links (port 443 only)."""
+    panel = ((store.get("settings") or {}).get("panel") or {})
+    sub = ((store.get("settings") or {}).get("sub") or {})
+    for cand in (panel.get("public_host"), sub.get("domain"), os.environ.get("L2XPANEL_PUBLIC_HOST", "")):
+        host = normalize_host(str(cand or ""))
+        if is_domain(host):
+            return host
+    return ""
+
+
 def _nginx_version() -> tuple[int, ...]:
     out = _run(["nginx", "-v"])
     m = re.search(r"nginx/(\d+)\.(\d+)\.(\d+)", out["stderr"] + out["stdout"])
@@ -72,10 +92,16 @@ def _ipv6() -> bool:
 # ---------------------------------------------------------------- plan
 
 def plan(store: dict) -> dict:
-    """Routing table derived from inbounds: {"sni": {name: port}, "sites": {domain: [loc]}, "problems": [...]}."""
+    """Routing table: SNI → Xray, HTTPS sites → panel/paths. Public domain always gets a panel site."""
+    pub = public_domain(store)
     sni: dict[str, int] = {}
     sites: dict[str, list[dict]] = {}
     problems: list[str] = []
+    if not pub:
+        problems.append("задайте публичный домен в Настройки → Панель (HTTPS :443 для панели, подписок и ссылок)")
+    else:
+        sites.setdefault(pub, [])
+
     for ib in store.get("inbounds") or []:
         if not ib.get("enabled", True):
             continue
@@ -89,6 +115,9 @@ def plan(store: dict) -> dict:
                 name = name.lower()
                 if _is_ip(name) and (ib["stream"].get("security") == "tls"):
                     name = '""'  # clients send no SNI for an IP address
+                if name == pub:
+                    problems.append(f"{tag}: SNI «{name}» совпадает с публичным доменом панели — смените Reality/TLS SNI")
+                    continue
                 if name != '""' and not is_domain(name):
                     problems.append(f"{tag}: SNI «{name}» — нужен домен")
                 elif sni.get(name, port) != port:
@@ -97,9 +126,9 @@ def plan(store: dict) -> dict:
                 else:
                     sni[name] = port
         elif mode == "http":
-            domain = (ib.get("share_host") or "").strip().lower()
+            domain = normalize_host(ib.get("share_host") or "") or pub
             if not is_domain(domain):
-                problems.append(f"{tag}: для {ib['stream'].get('network')} укажите домен в поле URL share")
+                problems.append(f"{tag}: для {ib['stream'].get('network')} нужен публичный домен или URL share")
                 continue
             path = P.front_http_path(ib)
             if not PATH_RE.match(path):
@@ -112,9 +141,12 @@ def plan(store: dict) -> dict:
             locs.append({"path": path, "port": port, "net": ib["stream"].get("network"), "tag": tag})
     for domain in list(sites):
         if domain in sni:
-            problems.append(f"{domain}: домен используется и как SNI Reality/TLS, и для WS/gRPC — разведите их")
+            problems.append(f"{domain}: домен используется и как SNI Reality/TLS, и для HTTPS — разведите их")
             del sites[domain]
-    return {"sni": sni, "sites": sites, "problems": problems}
+    # public domain must never be stolen by stream SNI routing
+    if pub and pub in sni:
+        del sni[pub]
+    return {"sni": sni, "sites": sites, "problems": problems, "public_domain": pub}
 
 
 # ---------------------------------------------------------------- certificates
@@ -138,13 +170,44 @@ def cert_for(domain: str) -> tuple[str, str, bool]:
 
 
 def domains_without_cert(store: dict) -> list[str]:
-    return [d for d in plan(store)["sites"] if not cert_for(d)[2]]
+    p = plan(store)
+    domains = set(p["sites"])
+    if p.get("public_domain"):
+        domains.add(p["public_domain"])
+    return [d for d in sorted(domains) if not cert_for(d)[2]]
 
 
 # ---------------------------------------------------------------- render
 
+def _panel_locations() -> list[str]:
+    """Proxy panel + subscriptions on the public domain (everything clients need on :443)."""
+    common = (
+        "        proxy_http_version 1.1;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-Proto https;\n"
+        "        proxy_set_header Upgrade $http_upgrade;\n"
+        "        proxy_set_header Connection $l2x_connection_upgrade;\n"
+        "        proxy_read_timeout 300s;\n"
+        "        client_max_body_size 64m;\n"
+    )
+    return [
+        "    location ^~ /.well-known/acme-challenge/ {\n"
+        "        root /var/www/l2x-acme;\n"
+        "        default_type text/plain;\n"
+        "        try_files $uri =404;\n"
+        "    }",
+        f"    location / {{\n"
+        f"        proxy_pass http://{PANEL_UPSTREAM};\n"
+        f"{common}"
+        "    }",
+    ]
+
+
 def render(store: dict) -> tuple[str, str, list[str]]:
     p = plan(store)
+    pub = p.get("public_domain") or ""
     internal = f"127.0.0.1:{P.FRONT_INTERNAL_PORT}"
     listen6 = "        listen [::]:443;\n" if _ipv6() else ""
     sni_lines = "".join(f"        {name} 127.0.0.1:{port};\n" for name, port in sorted(p["sni"].items()))
@@ -190,7 +253,10 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         ]
         for loc in sorted(locs, key=lambda x: x["path"]):
             body.append(_location(loc))
-        body.append("    location / {\n        return 404;\n    }")
+        if domain == pub:
+            body.extend(_panel_locations())
+        else:
+            body.append("    location / {\n        return 404;\n    }")
         blocks.append("server {\n" + "\n".join(body) + "\n}")
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
 

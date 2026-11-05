@@ -675,7 +675,12 @@ def tag_quota_suffix(client: dict, tag: str) -> str:
 def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
     if not client_access_ok(client):
         return []
-    host = host or public_host()
+    if not host:
+        try:
+            import front as _front
+            host = _front.public_domain(store) or public_host()
+        except Exception:
+            host = public_host()
     ibs = [i for i in client_inbounds(store, client) if inbound_access_ok(i)]
     multi = len(ibs) > 1
     eps = []
@@ -1044,7 +1049,8 @@ PORTBAN_CHAIN = "L2X_PORTBAN"
 
 def ban_inbound_ports(store: dict) -> None:
     """Drop incoming non-loopback traffic to every inbound port: clients reach Xray only via nginx :443."""
-    ports = sorted({int(ib["port"]) for ib in ensure_inbounds(store)} - P.RESERVED_PORTS)
+    # 2096/2053 — legacy dedicated listeners; never expose them (subs/panel live on :443)
+    ports = sorted(({int(ib["port"]) for ib in ensure_inbounds(store)} | {2096, 2053}) - P.RESERVED_PORTS)
     for tool in ("iptables", "ip6tables"):
         if not shutil.which(tool):
             continue

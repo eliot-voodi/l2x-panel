@@ -20,8 +20,9 @@
   <input type="hidden" name="section" value="panel">
   <div class="row">
     <div><label class="f">Название панели</label><input name="title" value="{{ p.title }}"></div>
-    <div><label class="f">Публичный адрес (IP/домен для ссылок)</label><input name="public_host" value="{{ p.public_host }}" placeholder="{{ public_host }}"></div>
+    <div><label class="f">Публичный домен (HTTPS :443)</label><input name="public_host" value="{{ p.public_host }}" placeholder="test.gentle-den.cc" required></div>
   </div>
+  <div class="hint">Единственный адрес для клиентов: <code>https://домен/</code> — панель, подписки и коннекты только на порту <b>443</b>. A-запись домена → IP сервера; сертификат Let's Encrypt выпускается автоматически. Можно менять в любой момент.</div>
   <div class="row">
     <div><label class="f">Язык</label><select name="lang"><option value="ru">Русский</option><option value="en" {% if p.lang == 'en' %}selected{% endif %}>English</option></select></div>
     <div><label class="f">Тема по умолчанию</label><select name="theme"><option value="dark">Тёмная</option><option value="light" {% if p.theme == 'light' %}selected{% endif %}>Светлая</option></select></div>
@@ -31,17 +32,7 @@
   <datalist id="tzs">{% for z in ('Europe/Moscow', 'UTC', 'Europe/Berlin', 'Europe/Kiev', 'Asia/Tehran', 'Asia/Almaty', 'Asia/Yekaterinburg', 'Asia/Novosibirsk', 'Asia/Vladivostok') %}<option>{{ z }}</option>{% endfor %}</datalist>
   <label class="f">Секретный путь панели (base path)</label>
   <input name="base_path" value="{{ p.base_path }}" placeholder="например x7Kq2m — панель будет по /x7Kq2m/">
-  <div class="hint">После сохранения панель доступна только по <code>http://{{ public_host }}/{{ p.base_path or '…' }}/</code>. Подписки /sub/ и REST API остаются на корне. Сбросить: CLI <code>l2x</code> → «Сбросить base path».</div>
-
-  <h3 class="mt">Дополнительный HTTPS-порт панели</h3>
-  {{ m.check('extra_enabled', p.extra_listen.enabled, 'Слушать панель напрямую по HTTPS') }}
-  {% if panel_tls_running %}<span class="badge ok">работает</span>{% elif panel_tls_error %}<span class="badge err">{{ panel_tls_error }}</span>{% endif %}
-  <div class="row">
-    <div style="max-width:120px"><label class="f">Порт</label><input name="extra_port" type="number" value="{{ p.extra_listen.port }}"></div>
-    <div><label class="f">Сертификат</label><input name="extra_cert" id="extra_cert" value="{{ p.extra_listen.cert_file }}"></div>
-    <div><label class="f">Ключ</label><input name="extra_key" id="extra_key" value="{{ p.extra_listen.key_file }}"></div>
-  </div>
-  {{ cert_picker('extra_cert', 'extra_key') }}
+  <div class="hint">После сохранения: <code>https://{{ public_host or 'домен' }}/{{ p.base_path or '…' }}/</code>. Подписки <code>/sub/</code> и API остаются на корне. Сбросить путь: CLI <code>l2x</code>.</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 
@@ -56,24 +47,10 @@
   </div>
   <div class="row">
     <div><label class="f">Ссылка поддержки</label><input name="support_url" value="{{ sb.support_url }}" placeholder="https://t.me/…"></div>
-    <div><label class="f">Домен в ссылках</label><input name="domain" value="{{ sb.domain }}" placeholder="{{ public_host }}"></div>
+    <div style="max-width:160px"><label class="f">Путь</label><input name="path" value="{{ sb.path }}" placeholder="sub"></div>
   </div>
   <label class="f">Объявление (announce)</label><input name="announce" value="{{ sb.announce }}">
-
-  <h3 class="mt">Отдельный сервер подписок</h3>
-  {{ m.check('server_enabled', sb.server_enabled, 'Запустить отдельный listener') }}
-  {% if sub_running %}<span class="badge ok">работает</span>{% elif sub_error %}<span class="badge err">{{ sub_error }}</span>{% endif %}
-  <div class="row">
-    <div><label class="f">Listen</label><input name="listen" value="{{ sb.listen }}"></div>
-    <div style="max-width:120px"><label class="f">Порт</label><input name="port" type="number" value="{{ sb.port }}"></div>
-    <div><label class="f">Путь</label><input name="path" value="{{ sb.path }}"></div>
-  </div>
-  <div class="row">
-    <div><label class="f">Сертификат</label><input name="cert_file" id="sub_cert" value="{{ sb.cert_file }}"></div>
-    <div><label class="f">Ключ</label><input name="key_file" id="sub_key" value="{{ sb.key_file }}"></div>
-  </div>
-  {{ cert_picker('sub_cert', 'sub_key') }}
-  <div class="hint">Без отдельного сервера подписки отдаются панелью: <code>http://{{ public_host }}/sub/&lt;token&gt;</code>. Форматы: base64 (по умолчанию), <code>?format=plain|json|clash|singbox|html</code>; Clash/sing-box определяются по User-Agent.</div>
+  <div class="hint">Ссылки подписки: <code>https://{{ public_host or 'домен' }}/{{ sb.path or 'sub' }}/&lt;token&gt;</code> — только порт 443, отдельный listener не используется. Форматы: base64, <code>?format=plain|json|clash|singbox|html</code>.</div>
 
   <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
   <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. Пусто = не трогать.</div>
