@@ -8,6 +8,7 @@ map() {
     xl2tpd|xl2tpd.service) echo xl2tpd ;;
     strongswan-starter|strongswan|ipsec|strongswan-starter.service) echo ipsec ;;
     l2xpanel|l2xpanel.service) echo l2xpanel ;;
+    nginx|nginx.service) echo nginx ;;
     cron) echo cron ;;
     *) echo "" ;;
   esac
@@ -21,7 +22,8 @@ for unit in "$@"; do
     start|stop|restart)
       [ -n "$prog" ] && { supervisorctl "$action" "$prog" >/dev/null || rc=1; } ;;
     reload|reload-or-restart|try-restart)
-      [ -n "$prog" ] && { supervisorctl restart "$prog" >/dev/null || rc=1; } ;;
+      if [ "$prog" = nginx ]; then nginx -s reload || rc=1
+      elif [ -n "$prog" ]; then supervisorctl restart "$prog" >/dev/null || rc=1; fi ;;
     status)
       [ -n "$prog" ] && supervisorctl status "$prog" ;;
     enable|disable|daemon-reload|mask|unmask) : ;;

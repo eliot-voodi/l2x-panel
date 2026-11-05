@@ -129,6 +129,15 @@ firewall() {
   c_head "Открытые порты INPUT (iptables)"
   iptables -S INPUT | grep -E 'dport|ACCEPT' | head -40
   read -r -p "Открыть TCP/UDP порт (пусто — пропустить): " port
+  if [ -n "$port" ] && pyrun "$port" <<'EOF'
+import json, os, sys
+s = json.load(open(os.path.join(os.environ["L2XPANEL_DATA"], "store.json"), encoding="utf-8"))
+sys.exit(0 if int(sys.argv[1]) in {int(i.get("port") or 0) for i in s.get("inbounds") or []} else 1)
+EOF
+  then
+    c_err "Порт $port занят inbound: inbounds доступны только через nginx :443, их порты закрыты снаружи"
+    return
+  fi
   if [ -n "$port" ]; then
     for proto in tcp udp; do
       iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT

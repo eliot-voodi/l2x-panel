@@ -142,14 +142,13 @@ install_packages() {
     python3 python3-venv \
     ppp xl2tpd strongswan strongswan-starter libstrongswan-standard-plugins wireguard-tools >/dev/null
   ok "Системные пакеты"
-  if [ "$MODE" = nginx ]; then
-    if systemctl is-active -q caddy 2>/dev/null; then
-      warn "Caddy занимает :80 — останавливаю и отключаю его"
-      systemctl disable --now caddy
-    fi
-    apt-get install -y -qq nginx >/dev/null
-    ok "$(nginx -v 2>&1 | sed 's/.*: //')"
+  # nginx is always the public entry: :443 front for inbounds (Xray listens only on 127.0.0.1)
+  if systemctl is-active -q caddy 2>/dev/null; then
+    warn "Caddy занимает :80/:443 — останавливаю и отключаю его"
+    systemctl disable --now caddy
   fi
+  apt-get install -y -qq nginx libnginx-mod-stream >/dev/null
+  ok "$(nginx -v 2>&1 | sed 's/.*: //') + stream"
 }
 
 install_xray() {
@@ -220,16 +219,18 @@ install_system() {
   systemctl enable -q strongswan-starter xl2tpd xray l2xpanel 2>/dev/null || true
   systemctl restart strongswan-starter xl2tpd 2>/dev/null || warn "strongSwan/xl2tpd не запустились — L2TP-туннели будут недоступны"
 
+  mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge" /etc/nginx/l2x
   if [ "$MODE" = nginx ]; then
-    mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
     install -m 644 "$SRC/deploy/nginx.conf" "$NGINX_SITE"
-    ln -sfn "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf
-    rm -f /etc/nginx/sites-enabled/default
-    nginx -t -q 2>/dev/null || die "Ошибка конфигурации nginx: nginx -t"
-    systemctl enable -q nginx
-    systemctl restart nginx
+  else
+    install -m 644 "$SRC/deploy/nginx-acme.conf" "$NGINX_SITE"
   fi
-  ok "systemd, sysctl, strongSwan, xl2tpd${MODE:+, $MODE}"
+  ln -sfn "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t -q 2>/dev/null || die "Ошибка конфигурации nginx: nginx -t"
+  systemctl enable -q nginx
+  systemctl restart nginx
+  ok "systemd, sysctl, strongSwan, xl2tpd, nginx ($MODE)"
 }
 
 write_env() {
@@ -351,8 +352,9 @@ uninstall() {
   systemctl disable --now xray 2>/dev/null || true
   rm -f /etc/systemd/system/l2xpanel.service /etc/systemd/system/xray.service /usr/local/bin/l2x
   systemctl daemon-reload
-  if [ -f "$NGINX_SITE" ]; then
-    rm -f "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf
+  if [ -f "$NGINX_SITE" ] || [ -d /etc/nginx/l2x ]; then
+    rm -rf "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf /etc/nginx/l2x /etc/nginx/conf.d/l2x-front.conf
+    sed -i '/l2x-panel: public :443 front/d; \#include /etc/nginx/l2x/stream.conf;#d' /etc/nginx/nginx.conf 2>/dev/null || true
     systemctl reload nginx 2>/dev/null || true
   fi
   rm -rf "$APP_DIR"
@@ -399,6 +401,7 @@ configure() {
     MODE=direct
     ask PANEL_PORT "Порт панели" "${L2X_PORT:-2053}"
     [[ $PANEL_PORT =~ ^[0-9]+$ ]] && [ "$PANEL_PORT" -ge 1 ] && [ "$PANEL_PORT" -le 65535 ] || die "Неверный порт"
+    case "$PANEL_PORT" in 22|80|443|7443) die "Порт $PANEL_PORT занят SSH/nginx" ;; esac
   else
     MODE=nginx
     PANEL_PORT=80
@@ -449,8 +452,9 @@ summary() {
   fi
   printf '\n  Меню управления на сервере: %sl2x%s\n' "$W" "$N"
   printf '  Сохраните пароль — он больше не будет показан (сброс: l2x reset-password).\n\n'
-  printf '  Откройте в файрволе: %s, порты ваших inbounds (например 443)%s.\n\n' \
-    "$([ "$MODE" = nginx ] && echo '80/tcp' || echo "80/tcp, $PANEL_PORT/tcp")" \
+  printf '  Inbounds доступны только через nginx :443 (Xray слушает 127.0.0.1, порты inbounds закрыты iptables).\n'
+  printf '  Откройте в файрволе: %s%s.\n\n' \
+    "$([ "$MODE" = nginx ] && echo '80/tcp, 443/tcp' || echo "80/tcp, 443/tcp, $PANEL_PORT/tcp")" \
     "$([ "$SSL" != none ] && echo ", $SUB_PORT/tcp$([ "$MODE" = nginx ] && echo ", $PANEL_TLS_PORT/tcp")")"
 }
 

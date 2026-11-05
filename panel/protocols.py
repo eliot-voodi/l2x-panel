@@ -37,6 +37,14 @@ TRAFFIC_RESETS = ("never", "daily", "weekly", "monthly")
 SOCKOPT_DOMAIN = ("AsIs", "UseIP", "UseIPv4", "UseIPv6")
 TPROXY_MODES = ("", "redirect", "tproxy", "off")
 
+# Inbounds are published only through the nginx front on :443; Xray itself never binds a public address.
+FRONT_PORT = 443
+FRONT_INTERNAL_PORT = 7443
+INBOUND_LISTEN = "127.0.0.1"
+RESERVED_PORTS = frozenset({22, 80, 443})
+FRONT_HTTP_NETWORKS = ("ws", "grpc", "httpupgrade", "xhttp")
+FRONT_PROTOCOLS = ("vless", "vmess", "trojan")
+
 
 # ---------------------------------------------------------------- defaults
 
@@ -118,7 +126,7 @@ def default_settings(protocol: str) -> dict:
     return {}
 
 
-def default_inbound(protocol: str = "vless", port: int = 443, tag: str = "vless-in") -> dict:
+def default_inbound(protocol: str = "vless", port: int = 10443, tag: str = "vless-in") -> dict:
     if protocol == "hysteria":
         sec = "tls"
     else:
@@ -128,7 +136,7 @@ def default_inbound(protocol: str = "vless", port: int = 443, tag: str = "vless-
         "tag": tag,
         "remark": tag,
         "enabled": True,
-        "listen": "0.0.0.0",
+        "listen": INBOUND_LISTEN,
         "port": port,
         "protocol": protocol,
         "settings": default_settings(protocol),
@@ -147,7 +155,7 @@ def default_inbound(protocol: str = "vless", port: int = 443, tag: str = "vless-
 
 def ensure_inbound_shape(ib: dict) -> dict:
     proto = ib.get("protocol") or "vless"
-    base = default_inbound(proto, int(ib.get("port") or 443), ib.get("tag") or f"{proto}-in")
+    base = default_inbound(proto, int(ib.get("port") or 10443), ib.get("tag") or f"{proto}-in")
     for k, v in base.items():
         ib.setdefault(k, v)
     for k, v in default_settings(proto).items():
@@ -341,6 +349,40 @@ def _fallbacks(ib: dict) -> list[dict]:
     return out
 
 
+def front_mode(ib: dict) -> str | None:
+    """How the nginx front publishes this inbound on :443.
+
+    "sni"  — TLS passthrough by SNI (Reality, or TLS terminated by Xray);
+    "http" — nginx terminates TLS for the share domain and proxies the path (ws/grpc/httpupgrade/xhttp);
+    None   — not reachable from outside.
+    """
+    if ib.get("protocol") not in FRONT_PROTOCOLS:
+        return None
+    st = ib.get("stream") or {}
+    sec = st.get("security") or "none"
+    if sec in ("reality", "tls"):
+        return "sni"
+    if (st.get("network") or "raw") in FRONT_HTTP_NETWORKS:
+        return "http"
+    return None
+
+
+def front_snis(ib: dict) -> list[str]:
+    st = ib.get("stream") or {}
+    if (st.get("security") or "none") == "reality":
+        return [n for n in ((st.get("reality") or {}).get("server_names") or []) if n]
+    name = (st.get("tls") or {}).get("server_name") or ib.get("share_host") or ""
+    return [name] if name else []
+
+
+def front_http_path(ib: dict) -> str:
+    st = ib.get("stream") or {}
+    net = st.get("network") or "raw"
+    if net == "grpc":
+        return "/" + ((st.get("grpc") or {}).get("service_name") or "grpc").strip("/") + "/"
+    return ((st.get(net) or {}).get("path") or "/").split("?", 1)[0]
+
+
 def supports_flow(ib: dict) -> bool:
     st = ib.get("stream") or {}
     return ib.get("protocol") == "vless" and (st.get("network") or "raw") == "raw" and st.get("security") in ("tls", "reality")
@@ -411,7 +453,7 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
         }
     out: dict[str, Any] = {
         "tag": ib["tag"],
-        "listen": ib.get("listen") or "0.0.0.0",
+        "listen": INBOUND_LISTEN,
         "port": int(ib["port"]),
         "protocol": proto,
         "settings": settings,
@@ -420,6 +462,9 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
         out["streamSettings"] = _hysteria_stream(ib)
     elif proto in USER_PROTOCOLS:
         out["streamSettings"] = build_stream_settings(ib.get("stream") or {})
+        if front_mode(ib) == "sni":
+            # nginx stream sends PROXY protocol so Xray sees the real client IP
+            out["streamSettings"].setdefault("sockopt", {})["acceptProxyProtocol"] = True
     sn = ib.get("sniffing") or {}
     if sn.get("enabled"):
         out["sniffing"] = {
@@ -591,6 +636,22 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         sids = r.get("short_ids") or []
         ep["sid"] = sids[0] if sids else ""
         ep["spx"] = r.get("spider_x") or "/"
+    mode = front_mode(ib)
+    if mode:
+        ep["port"] = FRONT_PORT
+    if mode == "sni" and sec == "tls" and not ep.get("sni"):
+        ep["sni"] = ib.get("share_host") or ""
+    elif mode == "http":
+        domain = ib.get("share_host") or host
+        ep.update({
+            "address": domain,
+            "security": "tls",
+            "sni": domain,
+            "host": ep.get("host") or domain,
+            "fp": "chrome",
+            "alpn": "h2,http/1.1" if net in ("grpc", "xhttp") else "http/1.1",
+            "allow_insecure": False,
+        })
     return ep
 
 

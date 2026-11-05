@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+import front
 import hwid
 import l2tp_runtime as l2tp
 import nodes as nodes_mod
@@ -185,11 +186,49 @@ def mutate():
         _save_store(store)
 
 
+FRONT_CERT_RETRY = 3600
+_front_cert_tried: dict[str, float] = {}
+
+
 def _apply_xray(store: dict) -> dict:
+    """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails."""
     with STORE_LOCK:
+        xray.ensure_inbounds(store)
+        staged = front.stage(store)
+        if not staged["ok"]:
+            return {"ok": False, "error": staged["error"], "verified": False}
         result = xray.apply_config(store)
+        if not result.get("ok"):
+            front.rollback(staged)
+            _save_store(store)
+            return result
+        fr = front.commit(staged)
+        if not fr["ok"]:
+            result = {**result, "ok": False, "error": fr["error"]}
+        elif staged.get("problems"):
+            result = {**result, "warning": "не опубликованы через nginx: " + "; ".join(staged["problems"])}
         _save_store(store)
+    _issue_front_certs(store)
     return result
+
+
+def _issue_front_certs(store: dict) -> None:
+    """Let's Encrypt for share domains still on a self-signed certificate; re-applies nginx when issued."""
+    if not front.available():
+        return
+    now = time.time()
+    for domain in front.domains_without_cert(store):
+        if now - _front_cert_tried.get(domain, 0) < FRONT_CERT_RETRY:
+            continue
+        _front_cert_tried[domain] = now
+
+        def issue(d: str = domain) -> dict:
+            r = ops.issue_cert(d, "")
+            if r.get("ok"):
+                _apply_xray(_load_store())
+            return r
+
+        ops.start_job(f"cert-{domain}", issue)
 
 
 def _settings() -> dict:
@@ -468,6 +507,8 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
 
 
 def _ok_msg(prefix: str, result: dict) -> tuple[str, str]:
+    if result.get("ok") and result.get("warning"):
+        return f"{prefix} / {result['warning']}", "error"
     if result.get("ok"):
         return prefix, "info"
     return f"{prefix} / Xray: {result.get('error')}", "error"
@@ -894,6 +935,14 @@ def _sync_xray_config() -> None:
         current = json.loads(xray.XRAY_CONFIG.read_text(encoding="utf-8")) if xray.XRAY_CONFIG.exists() else None
         if current != wanted:
             _apply_xray(_load_store())
+            return
+        # Xray unchanged, but the nginx front may be missing or stale (fresh update, renewed certificate)
+        with STORE_LOCK:
+            store = _load_store()
+            staged = front.stage(store)
+            if staged["ok"]:
+                front.commit(staged)
+        _issue_front_certs(store)
     except Exception:
         pass
 
@@ -1241,11 +1290,13 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["tag"] = tag
     ib["remark"] = str(form.get("remark") or tag).strip()
     ib["enabled"] = form.get("enabled") == "1"
-    ib["listen"] = str(form.get("listen") or "0.0.0.0").strip()
-    ib["port"] = _int(form.get("port"), 443)
-    if not 1 <= ib["port"] <= 65535:
-        return "Порт 1..65535"
-    ib["share_host"] = str(form.get("share_host") or "").strip()
+    ib["listen"] = P.INBOUND_LISTEN
+    ib["port"] = _int(form.get("port"), 0)
+    if reason := xray.port_forbidden_reason(ib["port"]):
+        return reason
+    share = str(form.get("share_host") or "").strip().lower()
+    share = re.sub(r"^[a-z]+://", "", share).split("/", 1)[0].split(":", 1)[0]
+    ib["share_host"] = share
     ib["total_gb"] = _float(form.get("total_gb"))
     ib["expire_at"] = local_to_iso(str(form.get("expire_at") or ""))
     ib["outbound"] = str(form.get("outbound") or "direct")
@@ -1407,6 +1458,11 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         fbs.append({"name": parts[0], "alpn": parts[1], "path": parts[2], "dest": parts[3], "xver": _int(parts[4])})
     ib["fallbacks"] = fbs
     xray.ensure_inbound_keys(ib)
+    mode = P.front_mode(ib)
+    if mode == "http" and not front.is_domain(ib["share_host"]):
+        return f"Для {st['network']} через nginx :443 укажите домен в поле URL share (A-запись на этот сервер)"
+    if mode == "http" and not front.PATH_RE.match(P.front_http_path(ib)):
+        return "Путь/serviceName: только латиница, цифры и /_.~-"
     return None
 
 
@@ -1428,8 +1484,7 @@ def inbound_new(request: Request):
         return redir
     store = _load_store()
     proto = request.query_params.get("protocol") or "vless"
-    used_ports = {i["port"] for i in store["inbounds"]}
-    port = 443 if 443 not in used_ports else next(p for p in range(8443, 65000) if p not in used_ports)
+    port = xray.free_inbound_port(store)
     ib = P.default_inbound(proto, port, f"{proto}-{port}")
     xray.ensure_inbound_keys(ib)
     return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=True, store=store,
@@ -1469,9 +1524,14 @@ async def inbound_save(request: Request):
         err = _inbound_form_to_model(form, ib)
         if not err and any(i is not ib and i["tag"] == ib["tag"] for i in store["inbounds"]):
             err = "Такой tag уже есть"
-        if not err and any(i is not ib and int(i["port"]) == int(ib["port"]) and i.get("listen") == ib.get("listen")
-                           for i in store["inbounds"]):
+        if not err and any(i is not ib and int(i["port"]) == int(ib["port"]) for i in store["inbounds"]):
             err = f"Порт {ib['port']} уже занят другим inbound"
+        if not err:
+            others = [i for i in store["inbounds"] if i is not ib]
+            problems = front.plan({"inbounds": [*others, ib]})["problems"]
+            mine = [p for p in problems if p.startswith(f"{ib['tag']}:") or ib["share_host"] and p.startswith(ib["share_host"])]
+            if mine:
+                err = mine[0]
         if err:
             flash(request, err, "error")
             return go(f"/inbounds/{ib_id}/edit" if ib_id else "/inbounds/new")

@@ -242,7 +242,8 @@ def issue_cert(domain: str, email: str) -> dict:
     CERT_DIR.mkdir(parents=True, exist_ok=True)
     crt, key = CERT_DIR / f"{domain}.crt", CERT_DIR / f"{domain}.key"
     r2 = _run([str(acme), "--install-cert", "-d", domain, "--fullchain-file", str(crt), "--key-file", str(key),
-               "--reloadcmd", "systemctl restart xray; systemd-run --on-active=5 systemctl restart l2xpanel"],
+               "--reloadcmd", "systemctl restart xray; systemctl reload nginx 2>/dev/null; "
+                              "systemd-run --on-active=5 systemctl restart l2xpanel"],
               120, env=env)
     log.append(r2["stdout"][-1500:])
     ok = crt.exists() and key.exists()

@@ -25,7 +25,8 @@
         <td><span class="dot {% if ib.enabled and ib.ok %}on{% endif %}" title="{{ 'включён' if ib.enabled else 'выключен' }}"></span></td>
         <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit"><b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div></td>
         <td><span class="badge accent">{{ ib.protocol }}</span></td>
-        <td class="mono">{{ ib.listen if ib.listen not in ('0.0.0.0', '') else '' }}{% if ib.listen not in ('0.0.0.0', '') %}:{% endif %}{{ ib.port }}</td>
+        {% set fm = P.front_mode(ib) %}
+        <td class="mono" title="{% if fm %}nginx :443 → 127.0.0.1:{{ ib.port }}{% else %}только 127.0.0.1{% endif %}">{% if fm %}443 → {% endif %}{{ ib.port }}{% if fm == 'http' and ib.share_host %}<div class="hint">{{ ib.share_host }}{{ P.front_http_path(ib) }}</div>{% endif %}</td>
         <td>
           {% if ib.protocol in P.USER_PROTOCOLS %}
           <span class="badge">{{ ib.stream.network }}</span>

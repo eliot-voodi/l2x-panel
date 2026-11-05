@@ -407,7 +407,37 @@ def ensure_inbounds(store: dict) -> list[dict]:
             ib["id"] = next_id
             next_id += 1
         ensure_inbound_keys(ib)
+        ib["listen"] = P.INBOUND_LISTEN
+    # Inbounds from older versions (or pushed by a master node) may sit on a forbidden port
+    for ib in inbounds:
+        if port_forbidden_reason(int(ib.get("port") or 0)):
+            ib["port"] = free_inbound_port(store, exclude=ib)
     return inbounds
+
+
+def system_ports() -> set[int]:
+    """Ports used by the panel itself on this host; inbounds may not take them."""
+    ports = {P.FRONT_INTERNAL_PORT, int(str(XRAY_API).rsplit(":", 1)[-1])}
+    try:
+        ports.add(int(os.environ.get("PORT") or 8090))
+    except ValueError:
+        pass
+    return ports
+
+
+def port_forbidden_reason(port: int) -> str:
+    if not 1 <= port <= 65535:
+        return "Порт 1..65535"
+    if port in P.RESERVED_PORTS:
+        return f"Порт {port} запрещён для inbound (22, 80, 443 заняты SSH и nginx)"
+    if port in system_ports():
+        return f"Порт {port} занят панелью"
+    return ""
+
+
+def free_inbound_port(store: dict, exclude: dict | None = None, start: int = 10000) -> int:
+    used = {int(i.get("port") or 0) for i in store.get("inbounds") or [] if i is not exclude}
+    return next(p for p in range(start, 65535) if p not in used and not port_forbidden_reason(p))
 
 
 def ensure_inbound_keys(ib: dict) -> None:
@@ -986,7 +1016,7 @@ def apply_config(store: dict) -> dict:
 
     restart = _restart_xray()
     if _xray_active():
-        open_inbound_ports(store)
+        ban_inbound_ports(store)
         return {"ok": True, "error": "", "config": cfg, "verified": True}
 
     # New config passed -test but broke the running service — roll back.
@@ -1009,19 +1039,28 @@ def apply_config(store: dict) -> dict:
     }
 
 
-def open_inbound_ports(store: dict) -> None:
-    for ib in ensure_inbounds(store):
-        if not ib.get("enabled", True) or (ib.get("listen") or "0.0.0.0") in ("127.0.0.1", "::1"):
+PORTBAN_CHAIN = "L2X_PORTBAN"
+
+
+def ban_inbound_ports(store: dict) -> None:
+    """Drop incoming non-loopback traffic to every inbound port: clients reach Xray only via nginx :443."""
+    ports = sorted({int(ib["port"]) for ib in ensure_inbounds(store)} - P.RESERVED_PORTS)
+    for tool in ("iptables", "ip6tables"):
+        if not shutil.which(tool):
             continue
-        port = str(int(ib["port"]))
-        protos = ["tcp"]
-        if ib["protocol"] in ("wireguard", "shadowsocks", "socks", "dokodemo-door") or (ib.get("stream") or {}).get("network") == "kcp":
-            protos.append("udp")
-        if ib["protocol"] == "wireguard" or (ib.get("stream") or {}).get("network") == "kcp":
-            protos = ["udp"]
-        for proto in protos:
-            if _run(["iptables", "-C", "INPUT", "-p", proto, "--dport", port, "-j", "ACCEPT"])["exit_code"] != 0:
-                _run(["iptables", "-I", "INPUT", "-p", proto, "--dport", port, "-j", "ACCEPT"])
+        if _run([tool, "-L", PORTBAN_CHAIN, "-n"])["exit_code"] != 0:
+            _run([tool, "-N", PORTBAN_CHAIN])
+        _run([tool, "-F", PORTBAN_CHAIN])
+        for port in ports:
+            for proto in ("tcp", "udp"):
+                _run([tool, "-A", PORTBAN_CHAIN, "!", "-i", "lo", "-p", proto, "--dport", str(port), "-j", "DROP"])
+                # ACCEPT rules left by older panel versions that published inbounds directly
+                while _run([tool, "-D", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"])["exit_code"] == 0:
+                    pass
+        # always first in INPUT, so no ACCEPT added later (by hand or by other tools) can bypass it
+        while _run([tool, "-D", "INPUT", "-j", PORTBAN_CHAIN])["exit_code"] == 0:
+            pass
+        _run([tool, "-I", "INPUT", "1", "-j", PORTBAN_CHAIN])
 
 
 def xray_status() -> dict:

@@ -22,9 +22,12 @@
     </div>
     <label class="f">Remark (имя в подписке)</label><input name="remark" value="{{ ib.remark }}">
     <div class="row">
-      <div><label class="f">Listen</label><input name="listen" value="{{ ib.listen }}"></div>
-      <div><label class="f">Порт</label><input name="port" type="number" min="1" max="65535" value="{{ ib.port }}" required></div>
+      <div><label class="f">Listen</label><input value="{{ P.INBOUND_LISTEN }}" readonly class="mono" title="Xray слушает только localhost, снаружи — nginx :443"></div>
+      <div><label class="f">Порт (внутренний)</label><input name="port" id="ib_port" type="number" min="1" max="65535" value="{{ ib.port }}" required>
+        <div class="hint" id="port_err" style="display:none;color:var(--bad,#e5484d)">Порты 22, 80, 443 запрещены для inbound</div>
+      </div>
     </div>
+    <div class="hint">Снаружи порт inbound закрыт iptables; клиенты подключаются на <b>:443</b> через nginx.</div>
     <div class="row">
       <div><label class="f">Лимит трафика inbound, GB</label><input name="total_gb" type="number" step="0.01" min="0" value="{{ ib.total_gb or '' }}" placeholder="∞"></div>
       <div><label class="f">Срок действия</label><input name="expire_at" type="datetime-local" value="{{ dt_input(ib.expire_at) }}"></div>
@@ -35,10 +38,11 @@
           {% for x in P.TRAFFIC_RESETS %}<option value="{{ x }}" {% if (ib.traffic_reset or 'never') == x %}selected{% endif %}>{{ x }}</option>{% endfor %}
         </select>
       </div>
-      <div><label class="f">Адрес в ссылках (share host)</label>
-        <input name="share_host" value="{{ ib.share_host }}" placeholder="{{ public_host }} (по умолчанию)">
+      <div><label class="f">URL share (домен)</label>
+        <input name="share_host" id="share_host" value="{{ ib.share_host }}" placeholder="vpn.example.com">
       </div>
     </div>
+    <div class="hint" id="front_hint"></div>
     <label class="f">Outbound по умолчанию</label>
     <select name="outbound">
       {% for tag in outbounds %}<option value="{{ tag }}" {% if tag == ib.outbound %}selected{% endif %}>{{ outbound_label(store, tag) }}</option>{% endfor %}
@@ -320,7 +324,40 @@
     var enc = document.getElementById('vless-enc');
     if (enc) enc.hidden = p !== 'vless' || sec === 'reality';
     syncAuthSelect();
+    syncFront();
   }
+  var RESERVED = {{ P.RESERVED_PORTS|list|tojson }};
+  var HTTP_NETS = {{ P.FRONT_HTTP_NETWORKS|list|tojson }};
+  var FRONT_PROTOS = {{ P.FRONT_PROTOCOLS|list|tojson }};
+  function syncFront() {
+    var p = document.getElementById('protocol').value;
+    var n = document.getElementById('network').value;
+    var sec = document.getElementById('security').value;
+    var dom = document.getElementById('share_host').value.trim();
+    var share = document.getElementById('share_host');
+    var hint = document.getElementById('front_hint');
+    var front = FRONT_PROTOS.indexOf(p) >= 0;
+    var http = front && sec === 'none' && HTTP_NETS.indexOf(n) >= 0;
+    share.required = http;
+    if (!front) {
+      hint.textContent = 'Этот протокол не публикуется через nginx :443 — доступен только локально.';
+    } else if (sec === 'reality' || sec === 'tls') {
+      hint.textContent = 'nginx :443 пробрасывает TLS по SNI (' + (sec === 'reality' ? 'Reality serverNames' : 'TLS server name') + ') прямо в Xray. Ссылка: ' + (dom || 'IP сервера') + ':443.';
+    } else if (http) {
+      hint.innerHTML = 'nginx завершает TLS для домена и проксирует путь в Xray. Домен обязателен: <code>' + (dom || 'vpn.example.com') + '</code> → ссылка <code>' + (dom || 'домен') + ':443</code>, сертификат Let\'s Encrypt выпускается автоматически (A-запись должна указывать на сервер).';
+    } else {
+      hint.textContent = 'raw без TLS не публикуется через nginx — выберите ws/grpc/httpupgrade/xhttp, TLS или Reality.';
+    }
+  }
+  document.getElementById('share_host').addEventListener('input', syncFront);
+  var portEl = document.getElementById('ib_port');
+  function checkPort() {
+    var bad = RESERVED.indexOf(parseInt(portEl.value, 10)) >= 0;
+    portEl.setCustomValidity(bad ? 'Порты 22, 80, 443 запрещены для inbound' : '');
+    document.getElementById('port_err').style.display = bad ? '' : 'none';
+  }
+  portEl.addEventListener('input', checkPort);
+  checkPort();
   function syncAuthSelect() {
     var dec = (document.getElementById('vless_decryption') || {}).value || 'none';
     var enc = (document.getElementById('vless_encryption') || {}).value || 'none';

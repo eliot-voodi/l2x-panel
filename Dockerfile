@@ -15,8 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv ca-certificates curl unzip openssl socat procps cron \
       iproute2 iptables iputils-ping kmod ppp xl2tpd strongswan strongswan-starter \
-      libstrongswan-standard-plugins wireguard-tools supervisor \
-    && rm -rf /var/lib/apt/lists/*
+      libstrongswan-standard-plugins wireguard-tools supervisor nginx libnginx-mod-stream \
+    && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
 
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
