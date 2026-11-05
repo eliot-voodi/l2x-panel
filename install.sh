@@ -140,7 +140,11 @@ install_packages() {
   apt-get install -y -qq --no-install-recommends \
     curl ca-certificates unzip jq openssl socat cron kmod iproute2 iptables \
     python3 python3-venv \
-    ppp xl2tpd strongswan strongswan-starter libstrongswan-standard-plugins wireguard-tools >/dev/null
+    ppp xl2tpd strongswan strongswan-starter strongswan-charon libstrongswan-standard-plugins wireguard-tools >/dev/null
+  # Debian 13+: metapackage may pull charon-systemd (conflicts with strongswan-starter/ipsec.conf path)
+  if dpkg -l charon-systemd 2>/dev/null | grep -q '^ii'; then
+    apt-get install -y -qq --no-install-recommends strongswan-charon >/dev/null || true
+  fi
   ok "Системные пакеты"
   # nginx is always the public entry: :443 front for inbounds (Xray listens only on 127.0.0.1)
   if systemctl is-active -q caddy 2>/dev/null; then

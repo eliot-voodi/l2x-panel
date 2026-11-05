@@ -30,6 +30,13 @@ def _run(cmd: list[str], timeout: int = 60) -> dict:
             "stdout": proc.stdout,
             "stderr": proc.stderr,
         }
+    except FileNotFoundError as exc:
+        return {
+            "cmd": " ".join(cmd),
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": f"not found: {exc.filename or cmd[0]}",
+        }
     except subprocess.TimeoutExpired as exc:
         return {
             "cmd": " ".join(cmd),
@@ -83,6 +90,13 @@ def ensure_services() -> dict:
     """Start ipsec/xl2tpd if needed — never restart NetworkManager."""
     ensure_runtime_dirs()
     out = {}
+    # Debian 13 metapackage may leave only charon-systemd; starter needs /usr/lib/ipsec/charon
+    if not Path("/usr/lib/ipsec/charon").exists():
+        out["charon"] = {
+            "ok": False,
+            "error": "нет /usr/lib/ipsec/charon — установите пакет strongswan-charon "
+                     "(apt-get install -y strongswan-charon)",
+        }
     for unit in ("strongswan-starter", "xl2tpd"):
         st = _run(["systemctl", "is-active", unit])
         if (st["stdout"] or "").strip() != "active":
@@ -94,9 +108,14 @@ def ensure_services() -> dict:
 
 
 def cleanup_nm_vpn_only() -> list[str]:
-    """Remove leftover NM L2TP profiles; keep ethernet parent (net0-l2x) intact."""
+    """Remove leftover NM L2TP profiles; keep ethernet parent (net0-l2x) intact.
+
+    No-op when NetworkManager/nmcli is not installed (minimal VPS images).
+    """
     removed: list[str] = []
     shown = _run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+    if shown["exit_code"] == 127:
+        return removed
     for line in (shown["stdout"] or "").splitlines():
         parts = line.split(":")
         if len(parts) < 2:
@@ -592,13 +611,18 @@ def _ppp_failure_hint(iface: str) -> str:
 
 
 def connect_tunnel(item: dict, password: str, psk: str) -> dict:
-    ensure_services()
+    svc = ensure_services()
+    if (svc.get("charon") or {}).get("ok") is False:
+        return {"ok": False, "error": svc["charon"]["error"], "details": svc}
+    swan = svc.get("strongswan-starter") or {}
+    if swan.get("exit_code") not in (None, 0) and not swan.get("already"):
+        return {"ok": False, "error": f"strongSwan не запущен: {swan.get('stderr') or swan}", "details": svc}
     cleanup_nm_vpn_only()
     iface = ifname_for(item["name"])
     lac = lac_name(item["name"])
     host = item["server_host"]
     candidates = _lns_candidates(host)
-    steps: dict = {"candidates": candidates}
+    steps: dict = {"candidates": candidates, "services": svc}
     last_up: dict | None = None
 
     for lns in candidates:
