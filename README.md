@@ -8,7 +8,7 @@
 а трафик уходит в интернет через выбранный L2TP-туннель, WireGuard, WARP или напрямую.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.2.1-cyan)
+![Version](https://img.shields.io/badge/version-1.2.2-cyan)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Xray-core](https://img.shields.io/badge/Xray--core-26.x-purple)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-orange)

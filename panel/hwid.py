@@ -28,15 +28,28 @@ def _trim(value: str, n: int = 512) -> str:
     return (value or "").strip()[:n]
 
 
+LINK_PREVIEW_BOTS = ("bot", "facebookexternalhit", "whatsapp", "skypeuripreview", "vkshare", "embedly")
+
+
 def app_name(user_agent: str) -> str:
-    """Client app without version: 'v2rayNG/1.9.16' → 'v2rayng', 'Happ/3.2 (iOS)' → 'happ'."""
+    """Client app without version: 'v2rayNG/1.9.16' → 'v2rayng', 'Happ/3.2 (iOS)' → 'happ'.
+
+    Real browsers get the HTML page (Accept: text/html) before the gate, so a 'Mozilla/…' UA here
+    is an app posing as a browser (V2Box, Shadowrocket…): it is identified by its platform part.
+    """
     ua = (user_agent or "").strip()
+    low = ua.lower()
+    if any(b in low for b in LINK_PREVIEW_BOTS):
+        return ""
     m = re.match(r"\s*([A-Za-z][A-Za-z0-9._-]*)", ua)
     if not m:
         return ""
     name = m.group(1).lower()
-    # Browsers and generic HTTP libraries say nothing about the device
-    return "" if name in ("mozilla", "curl", "wget", "python-requests", "go-http-client", "okhttp") else name
+    if name == "mozilla":
+        platform = re.search(r"\(([^)]*)\)", ua)
+        return f"mozilla[{platform.group(1).strip().lower()[:96]}]" if platform else ""
+    # Generic HTTP libraries say nothing about the device
+    return "" if name in ("curl", "wget", "python-requests", "go-http-client", "okhttp") else name
 
 
 def fallback_fingerprint(request_headers: dict[str, str], mode: str) -> tuple[str, str]:
