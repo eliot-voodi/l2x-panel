@@ -206,7 +206,7 @@ def _apply_xray(store: dict) -> dict:
         if not fr["ok"]:
             result = {**result, "ok": False, "error": fr["error"]}
         elif staged.get("problems"):
-            result = {**result, "warning": "не опубликованы через nginx: " + "; ".join(staged["problems"])}
+            result = {**result, "warning": "; ".join(staged["problems"])}
         _save_store(store)
     _issue_front_certs(store)
     return result
@@ -541,7 +541,8 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
 
 def _ok_msg(prefix: str, result: dict) -> tuple[str, str]:
     if result.get("ok") and result.get("warning"):
-        return f"{prefix} / {result['warning']}", "error"
+        # Soft front/routing notes (other inbounds still published) — not a hard failure
+        return f"{prefix}. Замечание: {result['warning']}", "info"
     if result.get("ok"):
         return prefix, "info"
     return f"{prefix} / Xray: {result.get('error')}", "error"
@@ -1388,6 +1389,9 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         st["security"] = "none" if proto not in ("vmess",) else "tls"
     if st["network"] not in P.NETWORKS:
         st["network"] = "raw"
+    # ws/grpc/httpupgrade/xhttp share the public HTTPS domain via nginx Path — TLS ends at nginx
+    if st["network"] in P.FRONT_HTTP_NETWORKS:
+        st["security"] = "none"
     st["accept_proxy_protocol"] = form.get("accept_proxy") == "1"
     st["raw"].update({
         "header": str(form.get("raw_header") or "none"),

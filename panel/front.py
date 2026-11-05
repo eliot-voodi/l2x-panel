@@ -102,29 +102,49 @@ def plan(store: dict) -> dict:
     else:
         sites.setdefault(pub, [])
 
+    base = re.sub(r"[^A-Za-z0-9_-]", "", str((((store.get("settings") or {}).get("panel") or {}).get("base_path") or ""))).strip("/")
+    reserved_paths = {"/sub/", "/panel/", "/health", "/.well-known/"}
+    if base:
+        reserved_paths.add(f"/{base}/")
+
     for ib in store.get("inbounds") or []:
         if not ib.get("enabled", True):
             continue
+        P.normalize_http_inbound(ib)
         mode = P.front_mode(ib)
         tag, port = ib.get("tag") or "?", int(ib.get("port") or 0)
         if mode == "sni":
             names = P.front_snis(ib)
             if not names:
                 problems.append(f"{tag}: нет SNI (serverNames / TLS server name / URL share)")
+            kept = 0
             for name in names:
                 name = name.lower()
                 if _is_ip(name) and (ib["stream"].get("security") == "tls"):
                     name = '""'  # clients send no SNI for an IP address
+                # Public domain always terminates at nginx (panel + Path inbounds).
+                # TLS whose cert/SNI is that domain is published as empty-SNI (IP connect);
+                # Reality must use a *different* camouflage SNI (ya.ru, …).
                 if name == pub:
-                    problems.append(f"{tag}: SNI «{name}» совпадает с публичным доменом панели — смените Reality/TLS SNI")
-                    continue
+                    if (ib.get("stream") or {}).get("security") == "tls":
+                        name = '""'
+                    else:
+                        problems.append(
+                            f"{tag}: Reality SNI «{pub}» = публичный домен — этот SNI отдаётся nginx "
+                            f"(панель и Path). Укажите другой serverName (например ya.ru)"
+                        )
+                        continue
                 if name != '""' and not is_domain(name):
                     problems.append(f"{tag}: SNI «{name}» — нужен домен")
-                elif sni.get(name, port) != port:
+                    continue
+                if sni.get(name, port) != port:
                     what = "приём без SNI (TLS на IP)" if name == '""' else f"SNI {name}"
                     problems.append(f"{tag}: {what} уже занят другим inbound")
-                else:
-                    sni[name] = port
+                    continue
+                sni[name] = port
+                kept += 1
+            if names and kept == 0 and (ib.get("stream") or {}).get("security") == "reality":
+                problems.append(f"{tag}: нет рабочего Reality SNI после исключения публичного домена")
         elif mode == "http":
             domain = normalize_host(ib.get("share_host") or "") or pub
             if not is_domain(domain):
@@ -134,16 +154,22 @@ def plan(store: dict) -> dict:
             if not PATH_RE.match(path):
                 problems.append(f"{tag}: путь «{path}» — допустимы латиница, цифры и /_.~-")
                 continue
+            if path in ("/", "") or any(path == r.rstrip("/") or path.startswith(r) for r in reserved_paths):
+                problems.append(f"{tag}: путь «{path}» занят панелью/подписками — выберите другой Path/serviceName")
+                continue
             locs = sites.setdefault(domain, [])
             if any(loc["path"] == path for loc in locs):
                 problems.append(f"{tag}: путь {path} на {domain} уже занят")
                 continue
             locs.append({"path": path, "port": port, "net": ib["stream"].get("network"), "tag": tag})
+    # Same hostname cannot be both stream-SNI passthrough and an HTTPS site.
+    # Public domain is always an HTTPS site; never steal it for Reality/TLS SNI.
     for domain in list(sites):
+        if domain == pub:
+            continue
         if domain in sni:
-            problems.append(f"{domain}: домен используется и как SNI Reality/TLS, и для HTTPS — разведите их")
+            problems.append(f"{domain}: домен используется и как SNI Reality/TLS, и для HTTPS Path — разведите их")
             del sites[domain]
-    # public domain must never be stolen by stream SNI routing
     if pub and pub in sni:
         del sni[pub]
     return {"sni": sni, "sites": sites, "problems": problems, "public_domain": pub}

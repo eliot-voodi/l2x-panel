@@ -332,19 +332,27 @@
   function syncFront() {
     var p = document.getElementById('protocol').value;
     var n = document.getElementById('network').value;
-    var sec = document.getElementById('security').value;
-    var dom = document.getElementById('share_host').value.trim();
+    var secEl = document.getElementById('security');
+    var sec = secEl.value;
     var share = document.getElementById('share_host');
     var hint = document.getElementById('front_hint');
     var front = FRONT_PROTOS.indexOf(p) >= 0;
-    var http = front && sec === 'none' && HTTP_NETS.indexOf(n) >= 0;
-    share.required = http;
+    var http = front && HTTP_NETS.indexOf(n) >= 0;
+    if (http && sec !== 'none') {
+      secEl.value = 'none';
+      sec = 'none';
+      document.querySelectorAll('[data-sec]').forEach(function (el) {
+        if (el.dataset.proto && el.dataset.proto.split(' ').indexOf(p) < 0) return;
+        el.hidden = true;
+      });
+    }
+    share.required = false;
     if (!front) {
       hint.textContent = 'Этот протокол не публикуется через nginx :443 — доступен только локально.';
-    } else if (sec === 'reality' || sec === 'tls') {
-      hint.textContent = 'Клиенты подключаются только на :443. В ссылке адрес = URL share или публичный домен; SNI Reality/TLS — отдельно. nginx пробрасывает по SNI в Xray.';
     } else if (http) {
-      hint.innerHTML = 'Клиенты только на <code>:443</code>. Пустое URL share → публичный домен из Настроек. Сертификат Let\'s Encrypt выпускается автоматически.';
+      hint.innerHTML = 'Как на reference: один публичный домен, несколько inbound через <b>Path</b> (location в nginx). TLS снимает nginx, в Xray security=none. Пустое URL share → домен из Настроек. Клиенты только на <code>:443</code>.';
+    } else if (sec === 'reality' || sec === 'tls') {
+      hint.textContent = 'Клиенты на :443. SNI Reality/TLS не должен совпадать с публичным доменом панели (тот домен — для панели и Path-inbound). Reality SNI = камуфляж (ya.ru…). TLS на IP — без SNI.';
     } else {
       hint.textContent = 'raw без TLS не публикуется через nginx — выберите ws/grpc/httpupgrade/xhttp, TLS или Reality.';
     }

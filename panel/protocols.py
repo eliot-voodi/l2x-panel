@@ -352,18 +352,22 @@ def _fallbacks(ib: dict) -> list[dict]:
 def front_mode(ib: dict) -> str | None:
     """How the nginx front publishes this inbound on :443.
 
-    "sni"  — TLS passthrough by SNI (Reality, or TLS terminated by Xray);
-    "http" — nginx terminates TLS for the share domain and proxies the path (ws/grpc/httpupgrade/xhttp);
+    "http" — nginx terminates TLS on the share/public domain and proxies by Path
+             (ws / grpc / httpupgrade / xhttp). Several inbounds share one domain.
+    "sni"  — TLS passthrough by SNI (Reality, or TLS terminated by Xray) for a
+             *different* hostname than the public panel domain;
     None   — not reachable from outside.
     """
     if ib.get("protocol") not in FRONT_PROTOCOLS:
         return None
     st = ib.get("stream") or {}
+    net = st.get("network") or "raw"
+    # Path transports always share the HTTPS site (like the reference nginx setup).
+    if net in FRONT_HTTP_NETWORKS:
+        return "http"
     sec = st.get("security") or "none"
     if sec in ("reality", "tls"):
         return "sni"
-    if (st.get("network") or "raw") in FRONT_HTTP_NETWORKS:
-        return "http"
     return None
 
 
@@ -373,6 +377,15 @@ def front_snis(ib: dict) -> list[str]:
         return [n for n in ((st.get("reality") or {}).get("server_names") or []) if n]
     name = (st.get("tls") or {}).get("server_name") or ib.get("share_host") or ""
     return [name] if name else []
+
+
+def normalize_http_inbound(ib: dict) -> None:
+    """nginx terminates TLS for path inbounds — Xray must speak plain HTTP on localhost."""
+    if front_mode(ib) != "http":
+        return
+    st = ib.setdefault("stream", {})
+    st["security"] = "none"
+    st.pop("accept_proxy_protocol", None)
 
 
 def front_http_path(ib: dict) -> str:

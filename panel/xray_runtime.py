@@ -408,6 +408,7 @@ def ensure_inbounds(store: dict) -> list[dict]:
             next_id += 1
         ensure_inbound_keys(ib)
         ib["listen"] = P.INBOUND_LISTEN
+        P.normalize_http_inbound(ib)
     # Inbounds from older versions (or pushed by a master node) may sit on a forbidden port
     for ib in inbounds:
         if port_forbidden_reason(int(ib.get("port") or 0)):
