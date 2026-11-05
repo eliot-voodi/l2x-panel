@@ -36,7 +36,7 @@
   <table>
     <thead><tr>
       <th style="width:32px"><input type="checkbox" id="selall"></th>
-      <th>Клиент</th><th>{{ t('Статус') }}</th><th>{{ t('Трафик') }}</th><th>{{ t('Срок') }}</th><th>Inbounds / outbound</th><th class="right">{{ t('Действия') }}</th>
+      <th>Клиент</th><th>{{ t('Статус') }}</th><th>Устройства</th><th>{{ t('Трафик') }}</th><th>{{ t('Срок') }}</th><th>Inbounds / outbound</th><th class="right">{{ t('Действия') }}</th>
     </tr></thead>
     <tbody>
     {% for c in items %}
@@ -48,6 +48,15 @@
           <div class="dim small">{% if c.comment %}{{ c.comment }} · {% endif %}{% if c.online_ips %}{{ c.online_ips|length }} IP онлайн{% else %}{{ ago(c.last_online) }}{% endif %}{% if c.limit_ip %} · IP ≤ {{ c.limit_ip }}{% endif %}{% if c.tg_id %} · tg{% endif %}</div>
         </td>
         <td>{{ m.status_badge(c.status) }}{% if c.reset_period %} <span class="badge" title="авто-сброс">↻ {{ c.reset_period }}</span>{% endif %}</td>
+        <td class="small">
+          {% set devs = c.hwids or [] %}
+          {% set by_hwid = devs|selectattr('kind', 'undefined')|list + devs|selectattr('kind', 'equalto', 'hwid')|list %}
+          {% if devs %}
+          <a href="{{ bp }}/clients/{{ c.email }}/edit" title="{% for d in devs %}{{ d.ua or '?' }}{% if d.model %} · {{ d.model }}{% endif %}&#10;{% endfor %}">
+            <b>{{ devs|length }}</b>{% if c.limit_hwid %} / {{ c.limit_hwid }}{% endif %}</a>
+          <div class="dim">{{ by_hwid|length }} HWID{% if devs|length - by_hwid|length %} · {{ devs|length - by_hwid|length }} без HWID{% endif %}</div>
+          {% else %}<span class="dim">—{% if c.limit_hwid %} / {{ c.limit_hwid }}{% endif %}</span>{% endif %}
+        </td>
         <td style="min-width:170px">
           <div class="small nowrap">{{ format_traffic(c.used) }} <span class="dim">/ {{ (c.limit_gb|string ~ ' GB') if c.limit_gb else '∞' }}</span></div>
           {{ m.progress(c.used, c.limit_bytes) }}
@@ -76,7 +85,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="7" class="empty">Нет клиентов{% if q or status %} по фильтру{% endif %}</td></tr>
+      <tr><td colspan="8" class="empty">Нет клиентов{% if q or status %} по фильтру{% endif %}</td></tr>
     {% endfor %}
     </tbody>
   </table>

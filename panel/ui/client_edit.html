@@ -159,8 +159,8 @@
   </div>
 
   <div class="card">
-    <div class="card-head"><h3>HWID устройства</h3>{% if hwids %}{{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/clear_hwids', 'Очистить') }}{% endif %}</div>
-    {% if c.limit_hwid %}<div class="hint mb0">лимит {{ c.limit_hwid }} · зарегистрировано {{ hwids|length }}</div>{% endif %}
+    <div class="card-head"><h3>Устройства</h3>{% if hwids %}{{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/clear_hwids', 'Очистить') }}{% endif %}</div>
+    <div class="hint mb0">{% if c.limit_hwid %}лимит {{ c.limit_hwid }} · {% endif %}зарегистрировано {{ hwids|length }}: по HWID и, для приложений без него, по приложению / ОС / модели. Записываются при обновлении подписки из приложения (не из браузера).</div>
     {% if hwids %}
     <table><thead><tr><th>FP</th><th>Определено по</th><th>OS / модель</th><th>Первый</th><th>Последний</th></tr></thead><tbody>
       {% for d in hwids %}
