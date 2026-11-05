@@ -8,6 +8,7 @@ import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
@@ -411,6 +412,24 @@ def provision_via_ssh(
         return {"ok": False, "error": f"SSH: {exc}", "log": "\n".join(log)}
 
     try:
+        # Hard stop: SSH landed on this same machine (self-provision), even if DNS checks lied.
+        local_mid = ""
+        try:
+            local_mid = Path("/etc/machine-id").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        remote_mid = (_ssh_run(client, "cat /etc/machine-id 2>/dev/null || true").get("stdout") or "").strip()
+        if local_mid and remote_mid and local_mid == remote_mid:
+            try:
+                client.close()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "error": f"SSH к {domain} попал на этот же сервер (machine-id совпал) — укажите другую ноду",
+                "log": "\n".join(log),
+            }
+
         sftp = client.open_sftp()
         # Non-interactive install: ensure curl, fail hard on errors (no silent "exit=0").
         env_body = "\n".join([
@@ -451,17 +470,23 @@ def provision_via_ssh(
         with sftp.file("/tmp/l2x_remote_install.sh", "w") as f:
             f.write(env_body)
         # Agent setup: keep existing secret path on re-provision; always re-apply nginx front.
+        # Refuse to demote an existing master unless L2X_FORCE_AGENT=1 (set by us for real remotes).
         remote_py = f"""
-import json, sys
+import json, os, sys
 from pathlib import Path
 sys.path.insert(0, "/opt/l2xpanel")
 TOKEN = {agent_tok!r}
 DOMAIN = {domain!r}
 PATH_NEW = {panel_path!r}
+FORCE = os.environ.get("L2X_FORCE_AGENT") == "1"
 store_path = Path("/var/lib/l2xpanel/store.json")
 store = json.loads(store_path.read_text()) if store_path.exists() else {{}}
 s = store.setdefault("settings", {{}})
 ns = s.setdefault("nodes", {{}})
+was_master = (ns.get("role") or "master") != "agent" and not ns.get("agent_enabled")
+if was_master and not FORCE:
+    print("refuse_demote_master")
+    raise SystemExit(2)
 ns["agent_enabled"] = True
 ns["agent_token"] = TOKEN
 ns["role"] = "agent"
@@ -506,12 +531,28 @@ except Exception as exc:
         r2 = _ssh_run(
             client,
             "set -a; . /etc/l2xpanel/panel.env; set +a; "
+            "export L2X_FORCE_AGENT=1; "
             "cd /opt/l2xpanel; PYTHONPATH=/opt/l2xpanel .venv/bin/python /tmp/l2x_agent_setup.py; "
+            "ec=$?; "
             "systemctl restart l2xpanel; sleep 2; curl -s http://127.0.0.1:8090/health || true; "
-            "rm -f /tmp/l2x_agent_setup.py",
+            "rm -f /tmp/l2x_agent_setup.py; exit $ec",
             timeout=90,
         )
         log.append(r2["stdout"][-1200:])
+        if "refuse_demote_master" in (r2["stdout"] or ""):
+            return {
+                "ok": False,
+                "error": "удалённый хост уже master — demote запрещён (похоже на self-provision)",
+                "log": "\n".join(log),
+                "node": node,
+            }
+        if not r2.get("ok"):
+            return {
+                "ok": False,
+                "error": f"agent setup exit={r2.get('code')}",
+                "log": "\n".join(log),
+                "node": node,
+            }
         # Prefer base_path reported by agent_ok
         used_bp = panel_path
         for line in (r2["stdout"] or "").splitlines():
@@ -522,10 +563,11 @@ except Exception as exc:
         node["url"] = f"https://{domain}"
         node["base_path"] = used_bp
         node["token"] = agent_tok
+        # On --update the existing admin password is kept; do not pretend we set a new one.
         return {
             "ok": True,
             "node": node,
-            "admin_password": admin_password,
+            "admin_password": "(без изменений, если панель уже была установлена)",
             "panel_url": f"https://{domain}/{used_bp}/",
             "log": "\n".join(log),
         }

@@ -376,9 +376,17 @@ def outbound_label(store: dict, tag: str) -> str:
 
 
 def _route_target(store: dict, tag: str) -> dict:
-    if _is_balancer_target(store, tag):
-        return {"balancerTag": tag}
-    return {"outboundTag": tag or "direct"}
+    """Map a logical tag to a routing target. Balancers without live members fall back
+    (otherwise Xray fails with 'balancer lb_* not found' because we omit empty balancers)."""
+    if not _is_balancer_target(store, tag):
+        return {"outboundTag": tag or "direct"}
+    for b in ensure_balancers(store).values():
+        if b.get("tag") != tag or not b.get("enabled", True):
+            continue
+        if balancer_member_tags(store, b):
+            return {"balancerTag": tag}
+        return {"outboundTag": b.get("fallback") or "direct"}
+    return {"outboundTag": "direct"}
 
 
 # ---------------------------------------------------------------- inbounds
