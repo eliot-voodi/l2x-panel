@@ -378,13 +378,19 @@ def outbound_label(store: dict, tag: str) -> str:
 def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = None) -> dict:
     """Map a logical tag to a routing target.
 
-    Enabled balancers are always emitted (empty membership → selector [direct]).
-    Unknown outbound tags (e.g. master's l2tp_* on an agent) fall back to direct
-    so Xray does not fail with 'not all dependencies are resolved'.
+    Balancers are only referenced when they have live members (and thus appear in
+    the config with observatory). Otherwise fall back to the balancer's fallback
+    outbound (usually direct). Unknown outbound tags also fall back to direct.
     """
     tag = (tag or "direct").strip() or "direct"
     if _is_balancer_target(store, tag):
-        return {"balancerTag": tag}
+        for b in ensure_balancers(store).values():
+            if b.get("tag") != tag or not b.get("enabled", True):
+                continue
+            if balancer_member_tags(store, b):
+                return {"balancerTag": tag}
+            return {"outboundTag": b.get("fallback") or "direct"}
+        return {"outboundTag": "direct"}
     if known_outbounds is not None and tag not in known_outbounds:
         return {"outboundTag": "direct"}
     return {"outboundTag": tag}
@@ -928,17 +934,22 @@ def build_config(store: dict) -> dict:
 
 
 def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
-    """Always emit enabled balancers. With no live members use [direct] so routes that
-    still reference lb_* do not crash Xray with 'balancer not found'."""
+    """Emit balancers only when they have live members.
+
+    leastPing/leastLoad require observatory/burstObservatory — emitting a balancer
+    with selector [direct] and no observatory makes Xray fail with
+    'not all dependencies are resolved'. Routes to empty balancers fall back via
+    _route_target().
+    """
     bals = ensure_balancers(store)
     out: list[dict] = []
     observatory = burst = None
     ping_b = bals.get("least_ping") or {}
     if ping_b.get("enabled", True):
-        members = balancer_member_tags(store, ping_b) or ["direct"]
-        out.append({"tag": ping_b["tag"], "selector": members, "fallbackTag": ping_b.get("fallback") or "direct",
-                    "strategy": {"type": "leastPing"}})
-        if members != ["direct"]:
+        members = balancer_member_tags(store, ping_b)
+        if members:
+            out.append({"tag": ping_b["tag"], "selector": members, "fallbackTag": ping_b.get("fallback") or "direct",
+                        "strategy": {"type": "leastPing"}})
             observatory = {
                 "subjectSelector": sorted(set(members)),
                 "probeURL": ping_b.get("probe_url") or "https://www.gstatic.com/generate_204",
@@ -947,14 +958,14 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
             }
     load_b = bals.get("least_load") or {}
     if load_b.get("enabled", True):
-        members = balancer_member_tags(store, load_b) or ["direct"]
-        out.append({
-            "tag": load_b["tag"], "selector": members, "fallbackTag": load_b.get("fallback") or "direct",
-            "strategy": {"type": "leastLoad", "settings": {
-                "expected": int(load_b.get("expected") or 1), "maxRTT": load_b.get("max_rtt") or "1s",
-                "tolerance": float(load_b.get("tolerance") or 0.15), "baselines": ["1s"]}},
-        })
-        if members != ["direct"]:
+        members = balancer_member_tags(store, load_b)
+        if members:
+            out.append({
+                "tag": load_b["tag"], "selector": members, "fallbackTag": load_b.get("fallback") or "direct",
+                "strategy": {"type": "leastLoad", "settings": {
+                    "expected": int(load_b.get("expected") or 1), "maxRTT": load_b.get("max_rtt") or "1s",
+                    "tolerance": float(load_b.get("tolerance") or 0.15), "baselines": ["1s"]}},
+            })
             burst = {
                 "subjectSelector": sorted(set(members)),
                 "pingConfig": {
