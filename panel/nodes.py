@@ -180,30 +180,51 @@ def sync_all_node_outbounds(store: dict) -> None:
     ]
 
 
+def _agent_safe_clients(clients: list[dict]) -> list[dict]:
+    """Agent has no master's L2TP ifaces — remap dangling outbound tags to direct."""
+    out = []
+    for c in clients or []:
+        c = dict(c)
+        ob = (c.get("outbound") or "direct").strip()
+        if ob.startswith("l2tp_") or ob.startswith("node_"):
+            c["outbound"] = "direct"
+        out.append(c)
+    return out
+
+
+def _agent_safe_routes(routes: list[dict]) -> list[dict]:
+    out = []
+    for r in routes or []:
+        r = dict(r)
+        ob = (r.get("outbound") or r.get("outbound_tag") or "direct").strip()
+        if ob.startswith("l2tp_") or ob.startswith("node_"):
+            r["outbound"] = "direct"
+            r.pop("outbound_tag", None)
+        out.append(r)
+    return out
+
+
+def _agent_safe_balancers(balancers: dict) -> dict:
+    """Drop explicit L2TP members — agent will use connected local tunnels or [direct]."""
+    bals = json.loads(json.dumps(balancers or {}))  # deep copy
+    for b in bals.values():
+        if not isinstance(b, dict):
+            continue
+        members = b.get("members") or []
+        b["members"] = [m for m in members if not str(m).startswith("l2tp_") and not str(m).startswith("node_")]
+    return bals
+
+
 def build_payload(store: dict, node: dict, build_config) -> dict:
     """Subset for a remote agent: clients + inbounds + xray config without local L2TP ifaces."""
-    clients = store.get("clients") or []
+    clients = _agent_safe_clients(store.get("clients") or [])
     inbounds = list(store.get("inbounds") or [])
     # Ensure bridge inbound exists on agent when used as outbound
     if node.get("as_outbound"):
         ensure_bridge(node)
         inbounds = [i for i in inbounds if i.get("tag") != "node-bridge"]
         inbounds.append(bridge_inbound(node))
-        # Attach bridge uuid as a synthetic "client" on that inbound only — already in bridge_inbound.clients
-    cfg = build_config(store)
-    outbounds = []
     self_tag = node_outbound_tag(node)
-    for o in cfg.get("outbounds") or []:
-        tag = o.get("tag") or ""
-        sock = ((o.get("streamSettings") or {}).get("sockopt") or {})
-        if tag == self_tag:
-            # never point a node at itself
-            continue
-        if tag.startswith("l2tp_") or sock.get("interface", "").startswith("l2x-"):
-            outbounds.append({"tag": tag, "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}})
-        else:
-            outbounds.append(o)
-    cfg["outbounds"] = outbounds
     # Also send bridge client into the main clients list so Xray email routing works if needed
     bridge_clients = []
     if node.get("as_outbound"):
@@ -213,15 +234,20 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             "outbound": "direct", "limit_gb": 0, "limit_ip": 0, "limit_hwid": 0,
             "sub_enabled": False, "comment": "node bridge (auto)",
         }]
+    # Agent store snapshot (no master's L2TP-bound custom outbounds that need local ifaces)
+    customs = []
+    for o in store.get("outbounds_custom") or []:
+        if o.get("tag") == self_tag or o.get("kind") == "node":
+            continue
+        customs.append(o)
     return {
         "clients": (clients if node.get("sync_clients", True) else []) + bridge_clients,
         "inbounds": inbounds if node.get("sync_inbounds", True) or node.get("as_outbound") else [],
-        "outbounds_custom": [o for o in (store.get("outbounds_custom") or []) if o.get("tag") != self_tag],
-        "routes": store.get("routes") or [],
-        "balancers": store.get("balancers") or {},
+        "outbounds_custom": customs,
+        "routes": _agent_safe_routes(store.get("routes") or []),
+        "balancers": _agent_safe_balancers(store.get("balancers") or {}),
         "dns": store.get("dns") or {},
         "xray_settings": store.get("xray_settings") or {},
-        "config": cfg,
         "pushed_at": now_iso(),
         "node_id": node.get("id"),
         "bridge": {

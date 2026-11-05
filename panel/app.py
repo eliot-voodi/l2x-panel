@@ -3527,6 +3527,14 @@ async def nodes_action(node_id: str, action: str, request: Request):
             nodes_mod.upsert_node_outbound(store, node)
             flash(request, f"{node['name']}: {'вкл' if node['enabled'] else 'выкл'}", "info")
             return go("/nodes")
+        if action == "token":
+            new_tok = str(form.get("token") or "").strip()
+            if len(new_tok) < 8:
+                flash(request, "Token слишком короткий", "error")
+                return go("/nodes")
+            node["token"] = new_tok
+            flash(request, f"{node['name']}: token обновлён — нажмите Sync", "info")
+            return go("/nodes")
         if action == "outbound":
             node["as_outbound"] = not node.get("as_outbound")
             if node["as_outbound"]:
@@ -3645,21 +3653,32 @@ async def agent_apply(request: Request):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     with mutate() as st:
         if payload.get("clients") is not None:
-            st["clients"] = payload["clients"]
+            st["clients"] = nodes_mod._agent_safe_clients(payload["clients"])
         if payload.get("inbounds") is not None:
             st["inbounds"] = payload["inbounds"]
         if payload.get("outbounds_custom") is not None:
-            st["outbounds_custom"] = payload["outbounds_custom"]
+            st["outbounds_custom"] = [
+                o for o in (payload["outbounds_custom"] or []) if o.get("kind") != "node"
+            ]
         if payload.get("routes") is not None:
-            st["routes"] = payload["routes"]
+            st["routes"] = nodes_mod._agent_safe_routes(payload["routes"])
         if payload.get("balancers") is not None:
-            st["balancers"] = payload["balancers"]
+            st["balancers"] = nodes_mod._agent_safe_balancers(payload["balancers"])
         if payload.get("dns") is not None:
             st["dns"] = payload["dns"]
         if payload.get("xray_settings") is not None:
             st["xray_settings"] = payload["xray_settings"]
+        # Keep agent mode sticky — a pushed payload must never demote/disable agent
+        ns = st.setdefault("settings", {}).setdefault("nodes", {})
+        ns["agent_enabled"] = True
+        ns["role"] = "agent"
     res = _apply_xray(_load_store())
-    return {"ok": bool(res.get("ok")), "error": res.get("error") or ""}
+    err = res.get("error") or ""
+    try:
+        err = xray.clean_xray_error(err) or err
+    except Exception:
+        pass
+    return {"ok": bool(res.get("ok")), "error": err}
 
 
 @app.get("/api-docs", response_class=HTMLResponse)

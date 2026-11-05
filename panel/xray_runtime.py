@@ -375,12 +375,19 @@ def outbound_label(store: dict, tag: str) -> str:
     return tag
 
 
-def _route_target(store: dict, tag: str) -> dict:
-    """Map a logical tag to a routing target. Enabled balancers are always emitted
-    (empty membership → selector [direct]), so balancerTag is always safe."""
+def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = None) -> dict:
+    """Map a logical tag to a routing target.
+
+    Enabled balancers are always emitted (empty membership → selector [direct]).
+    Unknown outbound tags (e.g. master's l2tp_* on an agent) fall back to direct
+    so Xray does not fail with 'not all dependencies are resolved'.
+    """
+    tag = (tag or "direct").strip() or "direct"
     if _is_balancer_target(store, tag):
         return {"balancerTag": tag}
-    return {"outboundTag": tag or "direct"}
+    if known_outbounds is not None and tag not in known_outbounds:
+        return {"outboundTag": "direct"}
+    return {"outboundTag": tag}
 
 
 # ---------------------------------------------------------------- inbounds
@@ -737,11 +744,11 @@ ROUTE_PRESETS = {
 }
 
 
-def _rule_from_route(store: dict, r: dict) -> dict | None:
+def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None = None) -> dict | None:
     if not r.get("enabled", True):
         return None
     target = r.get("outbound") or r.get("outbound_tag") or "direct"
-    rule: dict[str, Any] = {"type": "field", **_route_target(store, target)}
+    rule: dict[str, Any] = {"type": "field", **_route_target(store, target, known_outbounds=known_outbounds)}
     for key, xkey in (("domain", "domain"), ("ip", "ip"), ("user", "user"), ("protocol", "protocol"),
                       ("source", "source"), ("inbound_tags", "inboundTag")):
         val = r.get(key)
@@ -802,7 +809,6 @@ def build_config(store: dict) -> dict:
     active_clients = [c for c in clients if client_access_ok(c)]
 
     inbounds: list[dict] = []
-    per_inbound_rules: list[dict] = []
     for ib in inbounds_model:
         if not inbound_access_ok(ib):
             continue
@@ -816,9 +822,6 @@ def build_config(store: dict) -> dict:
             if "fakedns" not in dest:
                 dest.append("fakedns")
         inbounds.append(built)
-        if ib["protocol"] not in P.USER_PROTOCOLS:
-            ob = ib.get("outbound") or "direct"
-            per_inbound_rules.append({"type": "field", "inboundTag": [ib["tag"]], **_route_target(store, ob)})
 
     inbounds.append({
         "tag": "api", "listen": "127.0.0.1", "port": int(str(XRAY_API).rsplit(":", 1)[-1]),
@@ -834,23 +837,43 @@ def build_config(store: dict) -> dict:
     if fake.get("enabled"):
         outbounds.append({"tag": "dns-out", "protocol": "dns"})
 
+    # Build balancers before rules so we know which tags actually exist on this host
+    bals_cfg, observatory, burst = _balancers_cfg(store)
+    known_outbounds = {o.get("tag") for o in outbounds if o.get("tag")} | {"api"}
+
+    # Rebuild per-inbound rules with known outbound set (first pass used bare _route_target)
+    per_inbound_rules = []
+    for ib in inbounds_model:
+        if not inbound_access_ok(ib):
+            continue
+        if ib["protocol"] not in P.USER_PROTOCOLS:
+            ob = ib.get("outbound") or "direct"
+            per_inbound_rules.append(
+                {"type": "field", "inboundTag": [ib["tag"]], **_route_target(store, ob, known_outbounds=known_outbounds)}
+            )
+
     rules: list[dict] = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
     for r in store.get("routes") or []:
-        rule = _rule_from_route(store, r)
+        rule = _rule_from_route(store, r, known_outbounds=known_outbounds)
         if rule:
             rules.append(rule)
     for c in active_clients:
         for e in subscription_entries(store, c):
-            rules.append({"type": "field", "user": [e["email"]], **_route_target(store, e["tag"])})
+            rules.append({
+                "type": "field", "user": [e["email"]],
+                **_route_target(store, e["tag"], known_outbounds=known_outbounds),
+            })
         ob = c.get("outbound") or "direct"
         if ob != "direct" and not tag_allowed_for_client(c, ob):
             rules.append({"type": "field", "user": [c["email"]], "outboundTag": "block"})
         elif ob != "direct":
-            rules.append({"type": "field", "user": [c["email"]], **_route_target(store, ob)})
+            rules.append({
+                "type": "field", "user": [c["email"]],
+                **_route_target(store, ob, known_outbounds=known_outbounds),
+            })
     rules.extend(per_inbound_rules)
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})
 
-    bals_cfg, observatory, burst = _balancers_cfg(store)
     routing: dict[str, Any] = {"domainStrategy": "AsIs", "rules": rules}
     if bals_cfg:
         routing["balancers"] = bals_cfg
