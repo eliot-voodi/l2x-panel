@@ -47,8 +47,59 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("last_ok", False)
         n.setdefault("panel_version", "")
         n.setdefault("last_update", "")
+        # Auto-sync interval in minutes; 0 = disabled
+        n.setdefault("sync_interval_min", 0)
         n.setdefault("role", "agent")  # on master registry entries are always agents
     return nodes
+
+
+SYNC_INTERVAL_CHOICES = (
+    (0, "выкл"),
+    (5, "5 мин"),
+    (15, "15 мин"),
+    (30, "30 мин"),
+    (60, "1 ч"),
+    (180, "3 ч"),
+    (360, "6 ч"),
+    (720, "12 ч"),
+    (1440, "24 ч"),
+)
+
+
+def normalize_sync_interval(raw) -> int:
+    try:
+        v = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    allowed = {m for m, _ in SYNC_INTERVAL_CHOICES}
+    return v if v in allowed else 0
+
+
+def sync_interval_label(minutes: int) -> str:
+    for m, label in SYNC_INTERVAL_CHOICES:
+        if m == int(minutes or 0):
+            return label
+    return "выкл"
+
+
+def node_sync_due(node: dict, now: datetime | None = None) -> bool:
+    """True if enabled node with sync_interval_min > 0 is past due since last_sync."""
+    if not node.get("enabled", True):
+        return False
+    interval = normalize_sync_interval(node.get("sync_interval_min"))
+    if interval <= 0:
+        return False
+    last = (node.get("last_sync") or "").strip()
+    if not last:
+        return True
+    try:
+        ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return (now - ts).total_seconds() >= interval * 60
+    except Exception:
+        return True
 
 
 def agent_token(store: dict) -> str:

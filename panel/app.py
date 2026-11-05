@@ -1292,7 +1292,8 @@ def _startup():
     _admin()
     _ensure_base_path()
     _refresh_settings_cache()
-    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop, _l2tp_auto_loop):
+    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
+                   _l2tp_auto_loop, _nodes_sync_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -3391,6 +3392,40 @@ async def rest_api(path: str, request: Request):
 # ================================================================ nodes / agent
 
 NODES_JOB: dict[str, str] = {}
+NODES_SCHED_LOCK = threading.Lock()
+
+
+def _nodes_sync_loop() -> None:
+    """Periodic per-node sync according to each node's sync_interval_min."""
+    if _stop.wait(75):
+        return
+    while True:
+        try:
+            store = _load_store()
+            if nodes_mod.is_master(store):
+                host = public_host()
+                due_ids = [
+                    n["id"] for n in nodes_mod.ensure_list(store)
+                    if nodes_mod.node_sync_due(n)
+                ]
+                running = NODES_JOB.get("id")
+                busy = bool(running and ops.JOBS.get(running, {}).get("status") == "running")
+                if due_ids and not busy and NODES_SCHED_LOCK.acquire(blocking=False):
+                    try:
+                        for nid in due_ids:
+                            # re-check due under fresh store (previous push may have updated last_sync)
+                            st = _load_store()
+                            node = next((x for x in nodes_mod.ensure_list(st) if x.get("id") == nid), None)
+                            if not node or not nodes_mod.node_sync_due(node):
+                                continue
+                            name = node.get("name") or nid[:8]
+                            _node_push_job(nid, f"{name}: schedule", host)
+                    finally:
+                        NODES_SCHED_LOCK.release()
+        except Exception:
+            pass
+        if _stop.wait(60):
+            return
 
 
 @app.get("/nodes", response_class=HTMLResponse)
@@ -3416,6 +3451,7 @@ def nodes_page(request: Request):
                 ns=store["settings"].get("nodes") or {},
                 is_master=nodes_mod.is_master(store),
                 master_version=panel_version(),
+                sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
 
@@ -3451,6 +3487,7 @@ async def nodes_add(request: Request):
             "sync_inbounds": True if mirror else form.get("sync_inbounds") == "1",
             "as_outbound": True if mirror else form.get("as_outbound") == "1",
             "mirror": mirror, "domain": host, "base_path": base_path,
+            "sync_interval_min": nodes_mod.normalize_sync_interval(form.get("sync_interval_min")),
             "ssh_user": "", "ssh_port": 22,
             "last_sync": "", "last_error": "", "last_ok": False, "role": "agent",
         }
@@ -3478,6 +3515,7 @@ async def nodes_provision(request: Request):
     port = _int(form.get("ssh_port"), 22)
     as_outbound = form.get("as_outbound") == "1"
     mirror = form.get("mirror") == "1"
+    sync_interval_min = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
     if mirror:
         as_outbound = True
     if not domain or not password:
@@ -3513,6 +3551,7 @@ async def nodes_provision(request: Request):
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}
         node = res["node"]
+        node["sync_interval_min"] = sync_interval_min
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
             # replace same domain if re-provisioning
@@ -3575,7 +3614,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
             form = {}
 
     # --- quick local mutations (no network) ---
-    if action in ("delete", "toggle", "token"):
+    if action in ("delete", "toggle", "token", "schedule"):
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
             node = next((n for n in nodes if n["id"] == node_id), None)
@@ -3590,6 +3629,11 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 node["enabled"] = not node.get("enabled", True)
                 nodes_mod.upsert_node_outbound(store, node)
                 flash(request, f"{node['name']}: {'вкл' if node['enabled'] else 'выкл'}", "info")
+            elif action == "schedule":
+                mins = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
+                node["sync_interval_min"] = mins
+                label = nodes_mod.sync_interval_label(mins)
+                flash(request, f"{node['name']}: расписание sync — {label}", "info")
             else:
                 new_tok = str(form.get("token") or "").strip()
                 if len(new_tok) < 8:
