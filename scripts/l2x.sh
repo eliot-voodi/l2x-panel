@@ -75,6 +75,7 @@ show_status() {
     if [ "$st" = active ]; then c_ok "  $u: $st"; else c_warn "  $u: $st"; fi
   done
   echo "  Xray: $(/usr/local/bin/xray version 2>/dev/null | head -1)"
+  echo "  Версия панели: $(tr -d '[:space:]' <"${APP_DIR:-/opt/l2xpanel}/VERSION" 2>/dev/null || echo '?')"
   echo "  Панель: $(panel_url)"
   echo "  Админ: $("$PY" -c "import json;print(json.load(open('$DATA/admin.json'))['username'])" 2>/dev/null)"
   echo "  BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"

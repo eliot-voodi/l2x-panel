@@ -167,6 +167,7 @@
         <span>{{ user }}</span>
         <button class="btn ghost sm" type="button" onclick="toggleTheme()" title="Тема">{{ ic.icon('moon') }}</button>
       </div>
+      <div class="small muted mono" style="padding:.15rem .7rem 0" title="версия панели">v{{ panel_version }}</div>
       <form method="post" action="{{ bp }}/logout"><button class="nav-link" style="width:100%;background:none;border:0;cursor:pointer;font:inherit">{{ ic.icon('logout') }}{{ t('Выход') }}</button></form>
     </div>
   </aside>

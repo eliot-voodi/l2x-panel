@@ -3,9 +3,10 @@
 {% import "_icons.html" as ic %}
 {% block title %}{{ t('Дашборд') }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ t('Дашборд') }}{% endblock %}
-{% block page_sub %}{{ public_host }} · панель работает {{ fmt_uptime(panel_uptime) }}{% endblock %}
+{% block page_sub %}v{{ panel_version }} · {{ public_host }} · панель работает {{ fmt_uptime(panel_uptime) }}{% endblock %}
 {% block top_actions %}
 <div class="actions">
+  <span class="badge">Panel v{{ panel_version }}</span>
   <span class="badge {% if xs.active %}ok{% else %}err{% endif %}"><span class="dot {% if xs.active %}on{% endif %}"></span> Xray {{ xs.version }}</span>
   <form method="post" action="{{ bp }}/xray/control/restart"><button class="btn ghost sm">{{ ic.icon('refresh') }}{{ t('Перезапустить') }}</button></form>
   {% if xs.active %}

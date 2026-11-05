@@ -65,6 +65,18 @@ STORE_LOCK = threading.RLock()
 STARTED_AT = time.time()
 
 
+def panel_version() -> str:
+    """Panel release version from VERSION (shipped next to app.py)."""
+    for path in (ROOT / "VERSION", ROOT.parent / "VERSION"):
+        try:
+            v = path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            if v:
+                return v
+        except (OSError, IndexError):
+            continue
+    return "0.0.0"
+
+
 def _load_or_create_secret_key() -> str:
     env = os.environ.get("SECRET_KEY", "").strip()
     key_file = DATA / "secret_key"
@@ -534,6 +546,7 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
         "request": request, "app_name": app_title(), "user": _user(request), "flash": pop_flash(request),
         "bp": base_path(), "active": active, "theme": (s.get("panel") or {}).get("theme") or "dark",
         "lang": (s.get("panel") or {}).get("lang") or "ru", "public_host": public_host(),
+        "panel_version": panel_version(),
     }
     base.update(ctx)
     return templates.TemplateResponse(template, base, status_code=status_code)
@@ -1139,7 +1152,12 @@ def sub_dedicated(path: str, token: str, request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": app_title(), "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "app": app_title(),
+        "version": panel_version(),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ================================================================ auth pages

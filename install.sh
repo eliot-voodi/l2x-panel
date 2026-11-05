@@ -441,7 +441,9 @@ configure() {
 summary() {
   local base="https://$PUBLIC_HOST" path=/$PANEL_PATH
   is_ip "$PUBLIC_HOST" && base="http://$PUBLIC_HOST"
-  printf '\n%s  ════════════════════ L2X Panel установлена ════════════════════%s\n\n' "$G" "$N"
+  local ver
+  ver=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
+  printf '\n%s  ════════════════════ L2X Panel %s установлена ════════════════════%s\n\n' "$G" "$ver" "$N"
   printf '  Панель:   %s%s%s/%s   (корень сайта и прочие пути уводят на ya.ru)\n' "$W" "$base" "$path" "$N"
   printf '  Логин:    %s%s%s\n  Пароль:   %s%s%s\n' "$W" "$ADMIN_USER" "$N" "$W" "$ADMIN_PASSWORD" "$N"
   printf '  Подписки: %s/sub/<token>\n' "$base"
