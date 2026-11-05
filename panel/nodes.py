@@ -272,7 +272,15 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             ok = bool(parsed.get("ok", resp.status < 300))
             node["last_sync"] = now_iso()
             node["last_ok"] = ok
-            node["last_error"] = "" if ok else str(parsed.get("error") or body[:300])
+            err = "" if ok else str(parsed.get("error") or body[:300])
+            try:
+                from xray_runtime import clean_xray_error
+                err = clean_xray_error(err) or err
+            except Exception:
+                pass
+            node["last_error"] = err
+            if isinstance(parsed, dict) and err:
+                parsed = {**parsed, "error": err}
             return parsed if isinstance(parsed, dict) else {"ok": ok}
     except Exception as exc:  # noqa: BLE001
         node["last_sync"] = now_iso()

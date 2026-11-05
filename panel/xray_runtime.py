@@ -376,17 +376,11 @@ def outbound_label(store: dict, tag: str) -> str:
 
 
 def _route_target(store: dict, tag: str) -> dict:
-    """Map a logical tag to a routing target. Balancers without live members fall back
-    (otherwise Xray fails with 'balancer lb_* not found' because we omit empty balancers)."""
-    if not _is_balancer_target(store, tag):
-        return {"outboundTag": tag or "direct"}
-    for b in ensure_balancers(store).values():
-        if b.get("tag") != tag or not b.get("enabled", True):
-            continue
-        if balancer_member_tags(store, b):
-            return {"balancerTag": tag}
-        return {"outboundTag": b.get("fallback") or "direct"}
-    return {"outboundTag": "direct"}
+    """Map a logical tag to a routing target. Enabled balancers are always emitted
+    (empty membership → selector [direct]), so balancerTag is always safe."""
+    if _is_balancer_target(store, tag):
+        return {"balancerTag": tag}
+    return {"outboundTag": tag or "direct"}
 
 
 # ---------------------------------------------------------------- inbounds
@@ -911,15 +905,17 @@ def build_config(store: dict) -> dict:
 
 
 def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
+    """Always emit enabled balancers. With no live members use [direct] so routes that
+    still reference lb_* do not crash Xray with 'balancer not found'."""
     bals = ensure_balancers(store)
     out: list[dict] = []
     observatory = burst = None
     ping_b = bals.get("least_ping") or {}
     if ping_b.get("enabled", True):
-        members = balancer_member_tags(store, ping_b)
-        if members:
-            out.append({"tag": ping_b["tag"], "selector": members, "fallbackTag": ping_b.get("fallback") or "direct",
-                        "strategy": {"type": "leastPing"}})
+        members = balancer_member_tags(store, ping_b) or ["direct"]
+        out.append({"tag": ping_b["tag"], "selector": members, "fallbackTag": ping_b.get("fallback") or "direct",
+                    "strategy": {"type": "leastPing"}})
+        if members != ["direct"]:
             observatory = {
                 "subjectSelector": sorted(set(members)),
                 "probeURL": ping_b.get("probe_url") or "https://www.gstatic.com/generate_204",
@@ -928,14 +924,14 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
             }
     load_b = bals.get("least_load") or {}
     if load_b.get("enabled", True):
-        members = balancer_member_tags(store, load_b)
-        if members:
-            out.append({
-                "tag": load_b["tag"], "selector": members, "fallbackTag": load_b.get("fallback") or "direct",
-                "strategy": {"type": "leastLoad", "settings": {
-                    "expected": int(load_b.get("expected") or 1), "maxRTT": load_b.get("max_rtt") or "1s",
-                    "tolerance": float(load_b.get("tolerance") or 0.15), "baselines": ["1s"]}},
-            })
+        members = balancer_member_tags(store, load_b) or ["direct"]
+        out.append({
+            "tag": load_b["tag"], "selector": members, "fallbackTag": load_b.get("fallback") or "direct",
+            "strategy": {"type": "leastLoad", "settings": {
+                "expected": int(load_b.get("expected") or 1), "maxRTT": load_b.get("max_rtt") or "1s",
+                "tolerance": float(load_b.get("tolerance") or 0.15), "baselines": ["1s"]}},
+        })
+        if members != ["direct"]:
             burst = {
                 "subjectSelector": sorted(set(members)),
                 "pingConfig": {
@@ -945,6 +941,21 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
                 },
             }
     return out, observatory, burst
+
+
+def clean_xray_error(text: str) -> str:
+    """Drop version banner / deprecation spam; keep the real failure line."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        low = ln.lower()
+        if ln.startswith("Failed to start:") or "not found" in low or "failed to" in low:
+            return ln[:500]
+    skip = ("xray ", "penetrates", "anti-censorship", "a unified platform", "[info]", "[warning]", "reading config")
+    keep = [ln for ln in lines if not any(s in ln.lower() for s in skip)]
+    return (" | ".join(keep[-3:]) if keep else lines[-1])[:500]
 
 
 def test_config(cfg: dict) -> dict:
@@ -958,7 +969,8 @@ def test_config(cfg: dict) -> dict:
     tmp = XRAY_CONFIG.parent / (XRAY_CONFIG.stem + ".tmp.json")
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     test = _run([XRAY_BIN, "run", "-test", "-config", str(tmp)])
-    return {"ok": test["exit_code"] == 0, "tmp": tmp, "error": test["stderr"] or test["stdout"]}
+    err = clean_xray_error(test["stderr"] or test["stdout"])
+    return {"ok": test["exit_code"] == 0, "tmp": tmp, "error": err}
 
 
 def _xray_active() -> bool:
