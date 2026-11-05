@@ -228,6 +228,29 @@
 </div>
 
 {% elif tab == 'system' %}
+{% set pu = store.get('panel_update_state') if store is defined else {} %}
+{% set pu = pu or {} %}
+<div class="card">
+  <div class="card-head"><h3>Обновление панели</h3>
+    <form method="post" action="{{ bp }}/panel/update/check"><button class="btn ghost sm">{{ ic.icon('refresh') }}Проверить</button></form></div>
+  <table><tbody>
+    <tr><td class="dim">Установлена</td><td class="mono">v{{ panel_version }}</td></tr>
+    <tr><td class="dim">Последняя на GitHub</td><td class="mono">{{ pu.latest or '—' }}{% if pu.url %} · <a href="{{ pu.url }}" target="_blank" rel="noopener">релиз</a>{% endif %}</td></tr>
+    <tr><td class="dim">Проверено</td><td class="small">{{ fmt_dt(pu.checked_at) if pu.checked_at else 'ещё не проверялось' }}{% if pu.error %} · <span style="color:var(--danger)">{{ pu.error }}</span>{% endif %}</td></tr>
+  </tbody></table>
+  {% if pu.available %}
+  <form method="post" action="{{ bp }}/panel/update/install" class="mt"
+        onsubmit="return confirm('Обновить панель {{ panel_version }} → {{ pu.latest }}?\nСервис перезапустится, данные сохранятся.')">
+    <input type="hidden" name="version" value="{{ pu.latest }}">
+    <input type="hidden" name="confirm" value="yes">
+    <div class="actions"><button class="btn">{{ ic.icon('download') }}Установить {{ pu.latest }}</button></div>
+  </form>
+  {% elif pu.latest %}
+  <div class="hint mt">Установлена актуальная версия.</div>
+  {% endif %}
+  <div class="hint">То же, что <code>l2x update</code>: код с GitHub, store и секреты не трогаются.</div>
+</div>
+{% include "_jobs.html" %}
 <div class="grid g2">
   <div class="card">
     <h3>TCP BBR</h3>

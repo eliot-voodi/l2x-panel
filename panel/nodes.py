@@ -1,17 +1,25 @@
-"""Multi-node registry: push Xray config / clients to remote L2X agents."""
+"""Multi-node registry: SSH provision, sync, promote-to-master, node as outbound."""
 from __future__ import annotations
 
 import json
+import re
 import secrets
+import uuid
 import urllib.error
 import urllib.request
-import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", (name or "node").strip())[:32]
+    return s if SLUG_RE.match(s) else f"node_{secrets.token_hex(3)}"
 
 
 def ensure_list(store: dict) -> list[dict]:
@@ -24,9 +32,17 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("enabled", True)
         n.setdefault("sync_clients", True)
         n.setdefault("sync_inbounds", True)
+        n.setdefault("as_outbound", False)
+        n.setdefault("domain", "")
+        n.setdefault("ssh_user", "")
+        n.setdefault("ssh_port", 22)
+        n.setdefault("bridge_uuid", "")
+        n.setdefault("bridge_path", "")
+        n.setdefault("base_path", "")
         n.setdefault("last_sync", "")
         n.setdefault("last_error", "")
         n.setdefault("last_ok", False)
+        n.setdefault("role", "agent")  # on master registry entries are always agents
     return nodes
 
 
@@ -35,28 +51,171 @@ def agent_token(store: dict) -> str:
     if not s.get("agent_token"):
         s["agent_token"] = secrets.token_urlsafe(32)
     s.setdefault("agent_enabled", False)
+    s.setdefault("role", "master")  # master | agent
     return s["agent_token"]
+
+
+def is_master(store: dict) -> bool:
+    ns = store.get("settings", {}).get("nodes") or {}
+    if ns.get("agent_enabled") and ns.get("role") == "agent":
+        return False
+    return (ns.get("role") or "master") != "agent"
+
+
+def ensure_bridge(node: dict) -> dict:
+    """Allocate VLESS/WS bridge credentials used so the master can egress via this node."""
+    if not node.get("bridge_uuid"):
+        node["bridge_uuid"] = str(uuid.uuid4())
+    if not node.get("bridge_path"):
+        node["bridge_path"] = "/nb-" + secrets.token_urlsafe(8).replace("_", "").replace("-", "")[:12]
+    return node
+
+
+def bridge_inbound(node: dict) -> dict:
+    """Inbound definition pushed to the remote node for master→node egress."""
+    ensure_bridge(node)
+    return {
+        "id": 9000 + (abs(hash(node["id"])) % 1000),
+        "tag": "node-bridge",
+        "remark": "L2X node bridge (master egress)",
+        "enabled": True,
+        "listen": "127.0.0.1",
+        "port": 19000,
+        "protocol": "vless",
+        "settings": {"flow": "", "decryption": "none", "encryption": ""},
+        "stream": {
+            "network": "ws",
+            "security": "none",
+            "ws": {"path": node["bridge_path"], "host": "", "accept_proxy_protocol": False},
+            "tls": {"server_name": "", "cert_file": "", "key_file": "", "alpn": ["h2", "http/1.1"],
+                    "fingerprint": "chrome", "min_version": "1.2", "allow_insecure": False,
+                    "reject_unknown_sni": False, "ech_server_keys": ""},
+            "reality": {"dest": "ya.ru:443", "server_names": ["ya.ru"], "private_key": "", "public_key": "",
+                        "short_ids": [], "fingerprint": "chrome", "spider_x": "/", "show": False, "xver": 0},
+            "raw": {"header": "none", "http_host": "", "http_path": "/", "accept_proxy_protocol": False},
+            "grpc": {"service_name": "grpc", "multi_mode": False, "authority": ""},
+            "httpupgrade": {"path": "/up", "host": "", "accept_proxy_protocol": False},
+            "xhttp": {"path": "/xh", "host": "", "mode": "auto", "extra": ""},
+            "kcp": {"mtu": 1350, "tti": 20, "uplink": 5, "downlink": 20, "congestion": False, "header": "none", "seed": ""},
+            "sockopt": {"enabled": False},
+        },
+        "sniffing": {"enabled": False, "dest": ["http", "tls", "quic"], "route_only": False, "metadata_only": False},
+        "fallbacks": [],
+        "outbound": "direct",
+    }
+
+
+def node_outbound_tag(node: dict) -> str:
+    return f"node_{slugify(node.get('name') or 'node')}"
+
+
+def node_outbound_config(node: dict) -> dict:
+    """Xray outbound on the master that tunnels through the remote node's bridge inbound."""
+    ensure_bridge(node)
+    domain = (node.get("domain") or "").strip()
+    if not domain:
+        # derive from URL
+        from urllib.parse import urlparse
+        domain = urlparse(node.get("url") or "").hostname or ""
+    return {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": domain,
+                "port": 443,
+                "users": [{"id": node["bridge_uuid"], "encryption": "none", "flow": ""}],
+            }],
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "tls",
+            "wsSettings": {"path": node["bridge_path"], "headers": {}},
+            "tlsSettings": {"serverName": domain, "allowInsecure": False, "fingerprint": "chrome",
+                            "alpn": ["http/1.1"]},
+        },
+    }
+
+
+def upsert_node_outbound(store: dict, node: dict) -> None:
+    """Keep outbounds_custom in sync when node.as_outbound is enabled."""
+    customs = store.setdefault("outbounds_custom", [])
+    tag = node_outbound_tag(node)
+    existing = next((o for o in customs if o.get("tag") == tag or o.get("node_id") == node.get("id")), None)
+    if not node.get("as_outbound") or not node.get("enabled", True):
+        if existing:
+            customs.remove(existing)
+        return
+    ensure_bridge(node)
+    domain = (node.get("domain") or "").strip()
+    if not domain:
+        from urllib.parse import urlparse
+        domain = urlparse(node.get("url") or "").hostname or ""
+    if not domain:
+        return
+    entry = {
+        "tag": tag,
+        "remark": f"Node {node.get('name')}",
+        "kind": "node",
+        "node_id": node.get("id"),
+        "enabled": True,
+        "in_sub": True,
+        "country": (node.get("country") or "")[:2].upper(),
+        "config": node_outbound_config(node),
+    }
+    if existing:
+        existing.update(entry)
+    else:
+        customs.append(entry)
+
+
+def sync_all_node_outbounds(store: dict) -> None:
+    for n in ensure_list(store):
+        upsert_node_outbound(store, n)
+    # drop stale node_* outbounds whose node was deleted
+    ids = {n.get("id") for n in store.get("nodes") or []}
+    store["outbounds_custom"] = [
+        o for o in (store.get("outbounds_custom") or [])
+        if o.get("kind") != "node" or o.get("node_id") in ids
+    ]
 
 
 def build_payload(store: dict, node: dict, build_config) -> dict:
     """Subset for a remote agent: clients + inbounds + xray config without local L2TP ifaces."""
     clients = store.get("clients") or []
-    inbounds = store.get("inbounds") or []
-    # Build config then strip L2TP sockopt outbounds → freedom (remote has no l2x-* ifaces)
+    inbounds = list(store.get("inbounds") or [])
+    # Ensure bridge inbound exists on agent when used as outbound
+    if node.get("as_outbound"):
+        ensure_bridge(node)
+        inbounds = [i for i in inbounds if i.get("tag") != "node-bridge"]
+        inbounds.append(bridge_inbound(node))
+        # Attach bridge uuid as a synthetic "client" on that inbound only — already in bridge_inbound.clients
     cfg = build_config(store)
     outbounds = []
+    self_tag = node_outbound_tag(node)
     for o in cfg.get("outbounds") or []:
         tag = o.get("tag") or ""
         sock = ((o.get("streamSettings") or {}).get("sockopt") or {})
+        if tag == self_tag:
+            # never point a node at itself
+            continue
         if tag.startswith("l2tp_") or sock.get("interface", "").startswith("l2x-"):
             outbounds.append({"tag": tag, "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}})
         else:
             outbounds.append(o)
     cfg["outbounds"] = outbounds
+    # Also send bridge client into the main clients list so Xray email routing works if needed
+    bridge_clients = []
+    if node.get("as_outbound"):
+        bridge_clients = [{
+            "email": f"bridge@{slugify(node.get('name') or 'node')}",
+            "uuid": node["bridge_uuid"], "enabled": True, "inbounds": ["node-bridge"],
+            "outbound": "direct", "limit_gb": 0, "limit_ip": 0, "limit_hwid": 0,
+            "sub_enabled": False, "comment": "node bridge (auto)",
+        }]
     return {
-        "clients": clients if node.get("sync_clients", True) else [],
-        "inbounds": inbounds if node.get("sync_inbounds", True) else [],
-        "outbounds_custom": store.get("outbounds_custom") or [],
+        "clients": (clients if node.get("sync_clients", True) else []) + bridge_clients,
+        "inbounds": inbounds if node.get("sync_inbounds", True) or node.get("as_outbound") else [],
+        "outbounds_custom": [o for o in (store.get("outbounds_custom") or []) if o.get("tag") != self_tag],
         "routes": store.get("routes") or [],
         "balancers": store.get("balancers") or {},
         "dns": store.get("dns") or {},
@@ -64,6 +223,11 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         "config": cfg,
         "pushed_at": now_iso(),
         "node_id": node.get("id"),
+        "bridge": {
+            "uuid": node.get("bridge_uuid"),
+            "path": node.get("bridge_path"),
+            "enabled": bool(node.get("as_outbound")),
+        } if node.get("as_outbound") else None,
     }
 
 
@@ -96,7 +260,6 @@ def push(node: dict, payload: dict, timeout: int = 60) -> dict:
 
 
 def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
-    """Merge pushed payload into local store and apply Xray."""
     if payload.get("clients") is not None:
         store["clients"] = payload["clients"]
     if payload.get("inbounds") is not None:
@@ -111,9 +274,212 @@ def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
         store["dns"] = payload["dns"]
     if payload.get("xray_settings") is not None:
         store["xray_settings"] = payload["xray_settings"]
-    # Prefer applying the remote-built config if present and valid; else rebuild locally
-    if payload.get("config"):
-        # write via apply_config path by temporarily setting store and calling apply
-        pass
-    result = apply_config(store)
-    return result
+    return apply_config(store)
+
+
+# ---------------------------------------------------------------- SSH provision
+
+def _ssh_connect(host: str, user: str, password: str, port: int = 22, timeout: int = 30):
+    import paramiko
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, port=int(port or 22), username=user, password=password,
+                   timeout=timeout, banner_timeout=60, auth_timeout=30,
+                   look_for_keys=False, allow_agent=False)
+    return client
+
+
+def _ssh_run(client, cmd: str, timeout: int = 600) -> dict:
+    _stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    out = stdout.read().decode("utf-8", "replace")
+    err = stderr.read().decode("utf-8", "replace")
+    code = stdout.channel.recv_exit_status()
+    return {"ok": code == 0, "code": code, "stdout": out, "stderr": err}
+
+
+def provision_via_ssh(
+    *,
+    domain: str,
+    ssh_user: str,
+    ssh_password: str,
+    ssh_port: int = 22,
+    name: str = "",
+    master_url: str = "",
+    master_token: str = "",
+    as_outbound: bool = True,
+    admin_password: str = "",
+) -> dict:
+    """Install/configure L2X on a remote host over SSH and return node registry fields."""
+    domain = domain.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
+    if not domain or " " in domain:
+        return {"ok": False, "error": "некорректный domain"}
+    name = slugify(name or domain.split(".")[0])
+    admin_password = admin_password or secrets.token_urlsafe(12)
+    panel_path = secrets.token_urlsafe(9).replace("_", "").replace("-", "")[:12]
+    agent_tok = master_token or secrets.token_urlsafe(32)
+    node_id = str(uuid.uuid4())
+    node = {
+        "id": node_id, "name": name, "domain": domain, "ssh_user": ssh_user, "ssh_port": int(ssh_port or 22),
+        "token": agent_tok, "enabled": True, "sync_clients": True, "sync_inbounds": True,
+        "as_outbound": bool(as_outbound), "base_path": panel_path, "role": "agent",
+        "url": f"https://{domain}", "last_sync": "", "last_error": "", "last_ok": False,
+    }
+    ensure_bridge(node)
+    log: list[str] = [f"provision {name} @ {domain}"]
+
+    try:
+        client = _ssh_connect(domain, ssh_user, ssh_password, int(ssh_port or 22))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"SSH: {exc}", "log": "\n".join(log)}
+
+    try:
+        sftp = client.open_sftp()
+        # Env file for non-interactive install (avoids shell-metachar issues in passwords)
+        env_body = "\n".join([
+            "export DEBIAN_FRONTEND=noninteractive",
+            f"export L2X_HOST={json.dumps(domain)[1:-1]}",
+            f"export L2X_DOMAIN={json.dumps(domain)[1:-1]}",
+            "export L2X_SSL=domain",
+            "export L2X_MODE=nginx",
+            "export L2X_ADMIN=admin",
+            f"export L2X_PASSWORD={json.dumps(admin_password)[1:-1]}",
+            f"export L2X_PATH={json.dumps(panel_path)[1:-1]}",
+            "",
+            "if [ -f /etc/l2xpanel/panel.env ] && [ -f /opt/l2xpanel/app.py ]; then",
+            "  curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh | bash -s -- --update",
+            "else",
+            "  curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh | bash -s -- --yes",
+            "fi",
+            "",
+        ])
+        with sftp.file("/tmp/l2x_remote_install.sh", "w") as f:
+            f.write(env_body)
+        remote_py = (
+            "import json\nfrom pathlib import Path\n"
+            f"TOKEN={agent_tok!r}; DOMAIN={domain!r}; PATH_={panel_path!r}\n"
+            "store_path = Path('/var/lib/l2xpanel/store.json')\n"
+            "store = json.loads(store_path.read_text()) if store_path.exists() else {}\n"
+            "s = store.setdefault('settings', {})\n"
+            "ns = s.setdefault('nodes', {})\n"
+            "ns['agent_enabled'] = True\n"
+            "ns['agent_token'] = TOKEN\n"
+            "ns['role'] = 'agent'\n"
+            "panel = s.setdefault('panel', {})\n"
+            "panel['public_host'] = DOMAIN\n"
+            "panel['base_path'] = PATH_\n"
+            "store_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))\n"
+            "print('agent_ok', TOKEN[:8], PATH_)\n"
+        )
+        with sftp.file("/tmp/l2x_agent_setup.py", "w") as f:
+            f.write(remote_py)
+        sftp.close()
+
+        r = _ssh_run(client, "bash /tmp/l2x_remote_install.sh; rm -f /tmp/l2x_remote_install.sh", timeout=900)
+        log.append(f"install exit={r['code']}")
+        log.append((r["stdout"] or "")[-2500:])
+        if r["stderr"]:
+            log.append("stderr: " + r["stderr"][-1500:])
+        if not _ssh_run(client, "test -f /opt/l2xpanel/app.py")["ok"]:
+            return {"ok": False, "error": "установка на ноде не удалась", "log": "\n".join(log), "node": node}
+
+        r2 = _ssh_run(
+            client,
+            "set -a; . /etc/l2xpanel/panel.env; set +a; "
+            "cd /opt/l2xpanel; .venv/bin/python /tmp/l2x_agent_setup.py; "
+            "systemctl restart l2xpanel; sleep 2; curl -s http://127.0.0.1:8090/health || true; "
+            "rm -f /tmp/l2x_agent_setup.py",
+            timeout=60,
+        )
+        log.append(r2["stdout"][-800:])
+        node["url"] = f"https://{domain}"
+        node["base_path"] = panel_path
+        node["token"] = agent_tok
+        return {
+            "ok": True,
+            "node": node,
+            "admin_password": admin_password,
+            "panel_url": f"https://{domain}/{panel_path}/",
+            "log": "\n".join(log),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "log": "\n".join(log), "node": node}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def promote_via_ssh(
+    node: dict,
+    *,
+    ssh_password: str,
+    master_store_snapshot: dict,
+    old_master_node: dict,
+) -> dict:
+    """Make remote node the new master: push store snapshot, disable agent, register old master as node."""
+    domain = node.get("domain") or ""
+    user = node.get("ssh_user") or "root"
+    port = int(node.get("ssh_port") or 22)
+    if not domain or not ssh_password:
+        return {"ok": False, "error": "нужны domain и SSH-пароль ноды"}
+    log = [f"promote {node.get('name')} → master"]
+    try:
+        client = _ssh_connect(domain, user, ssh_password, port)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"SSH: {exc}"}
+
+    try:
+        # Merge snapshot into remote store (clients/inbounds/routes/balancers/nodes)
+        snap = {
+            "clients": master_store_snapshot.get("clients") or [],
+            "inbounds": master_store_snapshot.get("inbounds") or [],
+            "routes": master_store_snapshot.get("routes") or [],
+            "balancers": master_store_snapshot.get("balancers") or {},
+            "outbounds_custom": master_store_snapshot.get("outbounds_custom") or [],
+            "dns": master_store_snapshot.get("dns") or {},
+            "xray_settings": master_store_snapshot.get("xray_settings") or {},
+            "l2tp": [],  # L2TP stays local to each host
+            "nodes": [old_master_node],
+        }
+        sftp = client.open_sftp()
+        with sftp.file("/tmp/l2x_promote.json", "w") as f:
+            f.write(json.dumps(snap, ensure_ascii=False))
+        promote_py = """
+import json
+from pathlib import Path
+snap = json.loads(Path('/tmp/l2x_promote.json').read_text())
+store_path = Path('/var/lib/l2xpanel/store.json')
+store = json.loads(store_path.read_text()) if store_path.exists() else {}
+for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes'):
+    if k in snap:
+        store[k] = snap[k]
+store.setdefault('settings', {}).setdefault('nodes', {})
+store['settings']['nodes']['agent_enabled'] = False
+store['settings']['nodes']['role'] = 'master'
+store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+print('promoted')
+"""
+        with sftp.file("/tmp/l2x_promote.py", "w") as f:
+            f.write(promote_py)
+        sftp.close()
+        r = _ssh_run(
+            client,
+            "set -a; . /etc/l2xpanel/panel.env; set +a; "
+            "cd /opt/l2xpanel; .venv/bin/python /tmp/l2x_promote.py; "
+            "systemctl restart l2xpanel; sleep 2; "
+            "rm -f /tmp/l2x_promote.py /tmp/l2x_promote.json; "
+            "curl -s http://127.0.0.1:8090/health",
+            timeout=90,
+        )
+        log.append(r["stdout"][-500:])
+        ok = r["ok"] and "promoted" in (r["stdout"] or "")
+        return {"ok": ok, "log": "\n".join(log), "error": "" if ok else (r["stderr"] or "promote failed")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "log": "\n".join(log)}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass

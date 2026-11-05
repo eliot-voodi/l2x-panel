@@ -184,6 +184,18 @@
       {% block top_actions %}{% endblock %}
     </div>
     <div class="content">
+      {% if panel_update %}
+      <div class="card upd-banner">
+        <div>
+          <b>Доступна новая версия панели {{ panel_update.latest }}</b>
+          <div class="small muted">Установлена {{ panel_update.current or '?' }}{% if panel_update.url %} · <a href="{{ panel_update.url }}" target="_blank" rel="noopener">релиз</a>{% endif %}</div>
+        </div>
+        <div class="actions">
+          <a class="btn sm" href="{{ bp }}/settings?tab=system">Обновить…</a>
+          <form method="post" action="{{ bp }}/panel/update/dismiss?next={{ cur_path|urlencode }}"><button class="btn ghost sm">Скрыть</button></form>
+        </div>
+      </div>
+      {% endif %}
       {% if xray_update %}
       <div class="card upd-banner">
         <div>

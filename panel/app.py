@@ -132,7 +132,8 @@ def default_settings() -> dict:
         },
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
-        "nodes": {"agent_enabled": False, "agent_token": ""},
+        "nodes": {"agent_enabled": False, "agent_token": "", "role": "master"},
+        "panel_update": {"auto_check": True, "interval_hours": 12},
         "iplimit": {"ban_minutes": 30},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
         "l2tp_auto": {
@@ -170,7 +171,8 @@ def _load_store() -> dict:
         except ValueError:
             data = {}
     for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
-                         ("ip_ban_stats", {}), ("xray_update_state", {}), ("l2tp_auto_state", {})):
+                         ("ip_ban_stats", {}), ("xray_update_state", {}), ("l2tp_auto_state", {}),
+                         ("panel_update_state", {}), ("nodes", [])):
         data.setdefault(key, default)
     data.setdefault("reverse", {"bridges": [], "portals": []})
     xray.ensure_balancers(data)
@@ -563,7 +565,9 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
         "lang": (s.get("panel") or {}).get("lang") or "ru", "public_host": public_host(),
         "panel_version": panel_version(),
         "xray_update": xray_update_banner() if _user(request) else None,
+        "panel_update": panel_update_banner() if _user(request) else None,
         "cur_path": _cur_path(request),
+        "is_master": nodes_mod.is_master(_load_store()) if _user(request) else True,
     }
     base.update(ctx)
     return templates.TemplateResponse(template, base, status_code=status_code)
@@ -964,6 +968,50 @@ def _xray_update_loop() -> None:
             return
 
 
+# ================================================================ Panel self-update
+
+PANEL_UPDATE_JOB: dict[str, str] = {}
+
+
+def check_panel_update(force: bool = False) -> dict:
+    latest = ops.panel_latest(False)
+    current = panel_version()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with mutate() as store:
+        st = store.setdefault("panel_update_state", {})
+        prev = st.get("latest")
+        st.update({"checked_at": now, "current": current, "error": "" if latest.get("ok") else latest.get("error", "")})
+        if latest.get("ok"):
+            st.update({"latest": latest["tag"], "url": latest.get("url") or "", "notes": latest.get("notes") or ""})
+        available = bool(st.get("latest")) and ops.version_tuple(st["latest"]) > ops.version_tuple(current)
+        st["available"] = available
+        if available and st.get("latest") != prev:
+            st["dismissed"] = ""
+        return dict(st)
+
+
+def panel_update_banner() -> dict | None:
+    st = _load_store().get("panel_update_state") or {}
+    if not st.get("available") or st.get("dismissed") == st.get("latest"):
+        return None
+    return st
+
+
+def _panel_update_loop() -> None:
+    if _stop.wait(90):
+        return
+    while True:
+        cfg = (_settings().get("panel_update") or {})
+        hours = max(1, _int(cfg.get("interval_hours"), 12))
+        if cfg.get("auto_check", True):
+            try:
+                check_panel_update()
+            except Exception:
+                pass
+        if _stop.wait(hours * 3600):
+            return
+
+
 # ================================================================ L2TP auto-select (best N by ping + speed)
 
 L2TP_AUTO_JOB: dict[str, str] = {}
@@ -1234,7 +1282,7 @@ def _startup():
     _admin()
     _ensure_base_path()
     _refresh_settings_cache()
-    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _l2tp_auto_loop):
+    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop, _l2tp_auto_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -2801,6 +2849,56 @@ def _next(request: Request, default: str = "/xray?tab=core") -> str:
     return nxt if nxt.startswith("/") and not nxt.startswith("//") else default
 
 
+@app.post("/panel/update/check")
+def panel_update_check(request: Request):
+    if redir := _require(request):
+        return redir
+    st = check_panel_update(force=True)
+    if st.get("error"):
+        flash(request, f"Проверка панели: {st['error']}", "error")
+    elif st.get("available"):
+        flash(request, f"Доступна панель {st['latest']} (сейчас {st.get('current')})", "info")
+    else:
+        flash(request, f"Установлена актуальная панель {st.get('current')}", "info")
+    return go(_next(request, "/settings?tab=system"))
+
+
+@app.post("/panel/update/install")
+def panel_update_install(request: Request, version: str = Form(...), confirm: str = Form("")):
+    if redir := _require(request):
+        return redir
+    st = _load_store().get("panel_update_state") or {}
+    if confirm != "yes" or version != st.get("latest"):
+        flash(request, "Обновление панели не подтверждено", "error")
+        return go("/settings?tab=system")
+    running = PANEL_UPDATE_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Обновление панели уже идёт", "info")
+        return go("/settings?tab=system")
+
+    def do_update():
+        res = ops.update_panel()
+        try:
+            check_panel_update(force=True)
+        except Exception:
+            pass
+        return res
+
+    PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update", do_update)
+    flash(request, f"Обновление панели до {version} запущено. Сервис перезапустится; обновите страницу через минуту.", "info")
+    return go("/settings?tab=system")
+
+
+@app.post("/panel/update/dismiss")
+def panel_update_dismiss(request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        st = store.setdefault("panel_update_state", {})
+        st["dismissed"] = st.get("latest") or ""
+    return go(_next(request, "/"))
+
+
 @app.post("/xray/update/check")
 def xray_update_check(request: Request):
     if redir := _require(request):
@@ -2915,6 +3013,7 @@ def settings_page(request: Request):
         ctx["certs"] = ops.list_certs()
     if tab == "system":
         ctx["bbr"] = ops.bbr_status()
+        ctx["store"] = store
     new_token = request.session.pop("new_api_token", None)
     return page(request, "settings.html", active="settings", tab=tab, s=s, admin=_admin(), new_token=new_token,
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5],
@@ -3271,6 +3370,9 @@ async def rest_api(path: str, request: Request):
 
 # ================================================================ nodes / agent
 
+NODES_JOB: dict[str, str] = {}
+
+
 @app.get("/nodes", response_class=HTMLResponse)
 def nodes_page(request: Request):
     if redir := _require(request):
@@ -3278,12 +3380,19 @@ def nodes_page(request: Request):
     with mutate() as store:
         nodes_mod.ensure_list(store)
         nodes_mod.agent_token(store)
+        nodes_mod.sync_all_node_outbounds(store)
     store = _load_store()
-    return page(request, "nodes.html", active="nodes", items=store["nodes"], ns=store["settings"].get("nodes") or {})
+    running = NODES_JOB.get("id")
+    return page(request, "nodes.html", active="nodes", items=store["nodes"],
+                ns=store["settings"].get("nodes") or {},
+                is_master=nodes_mod.is_master(store),
+                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
+                job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
 
 
 @app.post("/nodes/add")
 async def nodes_add(request: Request):
+    """Manual add (URL + token) — kept for already-installed agents."""
     if redir := _require(request):
         return redir
     form = await request.form()
@@ -3294,19 +3403,87 @@ async def nodes_add(request: Request):
         flash(request, "URL ноды должен начинаться с http", "error")
         return go("/nodes")
     with mutate() as store:
-        nodes_mod.ensure_list(store).append({
+        node = {
             "id": str(uuid.uuid4()), "name": name, "url": url, "token": token, "enabled": True,
             "sync_clients": form.get("sync_clients") == "1", "sync_inbounds": form.get("sync_inbounds") == "1",
-            "last_sync": "", "last_error": "", "last_ok": False,
-        })
+            "as_outbound": form.get("as_outbound") == "1", "domain": "", "ssh_user": "", "ssh_port": 22,
+            "last_sync": "", "last_error": "", "last_ok": False, "role": "agent",
+        }
+        if node["as_outbound"]:
+            nodes_mod.ensure_bridge(node)
+        nodes_mod.ensure_list(store).append(node)
+        nodes_mod.upsert_node_outbound(store, node)
     flash(request, f"Нода {name} добавлена", "info")
     return go("/nodes")
 
 
-@app.post("/nodes/{node_id}/{action}")
-def nodes_action(node_id: str, action: str, request: Request):
+@app.post("/nodes/provision")
+async def nodes_provision(request: Request):
+    """Install/configure a remote L2X node over SSH (domain + login + password)."""
     if redir := _require(request):
         return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только мастер может добавлять ноды", "error")
+        return go("/nodes")
+    form = await request.form()
+    domain = str(form.get("domain") or "").strip()
+    login = str(form.get("login") or "root").strip()
+    password = str(form.get("password") or "")
+    name = str(form.get("name") or "").strip()
+    port = _int(form.get("ssh_port"), 22)
+    as_outbound = form.get("as_outbound") == "1"
+    if not domain or not password:
+        flash(request, "Нужны domain и SSH-пароль", "error")
+        return go("/nodes")
+    running = NODES_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Уже идёт операция с нодами", "info")
+        return go("/nodes")
+
+    master = _load_store()
+    token = nodes_mod.agent_token(master)
+    # Ensure master has a stable agent token even when not in agent mode (used on remotes)
+    with mutate() as store:
+        nodes_mod.agent_token(store)
+        token = store["settings"]["nodes"]["agent_token"]
+    master_url = f"https://{public_host()}" if public_host() else ""
+
+    def job():
+        res = nodes_mod.provision_via_ssh(
+            domain=domain, ssh_user=login, ssh_password=password, ssh_port=port,
+            name=name, master_url=master_url, master_token=token, as_outbound=as_outbound,
+        )
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}
+        node = res["node"]
+        with mutate() as store:
+            nodes = nodes_mod.ensure_list(store)
+            # replace same domain if re-provisioning
+            nodes[:] = [n for n in nodes if (n.get("domain") or "") != node["domain"] and n.get("url") != node["url"]]
+            nodes.append(node)
+            nodes_mod.upsert_node_outbound(store, node)
+            payload = nodes_mod.build_payload(store, node, xray.build_config)
+            push = nodes_mod.push(node, payload)
+            xr = _apply_xray(store)
+        log = (res.get("log") or "") + f"\npanel: {res.get('panel_url')}\nadmin pass: {res.get('admin_password')}\n"
+        log += f"sync: {push.get('ok')} {push.get('error') or ''}\nxray: {xr.get('ok')}"
+        return {"ok": True, "log": log}
+
+    NODES_JOB["id"] = ops.start_job("node-provision", job)
+    flash(request, f"Установка ноды {domain} по SSH запущена (несколько минут). Смотрите фоновые задачи.", "info")
+    return go("/nodes")
+
+
+@app.post("/nodes/{node_id}/{action}")
+async def nodes_action(node_id: str, action: str, request: Request):
+    if redir := _require(request):
+        return redir
+    form = {}
+    if request.method == "POST":
+        try:
+            form = await request.form()
+        except Exception:
+            form = {}
     with mutate() as store:
         nodes = nodes_mod.ensure_list(store)
         node = next((n for n in nodes if n["id"] == node_id), None)
@@ -3315,18 +3492,90 @@ def nodes_action(node_id: str, action: str, request: Request):
             return go("/nodes")
         if action == "delete":
             nodes.remove(node)
+            nodes_mod.sync_all_node_outbounds(store)
+            _apply_xray(store)
             flash(request, "Нода удалена", "info")
             return go("/nodes")
         if action == "toggle":
             node["enabled"] = not node.get("enabled", True)
+            nodes_mod.upsert_node_outbound(store, node)
             flash(request, f"{node['name']}: {'вкл' if node['enabled'] else 'выкл'}", "info")
             return go("/nodes")
+        if action == "outbound":
+            node["as_outbound"] = not node.get("as_outbound")
+            if node["as_outbound"]:
+                nodes_mod.ensure_bridge(node)
+            nodes_mod.upsert_node_outbound(store, node)
+            payload = nodes_mod.build_payload(store, node, xray.build_config)
+            res = nodes_mod.push(node, payload)
+            xr = _apply_xray(store)
+            flash(request, *_ok_msg(
+                f"{node['name']}: outbound {'вкл' if node['as_outbound'] else 'выкл'}; sync={'OK' if res.get('ok') else res.get('error')}",
+                xr))
+            return go("/nodes")
         if action == "sync":
+            nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
             res = nodes_mod.push(node, payload)
             webhooks.fire(store["settings"], "node.sync", {"node": node["name"], "ok": res.get("ok"), "error": res.get("error")})
-            flash(request, f"{node['name']}: {'OK' if res.get('ok') else res.get('error') or 'ошибка'}",
-                  "info" if res.get("ok") else "error")
+            xr = _apply_xray(store)
+            flash(request, *_ok_msg(f"{node['name']}: {'OK' if res.get('ok') else res.get('error') or 'ошибка'}", xr))
+            return go("/nodes")
+        if action == "promote":
+            ssh_password = str(form.get("password") or "")
+            if not ssh_password:
+                flash(request, "Для передачи роли master нужен SSH-пароль ноды", "error")
+                return go("/nodes")
+            running = NODES_JOB.get("id")
+            if running and ops.JOBS.get(running, {}).get("status") == "running":
+                flash(request, "Уже идёт операция с нодами", "info")
+                return go("/nodes")
+            # Snapshot current master identity as a future agent node
+            old = {
+                "id": str(uuid.uuid4()),
+                "name": public_host() or "old-master",
+                "url": f"https://{public_host()}" if public_host() else "",
+                "domain": public_host() or "",
+                "token": nodes_mod.agent_token(store),
+                "enabled": True, "sync_clients": True, "sync_inbounds": True,
+                "as_outbound": True, "role": "agent",
+                "last_sync": "", "last_error": "", "last_ok": False,
+            }
+            nodes_mod.ensure_bridge(old)
+            snap = {
+                "clients": store.get("clients") or [],
+                "inbounds": store.get("inbounds") or [],
+                "routes": store.get("routes") or [],
+                "balancers": store.get("balancers") or {},
+                "outbounds_custom": store.get("outbounds_custom") or [],
+                "dns": store.get("dns") or {},
+                "xray_settings": store.get("xray_settings") or {},
+            }
+            node_copy = dict(node)
+
+            def job():
+                # 1) enable agent mode on current master
+                with mutate() as st:
+                    ns = st.setdefault("settings", {}).setdefault("nodes", {})
+                    ns["agent_enabled"] = True
+                    ns["role"] = "agent"
+                    nodes_mod.agent_token(st)
+                # 2) promote remote
+                res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
+                                               master_store_snapshot=snap, old_master_node=old)
+                if not res.get("ok"):
+                    # rollback role
+                    with mutate() as st:
+                        st["settings"]["nodes"]["agent_enabled"] = False
+                        st["settings"]["nodes"]["role"] = "master"
+                    return {"ok": False, "error": res.get("error"), "log": res.get("log") or ""}
+                # 3) remove promoted node from local registry (we are agent now); keep others
+                with mutate() as st:
+                    st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
+                return {"ok": True, "log": (res.get("log") or "") + f"\nНовый master: https://{node_copy.get('domain')}/ — откройте его панель."}
+
+            NODES_JOB["id"] = ops.start_job("node-promote", job)
+            flash(request, f"Передача роли master → {node['name']} запущена", "info")
             return go("/nodes")
     flash(request, "Неизвестное действие", "error")
     return go("/nodes")
@@ -3338,6 +3587,7 @@ def nodes_sync_all(request: Request):
         return redir
     ok = fail = 0
     with mutate() as store:
+        nodes_mod.sync_all_node_outbounds(store)
         for node in nodes_mod.ensure_list(store):
             if not node.get("enabled", True):
                 continue
@@ -3346,6 +3596,7 @@ def nodes_sync_all(request: Request):
             ok += 1 if res.get("ok") else 0
             fail += 0 if res.get("ok") else 1
             webhooks.fire(store["settings"], "node.sync", {"node": node["name"], "ok": res.get("ok")})
+        _apply_xray(store)
     flash(request, f"Синхронизация: OK {ok}, ошибок {fail}", "info" if not fail else "error")
     return go("/nodes")
 

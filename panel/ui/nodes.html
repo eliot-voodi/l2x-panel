@@ -3,54 +3,103 @@
 {% import "_icons.html" as ic %}
 {% block title %}Nodes · {{ app_name }}{% endblock %}
 {% block page_title %}Nodes{% endblock %}
-{% block page_sub %}Мультиноды: пуш клиентов и Xray-конфига на удалённые L2X-агенты{% endblock %}
+{% block page_sub %}{% if is_master %}Мастер: SSH-установка нод, sync, outbound, передача роли{% else %}Режим агента — конфиг приходит с мастера{% endif %}{% endblock %}
 {% block top_actions %}
-<form method="post" action="{{ bp }}/nodes/sync-all" style="display:inline"><button class="btn ghost">Синхронизировать все</button></form>
+{% if is_master %}
+<form method="post" action="{{ bp }}/nodes/sync-all" style="display:inline"><button class="btn ghost" {% if job_running %}disabled{% endif %}>Синхронизировать все</button></form>
+{% endif %}
 {% endblock %}
 {% block content %}
 <div class="card">
   <h3>Как это работает</h3>
-  <div class="hint">На удалённой панели включите <b>Settings → Nodes agent</b>, скопируйте token. Здесь добавьте ноду с её URL и token, затем Sync. L2TP-туннели на ноду не переносятся (заменяются на freedom). TUIC в Xray нет — используйте Hysteria2.</div>
+  <div class="hint">
+    <b>Мастер</b> ставит ноду по SSH (domain + login + pass), включает agent token и пушит клиентов/inbounds.
+    Галочка <b>Outbound</b> поднимает на ноде VLESS/WS bridge — мастер получает outbound <code>node_…</code> (клиенты могут уходить через эту ноду).
+    <b>Сделать мастером</b> передаёт роль: текущая панель становится агентом, выбранная нода — новым мастером (нужен SSH-пароль).
+  </div>
+  {% if not is_master %}
+  <div class="badge warn">Эта панель сейчас agent. Управление нодами — на master.</div>
+  {% endif %}
 </div>
 
+{% include "_jobs.html" %}
+
+{% if is_master %}
 <div class="card" style="padding:0">
   <div class="table-wrap">
   <table>
-    <thead><tr><th>Нода</th><th>URL</th><th>Статус</th><th>Последний sync</th><th class="right">{{ t('Действия') }}</th></tr></thead>
+    <thead><tr>
+      <th>Нода</th><th>Domain / URL</th><th>Outbound</th><th>Статус</th><th>Sync</th><th class="right">{{ t('Действия') }}</th>
+    </tr></thead>
     <tbody>
     {% for n in items %}
       <tr>
         <td><b>{{ n.name }}</b><div class="dim small mono">{{ n.id[:8] }}</div></td>
-        <td class="small mono">{{ n.url }}</td>
+        <td class="small mono">{{ n.domain or n.url }}{% if n.base_path %}<div class="dim">/{{ n.base_path }}/</div>{% endif %}</td>
+        <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
         <td>{% if not n.enabled %}<span class="badge">выкл</span>{% elif n.last_ok %}<span class="badge ok">ok</span>{% elif n.last_error %}<span class="badge err" title="{{ n.last_error }}">ошибка</span>{% else %}<span class="badge">—</span>{% endif %}</td>
-        <td class="small dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% if n.last_error %}<div class="badge err">{{ n.last_error[:80] }}</div>{% endif %}{% else %}никогда{% endif %}</td>
+        <td class="small dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}{% if n.last_error %}<div class="badge err">{{ n.last_error[:60] }}</div>{% endif %}</td>
         <td>
-          <div class="actions" style="justify-content:flex-end">
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm">Sync</button></form>
+          <div class="actions" style="justify-content:flex-end;flex-wrap:wrap">
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm" title="Использовать как outbound">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/promote" class="flex" style="gap:.3rem"
+                  onsubmit="return confirm('Передать роль MASTER ноде {{ n.name }}?\nЭта панель станет агентом.')">
+              <input type="password" name="password" placeholder="SSH pass" required style="width:7rem;padding:.25rem .4rem;font-size:.75rem">
+              <button class="btn sm" {% if job_running %}disabled{% endif %}>→ Master</button>
+            </form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду?')"><button class="btn danger icon">{{ ic.icon('trash') }}</button></form>
           </div>
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="5" class="empty">Нод пока нет — добавьте первую ниже</td></tr>
+      <tr><td colspan="6" class="empty">Нод пока нет — установите первую по SSH ниже</td></tr>
     {% endfor %}
     </tbody>
   </table>
   </div>
 </div>
 
-<form class="card" method="post" action="{{ bp }}/nodes/add" style="max-width:720px">
-  <h3>Добавить ноду</h3>
+<form class="card" method="post" action="{{ bp }}/nodes/provision" style="max-width:820px"
+      onsubmit="return confirm('Установить L2X на '+this.domain.value+' по SSH? Это займёт несколько минут.')">
+  <h3>Установить ноду по SSH</h3>
   <div class="row">
-    <div><label class="f">Имя</label><input name="name" placeholder="eu-2" required></div>
-    <div style="flex:2"><label class="f">URL панели</label><input name="url" placeholder="https://node.example.com" required></div>
+    <div><label class="f">Имя</label><input name="name" placeholder="eu-2"></div>
+    <div style="flex:2"><label class="f">Domain</label><input name="domain" placeholder="node.example.com" required></div>
   </div>
-  <label class="f">Agent token</label><input name="token" class="mono" required>
+  <div class="row">
+    <div><label class="f">SSH login</label><input name="login" value="root" required></div>
+    <div><label class="f">SSH password</label><input name="password" type="password" required autocomplete="new-password"></div>
+    <div style="max-width:100px"><label class="f">Port</label><input name="ssh_port" type="number" value="22"></div>
+  </div>
   <div class="mt">
-    <input type="hidden" name="sync_clients" value="0">{{ m.check('sync_clients', True, 'Синхронизировать клиентов') }}
-    <input type="hidden" name="sync_inbounds" value="0">{{ m.check('sync_inbounds', True, 'Синхронизировать inbounds') }}
+    {{ m.check('as_outbound', True, 'Сразу сделать outbound (VLESS bridge на ноде)') }}
   </div>
-  <div class="actions mt"><button class="btn">{{ t('Добавить') }}</button></div>
+  <div class="hint">A-запись domain → IP сервера. Установщик поставит панель, выпустит сертификат, включит agent. Пароль админа ноды будет в логе задачи.</div>
+  <div class="actions mt"><button class="btn" {% if job_running %}disabled{% endif %}>Установить по SSH</button></div>
 </form>
+
+<details class="card">
+  <summary style="cursor:pointer"><b>Добавить вручную</b> (уже установленный агент)</summary>
+  <form method="post" action="{{ bp }}/nodes/add" style="max-width:720px;margin-top:1rem">
+    <div class="row">
+      <div><label class="f">Имя</label><input name="name" placeholder="eu-2" required></div>
+      <div style="flex:2"><label class="f">URL панели</label><input name="url" placeholder="https://node.example.com" required></div>
+    </div>
+    <label class="f">Agent token</label><input name="token" class="mono" required>
+    <div class="mt">
+      {{ m.check('sync_clients', True, 'Синхронизировать клиентов') }}
+      {{ m.check('sync_inbounds', True, 'Синхронизировать inbounds') }}
+      {{ m.check('as_outbound', False, 'Использовать как outbound') }}
+    </div>
+    <div class="actions mt"><button class="btn ghost">{{ t('Добавить') }}</button></div>
+  </form>
+</details>
+{% else %}
+<div class="card">
+  <h3>Agent</h3>
+  <div class="hint">В Settings → Nodes agent должен быть включён приём конфига. Outbound-bridge и клиенты приходят с мастера автоматически.</div>
+</div>
+{% endif %}
 {% endblock %}

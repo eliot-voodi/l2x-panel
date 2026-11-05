@@ -8,7 +8,7 @@
 Р° С‚СЂР°С„РёРє СѓС…РѕРґРёС‚ РІ РёРЅС‚РµСЂРЅРµС‚ С‡РµСЂРµР· РІС‹Р±СЂР°РЅРЅС‹Р№ L2TP-С‚СѓРЅРЅРµР»СЊ, WireGuard, WARP РёР»Рё РЅР°РїСЂСЏРјСѓСЋ.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.4.0-cyan)
+![Version](https://img.shields.io/badge/version-1.5.0-cyan)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Xray-core](https://img.shields.io/badge/Xray--core-26.x-purple)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-orange)

@@ -365,8 +365,13 @@ def outbound_label(store: dict, tag: str) -> str:
     for o in store.get("outbounds_custom") or []:
         if o["tag"] == tag:
             cc = o.get("country") or ""
+            if o.get("kind") == "node":
+                icon = flag_emoji(cc) if cc else "🖥️"
+                return f"{icon} Node {o.get('remark') or tag}"
             icon = flag_emoji(cc) if cc else "🔗"
             return f"{icon} {o.get('remark') or tag}"
+    if tag.startswith("node_"):
+        return f"🖥️ {tag}"
     return tag
 
 

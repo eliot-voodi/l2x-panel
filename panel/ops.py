@@ -74,6 +74,61 @@ def version_tuple(v: str) -> tuple[int, ...]:
     return tuple(nums)
 
 
+PANEL_REPO = os.environ.get("L2X_REPO_API", "eliot-voodi/l2x-panel")
+
+
+def panel_latest(include_prerelease: bool = False) -> dict:
+    """Newest L2X Panel release on GitHub."""
+    try:
+        data = json.loads(_http(f"https://api.github.com/repos/{PANEL_REPO}/releases?per_page=15", 20))
+    except Exception as exc:
+        return {"ok": False, "error": f"GitHub: {exc}"}
+    best = None
+    for r in data:
+        if r.get("draft") or not r.get("tag_name"):
+            continue
+        if r.get("prerelease") and not include_prerelease:
+            continue
+        if best is None or version_tuple(r["tag_name"]) > version_tuple(best["tag_name"]):
+            best = r
+    if not best:
+        # fall back to main VERSION file
+        try:
+            raw = _http(f"https://raw.githubusercontent.com/{PANEL_REPO}/main/VERSION", 15).decode().strip()
+            return {"ok": True, "tag": raw if raw.startswith("v") else f"v{raw}", "url": "", "published": "",
+                    "prerelease": False, "notes": ""}
+        except Exception as exc:
+            return {"ok": False, "error": f"нет релизов: {exc}"}
+    return {
+        "ok": True,
+        "tag": best["tag_name"],
+        "url": best.get("html_url") or "",
+        "published": best.get("published_at") or "",
+        "prerelease": bool(best.get("prerelease")),
+        "notes": (best.get("body") or "")[:4000],
+    }
+
+
+def update_panel() -> dict:
+    """Run install.sh --update (keeps data). Panel process will restart."""
+    script = (
+        "curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
+        "| bash -s -- --update"
+    )
+    if Path("/usr/local/bin/l2x").exists():
+        r = _run(["/usr/local/bin/l2x", "update"], timeout=900)
+    else:
+        r = _run(["bash", "-lc", script], timeout=900)
+    log = (r.get("stdout") or "")[-3000:] + ("\n" + (r.get("stderr") or "")[-1000:] if r.get("stderr") else "")
+    ver = ""
+    try:
+        ver = Path("/opt/l2xpanel/VERSION").read_text(encoding="utf-8").strip().splitlines()[0]
+    except OSError:
+        pass
+    return {"ok": bool(r.get("ok")), "log": log or f"exit {r.get('code')}", "version": ver,
+            "error": "" if r.get("ok") else (r.get("stderr") or "update failed")}
+
+
 def xray_latest(include_prerelease: bool = False) -> dict:
     """Newest Xray-core release on GitHub: {ok, tag, url, published, prerelease, notes} or {ok: False, error}."""
     try:
