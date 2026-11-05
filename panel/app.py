@@ -3733,22 +3733,13 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "last_sync": "", "last_error": "", "last_ok": False,
             }
             nodes_mod.ensure_bridge(old)
-            snap = {
-                "clients": store.get("clients") or [],
-                "inbounds": store.get("inbounds") or [],
-                "routes": store.get("routes") or [],
-                "balancers": store.get("balancers") or {},
-                "outbounds_custom": [
-                    o for o in (store.get("outbounds_custom") or [])
-                    if o.get("tag") != nodes_mod.node_outbound_tag(node)
-                ],
-                "dns": store.get("dns") or {},
-                "xray_settings": store.get("xray_settings") or {},
-            }
+            # Full master data → new master; outbound to THIS node remapped to direct
+            snap = nodes_mod.promote_snapshot(store, node)
             peers = [nodes_mod._peer_node_export(n) for n in nodes if n.get("id") != node.get("id")]
             node_copy = dict(node)
             use_api = bool(node.get("mirror")) and not ssh_password
             name = node["name"]
+            drop_tags = snap.get("drop_outbound_tags") or [nodes_mod.node_outbound_tag(node)]
 
         def job():
             import time as _time
@@ -3794,11 +3785,12 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "ok": True,
                 "log": "\n".join(x for x in log_lines if x)
                 + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."
+                + f"\nOutbound {', '.join(drop_tags)} → direct; остальные outbounds перенесены."
                 + "\nСтарый master стал agent с runtime_preserve (трафик не срезается).",
             }
 
         NODES_JOB["id"] = ops.start_job("node-promote", job)
-        flash(request, f"Передача роли master → {name} запущена ({'API' if use_api else 'SSH'}). Сначала поднимаем новую ноду, потом сдаём роль.", "info")
+        flash(request, f"Передача роли master → {name} запущена ({'API' if use_api else 'SSH'}). Все outbound переносятся, {nodes_mod.node_outbound_tag(node_copy)} → direct.", "info")
         return go("/nodes")
 
     flash(request, "Неизвестное действие", "error")

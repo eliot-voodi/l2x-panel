@@ -906,6 +906,88 @@ except Exception as exc:
             pass
 
 
+def _remap_outbound_tag(value: str, drop_tags: set[str]) -> str:
+    v = (value or "direct").strip() or "direct"
+    return "direct" if v in drop_tags else v
+
+
+def _remap_clients_drop_tags(clients: list[dict], drop_tags: set[str]) -> list[dict]:
+    out = []
+    for c in clients or []:
+        c = dict(c)
+        c["outbound"] = _remap_outbound_tag(c.get("outbound") or "direct", drop_tags)
+        out.append(c)
+    return out
+
+
+def _remap_routes_drop_tags(routes: list[dict], drop_tags: set[str]) -> list[dict]:
+    out = []
+    for r in routes or []:
+        r = dict(r)
+        if "outbound" in r or "outbound_tag" in r:
+            tag = r.get("outbound") or r.get("outbound_tag") or "direct"
+            r["outbound"] = _remap_outbound_tag(str(tag), drop_tags)
+            r.pop("outbound_tag", None)
+        out.append(r)
+    return out
+
+
+def _remap_balancers_drop_tags(balancers: dict, drop_tags: set[str]) -> dict:
+    bals = json.loads(json.dumps(balancers or {}))
+    for b in bals.values():
+        if not isinstance(b, dict):
+            continue
+        members = []
+        for m in b.get("members") or []:
+            if str(m) in drop_tags:
+                continue
+            members.append(m)
+        b["members"] = members or ["direct"]
+    return bals
+
+
+def _remap_inbounds_drop_tags(inbounds: list[dict], drop_tags: set[str]) -> list[dict]:
+    out = []
+    for ib in inbounds or []:
+        ib = dict(ib)
+        if ib.get("outbound"):
+            ib["outbound"] = _remap_outbound_tag(str(ib.get("outbound")), drop_tags)
+        out.append(ib)
+    return out
+
+
+def promote_snapshot(store: dict, target_node: dict) -> dict:
+    """Full master copy for the new master.
+
+    Transfers all outbounds/clients/routes/… except the outbound that pointed at
+    the target node itself (node_<slug>) — that tag is removed and every reference
+    to it is rewritten to ``direct``.
+    """
+    drop = {node_outbound_tag(target_node)}
+    # Also drop by node_id match (tag may have been renamed)
+    tid = target_node.get("id")
+    customs = []
+    for o in store.get("outbounds_custom") or []:
+        tag = str(o.get("tag") or "")
+        if tag in drop or (tid and o.get("node_id") == tid):
+            if tag:
+                drop.add(tag)
+            continue
+        customs.append(json.loads(json.dumps(o)))  # deep copy
+    return {
+        "clients": _remap_clients_drop_tags(store.get("clients") or [], drop),
+        "inbounds": _remap_inbounds_drop_tags(store.get("inbounds") or [], drop),
+        "routes": _remap_routes_drop_tags(store.get("routes") or [], drop),
+        "balancers": _remap_balancers_drop_tags(store.get("balancers") or {}, drop),
+        "outbounds_custom": customs,
+        "dns": json.loads(json.dumps(store.get("dns") or {})),
+        "xray_settings": json.loads(json.dumps(store.get("xray_settings") or {})),
+        # L2TP stays host-local — configs without running tunnels would break Xray
+        "l2tp": [],
+        "drop_outbound_tags": sorted(drop),
+    }
+
+
 def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_nodes: list[dict] | None = None) -> dict:
     """Body for /agent/promote — final snapshot + old master as a peer node."""
     peers = list(extra_nodes or [])
