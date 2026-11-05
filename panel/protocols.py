@@ -475,9 +475,15 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
         out["streamSettings"] = _hysteria_stream(ib)
     elif proto in USER_PROTOCOLS:
         out["streamSettings"] = build_stream_settings(ib.get("stream") or {})
-        if front_mode(ib) == "sni":
+        mode = front_mode(ib)
+        if mode == "sni":
             # nginx stream sends PROXY protocol so Xray sees the real client IP
             out["streamSettings"].setdefault("sockopt", {})["acceptProxyProtocol"] = True
+        elif mode == "http":
+            # nginx already matched the domain; a Host check in Xray only turns typos into 404
+            for key in ("wsSettings", "httpupgradeSettings", "xhttpSettings"):
+                out["streamSettings"].get(key, {}).pop("host", None)
+            out["streamSettings"].get("grpcSettings", {}).pop("authority", None)
     sn = ib.get("sniffing") or {}
     if sn.get("enabled"):
         out["sniffing"] = {
@@ -660,7 +666,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
             "address": domain,
             "security": "tls",
             "sni": domain,
-            "host": ep.get("host") or domain,
+            "host": domain,
             "fp": "chrome",
             "alpn": "h2,http/1.1" if net in ("grpc", "xhttp") else "http/1.1",
             "allow_insecure": False,
