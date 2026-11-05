@@ -210,24 +210,34 @@ FRONT_CERT_RETRY = 3600
 _front_cert_tried: dict[str, float] = {}
 
 
-def _apply_xray(store: dict) -> dict:
-    """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails."""
+def _apply_xray(store: dict, *, persist: bool = True) -> dict:
+    """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails.
+
+    On agent nodes, Xray is built from a runtime view (no local L2TP) while the persisted
+    store may still hold a full mirror of the master for fast failover.
+    """
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    is_agent = bool(ns.get("agent_enabled") and (ns.get("role") or "") == "agent")
+    runtime = nodes_mod.agent_runtime_store(store) if is_agent else store
     with STORE_LOCK:
-        xray.ensure_inbounds(store)
+        xray.ensure_inbounds(runtime)
+        # Front/certs use the real store (domains, base_path); Xray uses runtime
         staged = front.stage(store)
         if not staged["ok"]:
             return {"ok": False, "error": staged["error"], "verified": False}
-        result = xray.apply_config(store)
+        result = xray.apply_config(runtime)
         if not result.get("ok"):
             front.rollback(staged)
-            _save_store(store)
+            if persist:
+                _save_store(store)
             return result
         fr = front.commit(staged)
         if not fr["ok"]:
             result = {**result, "ok": False, "error": fr["error"]}
         elif staged.get("problems"):
             result = {**result, "warning": "; ".join(staged["problems"])}
-        _save_store(store)
+        if persist:
+            _save_store(store)
     _issue_front_certs(store)
     return result
 
@@ -3429,10 +3439,13 @@ async def nodes_add(request: Request):
         flash(request, self_err, "error")
         return go("/nodes")
     with mutate() as store:
+        mirror = form.get("mirror") == "1"
         node = {
             "id": str(uuid.uuid4()), "name": name, "url": origin, "token": token, "enabled": True,
-            "sync_clients": form.get("sync_clients") == "1", "sync_inbounds": form.get("sync_inbounds") == "1",
-            "as_outbound": form.get("as_outbound") == "1", "domain": host, "base_path": base_path,
+            "sync_clients": True if mirror else form.get("sync_clients") == "1",
+            "sync_inbounds": True if mirror else form.get("sync_inbounds") == "1",
+            "as_outbound": True if mirror else form.get("as_outbound") == "1",
+            "mirror": mirror, "domain": host, "base_path": base_path,
             "ssh_user": "", "ssh_port": 22,
             "last_sync": "", "last_error": "", "last_ok": False, "role": "agent",
         }
@@ -3459,6 +3472,9 @@ async def nodes_provision(request: Request):
     name = str(form.get("name") or "").strip()
     port = _int(form.get("ssh_port"), 22)
     as_outbound = form.get("as_outbound") == "1"
+    mirror = form.get("mirror") == "1"
+    if mirror:
+        as_outbound = True
     if not domain or not password:
         flash(request, "Нужны domain и SSH-пароль", "error")
         return go("/nodes")
@@ -3487,7 +3503,7 @@ async def nodes_provision(request: Request):
         res = nodes_mod.provision_via_ssh(
             domain=domain, ssh_user=login, ssh_password=password, ssh_port=port,
             name=name, master_url=master_url, master_token=token,
-            master_host=public_host(), as_outbound=as_outbound,
+            master_host=public_host(), as_outbound=as_outbound, mirror=mirror,
         )
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}
@@ -3557,6 +3573,23 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 f"{node['name']}: outbound {'вкл' if node['as_outbound'] else 'выкл'}; sync={'OK' if res.get('ok') else res.get('error')}",
                 xr))
             return go("/nodes")
+        if action == "mirror":
+            node["mirror"] = not node.get("mirror")
+            if node["mirror"]:
+                node["sync_clients"] = True
+                node["sync_inbounds"] = True
+                # Standby copy is most useful when the node is also an egress outbound
+                if not node.get("as_outbound"):
+                    node["as_outbound"] = True
+                    nodes_mod.ensure_bridge(node)
+            nodes_mod.upsert_node_outbound(store, node)
+            payload = nodes_mod.build_payload(store, node, xray.build_config)
+            res = nodes_mod.push(node, payload, master_host=public_host())
+            xr = _apply_xray(store)
+            flash(request, *_ok_msg(
+                f"{node['name']}: зеркало {'вкл' if node['mirror'] else 'выкл'}; sync={'OK' if res.get('ok') else res.get('error')}",
+                xr))
+            return go("/nodes")
         if action == "sync":
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
@@ -3622,8 +3655,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
             return go("/nodes")
         if action == "promote":
             ssh_password = str(form.get("password") or "")
-            if not ssh_password:
-                flash(request, "Для передачи роли master нужен SSH-пароль ноды", "error")
+            if not ssh_password and not node.get("mirror"):
+                flash(request, "Нужен SSH-пароль ноды (для зеркала можно без пароля — через API)", "error")
                 return go("/nodes")
             running = NODES_JOB.get("id")
             if running and ops.JOBS.get(running, {}).get("status") == "running":
@@ -3637,7 +3670,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "domain": public_host() or "",
                 "token": nodes_mod.agent_token(store),
                 "enabled": True, "sync_clients": True, "sync_inbounds": True,
-                "as_outbound": True, "role": "agent",
+                "as_outbound": True, "mirror": bool(node.get("mirror")),
+                "base_path": base_path().strip("/"), "role": "agent",
                 "last_sync": "", "last_error": "", "last_ok": False,
             }
             nodes_mod.ensure_bridge(old)
@@ -3646,11 +3680,17 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "inbounds": store.get("inbounds") or [],
                 "routes": store.get("routes") or [],
                 "balancers": store.get("balancers") or {},
-                "outbounds_custom": store.get("outbounds_custom") or [],
+                "outbounds_custom": [
+                    o for o in (store.get("outbounds_custom") or [])
+                    if o.get("tag") != nodes_mod.node_outbound_tag(node)
+                ],
                 "dns": store.get("dns") or {},
                 "xray_settings": store.get("xray_settings") or {},
             }
+            # Other peers stay in the new master's registry
+            peers = [nodes_mod._peer_node_export(n) for n in nodes if n.get("id") != node.get("id")]
             node_copy = dict(node)
+            use_api = bool(node.get("mirror")) and not ssh_password
 
             def job():
                 # 1) enable agent mode on current master
@@ -3659,9 +3699,13 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     ns["agent_enabled"] = True
                     ns["role"] = "agent"
                     nodes_mod.agent_token(st)
-                # 2) promote remote
-                res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
-                                               master_store_snapshot=snap, old_master_node=old)
+                # 2) promote remote — mirrored nodes prefer HTTP (data already on disk)
+                if use_api:
+                    body = nodes_mod.promote_payload(snap, old, extra_nodes=peers)
+                    res = nodes_mod.promote_via_api(node_copy, body)
+                else:
+                    res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
+                                                   master_store_snapshot=snap, old_master_node=old)
                 if not res.get("ok"):
                     # rollback role
                     with mutate() as st:
@@ -3671,10 +3715,11 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 # 3) remove promoted node from local registry (we are agent now); keep others
                 with mutate() as st:
                     st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
-                return {"ok": True, "log": (res.get("log") or "") + f"\nНовый master: https://{node_copy.get('domain')}/ — откройте его панель."}
+                via = "API" if use_api else "SSH"
+                return {"ok": True, "log": (res.get("log") or "") + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."}
 
             NODES_JOB["id"] = ops.start_job("node-promote", job)
-            flash(request, f"Передача роли master → {node['name']} запущена", "info")
+            flash(request, f"Передача роли master → {node['name']} запущена ({'API' if use_api else 'SSH'})", "info")
             return go("/nodes")
     flash(request, "Неизвестное действие", "error")
     return go("/nodes")
@@ -3739,6 +3784,42 @@ async def agent_update(request: Request):
     return {"ok": True, "started": True, "current": panel_version()}
 
 
+@app.post("/agent/promote")
+async def agent_promote(request: Request):
+    """Flip this mirrored agent to master using already-synced (or final) store data."""
+    store, err = _agent_auth(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    if not isinstance(payload, dict) or str(payload.get("confirm") or "") != "yes":
+        return JSONResponse({"ok": False, "error": "confirm required"}, status_code=400)
+    with mutate() as st:
+        for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings"):
+            if key in payload and payload[key] is not None:
+                st[key] = payload[key]
+        if payload.get("nodes") is not None:
+            st["nodes"] = payload["nodes"]
+        elif payload.get("old_master"):
+            nodes = nodes_mod.ensure_list(st)
+            old = payload["old_master"]
+            nodes[:] = [n for n in nodes if n.get("id") != old.get("id")]
+            nodes.insert(0, old)
+        ns = st.setdefault("settings", {}).setdefault("nodes", {})
+        ns["agent_enabled"] = False
+        ns["role"] = "master"
+        ns["mirror"] = False
+    res = _apply_xray(_load_store())
+    err_txt = res.get("error") or ""
+    try:
+        err_txt = xray.clean_xray_error(err_txt) or err_txt
+    except Exception:
+        pass
+    return {"ok": bool(res.get("ok")), "error": err_txt, "role": "master", "version": panel_version()}
+
+
 @app.post("/agent/apply")
 async def agent_apply(request: Request):
     """Remote node agent: accept pushed config from master panel."""
@@ -3749,34 +3830,52 @@ async def agent_apply(request: Request):
         payload = await request.json()
     except ValueError:
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    mirror = bool(payload.get("mirror"))
     with mutate() as st:
         if payload.get("clients") is not None:
-            st["clients"] = nodes_mod._agent_safe_clients(payload["clients"])
+            # Mirror keeps master's outbound tags; non-mirror remaps missing ones
+            st["clients"] = (
+                list(payload["clients"]) if mirror
+                else nodes_mod._agent_safe_clients(payload["clients"])
+            )
         if payload.get("inbounds") is not None:
             st["inbounds"] = payload["inbounds"]
         if payload.get("outbounds_custom") is not None:
-            st["outbounds_custom"] = [
-                o for o in (payload["outbounds_custom"] or []) if o.get("kind") != "node"
-            ]
+            if mirror:
+                st["outbounds_custom"] = list(payload["outbounds_custom"] or [])
+            else:
+                st["outbounds_custom"] = [
+                    o for o in (payload["outbounds_custom"] or []) if o.get("kind") != "node"
+                ]
         if payload.get("routes") is not None:
-            st["routes"] = nodes_mod._agent_safe_routes(payload["routes"])
+            st["routes"] = (
+                list(payload["routes"]) if mirror
+                else nodes_mod._agent_safe_routes(payload["routes"])
+            )
         if payload.get("balancers") is not None:
-            st["balancers"] = nodes_mod._agent_safe_balancers(payload["balancers"])
+            st["balancers"] = (
+                payload["balancers"] if mirror
+                else nodes_mod._agent_safe_balancers(payload["balancers"])
+            )
         if payload.get("dns") is not None:
             st["dns"] = payload["dns"]
         if payload.get("xray_settings") is not None:
             st["xray_settings"] = payload["xray_settings"]
+        if mirror and payload.get("nodes") is not None:
+            # Peer registry for failover — does not include this agent as master yet
+            st["nodes"] = list(payload["nodes"] or [])
         # Keep agent mode sticky — a pushed payload must never demote/disable agent
         ns = st.setdefault("settings", {}).setdefault("nodes", {})
         ns["agent_enabled"] = True
         ns["role"] = "agent"
+        ns["mirror"] = mirror
     res = _apply_xray(_load_store())
     err = res.get("error") or ""
     try:
         err = xray.clean_xray_error(err) or err
     except Exception:
         pass
-    return {"ok": bool(res.get("ok")), "error": err}
+    return {"ok": bool(res.get("ok")), "error": err, "mirror": mirror}
 
 
 @app.get("/api-docs", response_class=HTMLResponse)

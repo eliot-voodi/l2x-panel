@@ -34,6 +34,8 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("sync_clients", True)
         n.setdefault("sync_inbounds", True)
         n.setdefault("as_outbound", False)
+        # Full standby copy of master (clients/outbounds/routes/…) while still acting as outbound
+        n.setdefault("mirror", False)
         n.setdefault("domain", "")
         n.setdefault("ssh_user", "")
         n.setdefault("ssh_port", 22)
@@ -182,44 +184,87 @@ def sync_all_node_outbounds(store: dict) -> None:
     ]
 
 
-def _agent_safe_clients(clients: list[dict]) -> list[dict]:
+def _agent_safe_clients(clients: list[dict], *, keep_node: bool = False) -> list[dict]:
     """Agent has no master's L2TP ifaces — remap dangling outbound tags to direct."""
     out = []
     for c in clients or []:
         c = dict(c)
         ob = (c.get("outbound") or "direct").strip()
-        if ob.startswith("l2tp_") or ob.startswith("node_"):
+        if ob.startswith("l2tp_") or (ob.startswith("node_") and not keep_node):
             c["outbound"] = "direct"
         out.append(c)
     return out
 
 
-def _agent_safe_routes(routes: list[dict]) -> list[dict]:
+def _agent_safe_routes(routes: list[dict], *, keep_node: bool = False) -> list[dict]:
     out = []
     for r in routes or []:
         r = dict(r)
         ob = (r.get("outbound") or r.get("outbound_tag") or "direct").strip()
-        if ob.startswith("l2tp_") or ob.startswith("node_"):
+        if ob.startswith("l2tp_") or (ob.startswith("node_") and not keep_node):
             r["outbound"] = "direct"
             r.pop("outbound_tag", None)
         out.append(r)
     return out
 
 
-def _agent_safe_balancers(balancers: dict) -> dict:
+def _agent_safe_balancers(balancers: dict, *, keep_node: bool = False) -> dict:
     """Drop explicit L2TP members — agent will use connected local tunnels or [direct]."""
     bals = json.loads(json.dumps(balancers or {}))  # deep copy
     for b in bals.values():
         if not isinstance(b, dict):
             continue
         members = b.get("members") or []
-        b["members"] = [m for m in members if not str(m).startswith("l2tp_") and not str(m).startswith("node_")]
+        cleaned = []
+        for m in members:
+            s = str(m)
+            if s.startswith("l2tp_"):
+                continue
+            if s.startswith("node_") and not keep_node:
+                continue
+            cleaned.append(m)
+        b["members"] = cleaned
     return bals
 
 
+def _peer_node_export(n: dict) -> dict:
+    """Registry fields safe to push to a mirror (no secrets beyond agent token)."""
+    keys = (
+        "id", "name", "url", "token", "enabled", "sync_clients", "sync_inbounds",
+        "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
+        "bridge_uuid", "bridge_path", "role", "panel_version",
+    )
+    return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
+
+
+def agent_runtime_store(store: dict) -> dict:
+    """Deep copy for live Xray on an agent: drop local L2TP; keep peer node_* only in mirror mode."""
+    s = json.loads(json.dumps(store))
+    ns = (s.get("settings") or {}).get("nodes") or {}
+    keep_node = bool(ns.get("mirror"))
+    s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
+    s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
+    s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=keep_node)
+    s["l2tp"] = []
+    customs = []
+    for o in s.get("outbounds_custom") or []:
+        tag = str(o.get("tag") or "")
+        if tag.startswith("l2tp_") or o.get("kind") == "l2tp":
+            continue
+        # Non-mirror agents never received peer node_* outbounds
+        if not keep_node and (o.get("kind") == "node" or tag.startswith("node_")):
+            continue
+        customs.append(o)
+    s["outbounds_custom"] = customs
+    return s
+
+
 def build_payload(store: dict, node: dict, build_config) -> dict:
-    """Subset for a remote agent: clients + inbounds + xray config without local L2TP ifaces."""
-    clients = _agent_safe_clients(store.get("clients") or [])
+    """Config push for a remote agent. mirror=True → full master copy for fast failover."""
+    mirror = bool(node.get("mirror"))
+    if mirror:
+        node["sync_clients"] = True
+        node["sync_inbounds"] = True
     inbounds = list(store.get("inbounds") or [])
     # Ensure bridge inbound exists on agent when used as outbound
     if node.get("as_outbound"):
@@ -227,7 +272,6 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         inbounds = [i for i in inbounds if i.get("tag") != "node-bridge"]
         inbounds.append(bridge_inbound(node))
     self_tag = node_outbound_tag(node)
-    # Also send bridge client into the main clients list so Xray email routing works if needed
     bridge_clients = []
     if node.get("as_outbound"):
         bridge_clients = [{
@@ -236,20 +280,35 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             "outbound": "direct", "limit_gb": 0, "limit_ip": 0, "limit_hwid": 0,
             "sub_enabled": False, "comment": "node bridge (auto)",
         }]
-    # Agent store snapshot (no master's L2TP-bound custom outbounds that need local ifaces)
-    customs = []
-    for o in store.get("outbounds_custom") or []:
-        if o.get("tag") == self_tag or o.get("kind") == "node":
-            continue
-        customs.append(o)
+
+    if mirror:
+        # Full copy: keep outbound tags and all custom/node outbounds (except this node itself)
+        clients = list(store.get("clients") or [])
+        customs = [o for o in (store.get("outbounds_custom") or []) if o.get("tag") != self_tag]
+        routes = list(store.get("routes") or [])
+        balancers = json.loads(json.dumps(store.get("balancers") or {}))
+        peers = [_peer_node_export(n) for n in ensure_list(store) if n.get("id") != node.get("id")]
+    else:
+        clients = _agent_safe_clients(store.get("clients") or [])
+        customs = []
+        for o in store.get("outbounds_custom") or []:
+            if o.get("tag") == self_tag or o.get("kind") == "node":
+                continue
+            customs.append(o)
+        routes = _agent_safe_routes(store.get("routes") or [])
+        balancers = _agent_safe_balancers(store.get("balancers") or {})
+        peers = None
+
     return {
+        "mirror": mirror,
         "clients": (clients if node.get("sync_clients", True) else []) + bridge_clients,
         "inbounds": inbounds if node.get("sync_inbounds", True) or node.get("as_outbound") else [],
         "outbounds_custom": customs,
-        "routes": _agent_safe_routes(store.get("routes") or []),
-        "balancers": _agent_safe_balancers(store.get("balancers") or {}),
+        "routes": routes,
+        "balancers": balancers,
         "dns": store.get("dns") or {},
         "xray_settings": store.get("xray_settings") or {},
+        "nodes": peers,
         "pushed_at": now_iso(),
         "node_id": node.get("id"),
         "bridge": {
@@ -588,6 +647,7 @@ def provision_via_ssh(
     master_token: str = "",
     master_host: str = "",
     as_outbound: bool = True,
+    mirror: bool = False,
     admin_password: str = "",
 ) -> dict:
     """Install/configure L2X on a remote host over SSH and return node registry fields."""
@@ -604,10 +664,13 @@ def provision_via_ssh(
     panel_path = secrets.token_urlsafe(9).replace("_", "").replace("-", "")[:12]
     agent_tok = master_token or secrets.token_urlsafe(32)
     node_id = str(uuid.uuid4())
+    mirror = bool(mirror)
+    if mirror:
+        as_outbound = True
     node = {
         "id": node_id, "name": name, "domain": domain, "ssh_user": ssh_user, "ssh_port": int(ssh_port or 22),
         "token": agent_tok, "enabled": True, "sync_clients": True, "sync_inbounds": True,
-        "as_outbound": bool(as_outbound), "base_path": panel_path, "role": "agent",
+        "as_outbound": bool(as_outbound), "mirror": mirror, "base_path": panel_path, "role": "agent",
         "url": f"https://{domain}", "last_sync": "", "last_error": "", "last_ok": False,
     }
     ensure_bridge(node)
@@ -811,6 +874,62 @@ except Exception as exc:
             pass
 
 
+def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_nodes: list[dict] | None = None) -> dict:
+    """Body for /agent/promote — final snapshot + old master as a peer node."""
+    peers = list(extra_nodes or [])
+    peers = [n for n in peers if n.get("id") != old_master_node.get("id")]
+    peers.insert(0, old_master_node)
+    return {
+        "confirm": "yes",
+        "clients": master_store_snapshot.get("clients") or [],
+        "inbounds": master_store_snapshot.get("inbounds") or [],
+        "routes": master_store_snapshot.get("routes") or [],
+        "balancers": master_store_snapshot.get("balancers") or {},
+        "outbounds_custom": master_store_snapshot.get("outbounds_custom") or [],
+        "dns": master_store_snapshot.get("dns") or {},
+        "xray_settings": master_store_snapshot.get("xray_settings") or {},
+        "nodes": peers,
+        "old_master": old_master_node,
+    }
+
+
+def promote_via_api(node: dict, payload: dict, timeout: int = 90) -> dict:
+    """Promote a mirrored agent to master over HTTP (no SSH). Uses already-synced store + final delta."""
+    url = agent_endpoint(node, "agent/promote")
+    token = node.get("token") or ""
+    data = json.dumps(payload, ensure_ascii=False).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "L2XPanel-NodePromote/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = {"ok": resp.status < 300, "raw": body[:500]}
+            ok = bool(parsed.get("ok", resp.status < 300))
+            return parsed if isinstance(parsed, dict) else {"ok": ok, "log": body[:500]}
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        err = str(parsed.get("error") or body or f"HTTP {exc.code}")
+        if exc.code == 404:
+            err = "агент без /agent/promote — обновите ноду или укажите SSH-пароль"
+        return {"ok": False, "error": err, "log": body}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "log": ""}
+
+
 def promote_via_ssh(
     node: dict,
     *,
@@ -858,6 +977,7 @@ for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xr
 store.setdefault('settings', {}).setdefault('nodes', {})
 store['settings']['nodes']['agent_enabled'] = False
 store['settings']['nodes']['role'] = 'master'
+store['settings']['nodes']['mirror'] = False
 store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))
 print('promoted')
 """
