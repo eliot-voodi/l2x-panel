@@ -64,6 +64,14 @@
   <h3 class="mt">HWID и смена адреса (Happ)</h3>
   {{ m.check('hwid_required', sb.hwid_required, 'Обязательный HWID: без заголовка X-HWID подписка не выдаётся') }}
   <div class="hint">Клиент получает 404 с <code>X-Hwid-Not-Supported</code>, пока не включит отправку HWID. Happ дополнительно получает <code>subscription-always-hwid-enable: 1</code> и не даст отключить HWID (нужен Provider ID). Устройства видны в карточке клиента.</div>
+  {% set fb = sb.hwid_fallback or 'device' %}
+  <label class="f">Приложения без X-HWID (при лимите устройств)</label>
+  <select name="hwid_fallback" style="max-width:520px">
+    <option value="device" {% if fb == 'device' %}selected{% endif %}>Считать по приложению + ОС + модели (X-Device-OS / X-Device-Model)</option>
+    <option value="ua" {% if fb == 'ua' %}selected{% endif %}>То же, а если ОС и модели нет — по одному приложению (неточно)</option>
+    <option value="off" {% if fb == 'off' %}selected{% endif %}>Не выдавать подписку без X-HWID</option>
+  </select>
+  <div class="hint">Работает только у клиентов с лимитом устройств и при выключенном «Обязательном HWID». Версия приложения не учитывается, поэтому обновление не создаёт новое устройство. Режим «по одному приложению» считает два телефона с одним и тем же приложением за одно устройство — дополняйте его <b>лимитом одновременных IP</b>.</div>
   {{ m.check('migrate_url', sb.migrate_url, 'Переносить клиентов на текущий адрес подписки при следующем обновлении (new-url)') }}
   <div class="hint">Если клиент обновляет подписку по старому адресу (другой домен, порт или http), в ответе уходит <code>new-url</code> с актуальной ссылкой: домен/порт/путь из настроек выше. Старый адрес должен продолжать открываться, пока клиенты не обновятся. Работает в Happ при заданном Provider ID.</div>
   <label class="f">Happ Provider ID</label>

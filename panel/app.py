@@ -128,7 +128,7 @@ def default_settings() -> dict:
             "domain": "", "cert_file": "", "key_file": "", "update_hours": 1, "title": "",
             "support_url": "", "announce": "", "show_page": True,
             "json_fragment": "", "json_noise": "", "json_mux": "",
-            "hwid_required": False, "migrate_url": False, "happ_provider_id": "",
+            "hwid_required": False, "hwid_fallback": "device", "migrate_url": False, "happ_provider_id": "",
         },
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
@@ -1098,7 +1098,8 @@ def _sub_response(request: Request, token: str) -> Response:
         return PlainTextResponse(xray.client_status(client), status_code=403, headers=headers)
     # HWID gate applies only to machine-readable subscription bodies
     req_headers = {k.lower(): v for k, v in request.headers.items()}
-    gate = hwid.gate(client, req_headers, register=True, required=hwid_required)
+    fallback = s.get("hwid_fallback") if s.get("hwid_fallback") in hwid.FALLBACK_MODES else "device"
+    gate = hwid.gate(client, req_headers, register=True, required=hwid_required, fallback=fallback)
     headers.update(gate["headers"])
     if not gate["allowed"]:
         if gate["reason"] == "full":
@@ -2583,6 +2584,7 @@ async def settings_save(request: Request):
                 "json_noise": str(form.get("json_noise") or "").strip(),
                 "json_mux": str(form.get("json_mux") or "").strip(),
                 "hwid_required": form.get("hwid_required") == "1", "migrate_url": form.get("migrate_url") == "1",
+                "hwid_fallback": form.get("hwid_fallback") if form.get("hwid_fallback") in hwid.FALLBACK_MODES else "device",
                 "happ_provider_id": str(form.get("happ_provider_id") or "").strip(),
             })
         elif section == "webhooks":

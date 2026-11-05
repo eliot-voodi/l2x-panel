@@ -41,7 +41,7 @@
       <div><label class="f">Общий лимит трафика, GB</label><input name="limit_gb" type="number" step="0.01" min="0" value="{{ c.limit_gb or '' }}" placeholder="∞"></div>
       <div><label class="f">Лимит одновременных IP</label><input name="limit_ip" type="number" min="0" value="{{ c.limit_ip or '' }}" placeholder="∞"></div>
       <div><label class="f">Лимит устройств HWID</label><input name="limit_hwid" type="number" min="0" value="{{ c.limit_hwid or '' }}" placeholder="∞">
-        <div class="hint">0 = без лимита. Клиенты Happ / v2RayTun шлют заголовок X-HWID при обновлении подписки.</div></div>
+        <div class="hint">0 = без лимита. Считается при обновлении подписки: по X-HWID, а у приложений без него — по приложению, ОС и модели (Настройки → Подписки).</div></div>
     </div>
     <div class="row">
       <div><label class="f">Действует до</label><input name="expire_at" id="expire_at" type="datetime-local" value="{{ dt_input(c.expire_at) }}"></div>
@@ -162,9 +162,10 @@
     <div class="card-head"><h3>HWID устройства</h3>{% if hwids %}{{ m.post_btn(bp ~ '/clients/' ~ c.email ~ '/clear_hwids', 'Очистить') }}{% endif %}</div>
     {% if c.limit_hwid %}<div class="hint mb0">лимит {{ c.limit_hwid }} · зарегистрировано {{ hwids|length }}</div>{% endif %}
     {% if hwids %}
-    <table><thead><tr><th>FP</th><th>OS / модель</th><th>Первый</th><th>Последний</th></tr></thead><tbody>
+    <table><thead><tr><th>FP</th><th>Определено по</th><th>OS / модель</th><th>Первый</th><th>Последний</th></tr></thead><tbody>
       {% for d in hwids %}
-      <tr><td class="mono small">{{ d.fp }}</td><td class="small">{{ d.os }} {{ d.os_ver }} {% if d.model %}· {{ d.model }}{% endif %}<div class="dim">{{ d.ua[:80] }}</div></td>
+      <tr><td class="mono small">{{ d.fp }}</td>
+        <td><span class="badge {% if d.kind == 'hwid' %}ok{% elif d.kind == 'ua' %}warn{% endif %}">{{ {'hwid': 'HWID', 'device': 'ОС + модель', 'ua': 'приложение'}[d.kind] or d.kind }}</span></td><td class="small">{{ d.os }} {{ d.os_ver }} {% if d.model %}· {{ d.model }}{% endif %}<div class="dim">{{ d.ua[:80] }}</div></td>
         <td class="small dim">{{ fmt_dt(d.first_seen) }}</td><td class="small dim">{{ fmt_dt(d.last_seen) }}</td></tr>
       {% endfor %}
     </tbody></table>
