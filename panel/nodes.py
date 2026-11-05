@@ -43,6 +43,8 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("last_sync", "")
         n.setdefault("last_error", "")
         n.setdefault("last_ok", False)
+        n.setdefault("panel_version", "")
+        n.setdefault("last_update", "")
         n.setdefault("role", "agent")  # on master registry entries are always agents
     return nodes
 
@@ -258,13 +260,152 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     }
 
 
-def agent_apply_url(node: dict) -> str:
-    """Agent endpoint lives under the node's secret base_path (nginx only proxies that prefix)."""
+def agent_endpoint(node: dict, path: str) -> str:
+    """Agent API under the node's secret base_path (nginx only proxies that prefix)."""
     base = (node.get("url") or "").rstrip("/")
     bp = (node.get("base_path") or "").strip().strip("/")
+    path = (path or "").lstrip("/")
     if bp:
-        return f"{base}/{bp}/agent/apply"
-    return f"{base}/agent/apply"
+        return f"{base}/{bp}/{path}"
+    return f"{base}/{path}"
+
+
+def agent_apply_url(node: dict) -> str:
+    return agent_endpoint(node, "agent/apply")
+
+
+def agent_update_url(node: dict) -> str:
+    return agent_endpoint(node, "agent/update")
+
+
+def health_url(node: dict) -> str:
+    """Public /health is outside the secret base_path."""
+    base = (node.get("url") or "").rstrip("/")
+    if base:
+        return f"{base}/health"
+    domain = (node.get("domain") or "").strip()
+    return f"https://{domain}/health" if domain else ""
+
+
+def probe_health(node: dict, timeout: int = 8) -> dict:
+    """Fetch node /health and store panel_version on the registry entry."""
+    url = health_url(node)
+    if not url:
+        return {"ok": False, "error": "no url"}
+    req = urllib.request.Request(url, headers={"User-Agent": "L2XPanel-NodeProbe/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            data = json.loads(body) if body else {}
+            ver = str(data.get("version") or "").strip()
+            if ver:
+                node["panel_version"] = ver
+            return {"ok": True, "version": ver, "raw": data}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def trigger_update(node: dict, timeout: int = 45) -> dict:
+    """Ask the remote agent to run panel self-update (returns after job is queued)."""
+    url = agent_update_url(node)
+    token = node.get("token") or ""
+    data = json.dumps({"confirm": "yes"}).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "L2XPanel-NodeUpdate/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = {"ok": resp.status < 300, "raw": body[:500]}
+            ok = bool(parsed.get("ok", resp.status < 300))
+            if parsed.get("current"):
+                node["panel_version"] = str(parsed["current"])
+            node["last_update"] = now_iso()
+            if not ok:
+                node["last_error"] = str(parsed.get("error") or body[:300])
+            return parsed if isinstance(parsed, dict) else {"ok": ok}
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        err = str(parsed.get("error") or body or f"HTTP {exc.code}")
+        if exc.code == 404:
+            err = "агент без /agent/update — укажите SSH-пароль или обновите ноду вручную"
+        node["last_error"] = err
+        return {"ok": False, "error": err}
+    except Exception as exc:  # noqa: BLE001
+        node["last_error"] = str(exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def update_via_ssh(node: dict, ssh_password: str, ssh_user: str = "", ssh_port: int = 0) -> dict:
+    """Run panel update on the node over SSH (works even if agent endpoint is missing)."""
+    host = (node.get("domain") or "").strip()
+    if not host:
+        from urllib.parse import urlparse
+        host = urlparse(node.get("url") or "").hostname or ""
+    if not host:
+        return {"ok": False, "error": "нет domain/url ноды", "log": ""}
+    user = (ssh_user or node.get("ssh_user") or "root").strip() or "root"
+    port = int(ssh_port or node.get("ssh_port") or 22)
+    log: list[str] = [f"ssh {user}@{host}:{port} update"]
+    client = None
+    try:
+        client = _ssh_connect(host, user, ssh_password, port=port, timeout=45)
+        cmd = (
+            "set -e; "
+            "if [ -x /usr/local/bin/l2x ]; then /usr/local/bin/l2x update; "
+            "else curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
+            "| bash -s -- --update; fi; "
+            "sleep 2; curl -sS http://127.0.0.1:8090/health || true"
+        )
+        r = _ssh_run(client, cmd, timeout=900)
+        log.append((r.get("stdout") or "")[-2500:])
+        if r.get("stderr"):
+            log.append((r.get("stderr") or "")[-800:])
+        # parse version from health json in stdout
+        ver = ""
+        out = r.get("stdout") or ""
+        for line in reversed(out.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and "version" in line:
+                try:
+                    ver = str(json.loads(line).get("version") or "")
+                except json.JSONDecodeError:
+                    ver = ""
+                if ver:
+                    break
+        if ver:
+            node["panel_version"] = ver
+        node["last_update"] = now_iso()
+        ok = bool(r.get("ok"))
+        if not ok:
+            node["last_error"] = (r.get("stderr") or "ssh update failed")[:400]
+        else:
+            node["last_error"] = ""
+            node["last_ok"] = True
+        return {"ok": ok, "log": "\n".join(log), "version": ver,
+                "error": "" if ok else (r.get("stderr") or "update failed")}
+    except Exception as exc:  # noqa: BLE001
+        node["last_error"] = str(exc)
+        return {"ok": False, "error": str(exc), "log": "\n".join(log)}
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") -> dict:
@@ -305,6 +446,11 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             except Exception:
                 pass
             node["last_error"] = err
+            if ok:
+                try:
+                    probe_health(node, timeout=5)
+                except Exception:
+                    pass
             if isinstance(parsed, dict) and err:
                 parsed = {**parsed, "error": err}
             return parsed if isinstance(parsed, dict) else {"ok": ok}

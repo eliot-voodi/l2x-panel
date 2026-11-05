@@ -15,6 +15,7 @@
   <div class="hint">
     <b>Мастер</b> ставит ноду по SSH (domain + login + pass), включает agent token и пушит клиентов/inbounds.
     Галочка <b>Outbound</b> поднимает на ноде VLESS/WS bridge — мастер получает outbound <code>node_…</code> (клиенты могут уходить через эту ноду).
+    <b>Обновить</b> ставит свежий релиз панели на выбранную ноду (по agent API; для старых агентов — SSH-пароль).
     <b>Сделать мастером</b> передаёт роль: текущая панель становится агентом, выбранная нода — новым мастером (нужен SSH-пароль).
   </div>
   {% if not is_master %}
@@ -29,19 +30,27 @@
   <div class="table-wrap">
   <table>
     <thead><tr>
-      <th>Нода</th><th>Domain / URL</th><th>Outbound</th><th>Статус</th><th>Sync</th><th class="right">{{ t('Действия') }}</th>
+      <th>Нода</th><th>Domain / URL</th><th>Версия</th><th>Outbound</th><th>Статус</th><th>Sync</th><th class="right">{{ t('Действия') }}</th>
     </tr></thead>
     <tbody>
     {% for n in items %}
       <tr>
         <td><b>{{ n.name }}</b><div class="dim small mono">{{ n.id[:8] }}</div></td>
         <td class="small mono">{{ n.domain or n.url }}{% if n.base_path %}<div class="dim">/{{ n.base_path }}/</div>{% endif %}</td>
+        <td class="small mono">{% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn" title="мастер {{ master_version }}"{% endif %}>{{ n.panel_version }}</span>{% else %}<span class="dim">?</span>{% endif %}{% if n.last_update %}<div class="dim">{{ fmt_dt(n.last_update) }}</div>{% endif %}</td>
         <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
         <td>{% if not n.enabled %}<span class="badge">выкл</span>{% elif n.last_ok %}<span class="badge ok">ok</span>{% elif n.last_error %}<span class="badge err" title="{{ n.last_error }}">ошибка</span>{% else %}<span class="badge">—</span>{% endif %}</td>
         <td class="small dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}{% if n.last_error %}<div class="badge err" title="{{ n.last_error }}">{{ n.last_error[:80] }}</div>{% endif %}</td>
         <td>
           <div class="actions" style="justify-content:flex-end;flex-wrap:wrap">
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.3rem"
+                  title="Обновить панель на этой ноде. Без пароля — через agent API; с паролем — по SSH."
+                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }} до последнего релиза?')">
+              <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password"
+                     style="width:6.5rem;padding:.25rem .4rem;font-size:.75rem">
+              <button class="btn sm" {% if job_running %}disabled{% endif %}>{{ t('Обновить') }}</button>
+            </form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm" title="Использовать как outbound">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/token" class="flex" style="gap:.3rem"
@@ -60,7 +69,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="6" class="empty">Нод пока нет — установите первую по SSH ниже</td></tr>
+      <tr><td colspan="7" class="empty">Нод пока нет — установите первую по SSH ниже</td></tr>
     {% endfor %}
     </tbody>
   </table>

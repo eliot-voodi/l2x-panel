@@ -3386,11 +3386,21 @@ def nodes_page(request: Request):
         nodes_mod.ensure_list(store)
         nodes_mod.agent_token(store)
         nodes_mod.sync_all_node_outbounds(store)
+        # Refresh remote panel versions (best-effort, short timeout)
+        if nodes_mod.is_master(store):
+            for n in store.get("nodes") or []:
+                if not n.get("enabled", True):
+                    continue
+                try:
+                    nodes_mod.probe_health(n, timeout=4)
+                except Exception:
+                    pass
     store = _load_store()
     running = NODES_JOB.get("id")
     return page(request, "nodes.html", active="nodes", items=store["nodes"],
                 ns=store["settings"].get("nodes") or {},
                 is_master=nodes_mod.is_master(store),
+                master_version=panel_version(),
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
 
@@ -3555,6 +3565,61 @@ async def nodes_action(node_id: str, action: str, request: Request):
             xr = _apply_xray(store)
             flash(request, *_ok_msg(f"{node['name']}: {'OK' if res.get('ok') else res.get('error') or 'ошибка'}", xr))
             return go("/nodes")
+        if action == "update":
+            if not nodes_mod.is_master(store):
+                flash(request, "Только мастер может обновлять ноды", "error")
+                return go("/nodes")
+            ssh_password = str(form.get("password") or "")
+            running = NODES_JOB.get("id")
+            if running and ops.JOBS.get(running, {}).get("status") == "running":
+                flash(request, "Уже идёт операция с нодами", "info")
+                return go("/nodes")
+            node_copy = dict(node)
+            node_id_local = node["id"]
+            name = node["name"]
+
+            def job():
+                import time as _time
+                if ssh_password:
+                    res = nodes_mod.update_via_ssh(node_copy, ssh_password=ssh_password)
+                else:
+                    res = nodes_mod.trigger_update(node_copy)
+                    if res.get("ok") and (res.get("started") or res.get("already")):
+                        # wait for remote restart, then probe version
+                        _time.sleep(20)
+                        for _ in range(6):
+                            probe = nodes_mod.probe_health(node_copy, timeout=8)
+                            if probe.get("ok") and probe.get("version"):
+                                break
+                            _time.sleep(5)
+                with mutate() as st:
+                    for n in nodes_mod.ensure_list(st):
+                        if n.get("id") != node_id_local:
+                            continue
+                        if node_copy.get("panel_version"):
+                            n["panel_version"] = node_copy["panel_version"]
+                        if node_copy.get("last_update"):
+                            n["last_update"] = node_copy["last_update"]
+                        if res.get("ok"):
+                            n["last_error"] = ""
+                            n["last_ok"] = True
+                        elif node_copy.get("last_error"):
+                            n["last_error"] = node_copy["last_error"]
+                        break
+                log = res.get("log") or ""
+                ver = node_copy.get("panel_version") or res.get("version") or ""
+                if ver:
+                    log = (log + f"\nversion: {ver}").strip()
+                return {
+                    "ok": bool(res.get("ok")),
+                    "log": log or ("" if res.get("ok") else res.get("error") or "update failed"),
+                    "error": "" if res.get("ok") else (res.get("error") or "update failed"),
+                }
+
+            NODES_JOB["id"] = ops.start_job(f"node-update-{name}", job)
+            via = "SSH" if ssh_password else "agent API"
+            flash(request, f"Обновление ноды {name} запущено ({via}). Смотрите фоновые задачи.", "info")
+            return go("/nodes")
         if action == "promote":
             ssh_password = str(form.get("password") or "")
             if not ssh_password:
@@ -3635,18 +3700,51 @@ def nodes_sync_all(request: Request):
     return go("/nodes")
 
 
-@app.post("/agent/apply")
-async def agent_apply(request: Request):
-    """Remote node agent: accept pushed config from master panel."""
+def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Validate Bearer agent_token. Returns (store, None) or (None, error response)."""
     store = _load_store()
     ns = store["settings"].get("nodes") or {}
     if not ns.get("agent_enabled"):
-        return JSONResponse({"ok": False, "error": "agent disabled"}, status_code=403)
+        return None, JSONResponse({"ok": False, "error": "agent disabled"}, status_code=403)
     auth = request.headers.get("authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     expected = ns.get("agent_token") or ""
     if not expected or not token or not secrets.compare_digest(token, expected):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return None, JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return store, None
+
+
+@app.post("/agent/update")
+async def agent_update(request: Request):
+    """Master triggers panel self-update on this agent node (one node at a time from UI)."""
+    store, err = _agent_auth(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if str(payload.get("confirm") or "") != "yes":
+        return JSONResponse({"ok": False, "error": "confirm required"}, status_code=400)
+    running = PANEL_UPDATE_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        return {"ok": True, "started": False, "already": True, "current": panel_version()}
+
+    def do_update():
+        return ops.update_panel()
+
+    PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-agent", do_update)
+    return {"ok": True, "started": True, "current": panel_version()}
+
+
+@app.post("/agent/apply")
+async def agent_apply(request: Request):
+    """Remote node agent: accept pushed config from master panel."""
+    store, err = _agent_auth(request)
+    if err:
+        return err
     try:
         payload = await request.json()
     except ValueError:
