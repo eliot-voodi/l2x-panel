@@ -238,25 +238,57 @@ def _peer_node_export(n: dict) -> dict:
 
 
 def agent_runtime_store(store: dict) -> dict:
-    """Deep copy for live Xray on an agent: drop local L2TP; keep peer node_* only in mirror mode."""
+    """Deep copy for live Xray on an agent.
+
+    - runtime_preserve: keep full config (former master just demoted — do not strip L2TP)
+    - local l2tp entries present: keep them (this host still has tunnels)
+    - mirror: keep peer node_* outbounds
+    """
     s = json.loads(json.dumps(store))
     ns = (s.get("settings") or {}).get("nodes") or {}
+    if ns.get("runtime_preserve"):
+        return s
+    has_local_l2tp = bool(s.get("l2tp"))
     keep_node = bool(ns.get("mirror"))
-    s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
-    s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
-    s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=keep_node)
-    s["l2tp"] = []
+    if not has_local_l2tp:
+        s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
+        s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
+        s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=keep_node)
+        s["l2tp"] = []
+    else:
+        # Former master / host with tunnels: only remap missing node_* if not mirroring
+        s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
+        s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
+        s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=True)
+        # keep s["l2tp"]
     customs = []
     for o in s.get("outbounds_custom") or []:
         tag = str(o.get("tag") or "")
-        if tag.startswith("l2tp_") or o.get("kind") == "l2tp":
+        if not has_local_l2tp and (tag.startswith("l2tp_") or o.get("kind") == "l2tp"):
             continue
-        # Non-mirror agents never received peer node_* outbounds
         if not keep_node and (o.get("kind") == "node" or tag.startswith("node_")):
             continue
         customs.append(o)
     s["outbounds_custom"] = customs
     return s
+
+
+def probe_role(node: dict, timeout: int = 10) -> dict:
+    """Read /health from a node; expects role/master fields when panel ≥1.6.2."""
+    h = probe_health(node, timeout=timeout)
+    if not h.get("ok"):
+        return h
+    raw = h.get("raw") or {}
+    role = str(raw.get("role") or "").strip().lower()
+    agent = raw.get("agent")
+    return {
+        "ok": True,
+        "version": h.get("version") or "",
+        "role": role,
+        "agent": agent,
+        "is_master": role == "master" or (role == "" and agent is False),
+        "raw": raw,
+    }
 
 
 def build_payload(store: dict, node: dict, build_config) -> dict:
@@ -966,19 +998,23 @@ def promote_via_ssh(
         with sftp.file("/tmp/l2x_promote.json", "w") as f:
             f.write(json.dumps(snap, ensure_ascii=False))
         promote_py = """
-import json
+import json, sys
 from pathlib import Path
 snap = json.loads(Path('/tmp/l2x_promote.json').read_text())
 store_path = Path('/var/lib/l2xpanel/store.json')
 store = json.loads(store_path.read_text()) if store_path.exists() else {}
+prev = dict((store.get('settings') or {}).get('nodes') or {})
 for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes'):
     if k in snap:
         store[k] = snap[k]
-store.setdefault('settings', {}).setdefault('nodes', {})
-store['settings']['nodes']['agent_enabled'] = False
-store['settings']['nodes']['role'] = 'master'
-store['settings']['nodes']['mirror'] = False
-store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+ns = store.setdefault('settings', {}).setdefault('nodes', {})
+ns['agent_enabled'] = False
+ns['role'] = 'master'
+ns['mirror'] = False
+ns['runtime_preserve'] = False
+tmp = store_path.with_suffix('.tmp')
+tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+tmp.replace(store_path)
 print('promoted')
 """
         with sftp.file("/tmp/l2x_promote.py", "w") as f:
@@ -988,14 +1024,18 @@ print('promoted')
             client,
             "set -a; . /etc/l2xpanel/panel.env; set +a; "
             "cd /opt/l2xpanel; .venv/bin/python /tmp/l2x_promote.py; "
-            "systemctl restart l2xpanel; sleep 2; "
-            "rm -f /tmp/l2x_promote.py /tmp/l2x_promote.json; "
-            "curl -s http://127.0.0.1:8090/health",
-            timeout=90,
+            "systemctl restart l2xpanel; "
+            "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; "
+            "  curl -sf http://127.0.0.1:8090/health >/dev/null && break; done; "
+            "curl -s http://127.0.0.1:8090/health; echo; "
+            "rm -f /tmp/l2x_promote.py /tmp/l2x_promote.json",
+            timeout=120,
         )
-        log.append(r["stdout"][-500:])
-        ok = r["ok"] and "promoted" in (r["stdout"] or "")
-        return {"ok": ok, "log": "\n".join(log), "error": "" if ok else (r["stderr"] or "promote failed")}
+        log.append(r["stdout"][-800:])
+        out = r.get("stdout") or ""
+        health_ok = '"status"' in out and "ok" in out
+        ok = bool(r.get("ok")) and "promoted" in out and health_ok
+        return {"ok": ok, "log": "\n".join(log), "error": "" if ok else (r.get("stderr") or "promote failed")}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "log": "\n".join(log)}
     finally:

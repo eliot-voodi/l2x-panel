@@ -1448,10 +1448,15 @@ def sub_dedicated(path: str, token: str, request: Request):
 
 @app.get("/health")
 def health():
+    store = _load_store()
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    role = "agent" if (ns.get("agent_enabled") and (ns.get("role") or "") == "agent") else "master"
     return {
         "status": "ok",
         "app": app_title(),
         "version": panel_version(),
+        "role": role,
+        "agent": role == "agent",
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -3746,32 +3751,73 @@ async def nodes_action(node_id: str, action: str, request: Request):
             name = node["name"]
 
         def job():
-            with mutate() as st:
-                ns = st.setdefault("settings", {}).setdefault("nodes", {})
-                ns["agent_enabled"] = True
-                ns["role"] = "agent"
-                nodes_mod.agent_token(st)
+            import time as _time
+            log_lines = []
+            # 1) Promote REMOTE first while we are still master (critical: never demote early)
             if use_api:
                 body = nodes_mod.promote_payload(snap, old, extra_nodes=peers)
                 res = nodes_mod.promote_via_api(node_copy, body)
             else:
                 res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
                                                master_store_snapshot=snap, old_master_node=old)
+            log_lines.append(res.get("log") or "")
             if not res.get("ok"):
-                with mutate() as st:
-                    st["settings"]["nodes"]["agent_enabled"] = False
-                    st["settings"]["nodes"]["role"] = "master"
-                return {"ok": False, "error": res.get("error"), "log": res.get("log") or ""}
+                return {"ok": False, "error": res.get("error") or "promote failed",
+                        "log": "\n".join(x for x in log_lines if x)}
+
+            # 2) Verify new master is healthy and reports master role
+            verified = False
+            for i in range(8):
+                _time.sleep(2 if i else 1)
+                probe = nodes_mod.probe_role(node_copy, timeout=10)
+                log_lines.append(f"probe[{i}]: ok={probe.get('ok')} role={probe.get('role')} ver={probe.get('version')}")
+                if probe.get("ok") and probe.get("is_master"):
+                    verified = True
+                    break
+            if not verified:
+                return {
+                    "ok": False,
+                    "error": "новая нода не подтвердила роль master — старый master не трогали",
+                    "log": "\n".join(x for x in log_lines if x),
+                }
+
+            # 3) Only now demote ourselves; preserve live Xray (L2TP) until new master pushes
             with mutate() as st:
+                ns = st.setdefault("settings", {}).setdefault("nodes", {})
+                ns["agent_enabled"] = True
+                ns["role"] = "agent"
+                ns["runtime_preserve"] = True
+                nodes_mod.agent_token(st)
                 st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
             via = "API" if use_api else "SSH"
-            return {"ok": True, "log": (res.get("log") or "") + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."}
+            return {
+                "ok": True,
+                "log": "\n".join(x for x in log_lines if x)
+                + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."
+                + "\nСтарый master стал agent с runtime_preserve (трафик не срезается).",
+            }
 
         NODES_JOB["id"] = ops.start_job("node-promote", job)
-        flash(request, f"Передача роли master → {name} запущена ({'API' if use_api else 'SSH'})", "info")
+        flash(request, f"Передача роли master → {name} запущена ({'API' if use_api else 'SSH'}). Сначала поднимаем новую ноду, потом сдаём роль.", "info")
         return go("/nodes")
 
     flash(request, "Неизвестное действие", "error")
+    return go("/nodes")
+
+
+@app.post("/nodes/restore-master")
+def nodes_restore_master(request: Request):
+    """Emergency: force this panel back to master if promote/failover left it as agent."""
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        ns = store.setdefault("settings", {}).setdefault("nodes", {})
+        ns["agent_enabled"] = False
+        ns["role"] = "master"
+        ns["runtime_preserve"] = False
+        ns["mirror"] = False
+    xr = _apply_xray(_load_store())
+    flash(request, *_ok_msg("Роль MASTER восстановлена на этой панели", xr))
     return go("/nodes")
 
 
@@ -3858,7 +3904,10 @@ async def agent_update(request: Request):
 
 @app.post("/agent/promote")
 async def agent_promote(request: Request):
-    """Flip this mirrored agent to master using already-synced (or final) store data."""
+    """Flip this mirrored agent to master using already-synced (or final) store data.
+
+    Role flips only after Xray apply succeeds; otherwise rolls back to agent.
+    """
     store, err = _agent_auth(request)
     if err:
         return err
@@ -3868,7 +3917,14 @@ async def agent_promote(request: Request):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     if not isinstance(payload, dict) or str(payload.get("confirm") or "") != "yes":
         return JSONResponse({"ok": False, "error": "confirm required"}, status_code=400)
+    prev = {}
     with mutate() as st:
+        ns = st.setdefault("settings", {}).setdefault("nodes", {})
+        prev = {
+            "agent_enabled": bool(ns.get("agent_enabled")),
+            "role": ns.get("role") or "agent",
+            "mirror": bool(ns.get("mirror")),
+        }
         for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings"):
             if key in payload and payload[key] is not None:
                 st[key] = payload[key]
@@ -3879,17 +3935,24 @@ async def agent_promote(request: Request):
             old = payload["old_master"]
             nodes[:] = [n for n in nodes if n.get("id") != old.get("id")]
             nodes.insert(0, old)
-        ns = st.setdefault("settings", {}).setdefault("nodes", {})
         ns["agent_enabled"] = False
         ns["role"] = "master"
         ns["mirror"] = False
+        ns["runtime_preserve"] = False
     res = _apply_xray(_load_store())
-    err_txt = res.get("error") or ""
-    try:
-        err_txt = xray.clean_xray_error(err_txt) or err_txt
-    except Exception:
-        pass
-    return {"ok": bool(res.get("ok")), "error": err_txt, "role": "master", "version": panel_version()}
+    if not res.get("ok"):
+        with mutate() as st:
+            ns = st.setdefault("settings", {}).setdefault("nodes", {})
+            ns["agent_enabled"] = prev.get("agent_enabled", True)
+            ns["role"] = prev.get("role") or "agent"
+            ns["mirror"] = bool(prev.get("mirror"))
+        err_txt = res.get("error") or "xray apply failed"
+        try:
+            err_txt = xray.clean_xray_error(err_txt) or err_txt
+        except Exception:
+            pass
+        return JSONResponse({"ok": False, "error": err_txt, "rolled_back": True}, status_code=500)
+    return {"ok": True, "error": "", "role": "master", "version": panel_version()}
 
 
 @app.post("/agent/apply")
@@ -3941,6 +4004,8 @@ async def agent_apply(request: Request):
         ns["agent_enabled"] = True
         ns["role"] = "agent"
         ns["mirror"] = mirror
+        # First successful push from new master may replace preserve mode
+        ns["runtime_preserve"] = False
     res = _apply_xray(_load_store())
     err = res.get("error") or ""
     try:

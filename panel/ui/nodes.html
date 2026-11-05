@@ -16,10 +16,15 @@
     <b>Мастер</b> ставит ноду по SSH (domain + login + pass), включает agent token и пушит клиентов/inbounds.
     Галочка <b>Outbound</b> поднимает на ноде VLESS/WS bridge — мастер получает outbound <code>node_…</code>.
     <b>Зеркало</b> — полная копия мастера на ноде (клиенты, outbounds, маршруты, реестр нод). В обычном режиме нода остаётся outbound/agent; при сбое → <b>→ Master</b> без потери данных (для зеркала SSH не обязателен).
+    <b>→ Master</b> сначала поднимает новую ноду и проверяет health; старый master сдаёт роль только после подтверждения (трафик не срезается).
     <b>Обновить</b> ставит свежий релиз на выбранную ноду.
   </div>
   {% if not is_master %}
   <div class="badge warn">Эта панель сейчас agent. Управление нодами — на master.</div>
+  <form method="post" action="{{ bp }}/nodes/restore-master" class="mt"
+        onsubmit="return confirm('Принудительно вернуть этой панели роль MASTER?\nИспользуйте, если failover сломал кластер.')">
+    <button class="btn danger">Восстановить MASTER на этой панели</button>
+  </form>
   {% endif %}
 </div>
 
