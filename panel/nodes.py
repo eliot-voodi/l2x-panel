@@ -231,8 +231,17 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     }
 
 
+def agent_apply_url(node: dict) -> str:
+    """Agent endpoint lives under the node's secret base_path (nginx only proxies that prefix)."""
+    base = (node.get("url") or "").rstrip("/")
+    bp = (node.get("base_path") or "").strip().strip("/")
+    if bp:
+        return f"{base}/{bp}/agent/apply"
+    return f"{base}/agent/apply"
+
+
 def push(node: dict, payload: dict, timeout: int = 60) -> dict:
-    url = (node.get("url") or "").rstrip("/") + "/agent/apply"
+    url = agent_apply_url(node)
     token = node.get("token") or ""
     data = json.dumps(payload, ensure_ascii=False).encode()
     req = urllib.request.Request(url, data=data, method="POST", headers={
@@ -241,6 +250,7 @@ def push(node: dict, payload: dict, timeout: int = 60) -> dict:
         "User-Agent": "L2XPanel-NodeSync/1.0",
     })
     try:
+        # Default HTTPS context — SNI comes from the URL hostname.
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode()
             try:
@@ -297,6 +307,48 @@ def _ssh_run(client, cmd: str, timeout: int = 600) -> dict:
     return {"ok": code == 0, "code": code, "stdout": out, "stderr": err}
 
 
+def _normalize_domain(value: str) -> str:
+    return (value or "").strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
+
+
+def _local_ip_set() -> set[str]:
+    import socket
+    ips: set[str] = {"127.0.0.1", "::1"}
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("1.1.1.1", 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    return ips
+
+
+def same_host_as_master(domain: str, master_host: str = "") -> str:
+    """Return error text if domain points at this master; empty string if OK."""
+    domain = _normalize_domain(domain)
+    master = _normalize_domain(master_host)
+    if not domain:
+        return "некорректный domain"
+    if master and domain == master:
+        return f"нельзя провиженить сам master ({domain}) — укажите другой сервер"
+    import socket
+    try:
+        remote_ips = {info[4][0] for info in socket.getaddrinfo(domain, 443)}
+    except OSError as exc:
+        return f"DNS {domain}: {exc}"
+    local = _local_ip_set()
+    if remote_ips & local:
+        return f"{domain} резолвится в IP этого сервера — self-provision запрещён"
+    return ""
+
+
 def provision_via_ssh(
     *,
     domain: str,
@@ -306,13 +358,19 @@ def provision_via_ssh(
     name: str = "",
     master_url: str = "",
     master_token: str = "",
+    master_host: str = "",
     as_outbound: bool = True,
     admin_password: str = "",
 ) -> dict:
     """Install/configure L2X on a remote host over SSH and return node registry fields."""
-    domain = domain.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
+    domain = _normalize_domain(domain)
     if not domain or " " in domain:
         return {"ok": False, "error": "некорректный domain"}
+    if not master_host and master_url:
+        master_host = _normalize_domain(master_url)
+    self_err = same_host_as_master(domain, master_host)
+    if self_err:
+        return {"ok": False, "error": self_err}
     name = slugify(name or domain.split(".")[0])
     admin_password = admin_password or secrets.token_urlsafe(12)
     panel_path = secrets.token_urlsafe(9).replace("_", "").replace("-", "")[:12]
@@ -354,23 +412,40 @@ def provision_via_ssh(
         ])
         with sftp.file("/tmp/l2x_remote_install.sh", "w") as f:
             f.write(env_body)
-        remote_py = (
-            "import json\nfrom pathlib import Path\n"
-            f"TOKEN={agent_tok!r}; DOMAIN={domain!r}; PATH_={panel_path!r}\n"
-            "store_path = Path('/var/lib/l2xpanel/store.json')\n"
-            "store = json.loads(store_path.read_text()) if store_path.exists() else {}\n"
-            "s = store.setdefault('settings', {})\n"
-            "ns = s.setdefault('nodes', {})\n"
-            "ns['agent_enabled'] = True\n"
-            "ns['agent_token'] = TOKEN\n"
-            "ns['role'] = 'agent'\n"
-            "panel = s.setdefault('panel', {})\n"
-            "panel['public_host'] = DOMAIN\n"
-            "panel['base_path'] = PATH_\n"
-            "store_path.parent.mkdir(parents=True, exist_ok=True)\n"
-            "store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))\n"
-            "print('agent_ok', TOKEN[:8], PATH_)\n"
-        )
+        # Agent setup: keep existing secret path on re-provision; always re-apply nginx front.
+        remote_py = f"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/opt/l2xpanel")
+TOKEN = {agent_tok!r}
+DOMAIN = {domain!r}
+PATH_NEW = {panel_path!r}
+store_path = Path("/var/lib/l2xpanel/store.json")
+store = json.loads(store_path.read_text()) if store_path.exists() else {{}}
+s = store.setdefault("settings", {{}})
+ns = s.setdefault("nodes", {{}})
+ns["agent_enabled"] = True
+ns["agent_token"] = TOKEN
+ns["role"] = "agent"
+panel = s.setdefault("panel", {{}})
+panel["public_host"] = DOMAIN
+# Preserve existing base_path so re-provision does not break the admin URL
+existing_bp = (panel.get("base_path") or "").strip().strip("/")
+panel["base_path"] = existing_bp or PATH_NEW
+store_path.parent.mkdir(parents=True, exist_ok=True)
+store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+bp = panel["base_path"]
+print("agent_ok", TOKEN[:8], bp)
+try:
+    import front
+    staged = front.stage(store)
+    if staged.get("ok"):
+        print("front", front.commit(staged))
+    else:
+        print("front_stage_fail", staged.get("error"))
+except Exception as exc:
+    print("front_err", exc)
+"""
         with sftp.file("/tmp/l2x_agent_setup.py", "w") as f:
             f.write(remote_py)
         sftp.close()
@@ -386,20 +461,27 @@ def provision_via_ssh(
         r2 = _ssh_run(
             client,
             "set -a; . /etc/l2xpanel/panel.env; set +a; "
-            "cd /opt/l2xpanel; .venv/bin/python /tmp/l2x_agent_setup.py; "
+            "cd /opt/l2xpanel; PYTHONPATH=/opt/l2xpanel .venv/bin/python /tmp/l2x_agent_setup.py; "
             "systemctl restart l2xpanel; sleep 2; curl -s http://127.0.0.1:8090/health || true; "
             "rm -f /tmp/l2x_agent_setup.py",
-            timeout=60,
+            timeout=90,
         )
-        log.append(r2["stdout"][-800:])
+        log.append(r2["stdout"][-1200:])
+        # Prefer base_path reported by agent_ok
+        used_bp = panel_path
+        for line in (r2["stdout"] or "").splitlines():
+            if line.startswith("agent_ok "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    used_bp = parts[2]
         node["url"] = f"https://{domain}"
-        node["base_path"] = panel_path
+        node["base_path"] = used_bp
         node["token"] = agent_tok
         return {
             "ok": True,
             "node": node,
             "admin_password": admin_password,
-            "panel_url": f"https://{domain}/{panel_path}/",
+            "panel_url": f"https://{domain}/{used_bp}/",
             "log": "\n".join(log),
         }
     except Exception as exc:  # noqa: BLE001

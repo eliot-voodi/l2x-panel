@@ -3435,6 +3435,10 @@ async def nodes_provision(request: Request):
     if not domain or not password:
         flash(request, "Нужны domain и SSH-пароль", "error")
         return go("/nodes")
+    self_err = nodes_mod.same_host_as_master(domain, public_host())
+    if self_err:
+        flash(request, self_err, "error")
+        return go("/nodes")
     running = NODES_JOB.get("id")
     if running and ops.JOBS.get(running, {}).get("status") == "running":
         flash(request, "Уже идёт операция с нодами", "info")
@@ -3451,7 +3455,8 @@ async def nodes_provision(request: Request):
     def job():
         res = nodes_mod.provision_via_ssh(
             domain=domain, ssh_user=login, ssh_password=password, ssh_port=port,
-            name=name, master_url=master_url, master_token=token, as_outbound=as_outbound,
+            name=name, master_url=master_url, master_token=token,
+            master_host=public_host(), as_outbound=as_outbound,
         )
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}

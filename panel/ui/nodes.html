@@ -76,7 +76,7 @@
   <div class="mt">
     {{ m.check('as_outbound', True, 'Сразу сделать outbound (VLESS bridge на ноде)') }}
   </div>
-  <div class="hint">A-запись domain → IP сервера. Установщик поставит панель, выпустит сертификат, включит agent. Пароль админа ноды будет в логе задачи.</div>
+  <div class="hint">Другой сервер (не этот master). A-запись domain → IP ноды. Установщик поставит панель, сертификат, agent. Пароль админа — в логе задачи.</div>
   <div class="actions mt"><button class="btn" {% if job_running %}disabled{% endif %}>Установить по SSH</button></div>
 </form>
 
