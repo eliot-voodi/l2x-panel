@@ -3526,6 +3526,38 @@ async def nodes_provision(request: Request):
     return go("/nodes")
 
 
+def _node_push_job(node_id: str, label: str, host: str):
+    """Push config to one node outside STORE_LOCK (avoids deadlock / hung panel)."""
+    with mutate() as store:
+        node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
+        if not node:
+            return {"ok": False, "error": "нода не найдена", "log": ""}
+        nodes_mod.upsert_node_outbound(store, node)
+        payload = nodes_mod.build_payload(store, node, xray.build_config)
+        node_snap = dict(node)
+        name = node.get("name") or node_id
+    # Network I/O must not hold mutate()/STORE_LOCK
+    res = nodes_mod.push(node_snap, payload, master_host=host, timeout=120)
+    with mutate() as store:
+        for n in nodes_mod.ensure_list(store):
+            if n.get("id") != node_id:
+                continue
+            n["last_sync"] = node_snap.get("last_sync") or n.get("last_sync")
+            n["last_ok"] = bool(node_snap.get("last_ok"))
+            n["last_error"] = node_snap.get("last_error") or ""
+            if node_snap.get("panel_version"):
+                n["panel_version"] = node_snap["panel_version"]
+            break
+        webhooks.fire(store["settings"], "node.sync", {
+            "node": name, "ok": res.get("ok"), "error": res.get("error"), "label": label,
+        })
+        xr = _apply_xray(store)
+    log = f"{label}: {'OK' if res.get('ok') else res.get('error') or 'fail'}"
+    if not xr.get("ok"):
+        log += f"\nxray: {xr.get('error') or 'fail'}"
+    return {"ok": bool(res.get("ok")), "log": log, "error": "" if res.get("ok") else (res.get("error") or "push failed")}
+
+
 @app.post("/nodes/{node_id}/{action}")
 async def nodes_action(node_id: str, action: str, request: Request):
     if redir := _require(request):
@@ -3536,69 +3568,85 @@ async def nodes_action(node_id: str, action: str, request: Request):
             form = await request.form()
         except Exception:
             form = {}
-    with mutate() as store:
-        nodes = nodes_mod.ensure_list(store)
-        node = next((n for n in nodes if n["id"] == node_id), None)
-        if not node:
-            flash(request, "Нода не найдена", "error")
-            return go("/nodes")
-        if action == "delete":
-            nodes.remove(node)
-            nodes_mod.sync_all_node_outbounds(store)
-            _apply_xray(store)
-            flash(request, "Нода удалена", "info")
-            return go("/nodes")
-        if action == "toggle":
-            node["enabled"] = not node.get("enabled", True)
-            nodes_mod.upsert_node_outbound(store, node)
-            flash(request, f"{node['name']}: {'вкл' if node['enabled'] else 'выкл'}", "info")
-            return go("/nodes")
-        if action == "token":
-            new_tok = str(form.get("token") or "").strip()
-            if len(new_tok) < 8:
-                flash(request, "Token слишком короткий", "error")
+
+    # --- quick local mutations (no network) ---
+    if action in ("delete", "toggle", "token"):
+        with mutate() as store:
+            nodes = nodes_mod.ensure_list(store)
+            node = next((n for n in nodes if n["id"] == node_id), None)
+            if not node:
+                flash(request, "Нода не найдена", "error")
                 return go("/nodes")
-            node["token"] = new_tok
-            flash(request, f"{node['name']}: token обновлён — нажмите Sync", "info")
-            return go("/nodes")
-        if action == "outbound":
-            node["as_outbound"] = not node.get("as_outbound")
-            if node["as_outbound"]:
-                nodes_mod.ensure_bridge(node)
-            nodes_mod.upsert_node_outbound(store, node)
-            payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload, master_host=public_host())
-            xr = _apply_xray(store)
-            flash(request, *_ok_msg(
-                f"{node['name']}: outbound {'вкл' if node['as_outbound'] else 'выкл'}; sync={'OK' if res.get('ok') else res.get('error')}",
-                xr))
-            return go("/nodes")
-        if action == "mirror":
-            node["mirror"] = not node.get("mirror")
-            if node["mirror"]:
-                node["sync_clients"] = True
-                node["sync_inbounds"] = True
-                # Standby copy is most useful when the node is also an egress outbound
-                if not node.get("as_outbound"):
-                    node["as_outbound"] = True
+            if action == "delete":
+                nodes.remove(node)
+                nodes_mod.sync_all_node_outbounds(store)
+                flash(request, "Нода удалена", "info")
+            elif action == "toggle":
+                node["enabled"] = not node.get("enabled", True)
+                nodes_mod.upsert_node_outbound(store, node)
+                flash(request, f"{node['name']}: {'вкл' if node['enabled'] else 'выкл'}", "info")
+            else:
+                new_tok = str(form.get("token") or "").strip()
+                if len(new_tok) < 8:
+                    flash(request, "Token слишком короткий", "error")
+                    return go("/nodes")
+                node["token"] = new_tok
+                flash(request, f"{node['name']}: token обновлён — нажмите Sync", "info")
+        if action == "delete":
+            _apply_xray(_load_store())
+        return go("/nodes")
+
+    # --- outbound / mirror / sync: flip flags under lock, push in background ---
+    if action in ("outbound", "mirror", "sync"):
+        host = public_host()
+        with mutate() as store:
+            nodes = nodes_mod.ensure_list(store)
+            node = next((n for n in nodes if n["id"] == node_id), None)
+            if not node:
+                flash(request, "Нода не найдена", "error")
+                return go("/nodes")
+            if action == "outbound":
+                node["as_outbound"] = not node.get("as_outbound")
+                if node["as_outbound"]:
                     nodes_mod.ensure_bridge(node)
+                label = f"outbound {'вкл' if node['as_outbound'] else 'выкл'}"
+            elif action == "mirror":
+                node["mirror"] = not node.get("mirror")
+                if node["mirror"]:
+                    node["sync_clients"] = True
+                    node["sync_inbounds"] = True
+                    if not node.get("as_outbound"):
+                        node["as_outbound"] = True
+                        nodes_mod.ensure_bridge(node)
+                    # Refuse self-host before we start a heavy push
+                    self_err = nodes_mod.same_host_as_master(node.get("domain") or "", host)
+                    if self_err:
+                        node["mirror"] = False
+                        flash(request, self_err, "error")
+                        return go("/nodes")
+                label = f"зеркало {'вкл' if node['mirror'] else 'выкл'}"
+            else:
+                label = "sync"
             nodes_mod.upsert_node_outbound(store, node)
-            payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload, master_host=public_host())
-            xr = _apply_xray(store)
-            flash(request, *_ok_msg(
-                f"{node['name']}: зеркало {'вкл' if node['mirror'] else 'выкл'}; sync={'OK' if res.get('ok') else res.get('error')}",
-                xr))
-            return go("/nodes")
-        if action == "sync":
-            nodes_mod.upsert_node_outbound(store, node)
-            payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload, master_host=public_host())
-            webhooks.fire(store["settings"], "node.sync", {"node": node["name"], "ok": res.get("ok"), "error": res.get("error")})
-            xr = _apply_xray(store)
-            flash(request, *_ok_msg(f"{node['name']}: {'OK' if res.get('ok') else res.get('error') or 'ошибка'}", xr))
-            return go("/nodes")
-        if action == "update":
+            name = node["name"]
+            running = NODES_JOB.get("id")
+            if running and ops.JOBS.get(running, {}).get("status") == "running":
+                flash(request, "Уже идёт операция с нодами — флаг сохранён, Sync позже", "info")
+                return go("/nodes")
+        NODES_JOB["id"] = ops.start_job(
+            f"node-{action}-{name}",
+            _node_push_job, node_id, f"{name}: {label}", host,
+        )
+        flash(request, f"{name}: {label} — синхронизация в фоне", "info")
+        return go("/nodes")
+
+    if action == "update":
+        with mutate() as store:
+            nodes = nodes_mod.ensure_list(store)
+            node = next((n for n in nodes if n["id"] == node_id), None)
+            if not node:
+                flash(request, "Нода не найдена", "error")
+                return go("/nodes")
             if not nodes_mod.is_master(store):
                 flash(request, "Только мастер может обновлять ноды", "error")
                 return go("/nodes")
@@ -3611,49 +3659,55 @@ async def nodes_action(node_id: str, action: str, request: Request):
             node_id_local = node["id"]
             name = node["name"]
 
-            def job():
-                import time as _time
-                if ssh_password:
-                    res = nodes_mod.update_via_ssh(node_copy, ssh_password=ssh_password)
-                else:
-                    res = nodes_mod.trigger_update(node_copy)
-                    if res.get("ok") and (res.get("started") or res.get("already")):
-                        # wait for remote restart, then probe version
-                        _time.sleep(20)
-                        for _ in range(6):
-                            probe = nodes_mod.probe_health(node_copy, timeout=8)
-                            if probe.get("ok") and probe.get("version"):
-                                break
-                            _time.sleep(5)
-                with mutate() as st:
-                    for n in nodes_mod.ensure_list(st):
-                        if n.get("id") != node_id_local:
-                            continue
-                        if node_copy.get("panel_version"):
-                            n["panel_version"] = node_copy["panel_version"]
-                        if node_copy.get("last_update"):
-                            n["last_update"] = node_copy["last_update"]
-                        if res.get("ok"):
-                            n["last_error"] = ""
-                            n["last_ok"] = True
-                        elif node_copy.get("last_error"):
-                            n["last_error"] = node_copy["last_error"]
-                        break
-                log = res.get("log") or ""
-                ver = node_copy.get("panel_version") or res.get("version") or ""
-                if ver:
-                    log = (log + f"\nversion: {ver}").strip()
-                return {
-                    "ok": bool(res.get("ok")),
-                    "log": log or ("" if res.get("ok") else res.get("error") or "update failed"),
-                    "error": "" if res.get("ok") else (res.get("error") or "update failed"),
-                }
+        def job():
+            import time as _time
+            if ssh_password:
+                res = nodes_mod.update_via_ssh(node_copy, ssh_password=ssh_password)
+            else:
+                res = nodes_mod.trigger_update(node_copy)
+                if res.get("ok") and (res.get("started") or res.get("already")):
+                    _time.sleep(20)
+                    for _ in range(6):
+                        probe = nodes_mod.probe_health(node_copy, timeout=8)
+                        if probe.get("ok") and probe.get("version"):
+                            break
+                        _time.sleep(5)
+            with mutate() as st:
+                for n in nodes_mod.ensure_list(st):
+                    if n.get("id") != node_id_local:
+                        continue
+                    if node_copy.get("panel_version"):
+                        n["panel_version"] = node_copy["panel_version"]
+                    if node_copy.get("last_update"):
+                        n["last_update"] = node_copy["last_update"]
+                    if res.get("ok"):
+                        n["last_error"] = ""
+                        n["last_ok"] = True
+                    elif node_copy.get("last_error"):
+                        n["last_error"] = node_copy["last_error"]
+                    break
+            log = res.get("log") or ""
+            ver = node_copy.get("panel_version") or res.get("version") or ""
+            if ver:
+                log = (log + f"\nversion: {ver}").strip()
+            return {
+                "ok": bool(res.get("ok")),
+                "log": log or ("" if res.get("ok") else res.get("error") or "update failed"),
+                "error": "" if res.get("ok") else (res.get("error") or "update failed"),
+            }
 
-            NODES_JOB["id"] = ops.start_job(f"node-update-{name}", job)
-            via = "SSH" if ssh_password else "agent API"
-            flash(request, f"Обновление ноды {name} запущено ({via}). Смотрите фоновые задачи.", "info")
-            return go("/nodes")
-        if action == "promote":
+        NODES_JOB["id"] = ops.start_job(f"node-update-{name}", job)
+        via = "SSH" if ssh_password else "agent API"
+        flash(request, f"Обновление ноды {name} запущено ({via}). Смотрите фоновые задачи.", "info")
+        return go("/nodes")
+
+    if action == "promote":
+        with mutate() as store:
+            nodes = nodes_mod.ensure_list(store)
+            node = next((n for n in nodes if n["id"] == node_id), None)
+            if not node:
+                flash(request, "Нода не найдена", "error")
+                return go("/nodes")
             ssh_password = str(form.get("password") or "")
             if not ssh_password and not node.get("mirror"):
                 flash(request, "Нужен SSH-пароль ноды (для зеркала можно без пароля — через API)", "error")
@@ -3662,7 +3716,6 @@ async def nodes_action(node_id: str, action: str, request: Request):
             if running and ops.JOBS.get(running, {}).get("status") == "running":
                 flash(request, "Уже идёт операция с нодами", "info")
                 return go("/nodes")
-            # Snapshot current master identity as a future agent node
             old = {
                 "id": str(uuid.uuid4()),
                 "name": public_host() or "old-master",
@@ -3687,40 +3740,37 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "dns": store.get("dns") or {},
                 "xray_settings": store.get("xray_settings") or {},
             }
-            # Other peers stay in the new master's registry
             peers = [nodes_mod._peer_node_export(n) for n in nodes if n.get("id") != node.get("id")]
             node_copy = dict(node)
             use_api = bool(node.get("mirror")) and not ssh_password
+            name = node["name"]
 
-            def job():
-                # 1) enable agent mode on current master
+        def job():
+            with mutate() as st:
+                ns = st.setdefault("settings", {}).setdefault("nodes", {})
+                ns["agent_enabled"] = True
+                ns["role"] = "agent"
+                nodes_mod.agent_token(st)
+            if use_api:
+                body = nodes_mod.promote_payload(snap, old, extra_nodes=peers)
+                res = nodes_mod.promote_via_api(node_copy, body)
+            else:
+                res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
+                                               master_store_snapshot=snap, old_master_node=old)
+            if not res.get("ok"):
                 with mutate() as st:
-                    ns = st.setdefault("settings", {}).setdefault("nodes", {})
-                    ns["agent_enabled"] = True
-                    ns["role"] = "agent"
-                    nodes_mod.agent_token(st)
-                # 2) promote remote — mirrored nodes prefer HTTP (data already on disk)
-                if use_api:
-                    body = nodes_mod.promote_payload(snap, old, extra_nodes=peers)
-                    res = nodes_mod.promote_via_api(node_copy, body)
-                else:
-                    res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
-                                                   master_store_snapshot=snap, old_master_node=old)
-                if not res.get("ok"):
-                    # rollback role
-                    with mutate() as st:
-                        st["settings"]["nodes"]["agent_enabled"] = False
-                        st["settings"]["nodes"]["role"] = "master"
-                    return {"ok": False, "error": res.get("error"), "log": res.get("log") or ""}
-                # 3) remove promoted node from local registry (we are agent now); keep others
-                with mutate() as st:
-                    st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
-                via = "API" if use_api else "SSH"
-                return {"ok": True, "log": (res.get("log") or "") + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."}
+                    st["settings"]["nodes"]["agent_enabled"] = False
+                    st["settings"]["nodes"]["role"] = "master"
+                return {"ok": False, "error": res.get("error"), "log": res.get("log") or ""}
+            with mutate() as st:
+                st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
+            via = "API" if use_api else "SSH"
+            return {"ok": True, "log": (res.get("log") or "") + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."}
 
-            NODES_JOB["id"] = ops.start_job("node-promote", job)
-            flash(request, f"Передача роли master → {node['name']} запущена ({'API' if use_api else 'SSH'})", "info")
-            return go("/nodes")
+        NODES_JOB["id"] = ops.start_job("node-promote", job)
+        flash(request, f"Передача роли master → {name} запущена ({'API' if use_api else 'SSH'})", "info")
+        return go("/nodes")
+
     flash(request, "Неизвестное действие", "error")
     return go("/nodes")
 
@@ -3729,19 +3779,41 @@ async def nodes_action(node_id: str, action: str, request: Request):
 def nodes_sync_all(request: Request):
     if redir := _require(request):
         return redir
-    ok = fail = 0
-    with mutate() as store:
-        nodes_mod.sync_all_node_outbounds(store)
-        for node in nodes_mod.ensure_list(store):
-            if not node.get("enabled", True):
-                continue
-            payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload, master_host=public_host())
+    host = public_host()
+    running = NODES_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Уже идёт операция с нодами", "info")
+        return go("/nodes")
+
+    def job():
+        with mutate() as store:
+            nodes_mod.sync_all_node_outbounds(store)
+            payloads = [(n["id"], n.get("name") or n["id"],
+                         nodes_mod.build_payload(store, n, xray.build_config), dict(n)) for n in
+                        nodes_mod.ensure_list(store) if n.get("enabled", True)]
+        ok = fail = 0
+        logs = []
+        for nid, name, payload, node_snap in payloads:
+            res = nodes_mod.push(node_snap, payload, master_host=host, timeout=120)
             ok += 1 if res.get("ok") else 0
             fail += 0 if res.get("ok") else 1
-            webhooks.fire(store["settings"], "node.sync", {"node": node["name"], "ok": res.get("ok")})
-        _apply_xray(store)
-    flash(request, f"Синхронизация: OK {ok}, ошибок {fail}", "info" if not fail else "error")
+            logs.append(f"{name}: {'OK' if res.get('ok') else res.get('error')}")
+            with mutate() as store:
+                for n in nodes_mod.ensure_list(store):
+                    if n.get("id") != nid:
+                        continue
+                    n["last_sync"] = node_snap.get("last_sync") or n.get("last_sync")
+                    n["last_ok"] = bool(node_snap.get("last_ok"))
+                    n["last_error"] = node_snap.get("last_error") or ""
+                    break
+                webhooks.fire(store["settings"], "node.sync", {"node": name, "ok": res.get("ok")})
+        with mutate() as store:
+            _apply_xray(store)
+        return {"ok": fail == 0, "log": f"OK {ok}, ошибок {fail}\n" + "\n".join(logs),
+                "error": "" if fail == 0 else f"{fail} failed"}
+
+    NODES_JOB["id"] = ops.start_job("nodes-sync-all", job)
+    flash(request, "Синхронизация всех нод запущена в фоне", "info")
     return go("/nodes")
 
 
