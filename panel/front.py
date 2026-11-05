@@ -179,8 +179,11 @@ def domains_without_cert(store: dict) -> list[str]:
 
 # ---------------------------------------------------------------- render
 
-def _panel_locations() -> list[str]:
-    """Proxy panel + subscriptions on the public domain (everything clients need on :443)."""
+CAMOUFLAGE_URL = "https://ya.ru/"
+
+
+def _panel_locations(store: dict | None = None) -> list[str]:
+    """Public HTTPS site: correct links work; bare / and unknown paths go to ya.ru."""
     common = (
         "        proxy_http_version 1.1;\n"
         "        proxy_set_header Host $host;\n"
@@ -192,17 +195,29 @@ def _panel_locations() -> list[str]:
         "        proxy_read_timeout 300s;\n"
         "        client_max_body_size 64m;\n"
     )
-    return [
+    proxy = f"        proxy_pass http://{PANEL_UPSTREAM};\n{common}"
+    base = (((store or {}).get("settings") or {}).get("panel") or {}).get("base_path") or ""
+    base = re.sub(r"[^A-Za-z0-9_-]", "", str(base)).strip("/")
+    out = [
         "    location ^~ /.well-known/acme-challenge/ {\n"
         "        root /var/www/l2x-acme;\n"
         "        default_type text/plain;\n"
         "        try_files $uri =404;\n"
         "    }",
-        f"    location / {{\n"
-        f"        proxy_pass http://{PANEL_UPSTREAM};\n"
-        f"{common}"
-        "    }",
+        # Visitors without a real link (just open the site) land on Yandex
+        f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}",
+        f"    location ^~ /sub/ {{\n{proxy}    }}",
+        f"    location ^~ /panel/api/ {{\n{proxy}    }}",
+        f"    location = /health {{\n{proxy}    }}",
     ]
+    if base:
+        out.append(f"    location = /{base} {{\n        return 302 /{base}/;\n    }}")
+        out.append(f"    location ^~ /{base}/ {{\n{proxy}    }}")
+        out.append(f"    location / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
+    else:
+        # No secret path yet: only bare / is camouflaged; /login and the rest still reach the panel
+        out.append(f"    location / {{\n{proxy}    }}")
+    return out
 
 
 def render(store: dict) -> tuple[str, str, list[str]]:
@@ -254,9 +269,10 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         for loc in sorted(locs, key=lambda x: x["path"]):
             body.append(_location(loc))
         if domain == pub:
-            body.extend(_panel_locations())
+            body.extend(_panel_locations(store))
         else:
-            body.append("    location / {\n        return 404;\n    }")
+            body.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
+            body.append(f"    location / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
         blocks.append("server {\n" + "\n".join(body) + "\n}")
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
 
