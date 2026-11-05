@@ -942,6 +942,8 @@ def _sync_xray_config() -> None:
             staged = front.stage(store)
             if staged["ok"]:
                 front.commit(staged)
+            # iptables rules do not survive a reboot
+            xray.ban_inbound_ports(store)
         _issue_front_certs(store)
     except Exception:
         pass
