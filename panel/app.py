@@ -135,6 +135,10 @@ def default_settings() -> dict:
         "nodes": {"agent_enabled": False, "agent_token": ""},
         "iplimit": {"ban_minutes": 30},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
+        "l2tp_auto": {
+            "enabled": False, "max_connected": 4, "interval_minutes": 60,
+            "candidate_extra": 3, "dl_bytes": 8_000_000, "ul_bytes": 2_000_000,
+        },
         "security": {"totp_enabled": False, "totp_secret": ""},
         "api_tokens": [],
         "geo_custom": [],
@@ -166,7 +170,7 @@ def _load_store() -> dict:
         except ValueError:
             data = {}
     for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
-                         ("ip_ban_stats", {}), ("xray_update_state", {})):
+                         ("ip_ban_stats", {}), ("xray_update_state", {}), ("l2tp_auto_state", {})):
         data.setdefault(key, default)
     data.setdefault("reverse", {"bridges": [], "portals": []})
     xray.ensure_balancers(data)
@@ -960,6 +964,171 @@ def _xray_update_loop() -> None:
             return
 
 
+# ================================================================ L2TP auto-select (best N by ping + speed)
+
+L2TP_AUTO_JOB: dict[str, str] = {}
+
+
+def _persist_l2tp_item(name: str, item: dict, *, connected: bool, error: str = "") -> None:
+    with mutate() as store:
+        it = next((x for x in store["l2tp"] if x["name"] == name), None)
+        if not it:
+            return
+        if connected:
+            for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf"):
+                it[k] = item.get(k, "")
+            it["status"], it["last_error"] = "connected", ""
+            if item.get("metrics"):
+                it["metrics"] = item["metrics"]
+        else:
+            it["status"] = "disconnected"
+            for k in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
+                it[k] = ""
+            it["last_error"] = error
+            if item.get("metrics"):
+                it["metrics"] = item["metrics"]
+
+
+def select_best_l2tp(*, force: bool = False) -> dict:
+    """Connect at most N best L2TP tunnels ranked by egress ping + download/upload speed.
+
+    1) ICMP ping to each LNS (no tunnel needed) → shortlist
+    2) Connect shortlist, measure through each PPP iface
+    3) Keep top max_connected, disconnect the rest of the shortlist
+    """
+    cfg = (_settings().get("l2tp_auto") or {})
+    max_n = max(1, min(32, _int(cfg.get("max_connected"), 4)))
+    extra = max(0, min(20, _int(cfg.get("candidate_extra"), 3)))
+    dl_bytes = max(1_000_000, _int(cfg.get("dl_bytes"), 8_000_000))
+    ul_bytes = max(100_000, _int(cfg.get("ul_bytes"), 2_000_000))
+    store = _load_store()
+    tunnels = list(store.get("l2tp") or [])
+    if not tunnels:
+        return {"ok": False, "error": "нет L2TP туннелей", "log": ""}
+    log: list[str] = [f"select best of {len(tunnels)}, keep ≤{max_n}"]
+
+    # --- phase 1: LNS ping ---
+    ranked: list[tuple[float, dict]] = []
+    for t in tunnels:
+        ms = l2tp.ping_host_ms(t.get("server_host") or "", timeout=3)
+        metrics = dict(t.get("metrics") or {})
+        metrics["lns_ping_ms"] = ms
+        metrics["probed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        t["metrics"] = metrics
+        with mutate() as s:
+            it = next((x for x in s["l2tp"] if x["name"] == t["name"]), None)
+            if it:
+                it["metrics"] = metrics
+        key = ms if ms is not None else 99999.0
+        ranked.append((key, t))
+        log.append(f"  LNS {t['name']}: {ms if ms is not None else 'fail'} ms")
+    ranked.sort(key=lambda x: x[0])
+    shortlist_n = min(len(ranked), max_n + extra)
+    shortlist = [t for _, t in ranked[:shortlist_n]]
+    short_names = {t["name"] for t in shortlist}
+    log.append(f"shortlist ({shortlist_n}): " + ", ".join(t["name"] for t in shortlist))
+
+    # Disconnect tunnels that will never be candidates this round (except keep already-good ones outside? no — enforce max)
+    # First bring shortlist up, measure, then disconnect losers including previously connected outsiders.
+
+    # --- phase 2: connect shortlist ---
+    connected_ok: list[dict] = []
+    for t in shortlist:
+        fresh = next((x for x in _load_store()["l2tp"] if x["name"] == t["name"]), t)
+        if fresh.get("status") == "connected" and l2tp.is_connected(fresh["name"]):
+            t.update({k: fresh.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf", "status")})
+            connected_ok.append(t)
+            log.append(f"  already up {t['name']}")
+            continue
+        result = connect_l2tp(fresh)
+        if result.get("ok"):
+            t.update({k: fresh.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf")})
+            t["status"] = "connected"
+            _persist_l2tp_item(t["name"], t, connected=True)
+            connected_ok.append(t)
+            log.append(f"  connected {t['name']} egress {t.get('public_ip') or '?'}")
+        else:
+            err = result.get("error") or "connect failed"
+            t["metrics"] = {**(t.get("metrics") or {}), "error": err}
+            _persist_l2tp_item(t["name"], t, connected=False, error=err)
+            log.append(f"  FAIL {t['name']}: {err}")
+
+    # --- phase 3: measure egress ---
+    scored: list[tuple[float, dict]] = []
+    for t in connected_ok:
+        iface = t.get("ifname") or l2tp.ifname_for(t["name"])
+        m = l2tp.measure_iface(iface, dl_bytes=dl_bytes, ul_bytes=ul_bytes)
+        metrics = {**(t.get("metrics") or {}), **{k: m.get(k) for k in ("ping_ms", "dl_mbps", "ul_mbps", "ok", "error")}}
+        metrics["score"] = l2tp.score_tunnel(metrics)
+        metrics["probed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        t["metrics"] = metrics
+        with mutate() as s:
+            it = next((x for x in s["l2tp"] if x["name"] == t["name"]), None)
+            if it:
+                it["metrics"] = metrics
+        scored.append((float(metrics["score"]), t))
+        log.append(
+            f"  measure {t['name']}: ping={metrics.get('ping_ms')}ms "
+            f"↓{metrics.get('dl_mbps')} ↑{metrics.get('ul_mbps')} Mbps score={metrics['score']}"
+        )
+    scored.sort(key=lambda x: -x[0])
+    winners = [t for _, t in scored[:max_n]]
+    winner_names = {t["name"] for t in winners}
+    log.append("winners: " + (", ".join(t["name"] for t in winners) or "—"))
+
+    # --- phase 4: disconnect everyone not in winners ---
+    store = _load_store()
+    for t in store.get("l2tp") or []:
+        if t["name"] in winner_names:
+            continue
+        if t.get("status") == "connected" or l2tp.is_connected(t["name"]):
+            disconnect_l2tp(t, store)
+            _persist_l2tp_item(t["name"], t, connected=False)
+            log.append(f"  disconnect {t['name']}")
+
+    xr = _apply_xray(_load_store())
+    log.append(f"xray ok={xr.get('ok')} {xr.get('error') or xr.get('warning') or ''}".strip())
+    summary = {
+        "ok": bool(winners),
+        "max_connected": max_n,
+        "winners": [
+            {"name": t["name"], "score": (t.get("metrics") or {}).get("score"),
+             "ping_ms": (t.get("metrics") or {}).get("ping_ms"),
+             "dl_mbps": (t.get("metrics") or {}).get("dl_mbps"),
+             "ul_mbps": (t.get("metrics") or {}).get("ul_mbps"),
+             "public_ip": t.get("public_ip")}
+            for t in winners
+        ],
+        "ran_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "log": "\n".join(log),
+        "xray_ok": bool(xr.get("ok")),
+    }
+    with mutate() as s:
+        s["l2tp_auto_state"] = {
+            "ran_at": summary["ran_at"], "max_connected": max_n,
+            "winners": summary["winners"], "log": summary["log"][-6000:],
+            "ok": summary["ok"], "error": "" if summary["ok"] else "не удалось выбрать туннели",
+        }
+    return summary
+
+
+def _l2tp_auto_loop() -> None:
+    if _stop.wait(120):
+        return
+    while True:
+        cfg = (_settings().get("l2tp_auto") or {})
+        minutes = max(15, _int(cfg.get("interval_minutes"), 60))
+        if cfg.get("enabled"):
+            running = L2TP_AUTO_JOB.get("id")
+            if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
+                try:
+                    L2TP_AUTO_JOB["id"] = ops.start_job("l2tp-auto-select", select_best_l2tp)
+                except Exception:
+                    pass
+        if _stop.wait(minutes * 60):
+            return
+
+
 def _history_loop() -> None:
     sysmon.cpu_percent()
     try:
@@ -1065,7 +1234,7 @@ def _startup():
     _admin()
     _ensure_base_path()
     _refresh_settings_cache()
-    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop):
+    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _l2tp_auto_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -2034,7 +2203,52 @@ def l2tp_page(request: Request):
     items = [{**item, "bindings": _l2tp_bindings(store, item),
               "traffic": (store.get("outbound_traffic") or {}).get(item.get("outbound") or f"l2tp_{item['name']}", {})}
              for item in store["l2tp"]]
-    return page(request, "l2tp.html", active="l2tp", items=items)
+    # winners first, then connected, then by score/name
+    winners = {w.get("name") for w in (store.get("l2tp_auto_state") or {}).get("winners") or []}
+    def sort_key(i):
+        m = i.get("metrics") or {}
+        return (0 if i["name"] in winners else 1, 0 if i.get("status") == "connected" else 1,
+                -(float(m.get("score") or -9999)), i["name"])
+    items.sort(key=sort_key)
+    running = L2TP_AUTO_JOB.get("id")
+    job = ops.JOBS.get(running) if running else None
+    return page(request, "l2tp.html", active="l2tp", items=items,
+                auto_cfg=store["settings"].get("l2tp_auto") or {},
+                auto_state=store.get("l2tp_auto_state") or {},
+                auto_job=job, auto_job_id=running,
+                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5])
+
+
+@app.post("/l2tp/auto/settings")
+async def l2tp_auto_settings(request: Request):
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    with mutate() as store:
+        store["settings"]["l2tp_auto"] = {
+            "enabled": form.get("enabled") == "1",
+            "max_connected": max(1, min(32, _int(form.get("max_connected"), 4))),
+            "interval_minutes": max(15, min(24 * 60, _int(form.get("interval_minutes"), 60))),
+            "candidate_extra": max(0, min(20, _int(form.get("candidate_extra"), 3))),
+            "dl_bytes": max(1_000_000, _int(form.get("dl_bytes"), 8_000_000)),
+            "ul_bytes": max(100_000, _int(form.get("ul_bytes"), 2_000_000)),
+        }
+    _refresh_settings_cache()
+    flash(request, "Автовыбор L2TP сохранён", "info")
+    return go("/l2tp")
+
+
+@app.post("/l2tp/auto/run")
+def l2tp_auto_run(request: Request):
+    if redir := _require(request):
+        return redir
+    running = L2TP_AUTO_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Подбор лучших серверов уже идёт", "info")
+        return go("/l2tp")
+    L2TP_AUTO_JOB["id"] = ops.start_job("l2tp-auto-select", select_best_l2tp)
+    flash(request, "Запущен подбор лучших L2TP (пинг LNS → скорость через туннель). Это займёт несколько минут.", "info")
+    return go("/l2tp")
 
 
 @app.post("/l2tp")

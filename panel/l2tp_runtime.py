@@ -470,6 +470,84 @@ def probe_public_ip(iface: str, timeout: int = 8) -> str:
     return ""
 
 
+def ping_host_ms(host: str, timeout: int = 4) -> float | None:
+    """ICMP RTT to LNS host in ms (rough pre-filter before connecting)."""
+    host = (host or "").strip()
+    if not host:
+        return None
+    r = _run(["ping", "-4", "-c", "2", "-W", str(timeout), host], timeout=timeout * 3 + 2)
+    text = (r.get("stdout") or "") + "\n" + (r.get("stderr") or "")
+    # rtt min/avg/max/mdev = 12.3/14.1/...
+    m = re.search(r"=\s*([\d.]+)/([\d.]+)/", text)
+    if m:
+        return round(float(m.group(2)), 1)
+    m = re.search(r"time[=<]([\d.]+)\s*ms", text)
+    return round(float(m.group(1)), 1) if m else None
+
+
+def measure_iface(iface: str, *, dl_bytes: int = 8_000_000, ul_bytes: int = 2_000_000) -> dict:
+    """Egress quality through a PPP iface: ping ms, download/upload Mbps."""
+    out: dict = {"ok": False, "ping_ms": None, "dl_mbps": None, "ul_mbps": None, "error": ""}
+    if not iface or not iface_is_up(iface):
+        out["error"] = "iface down"
+        return out
+    # TCP connect time to a light endpoint ≈ latency through the tunnel
+    ping = _run(
+        ["curl", "-4", "-s", "-o", "/dev/null", "-w", "%{time_connect}",
+         "--max-time", "8", "--interface", iface, "https://www.gstatic.com/generate_204"],
+        timeout=12,
+    )
+    try:
+        out["ping_ms"] = round(float((ping.get("stdout") or "0").strip()) * 1000, 1)
+    except ValueError:
+        out["ping_ms"] = None
+    dl = _run(
+        ["curl", "-4", "-s", "-o", "/dev/null",
+         "-w", "%{speed_download}", "--max-time", "25", "--interface", iface,
+         f"https://speed.cloudflare.com/__down?bytes={int(dl_bytes)}"],
+        timeout=30,
+    )
+    try:
+        out["dl_mbps"] = round(float((dl.get("stdout") or "0").strip()) * 8 / 1e6, 2)
+    except ValueError:
+        out["dl_mbps"] = None
+    # Cloudflare upload sink (small blob through the tunnel)
+    tmp = f"/tmp/l2x-ul-{os.getpid()}-{iface.replace('/', '_')}.bin"
+    ul: dict = {"stdout": "", "stderr": "", "exit_code": 1}
+    try:
+        with open(tmp, "wb") as f:
+            f.write(b"\0" * max(64_000, int(ul_bytes)))
+        ul = _run(
+            ["curl", "-4", "-s", "-o", "/dev/null",
+             "-w", "%{speed_upload}", "--max-time", "20", "--interface", iface,
+             "-X", "POST", "--data-binary", f"@{tmp}",
+             "https://speed.cloudflare.com/__up"],
+            timeout=25,
+        )
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    try:
+        out["ul_mbps"] = round(float((ul.get("stdout") or "0").strip()) * 8 / 1e6, 2)
+    except ValueError:
+        out["ul_mbps"] = None
+    out["ok"] = out["dl_mbps"] is not None and out["dl_mbps"] > 0
+    if not out["ok"]:
+        out["error"] = (dl.get("stderr") or ul.get("stderr") or "measure failed")[:200]
+    return out
+
+
+def score_tunnel(metrics: dict) -> float:
+    """Higher is better: prefer throughput, penalize latency."""
+    dl = float(metrics.get("dl_mbps") or 0)
+    ul = float(metrics.get("ul_mbps") or 0)
+    ping = float(metrics.get("ping_ms") or metrics.get("lns_ping_ms") or 9999)
+    # Mbps dominate; ping penalty softens after ~50 ms
+    return round(dl * 1.0 + ul * 0.5 - min(ping, 2000) / 20.0, 3)
+
+
 def setup_tunnel_isolation(name: str, iface: str) -> dict:
     """Isolate overlapping PPP addresses with per-tunnel routing tables.
 

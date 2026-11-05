@@ -3,10 +3,14 @@
 {% import "_icons.html" as ic %}
 {% block title %}L2TP · {{ app_name }}{% endblock %}
 {% block page_title %}L2TP туннели{% endblock %}
-{% block page_sub %}{{ items|selectattr('status', 'equalto', 'connected')|list|length }} из {{ items|length }} подключено · каждый туннель — свой интерфейс (strongSwan + xl2tpd){% endblock %}
+{% block page_sub %}{{ items|selectattr('status', 'equalto', 'connected')|list|length }} из {{ items|length }} подключено · автовыбор до {{ auto_cfg.get('max_connected', 4) }} лучших{% endblock %}
 {% block top_actions %}
 <div class="actions">
   <a class="btn ghost" href="{{ bp }}/l2tp">{{ ic.icon('refresh') }}{{ t('Обновить') }}</a>
+  <form method="post" action="{{ bp }}/l2tp/auto/run"
+        onsubmit="return confirm('Подобрать до {{ auto_cfg.get('max_connected', 4) }} лучших серверов?\nПинг до LNS у всех, затем скорость через shortlist — займёт несколько минут.')">
+    <button class="btn sm" {% if auto_job and auto_job.status == 'running' %}disabled{% endif %}>{{ ic.icon('activity') }}Подобрать лучшие</button>
+  </form>
   <button class="btn" type="button" onclick="openDlg('dlg-add')">{{ ic.icon('plus') }}{{ t('Добавить') }}</button>
 </div>
 {% endblock %}
@@ -24,9 +28,35 @@
 </style>
 {% endblock %}
 {% block content %}
+<div class="card">
+  <div class="card-head"><h3>Автовыбор лучших серверов</h3>
+    {% if auto_job %}<span class="badge {% if auto_job.status == 'done' %}ok{% elif auto_job.status == 'failed' %}err{% else %}warn{% endif %}">{{ auto_job.status }}</span>{% endif %}
+  </div>
+  <form method="post" action="{{ bp }}/l2tp/auto/settings" class="row" style="align-items:end;flex-wrap:wrap;gap:1rem">
+    <div style="max-width:140px"><label class="f">Макс. подключений</label>
+      <input name="max_connected" type="number" min="1" max="32" value="{{ auto_cfg.get('max_connected', 4) }}"></div>
+    <div style="max-width:160px"><label class="f">Интервал авто, мин</label>
+      <input name="interval_minutes" type="number" min="15" max="1440" value="{{ auto_cfg.get('interval_minutes', 60) }}"></div>
+    <div style="max-width:140px"><label class="f">Запас кандидатов</label>
+      <input name="candidate_extra" type="number" min="0" max="20" value="{{ auto_cfg.get('candidate_extra', 3) }}" title="Сколько лишних подключить для замера скорости"></div>
+    <div>{{ m.check('enabled', auto_cfg.get('enabled'), 'Автоматически переизбирать') }}</div>
+    <button class="btn ghost sm">{{ t('Сохранить') }}</button>
+  </form>
+  <div class="hint mt mb0">Сначала пинг до LNS у всех туннелей (без подключения). Затем поднимаются лучшие по пингу (N + запас), через каждый меряются задержка и скорость ↓/↑. Остаются N с лучшим score. Балансировщик Xray <code>lb_least_ping</code> дальше выбирает среди уже подключённых.</div>
+  {% if auto_state.winners %}
+  <div class="small mt">Последний подбор {{ fmt_dt(auto_state.ran_at) if auto_state.ran_at else '—' }}:
+    {% for w in auto_state.winners %}
+      <span class="badge ok">{{ w.name }} · ↓{{ w.dl_mbps or '?' }} ↑{{ w.ul_mbps or '?' }} · {{ w.ping_ms or '?' }} мс</span>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if auto_state.error %}<div class="small" style="color:var(--danger)">{{ auto_state.error }}</div>{% endif %}
+</div>
+{% include "_jobs.html" %}
+
 <div class="nodes">
 {% for i in items %}
-  {% set cc = country_code(i) %}{% set up = i.status == 'connected' %}
+  {% set cc = country_code(i) %}{% set up = i.status == 'connected' %}{% set mtr = i.metrics or {} %}
   <div class="card node {% if up %}up{% endif %}">
     <div class="top">
       {% if cc %}<img class="flag" src="https://flagcdn.com/48x36/{{ cc|lower }}.png" alt="{{ flag_emoji(cc) }}" title="{{ cc }}">{% else %}<span style="font-size:1.5rem">🌐</span>{% endif %}
@@ -39,6 +69,7 @@
     <dl class="kv">
       <dt>Egress IP</dt><dd class="mono">{{ i.public_ip or '—' }}</dd>
       <dt>Интерфейс</dt><dd class="mono">{{ i.ifname or ('l2x-' ~ i.name) }}{% if i.local_ip %} · {{ i.local_ip }} → {{ i.peer_ip }}{% endif %}</dd>
+      <dt>Качество</dt><dd class="small">{% if mtr.get('score') is not none %}score {{ mtr.score }} · {% endif %}{% if mtr.get('ping_ms') is not none %}{{ mtr.ping_ms }} мс{% elif mtr.get('lns_ping_ms') is not none %}LNS {{ mtr.lns_ping_ms }} мс{% else %}—{% endif %}{% if mtr.get('dl_mbps') is not none %} · ↓{{ mtr.dl_mbps }}{% endif %}{% if mtr.get('ul_mbps') is not none %} ↑{{ mtr.ul_mbps }} Мбит/с{% endif %}</dd>
       <dt>Outbound</dt><dd class="mono">{{ i.bindings.outbound }}</dd>
       <dt>{{ t('Трафик') }}</dt><dd>↑{{ format_traffic(i.traffic.up or 0) }} ↓{{ format_traffic(i.traffic.down or 0) }}</dd>
       <dt>Логин</dt><dd>{{ i.username }}</dd>
