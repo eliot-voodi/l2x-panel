@@ -313,6 +313,7 @@ def _normalize_domain(value: str) -> str:
 
 def _local_ip_set() -> set[str]:
     import socket
+    import subprocess
     ips: set[str] = {"127.0.0.1", "::1"}
     try:
         hostname = socket.gethostname()
@@ -327,6 +328,14 @@ def _local_ip_set() -> set[str]:
         s.close()
     except OSError:
         pass
+    for cmd in (("hostname", "-I"), ("ip", "-4", "-o", "addr", "show", "scope", "global")):
+        try:
+            out = subprocess.check_output(cmd, text=True, timeout=5, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for tok in out.replace("/", " ").split():
+            if tok.count(".") == 3 and all(p.isdigit() for p in tok.split(".")):
+                ips.add(tok)
     return ips
 
 
@@ -392,8 +401,11 @@ def provision_via_ssh(
 
     try:
         sftp = client.open_sftp()
-        # Env file for non-interactive install (avoids shell-metachar issues in passwords)
+        # Non-interactive install: ensure curl, fail hard on errors (no silent "exit=0").
         env_body = "\n".join([
+            "#!/bin/bash",
+            "set -euo pipefail",
+            "export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}\"",
             "export DEBIAN_FRONTEND=noninteractive",
             f"export L2X_HOST={json.dumps(domain)[1:-1]}",
             f"export L2X_DOMAIN={json.dumps(domain)[1:-1]}",
@@ -402,6 +414,21 @@ def provision_via_ssh(
             "export L2X_ADMIN=admin",
             f"export L2X_PASSWORD={json.dumps(admin_password)[1:-1]}",
             f"export L2X_PATH={json.dumps(panel_path)[1:-1]}",
+            "",
+            "if ! command -v curl >/dev/null 2>&1; then",
+            "  if command -v apt-get >/dev/null 2>&1; then",
+            "    apt-get update -y",
+            "    apt-get install -y curl ca-certificates",
+            "  elif command -v dnf >/dev/null 2>&1; then",
+            "    dnf install -y curl ca-certificates",
+            "  elif command -v yum >/dev/null 2>&1; then",
+            "    yum install -y curl ca-certificates",
+            "  else",
+            "    echo 'curl is required but not installed' >&2",
+            "    exit 127",
+            "  fi",
+            "fi",
+            "command -v curl",
             "",
             "if [ -f /etc/l2xpanel/panel.env ] && [ -f /opt/l2xpanel/app.py ]; then",
             "  curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh | bash -s -- --update",
@@ -450,11 +477,18 @@ except Exception as exc:
             f.write(remote_py)
         sftp.close()
 
-        r = _ssh_run(client, "bash /tmp/l2x_remote_install.sh; rm -f /tmp/l2x_remote_install.sh", timeout=900)
+        r = _ssh_run(client, "bash /tmp/l2x_remote_install.sh; ec=$?; rm -f /tmp/l2x_remote_install.sh; exit $ec", timeout=900)
         log.append(f"install exit={r['code']}")
         log.append((r["stdout"] or "")[-2500:])
         if r["stderr"]:
             log.append("stderr: " + r["stderr"][-1500:])
+        if not r.get("ok"):
+            return {
+                "ok": False,
+                "error": f"установка на ноде завершилась с кодом {r.get('code')}",
+                "log": "\n".join(log),
+                "node": node,
+            }
         if not _ssh_run(client, "test -f /opt/l2xpanel/app.py")["ok"]:
             return {"ok": False, "error": "установка на ноде не удалась", "log": "\n".join(log), "node": node}
 

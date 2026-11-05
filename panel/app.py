@@ -3439,6 +3439,10 @@ async def nodes_provision(request: Request):
     if self_err:
         flash(request, self_err, "error")
         return go("/nodes")
+    # Extra guard: refuse literal master public host even if DNS is broken
+    if nodes_mod._normalize_domain(domain) == nodes_mod._normalize_domain(public_host() or ""):
+        flash(request, f"нельзя провиженить сам master ({domain})", "error")
+        return go("/nodes")
     running = NODES_JOB.get("id")
     if running and ops.JOBS.get(running, {}).get("status") == "running":
         flash(request, "Уже идёт операция с нодами", "info")
