@@ -230,8 +230,6 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         "        default_type text/plain;\n"
         "        try_files $uri =404;\n"
         "    }",
-        # Visitors without a real link (just open the site) land on Yandex
-        f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}",
         f"    location ^~ /sub/ {{\n{proxy}    }}",
         f"    location ^~ /panel/api/ {{\n{proxy}    }}",
         f"    location = /health {{\n{proxy}    }}",
@@ -243,6 +241,8 @@ def _panel_locations(store: dict | None = None) -> list[str]:
     else:
         # No secret path yet: only bare / is camouflaged; /login and the rest still reach the panel
         out.append(f"    location / {{\n{proxy}    }}")
+    # Visitors without a real link land on Yandex; kept as the last block of the server
+    out.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
     return out
 
 
@@ -297,8 +297,8 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         if domain == pub:
             body.extend(_panel_locations(store))
         else:
-            body.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
             body.append(f"    location / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
+            body.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
         blocks.append("server {\n" + "\n".join(body) + "\n}")
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
 
