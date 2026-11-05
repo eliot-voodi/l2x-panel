@@ -38,7 +38,7 @@
         <td class="small mono">{{ n.domain or n.url }}{% if n.base_path %}<div class="dim">/{{ n.base_path }}/</div>{% endif %}</td>
         <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
         <td>{% if not n.enabled %}<span class="badge">выкл</span>{% elif n.last_ok %}<span class="badge ok">ok</span>{% elif n.last_error %}<span class="badge err" title="{{ n.last_error }}">ошибка</span>{% else %}<span class="badge">—</span>{% endif %}</td>
-        <td class="small dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}{% if n.last_error %}<div class="badge err">{{ n.last_error[:60] }}</div>{% endif %}</td>
+        <td class="small dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}{% if n.last_error %}<div class="badge err" title="{{ n.last_error }}">{{ n.last_error[:80] }}</div>{% endif %}</td>
         <td>
           <div class="actions" style="justify-content:flex-end;flex-wrap:wrap">
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>

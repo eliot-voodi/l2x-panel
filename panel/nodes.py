@@ -240,7 +240,18 @@ def agent_apply_url(node: dict) -> str:
     return f"{base}/agent/apply"
 
 
-def push(node: dict, payload: dict, timeout: int = 60) -> dict:
+def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") -> dict:
+    domain = (node.get("domain") or "").strip()
+    if not domain:
+        from urllib.parse import urlparse
+        domain = urlparse(node.get("url") or "").hostname or ""
+    if master_host:
+        self_err = same_host_as_master(domain, master_host)
+        if self_err:
+            node["last_sync"] = now_iso()
+            node["last_ok"] = False
+            node["last_error"] = self_err
+            return {"ok": False, "error": self_err}
     url = agent_apply_url(node)
     token = node.get("token") or ""
     data = json.dumps(payload, ensure_ascii=False).encode()

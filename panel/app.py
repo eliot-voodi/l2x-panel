@@ -3402,6 +3402,12 @@ async def nodes_add(request: Request):
     if not url.startswith("http"):
         flash(request, "URL ноды должен начинаться с http", "error")
         return go("/nodes")
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    self_err = nodes_mod.same_host_as_master(host, public_host()) if host else ""
+    if self_err:
+        flash(request, self_err, "error")
+        return go("/nodes")
     with mutate() as store:
         node = {
             "id": str(uuid.uuid4()), "name": name, "url": url, "token": token, "enabled": True,
@@ -3472,7 +3478,7 @@ async def nodes_provision(request: Request):
             nodes.append(node)
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
-            push = nodes_mod.push(node, payload)
+            push = nodes_mod.push(node, payload, master_host=public_host())
             xr = _apply_xray(store)
         log = (res.get("log") or "") + f"\npanel: {res.get('panel_url')}\nadmin pass: {res.get('admin_password')}\n"
         log += f"sync: {push.get('ok')} {push.get('error') or ''}\nxray: {xr.get('ok')}"
@@ -3516,7 +3522,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 nodes_mod.ensure_bridge(node)
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload)
+            res = nodes_mod.push(node, payload, master_host=public_host())
             xr = _apply_xray(store)
             flash(request, *_ok_msg(
                 f"{node['name']}: outbound {'вкл' if node['as_outbound'] else 'выкл'}; sync={'OK' if res.get('ok') else res.get('error')}",
@@ -3525,7 +3531,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
         if action == "sync":
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload)
+            res = nodes_mod.push(node, payload, master_host=public_host())
             webhooks.fire(store["settings"], "node.sync", {"node": node["name"], "ok": res.get("ok"), "error": res.get("error")})
             xr = _apply_xray(store)
             flash(request, *_ok_msg(f"{node['name']}: {'OK' if res.get('ok') else res.get('error') or 'ошибка'}", xr))
@@ -3601,7 +3607,7 @@ def nodes_sync_all(request: Request):
             if not node.get("enabled", True):
                 continue
             payload = nodes_mod.build_payload(store, node, xray.build_config)
-            res = nodes_mod.push(node, payload)
+            res = nodes_mod.push(node, payload, master_host=public_host())
             ok += 1 if res.get("ok") else 0
             fail += 0 if res.get("ok") else 1
             webhooks.fire(store["settings"], "node.sync", {"node": node["name"], "ok": res.get("ok")})
