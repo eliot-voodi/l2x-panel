@@ -106,6 +106,34 @@
 
 {% elif tab == 'core' %}
 <div class="grid g2">
+  <div class="card">
+    <div class="card-head"><h3>Обновления Xray</h3>
+      <form method="post" action="{{ bp }}/xray/update/check"><button class="btn ghost sm">{{ ic.icon('refresh') }}Проверить сейчас</button></form></div>
+    <table><tbody>
+      <tr><td class="dim">Установлена</td><td class="mono">{{ xs.version or '?' }}</td></tr>
+      <tr><td class="dim">Последняя на GitHub</td><td class="mono">{{ upd.latest or '—' }}{% if upd.prerelease %} <span class="badge warn">pre-release</span>{% endif %}
+        {% if upd.url %} · <a href="{{ upd.url }}" target="_blank" rel="noopener">релиз</a>{% endif %}</td></tr>
+      <tr><td class="dim">Проверено</td><td class="small">{{ fmt_dt(upd.checked_at) if upd.checked_at else 'ещё не проверялось' }}{% if upd.error %} · <span style="color:var(--danger)">{{ upd.error }}</span>{% endif %}</td></tr>
+    </tbody></table>
+    {% if upd.available %}
+    <form method="post" action="{{ bp }}/xray/update/install" class="mt"
+          onsubmit="return confirm('Обновить Xray {{ xs.version }} → {{ upd.latest }}?\n\nXray перезапустится, клиенты переподключатся. Если текущий конфиг не пройдёт проверку или ядро не стартует — вернётся прежняя версия.')">
+      <input type="hidden" name="version" value="{{ upd.latest }}">
+      <input type="hidden" name="confirm" value="yes">
+      <div class="actions"><button class="btn">{{ ic.icon('download') }}Установить {{ upd.latest }}</button></div>
+    </form>
+    {% if upd.notes %}<details class="mt"><summary class="small" style="cursor:pointer">Список изменений</summary><pre style="max-height:300px">{{ upd.notes }}</pre></details>{% endif %}
+    {% elif upd.latest %}
+    <div class="hint mt">Установлена актуальная версия.</div>
+    {% endif %}
+    <form method="post" action="{{ bp }}/xray/update/settings" class="mt">
+      {{ m.check('auto_check', upd_cfg.get('auto_check', True), 'Автоматически проверять новые версии') }}
+      {{ m.check('include_prerelease', upd_cfg.get('include_prerelease'), 'Учитывать pre-release') }}
+      <div style="max-width:200px"><label class="f">Интервал проверки, ч</label><input name="interval_hours" type="number" min="1" max="168" value="{{ upd_cfg.get('interval_hours', 12) }}"></div>
+      <div class="actions mt"><button class="btn ghost sm">{{ t('Сохранить') }}</button></div>
+      <div class="hint">Панель только уведомляет о релизе (баннер и Telegram, если бот включён). Установка начинается только после вашего подтверждения.</div>
+    </form>
+  </div>
   <form class="card" method="post" action="{{ bp }}/xray/install" onsubmit="return confirm('Установить выбранную версию Xray? Текущий бинарник будет сохранён как .bak')">
     <h3>Версия Xray-core</h3>
     <div class="small muted">Установлена: <b>{{ xs.version or '?' }}</b></div>

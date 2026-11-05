@@ -120,6 +120,8 @@
     .tabs a { padding: .6rem .95rem; color: var(--muted); border-bottom: 2px solid transparent; font-weight: 500; white-space: nowrap }
     .tabs a.active { color: var(--accent); border-color: var(--accent) }
 
+    .upd-banner { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+      border-color: var(--warn); background: var(--warn-soft) }
     .toast { position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 50; max-width: 460px; padding: .85rem 1rem; border-radius: 12px;
       background: var(--surface-2); border: 1px solid var(--border-2); box-shadow: var(--shadow); display: flex; gap: .6rem; animation: slide .25s ease }
     .toast.error { border-color: var(--danger) } .toast.info { border-color: var(--ok) }
@@ -182,6 +184,18 @@
       {% block top_actions %}{% endblock %}
     </div>
     <div class="content">
+      {% if xray_update %}
+      <div class="card upd-banner">
+        <div>
+          <b>Доступна новая версия Xray {{ xray_update.latest }}</b>{% if xray_update.prerelease %} <span class="badge warn">pre-release</span>{% endif %}
+          <div class="small muted">Установлена {{ xray_update.current or '?' }}{% if xray_update.url %} · <a href="{{ xray_update.url }}" target="_blank" rel="noopener">что нового</a>{% endif %}</div>
+        </div>
+        <div class="actions">
+          <a class="btn sm" href="{{ bp }}/xray?tab=core">Обновить…</a>
+          <form method="post" action="{{ bp }}/xray/update/dismiss?next={{ cur_path|urlencode }}"><button class="btn ghost sm">Скрыть</button></form>
+        </div>
+      </div>
+      {% endif %}
       {% block content %}{% endblock %}
     </div>
   </main>

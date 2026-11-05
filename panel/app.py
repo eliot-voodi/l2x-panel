@@ -134,6 +134,7 @@ def default_settings() -> dict:
         "webhooks": webhooks.default_settings(),
         "nodes": {"agent_enabled": False, "agent_token": ""},
         "iplimit": {"ban_minutes": 30},
+        "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
         "security": {"totp_enabled": False, "totp_secret": ""},
         "api_tokens": [],
         "geo_custom": [],
@@ -165,7 +166,7 @@ def _load_store() -> dict:
         except ValueError:
             data = {}
     for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
-                         ("ip_ban_stats", {})):
+                         ("ip_ban_stats", {}), ("xray_update_state", {})):
         data.setdefault(key, default)
     data.setdefault("reverse", {"bridges": [], "portals": []})
     xray.ensure_balancers(data)
@@ -541,6 +542,15 @@ def _require(request: Request):
     return None
 
 
+def _cur_path(request: Request) -> str:
+    """Current page path without the secret base path (for ?next= redirects)."""
+    path = request.url.path or "/"
+    bp = base_path()
+    if bp and path.startswith(bp):
+        path = path[len(bp):] or "/"
+    return path if path.startswith("/") else "/"
+
+
 def page(request: Request, template: str, active: str = "", status_code: int = 200, **ctx) -> HTMLResponse:
     s = SETTINGS_CACHE or _refresh_settings_cache()
     base = {
@@ -548,6 +558,8 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
         "bp": base_path(), "active": active, "theme": (s.get("panel") or {}).get("theme") or "dark",
         "lang": (s.get("panel") or {}).get("lang") or "ru", "public_host": public_host(),
         "panel_version": panel_version(),
+        "xray_update": xray_update_banner() if _user(request) else None,
+        "cur_path": _cur_path(request),
     }
     base.update(ctx)
     return templates.TemplateResponse(template, base, status_code=status_code)
@@ -893,6 +905,61 @@ def _watchdog_loop() -> None:
             pass
 
 
+# ================================================================ Xray core update check
+
+XRAY_UPDATE_JOB: dict[str, str] = {}
+
+
+def check_xray_update(force: bool = False) -> dict:
+    """Compare installed Xray with GitHub; persist the result in store['xray_update_state']."""
+    cfg = (_settings().get("xray_update") or {})
+    latest = ops.xray_latest(bool(cfg.get("include_prerelease")))
+    current = xray.xray_status().get("version") or ""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with mutate() as store:
+        st = store.setdefault("xray_update_state", {})
+        prev_latest = st.get("latest")
+        st.update({"checked_at": now, "current": current, "error": "" if latest.get("ok") else latest.get("error", "")})
+        if latest.get("ok"):
+            st.update({"latest": latest["tag"], "url": latest["url"], "published": latest["published"],
+                       "prerelease": latest["prerelease"], "notes": latest["notes"]})
+        available = bool(st.get("latest")) and ops.version_tuple(st["latest"]) > ops.version_tuple(current)
+        st["available"] = available
+        is_new = available and st.get("latest") != prev_latest
+        if is_new:
+            st["dismissed"] = ""
+        result = dict(st)
+    if is_new and _bot_settings().get("enabled"):
+        try:
+            BOT.send(f"⬆️ Доступна новая версия Xray {result['latest']} (установлена {current}). "
+                     f"Установка — в панели, вкладка Xray → Ядро.")
+        except Exception:
+            pass
+    return result
+
+
+def xray_update_banner() -> dict | None:
+    st = _load_store().get("xray_update_state") or {}
+    if not st.get("available") or st.get("dismissed") == st.get("latest"):
+        return None
+    return st
+
+
+def _xray_update_loop() -> None:
+    if _stop.wait(60):
+        return
+    while True:
+        cfg = (_settings().get("xray_update") or {})
+        hours = max(1, _int(cfg.get("interval_hours"), 12))
+        if cfg.get("auto_check", True):
+            try:
+                check_xray_update()
+            except Exception:
+                pass
+        if _stop.wait(hours * 3600):
+            return
+
+
 def _history_loop() -> None:
     sysmon.cpu_percent()
     try:
@@ -998,7 +1065,7 @@ def _startup():
     _admin()
     _ensure_base_path()
     _refresh_settings_cache()
-    for target in (_sync_xray_config, _watchdog_loop, _history_loop):
+    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -2434,6 +2501,8 @@ def xray_page(request: Request):
     ctx: dict[str, Any] = {}
     if tab == "core":
         ctx["releases"] = ops.xray_releases()
+        ctx["upd"] = store.get("xray_update_state") or {}
+        ctx["upd_cfg"] = store["settings"].get("xray_update") or {}
     if tab == "template":
         ctx["final"] = json.dumps(xray.build_config(store), ensure_ascii=False, indent=2)
     if tab == "geo":
@@ -2510,6 +2579,79 @@ def xray_install(request: Request, version: str = Form(...)):
         return redir
     ops.start_job("xray-install", ops.install_xray, version)
     flash(request, f"Установка Xray {version} запущена", "info")
+    return go("/xray?tab=core")
+
+
+def _next(request: Request, default: str = "/xray?tab=core") -> str:
+    nxt = request.query_params.get("next") or default
+    return nxt if nxt.startswith("/") and not nxt.startswith("//") else default
+
+
+@app.post("/xray/update/check")
+def xray_update_check(request: Request):
+    if redir := _require(request):
+        return redir
+    st = check_xray_update(force=True)
+    if st.get("error"):
+        flash(request, f"Проверка обновлений: {st['error']}", "error")
+    elif st.get("available"):
+        flash(request, f"Доступна Xray {st['latest']} (установлена {st.get('current') or '?'})", "info")
+    else:
+        flash(request, f"Установлена последняя версия Xray {st.get('current') or ''}", "info")
+    return go(_next(request))
+
+
+@app.post("/xray/update/install")
+def xray_update_install(request: Request, version: str = Form(...), confirm: str = Form("")):
+    """Install the version shown in the update banner — only after explicit approval."""
+    if redir := _require(request):
+        return redir
+    st = _load_store().get("xray_update_state") or {}
+    if confirm != "yes" or version != st.get("latest"):
+        flash(request, "Установка не подтверждена или версия устарела — проверьте обновления ещё раз", "error")
+        return go("/xray?tab=core")
+    running = XRAY_UPDATE_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Установка Xray уже идёт", "info")
+        return go("/xray?tab=core")
+
+    def install_and_recheck(v: str) -> dict:
+        res = ops.install_xray(v)
+        try:
+            check_xray_update(force=True)
+        except Exception:
+            pass
+        return res
+
+    XRAY_UPDATE_JOB["id"] = ops.start_job("xray-update", install_and_recheck, version)
+    flash(request, f"Обновление Xray до {version} запущено. При ошибке будет возвращена прежняя версия.", "info")
+    return go("/xray?tab=core")
+
+
+@app.post("/xray/update/dismiss")
+def xray_update_dismiss(request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        st = store.setdefault("xray_update_state", {})
+        st["dismissed"] = st.get("latest") or ""
+    flash(request, "Уведомление скрыто до следующего релиза Xray", "info")
+    return go(_next(request, "/"))
+
+
+@app.post("/xray/update/settings")
+async def xray_update_settings(request: Request):
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    with mutate() as store:
+        store["settings"]["xray_update"] = {
+            "auto_check": form.get("auto_check") == "1",
+            "interval_hours": max(1, min(168, _int(form.get("interval_hours"), 12))),
+            "include_prerelease": form.get("include_prerelease") == "1",
+        }
+    _refresh_settings_cache()
+    flash(request, "Настройки проверки обновлений сохранены", "info")
     return go("/xray?tab=core")
 
 

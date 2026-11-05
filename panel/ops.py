@@ -63,6 +63,43 @@ def xray_releases(limit: int = 15) -> list[str]:
         return []
 
 
+def version_tuple(v: str) -> tuple[int, ...]:
+    """'v26.10.31' / '26.10.31' → (26, 10, 31); non-numeric parts are ignored."""
+    nums = []
+    for part in str(v or "").lstrip("vV").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if digits == "":
+            break
+        nums.append(int(digits))
+    return tuple(nums)
+
+
+def xray_latest(include_prerelease: bool = False) -> dict:
+    """Newest Xray-core release on GitHub: {ok, tag, url, published, prerelease, notes} or {ok: False, error}."""
+    try:
+        data = json.loads(_http("https://api.github.com/repos/XTLS/Xray-core/releases?per_page=20", 20))
+    except Exception as exc:
+        return {"ok": False, "error": f"GitHub: {exc}"}
+    best = None
+    for r in data:
+        if r.get("draft") or not r.get("tag_name"):
+            continue
+        if r.get("prerelease") and not include_prerelease:
+            continue
+        if best is None or version_tuple(r["tag_name"]) > version_tuple(best["tag_name"]):
+            best = r
+    if not best:
+        return {"ok": False, "error": "нет подходящих релизов"}
+    return {
+        "ok": True,
+        "tag": best["tag_name"],
+        "url": best.get("html_url") or "",
+        "published": best.get("published_at") or "",
+        "prerelease": bool(best.get("prerelease")),
+        "notes": (best.get("body") or "")[:4000],
+    }
+
+
 def _xray_asset() -> str:
     m = platform.machine().lower()
     if m in ("aarch64", "arm64"):
@@ -88,11 +125,32 @@ def install_xray(version: str) -> dict:
     if not test["ok"]:
         tmp.unlink(missing_ok=True)
         return {"ok": False, "error": test["stderr"] or "new binary does not run"}
-    if XRAY_BIN.exists():
-        shutil.copy2(XRAY_BIN, XRAY_BIN.with_suffix(".bak"))
+    backup = XRAY_BIN.with_suffix(".bak")
+    had_old = XRAY_BIN.exists()
+    if had_old:
+        shutil.copy2(XRAY_BIN, backup)
     os.replace(tmp, XRAY_BIN)
+    # The current config must still pass with the new core, otherwise roll back
+    cfg = os.environ.get("XRAY_CONFIG", "/etc/xray/config.json")
+    log = [f"downloaded {version}", test["stdout"].splitlines()[0] if test["stdout"] else ""]
+    if Path(cfg).exists():
+        check = _run([str(XRAY_BIN), "run", "-test", "-config", cfg], 60)
+        if not check["ok"]:
+            if had_old:
+                os.replace(backup, XRAY_BIN)
+            return {"ok": False, "error": "текущий конфиг не проходит xray -test на новой версии, откат:\n"
+                                          + (check["stderr"] or check["stdout"])[-1500:]}
+        log.append("config test: ok")
     r = _run(["systemctl", "restart", "xray"], 30)
-    return {"ok": r["ok"], "log": f"installed {version}\n{test['stdout'].splitlines()[0] if test['stdout'] else ''}"}
+    time.sleep(3)
+    active = _run(["systemctl", "is-active", "xray"])["stdout"].strip() == "active"
+    if not (r["ok"] and active):
+        if had_old:
+            os.replace(backup, XRAY_BIN)
+            _run(["systemctl", "restart", "xray"], 30)
+        return {"ok": False, "error": f"Xray {version} не запустился, возвращена прежняя версия\n{r['stderr'][-800:]}"}
+    log.append(f"installed {version}, xray active")
+    return {"ok": True, "log": "\n".join(x for x in log if x), "version": version}
 
 
 def xray_control(action: str) -> dict:

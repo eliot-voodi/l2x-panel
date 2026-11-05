@@ -8,7 +8,7 @@
 а трафик уходит в интернет через выбранный L2TP-туннель, WireGuard, WARP или напрямую.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.2.2-cyan)
+![Version](https://img.shields.io/badge/version-1.3.0-cyan)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Xray-core](https://img.shields.io/badge/Xray--core-26.x-purple)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-orange)
@@ -48,6 +48,7 @@
 - **Inbounds**: VLESS (Reality, Vision), VMess, Trojan, Shadowsocks (включая 2022), **Hysteria2**, WireGuard, SOCKS, HTTP, dokodemo-door.
 - **Транспорты**: RAW, WebSocket, gRPC, HTTPUpgrade, XHTTP, mKCP; TLS и Reality с генерацией ключей.
 - Управление версией Xray-core (установка любого релиза из GitHub), обновление geoip/geosite, редактор DNS, policy, логов.
+- Автопроверка новых релизов Xray-core (по умолчанию раз в 12 ч): баннер в панели и уведомление в Telegram. Обновление ставится только после подтверждения; если текущий конфиг не проходит `xray -test` или ядро не стартует, возвращается прежняя версия.
 
 ### Мульти-L2TP
 - Неограниченное число L2TP/IPsec-туннелей (strongSwan + xl2tpd), у каждого свой PPP-интерфейс и таблица маршрутизации.
