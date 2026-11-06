@@ -4438,14 +4438,21 @@ async def backup_restore(request: Request, file: UploadFile = File(...)):
     if not res["ok"]:
         flash(request, f"Восстановление: {res['error']}", "error")
         return go("/settings?tab=backup")
+    # Restored secret_key file may differ from env SECRET_KEY — realign ciphertexts.
+    sec_align = ops.realign_l2tp_secrets(DATA, SECRET_KEY)
     _refresh_settings_cache()
     xr = _apply_xray(_load_store())
     restored = res.get("restored") or {}
     detail = (
         f"data={restored.get('data', '?')}, certs={restored.get('certs', 0)}, "
-        f"doh={restored.get('doh', 0)}"
+        f"doh={restored.get('doh', 0)}, l2tp_secrets={sec_align.get('reencrypted', 0)}"
     )
-    flash(request, *_ok_msg(f"Бэкап восстановлен ({detail}; копия до: {res['safety_copy']})", xr))
+    msg = f"Бэкап восстановлен ({detail}; копия до: {res['safety_copy']})"
+    if res.get("doh_warning"):
+        msg += f". DoH: {res['doh_warning']}"
+    if sec_align.get("failed"):
+        msg += f". L2TP secrets не расшифрованы: {sec_align['failed']}"
+    flash(request, *_ok_msg(msg, xr))
     return go("/settings?tab=backup")
 
 

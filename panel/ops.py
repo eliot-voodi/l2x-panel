@@ -22,9 +22,17 @@ UA = {"User-Agent": "l2xpanel"}
 JOBS: dict[str, dict] = {}
 
 
-def _run(cmd: list[str] | str, timeout: int = 120, shell: bool = False, env: dict | None = None) -> dict:
+def _run(
+    cmd: list[str] | str,
+    timeout: int = 120,
+    shell: bool = False,
+    env: dict | None = None,
+    cwd: str | None = None,
+) -> dict:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=shell, env=env)
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, shell=shell, env=env, cwd=cwd,
+        )
         return {"ok": p.returncode == 0, "code": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "code": 127, "stdout": "", "stderr": str(exc)}
@@ -489,16 +497,98 @@ def restore_backup(data_dir: Path, blob: bytes) -> dict:
                 os.chmod(target, 0o600)
         except OSError:
             pass
-    # Bring Pi-hole back if compose was restored
+    # Bring Pi-hole back if compose was restored (docker may be missing on fresh hosts)
+    doh_note = ""
     if restored["doh"] and (ddir / "docker-compose.yml").is_file():
-        for base in (
-            ["docker", "compose", "-f", str(ddir / "docker-compose.yml")],
-            ["docker-compose", "-f", str(ddir / "docker-compose.yml")],
-        ):
-            up = _run([*base, "up", "-d"], timeout=180, cwd=str(ddir))
-            if up.get("ok"):
+        if not shutil.which("docker") and not shutil.which("docker-compose"):
+            doh_note = "docker not installed — DoH files restored, start Pi-hole later"
+        else:
+            up = {"ok": False}
+            for base in (
+                ["docker", "compose", "-f", str(ddir / "docker-compose.yml")],
+                ["docker-compose", "-f", str(ddir / "docker-compose.yml")],
+            ):
+                up = _run([*base, "up", "-d"], timeout=180, cwd=str(ddir))
+                if up.get("ok"):
+                    break
+            if not up.get("ok"):
+                doh_note = (up.get("stderr") or up.get("stdout") or "docker compose up failed")[:300]
+    out = {"ok": True, "safety_copy": str(safety), "restored": restored}
+    if doh_note:
+        out["doh_warning"] = doh_note
+    return out
+
+
+def realign_l2tp_secrets(data_dir: Path, active_secret_key: str) -> dict:
+    """After restore, ciphertexts may be encrypted with a restored secret_key file while
+    the running panel uses SECRET_KEY from the environment. Re-encrypt to the active key.
+    """
+    import base64
+    import hashlib
+    from cryptography.fernet import Fernet, InvalidToken
+
+    def _fernet(sk: str) -> Fernet:
+        return Fernet(base64.urlsafe_b64encode(hashlib.sha256(sk.encode()).digest()))
+
+    active = (active_secret_key or "").strip()
+    if not active:
+        return {"ok": False, "error": "no active secret key", "reencrypted": 0}
+    secrets_dir = Path(data_dir) / "l2tp_secrets"
+    key_file = Path(data_dir) / "secret_key"
+    candidates = [active]
+    if key_file.is_file():
+        try:
+            fk = key_file.read_text(encoding="utf-8").strip()
+            if fk and fk not in candidates:
+                candidates.append(fk)
+        except OSError:
+            pass
+    if not secrets_dir.is_dir():
+        try:
+            key_file.write_text(active, encoding="utf-8")
+            os.chmod(key_file, 0o600)
+        except OSError:
+            pass
+        return {"ok": True, "reencrypted": 0}
+    active_f = _fernet(active)
+    fernets = [_fernet(sk) for sk in candidates]
+    n = 0
+    bad = 0
+    for path in sorted(secrets_dir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except ValueError:
+            bad += 1
+            continue
+        plain_pw = plain_psk = ""
+        unlocked = False
+        for f in fernets:
+            try:
+                plain_pw = f.decrypt(data["password"].encode()).decode() if data.get("password") else ""
+                plain_psk = f.decrypt(data["psk"].encode()).decode() if data.get("psk") else ""
+                unlocked = True
                 break
-    return {"ok": True, "safety_copy": str(safety), "restored": restored}
+            except (InvalidToken, ValueError, TypeError):
+                continue
+        if not unlocked:
+            bad += 1
+            continue
+        new = {
+            "password": active_f.encrypt(plain_pw.encode()).decode() if plain_pw else "",
+            "psk": active_f.encrypt(plain_psk.encode()).decode() if plain_psk else "",
+        }
+        path.write_text(json.dumps(new), encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        n += 1
+    try:
+        key_file.write_text(active, encoding="utf-8")
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass
+    return {"ok": bad == 0, "reencrypted": n, "failed": bad}
 
 
 def export_certs_bundle(*, max_file: int = PROMOTE_FILE_MAX) -> list[dict]:
