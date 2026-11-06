@@ -5161,7 +5161,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
             log_lines = []
             # 1) Promote REMOTE first while we are still master (critical: never demote early)
             if use_api:
-                body = nodes_mod.promote_payload(snap, old, extra_nodes=peers)
+                body = nodes_mod.promote_payload(snap, old, extra_nodes=peers, for_api=True)
                 res = nodes_mod.promote_via_api(node_copy, body)
             else:
                 res = nodes_mod.promote_via_ssh(node_copy, ssh_password=ssh_password,
@@ -5593,6 +5593,7 @@ async def agent_promote(request: Request):
     """Flip this mirrored agent to master using already-synced (or final) store data.
 
     Role flips only after Xray apply succeeds; otherwise rolls back to agent.
+    Heavy DoH docker recreate runs in background so the HTTP call does not time out.
     """
     store, err = _agent_auth(request)
     if err:
@@ -5603,61 +5604,75 @@ async def agent_promote(request: Request):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     if not isinstance(payload, dict) or str(payload.get("confirm") or "") != "yes":
         return JSONResponse({"ok": False, "error": "confirm required"}, status_code=400)
-    prev = {}
-    with mutate() as st:
-        ns = st.setdefault("settings", {}).setdefault("nodes", {})
-        prev = {
-            "agent_enabled": bool(ns.get("agent_enabled")),
-            "role": ns.get("role") or "agent",
-            "mirror": bool(ns.get("mirror")),
-        }
-        for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "l2tp", "ip_bans"):
-            if key in payload and payload[key] is not None:
-                st[key] = payload[key]
-        if payload.get("settings"):
-            nodes_mod.apply_promoted_settings(st, payload.get("settings"))
-        if payload.get("nodes") is not None:
-            st["nodes"] = payload["nodes"]
-        elif payload.get("old_master"):
-            nodes = nodes_mod.ensure_list(st)
-            old = payload["old_master"]
-            nodes[:] = [n for n in nodes if n.get("id") != old.get("id")]
-            nodes.insert(0, old)
-        ns = st.setdefault("settings", {}).setdefault("nodes", {})
-        ns["agent_enabled"] = False
-        ns["role"] = "master"
-        ns["mirror"] = False
-        ns["runtime_preserve"] = False
-    # Re-encrypt L2TP secrets with this host's SECRET_KEY (plaintext over agent TLS + Bearer)
-    for tname, sec in (payload.get("l2tp_secrets") or {}).items():
-        if not tname or not isinstance(sec, dict):
-            continue
-        _save_l2tp_secrets(str(tname), str(sec.get("password") or ""), str(sec.get("psk") or ""))
-    n_certs = ops.import_certs_bundle(payload.get("certs") or [])
-    doh_res = ops.import_doh_bundle(payload.get("doh_bundle") or [], recreate=True)
-    _refresh_settings_cache()
-    res = _apply_xray(_load_store())
-    if not res.get("ok"):
+    try:
+        prev = {}
         with mutate() as st:
             ns = st.setdefault("settings", {}).setdefault("nodes", {})
-            ns["agent_enabled"] = prev.get("agent_enabled", True)
-            ns["role"] = prev.get("role") or "agent"
-            ns["mirror"] = bool(prev.get("mirror"))
-        err_txt = res.get("error") or "xray apply failed"
-        try:
-            err_txt = xray.clean_xray_error(err_txt) or err_txt
-        except Exception:
-            pass
-        return JSONResponse({"ok": False, "error": err_txt, "rolled_back": True}, status_code=500)
-    n_l2tp = len(payload.get("l2tp") or [])
-    n_custom = len(payload.get("outbounds_custom") or [])
-    return {
-        "ok": True, "error": "", "role": "master", "version": panel_version(),
-        "transferred_l2tp": n_l2tp, "transferred_custom": n_custom,
-        "transferred_certs": n_certs,
-        "transferred_doh_files": int((doh_res or {}).get("files") or 0),
-        "doh_enabled": bool(((_load_store().get("settings") or {}).get("doh") or {}).get("enabled")),
-    }
+            prev = {
+                "agent_enabled": bool(ns.get("agent_enabled")),
+                "role": ns.get("role") or "agent",
+                "mirror": bool(ns.get("mirror")),
+            }
+            for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "l2tp", "ip_bans"):
+                if key in payload and payload[key] is not None:
+                    st[key] = payload[key]
+            if payload.get("settings"):
+                nodes_mod.apply_promoted_settings(st, payload.get("settings"))
+            if payload.get("nodes") is not None:
+                st["nodes"] = payload["nodes"]
+            elif payload.get("old_master"):
+                nodes = nodes_mod.ensure_list(st)
+                old = payload["old_master"]
+                nodes[:] = [n for n in nodes if n.get("id") != old.get("id")]
+                nodes.insert(0, old)
+            ns = st.setdefault("settings", {}).setdefault("nodes", {})
+            ns["agent_enabled"] = False
+            ns["role"] = "master"
+            ns["mirror"] = False
+            ns["runtime_preserve"] = False
+        # Re-encrypt L2TP secrets with this host's SECRET_KEY (plaintext over agent TLS + Bearer)
+        for tname, sec in (payload.get("l2tp_secrets") or {}).items():
+            if not tname or not isinstance(sec, dict):
+                continue
+            _save_l2tp_secrets(str(tname), str(sec.get("password") or ""), str(sec.get("psk") or ""))
+        n_certs = ops.import_certs_bundle(payload.get("certs") or [])
+        # Write DoH files now; recreate container in background (docker pull/up can exceed proxy timeouts)
+        doh_res = ops.import_doh_bundle(payload.get("doh_bundle") or [], recreate=False)
+        doh_files = int((doh_res or {}).get("files") or 0)
+        if doh_files:
+            def _bg_pihole():
+                try:
+                    ops.import_doh_bundle(payload.get("doh_bundle") or [], recreate=True)
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_pihole, name="promote-pihole", daemon=True).start()
+        _refresh_settings_cache()
+        res = _apply_xray(_load_store())
+        if not res.get("ok"):
+            with mutate() as st:
+                ns = st.setdefault("settings", {}).setdefault("nodes", {})
+                ns["agent_enabled"] = prev.get("agent_enabled", True)
+                ns["role"] = prev.get("role") or "agent"
+                ns["mirror"] = bool(prev.get("mirror"))
+            err_txt = res.get("error") or "xray apply failed"
+            try:
+                err_txt = xray.clean_xray_error(err_txt) or err_txt
+            except Exception:
+                pass
+            return JSONResponse({"ok": False, "error": err_txt, "rolled_back": True}, status_code=500)
+        n_l2tp = len(payload.get("l2tp") or [])
+        n_custom = len(payload.get("outbounds_custom") or [])
+        return {
+            "ok": True, "error": "", "role": "master", "version": panel_version(),
+            "transferred_l2tp": n_l2tp, "transferred_custom": n_custom,
+            "transferred_certs": n_certs,
+            "transferred_doh_files": doh_files,
+            "doh_pihole_async": bool(doh_files),
+            "assets_slimmed": bool(payload.get("assets_slimmed")),
+            "doh_enabled": bool(((_load_store().get("settings") or {}).get("doh") or {}).get("enabled")),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"promote exception: {exc}"}, status_code=500)
 
 
 @app.post("/agent/apply")

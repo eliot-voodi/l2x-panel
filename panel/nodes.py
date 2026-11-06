@@ -1174,26 +1174,79 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
     }
 
 
-def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_nodes: list[dict] | None = None) -> dict:
+def slim_assets_for_api(snap: dict, *, max_total_b64: int = 1_500_000) -> dict:
+    """Shrink certs/doh for HTTP promote — full trees go via SSH; API keeps essentials.
+
+    Keeps all TLS certs that fit the budget, and DoH ``docker-compose.yml`` / ``.env``
+    (plus other small files). Large gravity DB / lists are skipped so nginx/proxy
+    timeouts and body limits do not turn promote into a bare 500.
+    """
+    out = json.loads(json.dumps(snap))
+    total = 0
+    certs: list[dict] = []
+    for it in out.get("certs") or []:
+        if not isinstance(it, dict):
+            continue
+        sz = len(it.get("data_b64") or "")
+        if total + sz > max_total_b64:
+            out["certs_truncated"] = True
+            break
+        certs.append(it)
+        total += sz
+    out["certs"] = certs
+    out["transferred_certs"] = len(certs)
+
+    essential = {"docker-compose.yml", ".env"}
+    doh: list[dict] = []
+    skipped = 0
+    for it in out.get("doh_bundle") or []:
+        if not isinstance(it, dict):
+            continue
+        rel = str(it.get("rel") or "").replace("\\", "/").lstrip("./")
+        sz = len(it.get("data_b64") or "")
+        keep = rel in essential or (sz < 80_000 and not rel.endswith(".db") and "/gravity" not in rel)
+        if not keep:
+            skipped += 1
+            continue
+        if total + sz > max_total_b64 and rel not in essential:
+            skipped += 1
+            out["doh_truncated"] = True
+            continue
+        doh.append(it)
+        total += sz
+    out["doh_bundle"] = doh
+    out["transferred_doh_files"] = len(doh)
+    out["doh_files_skipped"] = skipped
+    out["assets_slimmed"] = True
+    return out
+
+
+def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_nodes: list[dict] | None = None,
+                    *, for_api: bool = False) -> dict:
     """Body for /agent/promote — final snapshot + old master as a peer node."""
     peers = list(extra_nodes or [])
     peers = [n for n in peers if n.get("id") != old_master_node.get("id")]
     peers.insert(0, old_master_node)
+    snap = master_store_snapshot
+    if for_api:
+        snap = slim_assets_for_api(snap)
     return {
         "confirm": "yes",
-        "clients": master_store_snapshot.get("clients") or [],
-        "inbounds": master_store_snapshot.get("inbounds") or [],
-        "routes": master_store_snapshot.get("routes") or [],
-        "balancers": master_store_snapshot.get("balancers") or {},
-        "outbounds_custom": master_store_snapshot.get("outbounds_custom") or [],
-        "l2tp": master_store_snapshot.get("l2tp") or [],
-        "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
-        "dns": master_store_snapshot.get("dns") or {},
-        "xray_settings": master_store_snapshot.get("xray_settings") or {},
-        "settings": master_store_snapshot.get("settings") or {},
-        "ip_bans": master_store_snapshot.get("ip_bans") or [],
-        "certs": master_store_snapshot.get("certs") or [],
-        "doh_bundle": master_store_snapshot.get("doh_bundle") or [],
+        "clients": snap.get("clients") or [],
+        "inbounds": snap.get("inbounds") or [],
+        "routes": snap.get("routes") or [],
+        "balancers": snap.get("balancers") or {},
+        "outbounds_custom": snap.get("outbounds_custom") or [],
+        "l2tp": snap.get("l2tp") or [],
+        "l2tp_secrets": snap.get("l2tp_secrets") or {},
+        "dns": snap.get("dns") or {},
+        "xray_settings": snap.get("xray_settings") or {},
+        "settings": snap.get("settings") or {},
+        "ip_bans": snap.get("ip_bans") or [],
+        "certs": snap.get("certs") or [],
+        "doh_bundle": snap.get("doh_bundle") or [],
+        "assets_slimmed": bool(snap.get("assets_slimmed")),
+        "doh_files_skipped": int(snap.get("doh_files_skipped") or 0),
         "nodes": peers,
         "old_master": old_master_node,
     }
@@ -1222,7 +1275,7 @@ def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
         panel["public_host"] = keep_host
 
 
-def promote_via_api(node: dict, payload: dict, timeout: int = 90) -> dict:
+def promote_via_api(node: dict, payload: dict, timeout: int = 180) -> dict:
     """Promote a mirrored agent to master over HTTP (no SSH). Uses already-synced store + final delta."""
     url = agent_endpoint(node, "agent/promote")
     token = node.get("token") or ""
@@ -1231,6 +1284,7 @@ def promote_via_api(node: dict, payload: dict, timeout: int = 90) -> dict:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
         "User-Agent": "L2XPanel-NodePromote/1.0",
+        "Content-Length": str(len(data)),
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1244,17 +1298,31 @@ def promote_via_api(node: dict, payload: dict, timeout: int = 90) -> dict:
     except urllib.error.HTTPError as exc:
         body = ""
         try:
-            body = exc.read().decode("utf-8", "replace")[:500]
+            body = exc.read().decode("utf-8", "replace")[:800]
         except Exception:
             pass
         try:
             parsed = json.loads(body) if body else {}
         except json.JSONDecodeError:
             parsed = {}
-        err = str(parsed.get("error") or body or f"HTTP {exc.code}")
+        err = str(parsed.get("error") or "")
+        if not err:
+            low = body.lower()
+            if "413" in str(exc.code) or "request entity too large" in low:
+                err = f"HTTP {exc.code}: тело promote слишком большое — повторите с SSH-паролем или обновите ноду"
+            elif "504" in str(exc.code) or "timeout" in low or "gateway" in low:
+                err = f"HTTP {exc.code}: таймаут на ноде (Pi-hole/docker) — обновите панель на ноде и повторите"
+            elif "internal server error" in low:
+                err = (
+                    f"HTTP {exc.code}: Internal Server Error на ноде — "
+                    "обычно старая панель / таймаут docker при импорте DoH. "
+                    "Обновите ноду и повторите promote (или укажите SSH)."
+                )
+            else:
+                err = f"HTTP {exc.code}: {(body or '')[:300]}"
         if exc.code == 404:
             err = "агент без /agent/promote — обновите ноду или укажите SSH-пароль"
-        return {"ok": False, "error": err, "log": body}
+        return {"ok": False, "error": err, "log": body, "status": exc.code}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "log": ""}
 
