@@ -404,15 +404,55 @@ def list_certs() -> list[dict]:
 # ---------------------------------------------------------------- backup
 
 BACKUP_EXCLUDE = {"history.json"}
+# Max size for a single file in promote JSON bundles (certs / DoH); larger files stay on disk backup only
+PROMOTE_FILE_MAX = 8 * 1024 * 1024
+
+
+def doh_dir() -> Path:
+    return Path(os.environ.get("L2XPANEL_DOH_DIR", "/opt/l2xpanel/doh"))
+
+
+def _safe_zip_name(name: str) -> bool:
+    return bool(name) and not name.startswith("/") and ".." not in name.split("/")
+
+
+def _add_tree_to_zip(z: zipfile.ZipFile, root: Path, prefix: str) -> int:
+    """Write files under root into the zip as ``prefix/rel``. Returns file count."""
+    if not root.is_dir():
+        return 0
+    n = 0
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if not _safe_zip_name(rel):
+            continue
+        z.write(p, f"{prefix}/{rel}")
+        n += 1
+    return n
 
 
 def make_backup(data_dir: Path) -> bytes:
+    """Full system backup: panel data + TLS certs + DoH/Pi-hole compose volumes."""
     buf = io.BytesIO()
+    counts = {"data": 0, "certs": 0, "doh": 0}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(data_dir.rglob("*")):
-            if p.is_file() and p.name not in BACKUP_EXCLUDE:
-                z.write(p, p.relative_to(data_dir).as_posix())
-        z.writestr("_meta.json", json.dumps({"created": int(time.time()), "app": "l2xpanel"}))
+            if not p.is_file():
+                continue
+            if p.name in BACKUP_EXCLUDE or p.name.startswith("pre-restore-"):
+                continue
+            rel = p.relative_to(data_dir).as_posix()
+            if not _safe_zip_name(rel):
+                continue
+            z.write(p, rel)
+            counts["data"] += 1
+        counts["certs"] = _add_tree_to_zip(z, CERT_DIR, "certs")
+        counts["doh"] = _add_tree_to_zip(z, doh_dir(), "doh")
+        z.writestr("_meta.json", json.dumps({
+            "created": int(time.time()), "app": "l2xpanel",
+            "includes": ["data", "certs", "doh"], "counts": counts,
+        }))
     return buf.getvalue()
 
 
@@ -426,13 +466,151 @@ def restore_backup(data_dir: Path, blob: bytes) -> dict:
         return {"ok": False, "error": "в архиве нет store.json"}
     safety = data_dir / f"pre-restore-{int(time.time())}.zip"
     safety.write_bytes(make_backup(data_dir))
+    restored = {"data": 0, "certs": 0, "doh": 0}
+    ddir = doh_dir()
     for name in names:
-        if name.startswith("/") or ".." in name or name == "_meta.json" or name.startswith("pre-restore-"):
+        if not _safe_zip_name(name) or name == "_meta.json" or name.startswith("pre-restore-"):
             continue
-        target = data_dir / name
+        if name.endswith("/"):
+            continue
+        if name.startswith("certs/"):
+            target = CERT_DIR / name[len("certs/"):]
+            restored["certs"] += 1
+        elif name.startswith("doh/"):
+            target = ddir / name[len("doh/"):]
+            restored["doh"] += 1
+        else:
+            target = data_dir / name
+            restored["data"] += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(z.read(name))
-    return {"ok": True, "safety_copy": str(safety)}
+        try:
+            if name.endswith(".key") or name.endswith(".env") or "secret" in name.lower():
+                os.chmod(target, 0o600)
+        except OSError:
+            pass
+    # Bring Pi-hole back if compose was restored
+    if restored["doh"] and (ddir / "docker-compose.yml").is_file():
+        for base in (
+            ["docker", "compose", "-f", str(ddir / "docker-compose.yml")],
+            ["docker-compose", "-f", str(ddir / "docker-compose.yml")],
+        ):
+            up = _run([*base, "up", "-d"], timeout=180, cwd=str(ddir))
+            if up.get("ok"):
+                break
+    return {"ok": True, "safety_copy": str(safety), "restored": restored}
+
+
+def export_certs_bundle(*, max_file: int = PROMOTE_FILE_MAX) -> list[dict]:
+    """List of {rel, data_b64} for promote / API transfer."""
+    import base64
+    out: list[dict] = []
+    if not CERT_DIR.is_dir():
+        return out
+    for p in sorted(CERT_DIR.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            if p.stat().st_size > max_file:
+                continue
+            rel = p.relative_to(CERT_DIR).as_posix()
+            if not _safe_zip_name(rel):
+                continue
+            out.append({"rel": rel, "data_b64": base64.b64encode(p.read_bytes()).decode("ascii")})
+        except OSError:
+            continue
+    return out
+
+
+def import_certs_bundle(items: list | None) -> int:
+    import base64
+    n = 0
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        rel = str(it.get("rel") or "").replace("\\", "/")
+        if not _safe_zip_name(rel):
+            continue
+        raw_b64 = it.get("data_b64") or ""
+        try:
+            raw = base64.b64decode(raw_b64)
+        except Exception:
+            continue
+        target = CERT_DIR / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        try:
+            if rel.endswith(".key"):
+                os.chmod(target, 0o600)
+        except OSError:
+            pass
+        n += 1
+    return n
+
+
+def export_doh_bundle(*, max_file: int = PROMOTE_FILE_MAX, max_total: int = 64 * 1024 * 1024) -> list[dict]:
+    """DoH/Pi-hole files for promote (compose, .env, etc-pihole, dnsmasq). Skips oversized trees."""
+    import base64
+    root = doh_dir()
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    total = 0
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            continue
+        if sz > max_file:
+            continue
+        if total + sz > max_total:
+            break
+        rel = p.relative_to(root).as_posix()
+        if not _safe_zip_name(rel):
+            continue
+        try:
+            out.append({"rel": rel, "data_b64": base64.b64encode(p.read_bytes()).decode("ascii")})
+            total += sz
+        except OSError:
+            continue
+    return out
+
+
+def import_doh_bundle(items: list | None, *, recreate: bool = True) -> dict:
+    import base64
+    root = doh_dir()
+    n = 0
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        rel = str(it.get("rel") or "").replace("\\", "/")
+        if not _safe_zip_name(rel):
+            continue
+        try:
+            raw = base64.b64decode(it.get("data_b64") or "")
+        except Exception:
+            continue
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        try:
+            if rel.endswith(".env") or rel.endswith(".key"):
+                os.chmod(target, 0o600)
+        except OSError:
+            pass
+        n += 1
+    if recreate and n and (root / "docker-compose.yml").is_file():
+        for base in (
+            ["docker", "compose", "-f", str(root / "docker-compose.yml")],
+            ["docker-compose", "-f", str(root / "docker-compose.yml")],
+        ):
+            up = _run([*base, "up", "-d", "--force-recreate"], timeout=180, cwd=str(root))
+            if up.get("ok"):
+                return {"ok": True, "files": n, "pihole": "recreated"}
+        return {"ok": True, "files": n, "pihole": "files_only"}
+    return {"ok": True, "files": n}
 
 
 # ---------------------------------------------------------------- WARP / NordVPN

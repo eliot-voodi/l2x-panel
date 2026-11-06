@@ -4409,7 +4409,12 @@ async def backup_restore(request: Request, file: UploadFile = File(...)):
         return go("/settings?tab=backup")
     _refresh_settings_cache()
     xr = _apply_xray(_load_store())
-    flash(request, *_ok_msg(f"Бэкап восстановлен (копия до: {res['safety_copy']})", xr))
+    restored = res.get("restored") or {}
+    detail = (
+        f"data={restored.get('data', '?')}, certs={restored.get('certs', 0)}, "
+        f"doh={restored.get('doh', 0)}"
+    )
+    flash(request, *_ok_msg(f"Бэкап восстановлен ({detail}; копия до: {res['safety_copy']})", xr))
     return go("/settings?tab=backup")
 
 
@@ -5123,7 +5128,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "log": "\n".join(x for x in log_lines if x)
                 + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."
                 + f"\nOutbound {', '.join(drop_tags)} → direct;"
-                + f" перенесено custom={n_custom}, l2tp={n_l2tp} (туннели disconnected — Connect на новом master)."
+                + f" перенесено custom={n_custom}, l2tp={n_l2tp}"
+                + f", certs={int(snap.get('transferred_certs') or 0)}"
+                + f", doh_files={int(snap.get('transferred_doh_files') or 0)}"
+                + " (туннели disconnected — Connect на новом master; settings/DoH/Pi-hole включены)."
                 + "\nСтарый master стал agent с runtime_preserve (трафик не срезается).",
             }
 
@@ -5510,9 +5518,11 @@ async def agent_promote(request: Request):
             "role": ns.get("role") or "agent",
             "mirror": bool(ns.get("mirror")),
         }
-        for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "l2tp"):
+        for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "l2tp", "ip_bans"):
             if key in payload and payload[key] is not None:
                 st[key] = payload[key]
+        if payload.get("settings"):
+            nodes_mod.apply_promoted_settings(st, payload.get("settings"))
         if payload.get("nodes") is not None:
             st["nodes"] = payload["nodes"]
         elif payload.get("old_master"):
@@ -5520,6 +5530,7 @@ async def agent_promote(request: Request):
             old = payload["old_master"]
             nodes[:] = [n for n in nodes if n.get("id") != old.get("id")]
             nodes.insert(0, old)
+        ns = st.setdefault("settings", {}).setdefault("nodes", {})
         ns["agent_enabled"] = False
         ns["role"] = "master"
         ns["mirror"] = False
@@ -5529,6 +5540,9 @@ async def agent_promote(request: Request):
         if not tname or not isinstance(sec, dict):
             continue
         _save_l2tp_secrets(str(tname), str(sec.get("password") or ""), str(sec.get("psk") or ""))
+    n_certs = ops.import_certs_bundle(payload.get("certs") or [])
+    doh_res = ops.import_doh_bundle(payload.get("doh_bundle") or [], recreate=True)
+    _refresh_settings_cache()
     res = _apply_xray(_load_store())
     if not res.get("ok"):
         with mutate() as st:
@@ -5547,6 +5561,9 @@ async def agent_promote(request: Request):
     return {
         "ok": True, "error": "", "role": "master", "version": panel_version(),
         "transferred_l2tp": n_l2tp, "transferred_custom": n_custom,
+        "transferred_certs": n_certs,
+        "transferred_doh_files": int((doh_res or {}).get("files") or 0),
+        "doh_enabled": bool(((_load_store().get("settings") or {}).get("doh") or {}).get("enabled")),
     }
 
 
@@ -5591,6 +5608,9 @@ async def agent_apply(request: Request):
             st["dns"] = payload["dns"]
         if payload.get("xray_settings") is not None:
             st["xray_settings"] = payload["xray_settings"]
+        if mirror and payload.get("settings"):
+            # Keep local panel identity; merge DoH/TG/sub/… from master for promote-ready mirror
+            nodes_mod.apply_promoted_settings(st, payload.get("settings"))
         if mirror and payload.get("nodes") is not None:
             # Peer registry for failover — does not include this agent as master yet
             st["nodes"] = list(payload["nodes"] or [])

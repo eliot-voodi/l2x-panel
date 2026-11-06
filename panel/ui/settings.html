@@ -221,7 +221,7 @@
 <div class="grid g2">
   <div class="card">
     <h3>Создать бэкап</h3>
-    <div class="small muted">Архив: store.json (клиенты, inbounds, настройки), админ, ключи, зашифрованные секреты L2TP, история.</div>
+    <div class="small muted">Полный архив: store.json (клиенты, inbounds, outbounds, DNS, DoH/Pi-hole настройки, Telegram…), admin, secret_key, L2TP secrets, TLS-сертификаты (<code>/etc/l2xpanel/certs</code>), каталог DoH/Pi-hole (<code>/opt/l2xpanel/doh</code> — compose, .env, gravity/lists).</div>
     <div class="actions mt">
       <a class="btn" href="{{ bp }}/backup/download">{{ ic.icon('download') }}Скачать .zip</a>
       <form method="post" action="{{ bp }}/backup/telegram"><button class="btn ghost" {% if not s.tg.enabled %}disabled title="Telegram-бот выключен"{% endif %}>Отправить в Telegram</button></form>

@@ -383,6 +383,12 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         balancers = _agent_safe_balancers(store.get("balancers") or {})
         peers = None
 
+    settings_out = None
+    if mirror:
+        # Mirror keeps a copy of master settings (DoH/Pi-hole, TG, sub, …) for fast promote
+        settings_out = json.loads(json.dumps(store.get("settings") or {}))
+        settings_out.pop("nodes", None)
+
     return {
         "mirror": mirror,
         "clients": (clients if node.get("sync_clients", True) else []) + bridge_clients,
@@ -392,6 +398,7 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         "balancers": balancers,
         "dns": store.get("dns") or {},
         "xray_settings": store.get("xray_settings") or {},
+        "settings": settings_out,
         "nodes": peers,
         "pushed_at": now_iso(),
         "node_id": node.get("id"),
@@ -1105,11 +1112,14 @@ def promote_l2tp_entries(store: dict) -> list[dict]:
 def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | None = None) -> dict:
     """Full master copy for the new master.
 
-    Transfers all outbounds/clients/routes/L2TP/… except the outbound that pointed at
-    the target node itself (node_<slug>) — that tag is removed and every reference
-    to it is rewritten to ``direct``. L2TP tunnels arrive disconnected; secrets are
-    passed plaintext in ``l2tp_secrets`` so the new host can re-encrypt with its key.
+    Transfers all outbounds/clients/routes/L2TP/settings (incl. DoH)/certs/Pi-hole files
+    except the outbound that pointed at the target node itself (node_<slug>) — that tag
+    is removed and every reference to it is rewritten to ``direct``. L2TP tunnels arrive
+    disconnected; secrets are passed plaintext in ``l2tp_secrets`` so the new host can
+    re-encrypt with its key.
     """
+    import ops as ops_mod
+
     drop = {node_outbound_tag(target_node)}
     # Also drop by node_id match (tag may have been renamed)
     tid = target_node.get("id")
@@ -1130,6 +1140,11 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
             "password": str(sec.get("password") or ""),
             "psk": str(sec.get("psk") or ""),
         }
+    settings = json.loads(json.dumps(store.get("settings") or {}))
+    # Receiving node will force role=master; don't ship old agent flags as truth
+    settings.pop("nodes", None)
+    certs = ops_mod.export_certs_bundle()
+    doh_bundle = ops_mod.export_doh_bundle()
     return {
         "clients": _remap_clients_drop_tags(store.get("clients") or [], drop),
         "inbounds": _remap_inbounds_drop_tags(store.get("inbounds") or [], drop),
@@ -1138,11 +1153,17 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
         "outbounds_custom": customs,
         "dns": json.loads(json.dumps(store.get("dns") or {})),
         "xray_settings": json.loads(json.dumps(store.get("xray_settings") or {})),
+        "settings": settings,
+        "ip_bans": json.loads(json.dumps(store.get("ip_bans") or [])),
         "l2tp": l2tp,
         "l2tp_secrets": secrets,
+        "certs": certs,
+        "doh_bundle": doh_bundle,
         "drop_outbound_tags": sorted(drop),
         "transferred_custom": len(customs),
         "transferred_l2tp": len(l2tp),
+        "transferred_certs": len(certs),
+        "transferred_doh_files": len(doh_bundle),
     }
 
 
@@ -1162,9 +1183,36 @@ def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_no
         "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
         "dns": master_store_snapshot.get("dns") or {},
         "xray_settings": master_store_snapshot.get("xray_settings") or {},
+        "settings": master_store_snapshot.get("settings") or {},
+        "ip_bans": master_store_snapshot.get("ip_bans") or [],
+        "certs": master_store_snapshot.get("certs") or [],
+        "doh_bundle": master_store_snapshot.get("doh_bundle") or [],
         "nodes": peers,
         "old_master": old_master_node,
     }
+
+
+def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
+    """Merge master settings onto the new master; keep local panel host/base_path."""
+    if not isinstance(incoming, dict) or not incoming:
+        return
+    local = store.setdefault("settings", {})
+    local_panel = dict(local.get("panel") or {})
+    keep_bp = local_panel.get("base_path")
+    keep_host = local_panel.get("public_host")
+    merged = json.loads(json.dumps(incoming))
+    merged.pop("nodes", None)  # role forced by caller
+    # Deep-ish replace of known sections
+    for key, val in merged.items():
+        if isinstance(val, dict) and isinstance(local.get(key), dict):
+            local[key] = {**local.get(key, {}), **val}
+        else:
+            local[key] = val
+    panel = local.setdefault("panel", {})
+    if keep_bp:
+        panel["base_path"] = keep_bp
+    if keep_host:
+        panel["public_host"] = keep_host
 
 
 def promote_via_api(node: dict, payload: dict, timeout: int = 90) -> dict:
@@ -1224,7 +1272,7 @@ def promote_via_ssh(
         return {"ok": False, "error": f"SSH: {exc}"}
 
     try:
-        # Merge snapshot into remote store (clients/inbounds/routes/balancers/l2tp/nodes)
+        # Merge snapshot into remote store (clients/inbounds/routes/balancers/l2tp/settings/certs/doh/nodes)
         snap = {
             "clients": master_store_snapshot.get("clients") or [],
             "inbounds": master_store_snapshot.get("inbounds") or [],
@@ -1233,6 +1281,10 @@ def promote_via_ssh(
             "outbounds_custom": master_store_snapshot.get("outbounds_custom") or [],
             "dns": master_store_snapshot.get("dns") or {},
             "xray_settings": master_store_snapshot.get("xray_settings") or {},
+            "settings": master_store_snapshot.get("settings") or {},
+            "ip_bans": master_store_snapshot.get("ip_bans") or [],
+            "certs": master_store_snapshot.get("certs") or [],
+            "doh_bundle": master_store_snapshot.get("doh_bundle") or [],
             "l2tp": master_store_snapshot.get("l2tp") or [],
             "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
             "nodes": [old_master_node],
@@ -1241,15 +1293,33 @@ def promote_via_ssh(
         with sftp.file("/tmp/l2x_promote.json", "w") as f:
             f.write(json.dumps(snap, ensure_ascii=False))
         promote_py = """
-import base64, hashlib, json, os
+import base64, hashlib, json, os, subprocess
 from pathlib import Path
 from cryptography.fernet import Fernet
 snap = json.loads(Path('/tmp/l2x_promote.json').read_text())
 store_path = Path('/var/lib/l2xpanel/store.json')
 store = json.loads(store_path.read_text()) if store_path.exists() else {}
-for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes','l2tp'):
+local_panel = dict((store.get('settings') or {}).get('panel') or {})
+keep_bp = local_panel.get('base_path')
+keep_host = local_panel.get('public_host')
+for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes','l2tp','ip_bans'):
     if k in snap:
         store[k] = snap[k]
+incoming = snap.get('settings') or {}
+if isinstance(incoming, dict) and incoming:
+    cur = store.setdefault('settings', {})
+    for key, val in incoming.items():
+        if key == 'nodes':
+            continue
+        if isinstance(val, dict) and isinstance(cur.get(key), dict):
+            cur[key] = {**cur.get(key, {}), **val}
+        else:
+            cur[key] = val
+    panel = cur.setdefault('panel', {})
+    if keep_bp:
+        panel['base_path'] = keep_bp
+    if keep_host:
+        panel['public_host'] = keep_host
 ns = store.setdefault('settings', {}).setdefault('nodes', {})
 ns['agent_enabled'] = False
 ns['role'] = 'master'
@@ -1282,7 +1352,59 @@ if secrets:
         p = d / f'{name}.json'
         p.write_text(json.dumps(payload))
         os.chmod(p, 0o600)
-print('promoted', 'l2tp', len(store.get('l2tp') or []), 'custom', len(store.get('outbounds_custom') or []))
+# TLS certs
+cert_dir = Path(os.environ.get('L2XPANEL_CERT_DIR', '/etc/l2xpanel/certs'))
+n_certs = 0
+for it in snap.get('certs') or []:
+    if not isinstance(it, dict):
+        continue
+    rel = str(it.get('rel') or '').replace('\\\\', '/')
+    if not rel or rel.startswith('/') or '..' in rel.split('/'):
+        continue
+    try:
+        raw = base64.b64decode(it.get('data_b64') or '')
+    except Exception:
+        continue
+    target = cert_dir / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    if rel.endswith('.key'):
+        try: os.chmod(target, 0o600)
+        except OSError: pass
+    n_certs += 1
+# DoH / Pi-hole files
+doh_dir = Path(os.environ.get('L2XPANEL_DOH_DIR', '/opt/l2xpanel/doh'))
+n_doh = 0
+for it in snap.get('doh_bundle') or []:
+    if not isinstance(it, dict):
+        continue
+    rel = str(it.get('rel') or '').replace('\\\\', '/')
+    if not rel or rel.startswith('/') or '..' in rel.split('/'):
+        continue
+    try:
+        raw = base64.b64decode(it.get('data_b64') or '')
+    except Exception:
+        continue
+    target = doh_dir / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    if rel.endswith('.env'):
+        try: os.chmod(target, 0o600)
+        except OSError: pass
+    n_doh += 1
+if n_doh and (doh_dir / 'docker-compose.yml').is_file():
+    for cmd in (
+        ['docker', 'compose', '-f', str(doh_dir / 'docker-compose.yml'), 'up', '-d', '--force-recreate'],
+        ['docker-compose', '-f', str(doh_dir / 'docker-compose.yml'), 'up', '-d', '--force-recreate'],
+    ):
+        try:
+            r = subprocess.run(cmd, cwd=str(doh_dir), capture_output=True, text=True, timeout=180)
+            if r.returncode == 0:
+                break
+        except Exception:
+            pass
+print('promoted', 'l2tp', len(store.get('l2tp') or []), 'custom', len(store.get('outbounds_custom') or []),
+      'certs', n_certs, 'doh_files', n_doh, 'doh_enabled', bool((store.get('settings') or {}).get('doh', {}).get('enabled')))
 """
         with sftp.file("/tmp/l2x_promote.py", "w") as f:
             f.write(promote_py)
@@ -1296,7 +1418,7 @@ print('promoted', 'l2tp', len(store.get('l2tp') or []), 'custom', len(store.get(
             "  curl -sf http://127.0.0.1:8090/health >/dev/null && break; done; "
             "curl -s http://127.0.0.1:8090/health; echo; "
             "rm -f /tmp/l2x_promote.py /tmp/l2x_promote.json",
-            timeout=120,
+            timeout=300,
         )
         log.append(r["stdout"][-800:])
         out = r.get("stdout") or ""
