@@ -102,7 +102,10 @@
   <label class="f">Agent token</label>
   <input value="{{ ns.agent_token }}" class="mono" readonly>
   {{ m.check('regen_token', False, 'Сгенерировать новый token') }}
-  <div class="hint">На мастер-панели: страница Nodes → добавить эту ноду с URL <code>http://{{ public_host }}</code> и этим token. Эндпоинт: <code>POST /agent/apply</code>.</div>
+  <div class="hint">
+    Агент остаётся включённым после обновлений и перезапусков. Выключить можно только сняв эту галочку.
+    На мастер-панели: Nodes → добавить ноду с URL <code>https://{{ public_host }}</code> и этим token (<code>POST /agent/apply</code>).
+  </div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 

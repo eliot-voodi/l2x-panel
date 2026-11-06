@@ -108,6 +108,7 @@ def agent_token(store: dict) -> str:
         s["agent_token"] = secrets.token_urlsafe(32)
     s.setdefault("agent_enabled", False)
     s.setdefault("role", "master")  # master | agent
+    s.setdefault("agent_manual_off", False)
     return s["agent_token"]
 
 
@@ -613,18 +614,8 @@ def update_via_ssh(node: dict, ssh_password: str, ssh_user: str = "", ssh_port: 
                 pass
 
 
-def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") -> dict:
-    domain = (node.get("domain") or "").strip()
-    if not domain:
-        from urllib.parse import urlparse
-        domain = urlparse(node.get("url") or "").hostname or ""
-    if master_host:
-        self_err = same_host_as_master(domain, master_host)
-        if self_err:
-            node["last_sync"] = now_iso()
-            node["last_ok"] = False
-            node["last_error"] = self_err
-            return {"ok": False, "error": self_err}
+def _push_once(node: dict, payload: dict, timeout: int = 60) -> dict:
+    """Single POST /agent/apply attempt."""
     url = agent_apply_url(node)
     token = node.get("token") or ""
     data = json.dumps(payload, ensure_ascii=False).encode()
@@ -634,7 +625,6 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
         "User-Agent": "L2XPanel-NodeSync/1.0",
     })
     try:
-        # Default HTTPS context — SNI comes from the URL hostname.
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode()
             try:
@@ -642,23 +632,15 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             except json.JSONDecodeError:
                 parsed = {"ok": resp.status < 300, "raw": body[:500]}
             ok = bool(parsed.get("ok", resp.status < 300))
-            node["last_sync"] = now_iso()
-            node["last_ok"] = ok
             err = "" if ok else str(parsed.get("error") or body[:300])
             try:
                 from xray_runtime import clean_xray_error
                 err = clean_xray_error(err) or err
             except Exception:
                 pass
-            node["last_error"] = err
-            if ok:
-                try:
-                    probe_health(node, timeout=5)
-                except Exception:
-                    pass
             if isinstance(parsed, dict) and err:
                 parsed = {**parsed, "error": err}
-            return parsed if isinstance(parsed, dict) else {"ok": ok}
+            return parsed if isinstance(parsed, dict) else {"ok": ok, "error": err}
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -675,22 +657,57 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             err = clean_xray_error(err) or err
         except Exception:
             pass
-        # Prefer explicit agent errors over opaque "HTTP Error 403"
-        if exc.code == 403 and "agent" in err.lower():
-            err = err
-        elif body and "error" in (parsed or {}):
-            err = str(parsed.get("error"))
-        else:
-            err = f"HTTP {exc.code}: {err}"
-        node["last_sync"] = now_iso()
-        node["last_ok"] = False
-        node["last_error"] = err
-        return {"ok": False, "error": err}
+        if not (exc.code == 403 and "agent" in err.lower()):
+            if body and "error" in (parsed or {}):
+                err = str(parsed.get("error"))
+            else:
+                err = f"HTTP {exc.code}: {err}"
+        return {"ok": False, "error": err, "status": exc.code}
     except Exception as exc:  # noqa: BLE001
-        node["last_sync"] = now_iso()
-        node["last_ok"] = False
-        node["last_error"] = str(exc)
         return {"ok": False, "error": str(exc)}
+
+
+def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") -> dict:
+    domain = (node.get("domain") or "").strip()
+    if not domain:
+        from urllib.parse import urlparse
+        domain = urlparse(node.get("url") or "").hostname or ""
+    if master_host:
+        self_err = same_host_as_master(domain, master_host)
+        if self_err:
+            node["last_sync"] = now_iso()
+            node["last_ok"] = False
+            node["last_error"] = self_err
+            return {"ok": False, "error": self_err}
+    result = _push_once(node, payload, timeout=timeout)
+    # Auto-heal: agent was turned off by update/restart — re-enable via manage API and retry once.
+    # Respects remote agent_manual_off (admin unchecked Settings → Nodes).
+    err = str(result.get("error") or "")
+    if not result.get("ok") and "agent disabled" in err.lower():
+        heal = manage_request(node, action="enable_agent", timeout=30)
+        if heal.get("ok"):
+            result = _push_once(node, payload, timeout=timeout)
+            if result.get("ok"):
+                err = ""
+            else:
+                err = str(result.get("error") or err)
+        elif heal.get("manual_off"):
+            err = "agent выключен вручную на ноде"
+            result = {"ok": False, "error": err, "manual_off": True}
+        else:
+            # Old panel without enable_agent: fall back to manage update_panel path is N/A;
+            # surface a clear error so admin can Update (manage) or SSH.
+            err = f"agent disabled (auto-enable: {heal.get('error') or 'fail'})"
+            result = {"ok": False, "error": err}
+    node["last_sync"] = now_iso()
+    node["last_ok"] = bool(result.get("ok"))
+    node["last_error"] = "" if result.get("ok") else err
+    if result.get("ok"):
+        try:
+            probe_health(node, timeout=5)
+        except Exception:
+            pass
+    return result
 
 
 def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
@@ -906,6 +923,7 @@ if was_master and not FORCE:
 ns["agent_enabled"] = True
 ns["agent_token"] = TOKEN
 ns["role"] = "agent"
+ns["agent_manual_off"] = False
 panel = s.setdefault("panel", {{}})
 panel["public_host"] = DOMAIN
 # Preserve existing base_path so re-provision does not break the admin URL

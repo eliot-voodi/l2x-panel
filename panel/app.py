@@ -133,7 +133,7 @@ def default_settings() -> dict:
         },
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
-        "nodes": {"agent_enabled": False, "agent_token": "", "role": "master"},
+        "nodes": {"agent_enabled": False, "agent_token": "", "role": "master", "agent_manual_off": False},
         "panel_update": {"auto_check": True, "interval_hours": 12},
         "iplimit": {"ban_minutes": 30},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
@@ -1471,10 +1471,28 @@ def _sync_xray_config() -> None:
         pass
 
 
+def _ensure_agent_sticky() -> None:
+    """Keep agent mode on after restarts/updates unless the admin turned it off manually."""
+    try:
+        with mutate() as store:
+            ns = store.setdefault("settings", {}).setdefault("nodes", {})
+            ns.setdefault("agent_manual_off", False)
+            role = (ns.get("role") or "master").strip() or "master"
+            if role == "agent" and not ns.get("agent_manual_off"):
+                if not ns.get("agent_enabled"):
+                    ns["agent_enabled"] = True
+            # Token must exist for manage/apply even before first provision push
+            if not ns.get("agent_token"):
+                ns["agent_token"] = secrets.token_urlsafe(32)
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 def _startup():
     _admin()
     _ensure_base_path()
+    _ensure_agent_sticky()
     _refresh_settings_cache()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
                    _l2tp_auto_loop, _nodes_sync_loop, _pia_loop):
@@ -3884,12 +3902,17 @@ async def settings_save(request: Request):
             wh["events"] = [e for e in webhooks.EVENTS if form.get(f"ev_{e}") == "1"] or list(webhooks.EVENTS)
         elif section == "nodes":
             ns = s.setdefault("nodes", {})
-            ns["agent_enabled"] = form.get("agent_enabled") == "1"
-            # Keep role in sync with the checkbox so is_master() / agent apply stay consistent
-            if ns["agent_enabled"]:
+            want_agent = form.get("agent_enabled") == "1"
+            ns["agent_enabled"] = want_agent
+            # Manual off is sticky: only an explicit uncheck turns agent off permanently.
+            # Sync/update/restart must not demote an agent unless this flag is set.
+            if want_agent:
                 ns["role"] = "agent"
-            elif (ns.get("role") or "") == "agent":
-                ns["role"] = "master"
+                ns["agent_manual_off"] = False
+            else:
+                ns["agent_manual_off"] = True
+                if (ns.get("role") or "") == "agent":
+                    ns["role"] = "master"
             if form.get("regen_token") == "1" or not ns.get("agent_token"):
                 ns["agent_token"] = secrets.token_urlsafe(32)
         elif section == "tg":
@@ -4753,6 +4776,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 ns = st.setdefault("settings", {}).setdefault("nodes", {})
                 ns["agent_enabled"] = True
                 ns["role"] = "agent"
+                ns["agent_manual_off"] = False
                 ns["runtime_preserve"] = True
                 nodes_mod.agent_token(st)
                 st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
@@ -4836,6 +4860,14 @@ def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
     """Validate Bearer agent_token. Returns (store, None) or (None, error response)."""
     store = _load_store()
     ns = store["settings"].get("nodes") or {}
+    # Auto-heal: role=agent and not manually disabled → keep accepting pushes
+    if (ns.get("role") or "") == "agent" and not ns.get("agent_manual_off") and not ns.get("agent_enabled"):
+        with mutate() as st:
+            n2 = st.setdefault("settings", {}).setdefault("nodes", {})
+            n2["agent_enabled"] = True
+            n2["role"] = "agent"
+        store = _load_store()
+        ns = store["settings"].get("nodes") or {}
     if not ns.get("agent_enabled"):
         return None, JSONResponse({"ok": False, "error": "agent disabled"}, status_code=403)
     auth = request.headers.get("authorization") or ""
@@ -4932,6 +4964,20 @@ def _manage_action(action: str, payload: dict) -> dict:
     action = (action or "").strip()
     if action in ("", "snapshot", "status"):
         return _manage_snapshot(_load_store())
+
+    if action == "enable_agent":
+        # Master re-enables a node that lost agent mode. Never overrides Settings → uncheck
+        # (agent_manual_off): only the local admin can clear that flag by enabling the checkbox.
+        with mutate() as st:
+            ns = st.setdefault("settings", {}).setdefault("nodes", {})
+            if ns.get("agent_manual_off"):
+                return {"ok": False, "error": "agent выключен вручную на этой ноде", "manual_off": True}
+            ns["agent_enabled"] = True
+            ns["role"] = "agent"
+            ns["agent_manual_off"] = False
+            if not ns.get("agent_token"):
+                ns["agent_token"] = secrets.token_urlsafe(32)
+        return {"ok": True, "error": "", "agent_enabled": True, "role": "agent"}
 
     if action == "restart_xray":
         r = ops.xray_control("restart")
@@ -5081,8 +5127,8 @@ async def agent_manage(request: Request):
 
 @app.post("/agent/update")
 async def agent_update(request: Request):
-    """Master triggers panel self-update on this agent node (one node at a time from UI)."""
-    store, err = _agent_auth(request)
+    """Master triggers panel self-update on this node (works even if agent mode is off)."""
+    store, err = _agent_manage_auth(request)
     if err:
         return err
     try:
@@ -5212,9 +5258,11 @@ async def agent_apply(request: Request):
             # Peer registry for failover — does not include this agent as master yet
             st["nodes"] = list(payload["nodes"] or [])
         # Keep agent mode sticky — a pushed payload must never demote/disable agent
+        # (unless admin explicitly set agent_manual_off in Settings → Nodes).
         ns = st.setdefault("settings", {}).setdefault("nodes", {})
-        ns["agent_enabled"] = True
-        ns["role"] = "agent"
+        if not ns.get("agent_manual_off"):
+            ns["agent_enabled"] = True
+            ns["role"] = "agent"
         ns["mirror"] = mirror
         # First successful push from new master may replace preserve mode
         ns["runtime_preserve"] = False
