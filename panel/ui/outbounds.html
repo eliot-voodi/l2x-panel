@@ -15,11 +15,49 @@
   #dlg-add .import input { flex: 1 }
   #ob-json { min-height: 24rem; font-size: .8rem }
   #ob-err { color: var(--danger); font-size: .8rem; margin-top: .4rem }
+  .ob-mobile { display: none }
+  @media (max-width: 860px) {
+    .ob-desktop { display: none }
+    .ob-mobile { display: block }
+    .ob-list { list-style: none; margin: 0; padding: 0 }
+    .ob-item { border-bottom: 1px solid var(--border) }
+    .ob-item:last-child { border-bottom: 0 }
+    .ob-row {
+      display: flex; align-items: center; gap: .65rem; width: 100%;
+      padding: .85rem 1rem; background: none; border: 0; color: inherit;
+      font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .ob-row:active { background: var(--surface-2) }
+    .ob-row .meta { flex: 1; min-width: 0 }
+    .ob-row .meta b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .ob-row .meta .dim { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .ob-row .chev {
+      flex-shrink: 0; width: 18px; height: 18px; color: var(--dim);
+      transition: transform .18s ease;
+    }
+    .ob-item.open .ob-row .chev { transform: rotate(90deg); color: var(--accent) }
+    .ob-detail {
+      display: none; padding: 0 1rem 1rem 1rem;
+      border-top: 1px dashed var(--border);
+      background: var(--surface-2);
+    }
+    .ob-item.open .ob-detail { display: block }
+    .ob-detail .kv { display: grid; gap: .55rem; padding: .75rem 0 }
+    .ob-detail .kv > div { display: flex; justify-content: space-between; gap: .75rem; align-items: baseline }
+    .ob-detail .kv .lbl { color: var(--muted); font-size: .78rem; flex-shrink: 0 }
+    .ob-detail .kv .val { text-align: right; font-size: .85rem; min-width: 0; word-break: break-word }
+    .ob-detail .actions { padding-bottom: .15rem }
+    .ob-detail .actions .btn { flex: 1 1 calc(33% - .35rem); min-width: 0 }
+    #dlg-add { width: calc(100% - 1rem); margin: .5rem; max-height: calc(100dvh - 1rem) }
+    #dlg-add .row > * { min-width: min(100%, 140px) }
+    #ob-json { min-height: 14rem }
+  }
 </style>
 {% endblock %}
 {% block content %}
 <div class="card" style="padding:0">
-  <div class="table-wrap">
+  {# —— Desktop —— #}
+  <div class="table-wrap ob-desktop">
   <table>
     <thead><tr><th>Outbound</th><th>Тип</th><th>{{ t('Статус') }}</th><th>Инфо</th><th>{{ t('Трафик') }}</th><th>Тест</th><th class="right">{{ t('Действия') }}</th></tr></thead>
     <tbody>
@@ -50,6 +88,49 @@
     {% endfor %}
     </tbody>
   </table>
+  </div>
+
+  {# —— Mobile accordion —— #}
+  <div class="ob-mobile">
+    {% if items %}
+    <ul class="ob-list">
+      {% for o in items %}
+      <li class="ob-item">
+        <button type="button" class="ob-row" onclick="toggleOutbound(this)" aria-expanded="false">
+          <span class="meta">
+            <b>{{ o.label }}</b>
+            <span class="dim small mono">{{ o.tag }}</span>
+          </span>
+          {{ m.status_badge(o.status if o.status else 'active') }}
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="ob-detail" hidden>
+          <div class="kv">
+            <div><span class="lbl">Тип</span><span class="val"><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.in_sub %} · в подписке{% endif %}</span></div>
+            {% if o.info %}<div><span class="lbl">Инфо</span><span class="val mono">{{ o.info }}</span></div>{% endif %}
+            <div><span class="lbl">Трафик</span><span class="val">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</span></div>
+            <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
+          </div>
+          <div class="actions">
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm">{{ t('Тест') }}</button></form>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reset"><button class="btn ghost sm">{{ ic.icon('refresh') }}</button></form>
+            {% if o.custom %}
+            {% if o.kind == 'pia' %}
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reconnect"><button class="btn ghost sm">Reconnect</button></form>
+            {% endif %}
+            <button type="button" class="btn ghost sm" data-tag="{{ o.tag }}" onclick="obOpen(this.dataset.tag)">{{ ic.icon('edit') }} Правка</button>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/sub"><button class="btn ghost sm">{{ ic.icon('link') }}</button></form>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/delete" onsubmit="return confirm('Удалить {{ o.tag }}?')"><button class="btn danger sm">{{ ic.icon('trash') }}</button></form>
+            {% endif %}
+          </div>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">Нет outbounds</div>
+    {% endif %}
   </div>
 </div>
 <div class="hint">Свои outbounds можно выбрать у клиента, в правилах маршрутизации и в балансировщиках. Тест поднимает временный Xray и замеряет запрос к generate_204.</div>
@@ -287,6 +368,23 @@
 {% endblock %}
 {% block scripts %}
 <script>
+  function toggleOutbound(btn) {
+    var item = btn.closest('.ob-item');
+    var open = !item.classList.contains('open');
+    document.querySelectorAll('.ob-item.open').forEach(function (el) {
+      if (el !== item) {
+        el.classList.remove('open');
+        var d = el.querySelector('.ob-detail');
+        var b = el.querySelector('.ob-row');
+        if (d) d.hidden = true;
+        if (b) b.setAttribute('aria-expanded', 'false');
+      }
+    });
+    item.classList.toggle('open', open);
+    var detail = item.querySelector('.ob-detail');
+    if (detail) detail.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
   var BP = {{ bp|tojson }}, CUSTOM = {{ custom|tojson }}, nordLoaded = false, piaLoaded = false, piaData = [], curMode = 'form';
   var piaAccount = {{ pia|tojson }};
   var form = document.getElementById('ob-form');
