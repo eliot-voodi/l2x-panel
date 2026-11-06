@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.request import Request as UrlRequest, urlopen
+from urllib.error import HTTPError, URLError
 
 import bcrypt
 import yaml
@@ -23,6 +25,7 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 import front
@@ -306,7 +309,10 @@ def base_path() -> str:
 
 
 # Public site root and these prefixes belong to nginx / subscriptions, never to the panel
-BASE_PATH_RESERVED = {"sub", "panel", "health", "static", "login", "logout", "well-known"}
+BASE_PATH_RESERVED = {
+    "sub", "panel", "health", "static", "login", "logout", "well-known",
+    "pihole", "pihole-gate", "doh",
+}
 
 
 def _clean_base_path(value: str) -> str:
@@ -401,6 +407,15 @@ class BasePathMiddleware:
     def __init__(self, inner):
         self.inner = inner
 
+    def _public(self, path: str) -> bool:
+        if path.startswith(self.PUBLIC):
+            return True
+        # DoH is always outside the secret base path (nginx → panel)
+        prefix = doh_mod.normalize_prefix(
+            str((SETTINGS_CACHE.get("doh") or {}).get("path_prefix") or "doh")
+        )
+        return path == f"/{prefix}" or path.startswith(f"/{prefix}/")
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             bp = base_path()
@@ -409,7 +424,7 @@ class BasePathMiddleware:
                 if path == bp or path.startswith(bp + "/"):
                     scope = dict(scope)
                     scope["path"] = path[len(bp):] or "/"
-                elif not path.startswith(self.PUBLIC):
+                elif not self._public(path):
                     resp = PlainTextResponse("404 page not found", status_code=404)
                     await resp(scope, receive, send)
                     return
@@ -3861,8 +3876,20 @@ def doh_page(request: Request):
             "email": c["email"], "token": c.get("doh_token"), "in_tunnel": bool(c.get("doh_in_tunnel")),
             "url": doh_mod.public_url(store, c),
         })
+    link = request.session.pop("pihole_link", None)
+    until = request.session.get("pihole_until")
+    try:
+        until_f = float(until or 0)
+    except (TypeError, ValueError):
+        until_f = 0.0
+    pihole_session = {
+        "active": until_f > time.time(),
+        "until": until_f,
+        "left_sec": max(0, int(until_f - time.time())) if until_f else 0,
+    }
     return page(request, "doh.html", active="doh", doh=cfg, status=st, doh_clients=clients,
-                public_host=public_host())
+                public_host=public_host(), pihole_link=link, pihole_session=pihole_session,
+                pihole_open=f"{base_path()}/pihole/admin/")
 
 
 @app.post("/doh/save")
@@ -3917,6 +3944,207 @@ def doh_stop(request: Request):
     flash(request, "Pi-hole остановлен" if res.get("ok") else f"stop: {res.get('error')}",
           "info" if res.get("ok") else "error")
     return go("/doh")
+
+
+@app.post("/doh/pihole-link")
+def doh_pihole_link(request: Request):
+    """Create a single-use link that opens Pi-hole admin via reverse proxy."""
+    if redir := _require(request):
+        return redir
+    ticket = doh_mod.create_pihole_ticket(by=str(_user(request) or ""))
+    abs_url = f"{public_https_base()}{base_path()}{ticket['url_path']}"
+    request.session["pihole_link"] = {
+        "url": abs_url,
+        "exp": ticket["exp"],
+        "ttl_sec": ticket["ttl_sec"],
+    }
+    flash(request, "Одноразовая ссылка создана. Откройте её один раз — действует 15 минут.", "info")
+    return go("/doh")
+
+
+@app.post("/doh/pihole-session-end")
+def doh_pihole_session_end(request: Request):
+    if redir := _require(request):
+        return redir
+    request.session.pop("pihole_until", None)
+    flash(request, "Сессия доступа к Pi-hole закрыта", "info")
+    return go("/doh")
+
+
+def _pihole_session_ok(request: Request) -> bool:
+    try:
+        return float(request.session.get("pihole_until") or 0) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+_PIHOLE_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "content-encoding",  # urllib decompresses; don't re-advertise gzip
+}
+
+
+def _pihole_mount() -> str:
+    return f"{base_path()}/pihole"
+
+
+def _rewrite_set_cookie(value: str, mount: str) -> str:
+    """Point Pi-hole cookies at the proxied path prefix."""
+    parts = []
+    for part in value.split(";"):
+        p = part.strip()
+        low = p.lower()
+        if low.startswith("path="):
+            raw = p.split("=", 1)[1].strip() or "/"
+            if raw == "/":
+                parts.append(f"Path={mount}/")
+            elif not raw.startswith(mount):
+                parts.append(f"Path={mount}{raw if raw.startswith('/') else '/' + raw}")
+            else:
+                parts.append(p)
+        else:
+            parts.append(p)
+    return "; ".join(parts)
+
+
+def _rewrite_location(value: str, mount: str, upstream: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return v
+    for prefix in (f"http://{upstream}", f"https://{upstream}", "http://127.0.0.1:8089", "http://localhost:8089"):
+        if v.startswith(prefix):
+            v = v[len(prefix):] or "/"
+            break
+    if v.startswith("/") and not v.startswith(mount + "/") and v != mount:
+        return mount + v
+    return v
+
+
+def _rewrite_pihole_body(body: bytes, content_type: str, mount: str) -> bytes:
+    ct = (content_type or "").lower()
+    if not any(x in ct for x in ("text/html", "javascript", "json", "css", "text/plain")):
+        return body
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body
+    repl = (
+        ('"/admin', f'"{mount}/admin'),
+        ("'/admin", f"'{mount}/admin"),
+        ('"/api', f'"{mount}/api'),
+        ("'/api", f"'{mount}/api"),
+        ("`/admin", f"`{mount}/admin"),
+        ("`/api", f"`{mount}/api"),
+        ("url(/admin", f"url({mount}/admin"),
+        ("url(/api", f"url({mount}/api"),
+        ("url('/admin", f"url('{mount}/admin"),
+        ('url("/admin', f'url("{mount}/admin'),
+    )
+    for a, b in repl:
+        text = text.replace(a, b)
+    return text.encode("utf-8")
+
+
+def _proxy_pihole(request: Request, path: str) -> Response:
+    if not _pihole_session_ok(request):
+        return PlainTextResponse(
+            "Нет доступа к Pi-hole. Создайте одноразовую ссылку на странице DoH / Pi-hole.",
+            status_code=403,
+        )
+    store = _load_store()
+    cfg = {**doh_mod.default_settings(), **(store["settings"].get("doh") or {})}
+    host, port = doh_mod.pihole_upstream(cfg)
+    upstream = f"{host}:{port}"
+    mount = _pihole_mount()
+    rel = (path or "").lstrip("/")
+    qs = request.url.query
+    target = f"http://{upstream}/{rel}" + (f"?{qs}" if qs else "")
+
+    headers: dict[str, str] = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in _PIHOLE_HOP:
+            continue
+        if lk.startswith("x-forwarded") or lk == "forwarded":
+            continue
+        if lk == "cookie":
+            headers["Cookie"] = v
+            continue
+        headers[k] = v
+    headers["Host"] = upstream
+    headers["X-Forwarded-Prefix"] = mount
+    headers["Accept-Encoding"] = "identity"
+
+    body = None
+    if request.method not in ("GET", "HEAD"):
+        # Starlette caches body on sync routes via run_in_threadpool when called from async;
+        # read via request.stream consumed already — use _body if present.
+        body = getattr(request, "_body", None)
+
+    req = UrlRequest(target, data=body, method=request.method, headers=headers)
+    try:
+        with urlopen(req, timeout=float(cfg.get("timeout_sec") or 30)) as resp:
+            raw = resp.read()
+            status = resp.status
+            resp_headers = list(resp.headers.items())
+            content_type = resp.headers.get("Content-Type") or ""
+    except HTTPError as exc:
+        raw = exc.read() if exc.fp else b""
+        status = exc.code
+        resp_headers = list(exc.headers.items()) if exc.headers else []
+        content_type = (exc.headers.get("Content-Type") if exc.headers else "") or ""
+    except URLError as exc:
+        return PlainTextResponse(f"Pi-hole недоступен: {exc.reason}", status_code=502)
+    except Exception as exc:
+        return PlainTextResponse(f"Pi-hole proxy error: {exc}", status_code=502)
+
+    raw = _rewrite_pihole_body(raw, content_type, mount)
+    out_headers: dict[str, str] = {}
+    set_cookies: list[str] = []
+    for k, v in resp_headers:
+        lk = k.lower()
+        if lk in _PIHOLE_HOP:
+            continue
+        if lk == "location":
+            out_headers["Location"] = _rewrite_location(v, mount, upstream)
+        elif lk == "set-cookie":
+            set_cookies.append(_rewrite_set_cookie(v, mount))
+        elif lk == "content-type":
+            out_headers["Content-Type"] = v
+        elif lk not in ("content-length", "content-encoding"):
+            out_headers[k] = v
+    response = Response(content=raw, status_code=status, headers=out_headers)
+    for sc in set_cookies:
+        response.headers.append("Set-Cookie", sc)
+    return response
+
+
+@app.get("/pihole-gate/{token}")
+def pihole_gate(token: str, request: Request):
+    """Redeem one-time link → session cookie → redirect into proxied admin."""
+    res = doh_mod.redeem_pihole_ticket(token)
+    if not res.get("ok"):
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>Pi-hole</title>"
+            f"<body style='font-family:system-ui;padding:2rem'><h1>Доступ закрыт</h1>"
+            f"<p>{res.get('error') or 'ссылка недействительна'}</p>"
+            f"<p class=dim>Создайте новую одноразовую ссылку в панели (DoH / Pi-hole).</p></body>",
+            status_code=403,
+        )
+    request.session["pihole_until"] = time.time() + int(res.get("session_ttl") or doh_mod.PIHOLE_SESSION_TTL_SEC)
+    return RedirectResponse(base_path() + "/pihole/admin/", status_code=303)
+
+
+@app.api_route("/pihole", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+@app.api_route("/pihole/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def pihole_proxy(request: Request, path: str = ""):
+    # Read body before thread offload (sync urllib proxy uses request._body)
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        request._body = await request.body()  # type: ignore[attr-defined]
+    else:
+        request._body = None  # type: ignore[attr-defined]
+    return await run_in_threadpool(_proxy_pihole, request, path)
 
 
 # ================================================================ settings

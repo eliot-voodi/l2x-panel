@@ -20,8 +20,15 @@ import time
 from pathlib import Path
 
 COMPOSE_DIR = Path(os.environ.get("L2XPANEL_DOH_DIR", "/opt/l2xpanel/doh"))
+TICKETS_FILE = Path(os.environ.get(
+    "L2XPANEL_PIHOLE_TICKETS",
+    str(Path(os.environ.get("L2XPANEL_DATA", "/var/lib/l2xpanel")) / "pihole_tickets.json"),
+))
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 PATH_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
+# One-time gate link TTL; session after redeem lasts longer
+PIHOLE_LINK_TTL_SEC = 15 * 60
+PIHOLE_SESSION_TTL_SEC = 2 * 3600
 
 
 def default_settings() -> dict:
@@ -233,3 +240,92 @@ def dns_servers_for_client(doh_https: str, *, in_tunnel: bool) -> dict:
         "clash_nameserver": [doh_https],
         "clash_nameserver_policy": {"PROXY": [doh_https]} if in_tunnel else {},
     }
+
+
+# ---------------------------------------------------------------- one-time Pi-hole admin access
+
+def pihole_upstream(cfg: dict | None = None) -> tuple[str, int]:
+    """Parse pihole_web → (host, port), default 127.0.0.1:8089."""
+    cfg = {**default_settings(), **(cfg or {})}
+    raw = str(cfg.get("pihole_web") or "127.0.0.1:8089").strip()
+    raw = raw.replace("http://", "").replace("https://", "").split("/")[0]
+    if ":" in raw:
+        host, _, port_s = raw.rpartition(":")
+        try:
+            return (host or "127.0.0.1"), int(port_s)
+        except ValueError:
+            return "127.0.0.1", 8089
+    return raw or "127.0.0.1", 8089
+
+
+def _load_tickets() -> list[dict]:
+    try:
+        if TICKETS_FILE.is_file():
+            data = json.loads(TICKETS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def _save_tickets(items: list[dict]) -> None:
+    TICKETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TICKETS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(TICKETS_FILE)
+    try:
+        os.chmod(TICKETS_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _purge_tickets(items: list[dict], now: float | None = None) -> list[dict]:
+    now = time.time() if now is None else now
+    return [
+        t for t in items
+        if isinstance(t, dict)
+        and t.get("token")
+        and float(t.get("exp") or 0) > now
+        and not t.get("used")
+    ]
+
+
+def create_pihole_ticket(*, ttl_sec: int = PIHOLE_LINK_TTL_SEC, by: str = "") -> dict:
+    """Create a single-use ticket. Returns {token, exp, url_path, ttl_sec}."""
+    now = time.time()
+    token = secrets.token_urlsafe(24)
+    exp = now + max(60, int(ttl_sec))
+    items = _purge_tickets(_load_tickets(), now)
+    items.append({"token": token, "exp": exp, "used": False, "by": (by or "")[:64], "created": now})
+    _save_tickets(items)
+    return {
+        "token": token,
+        "exp": exp,
+        "ttl_sec": int(exp - now),
+        "url_path": f"/pihole-gate/{token}",
+    }
+
+
+def redeem_pihole_ticket(token: str) -> dict:
+    """Consume a single-use ticket. Returns {ok, session_ttl} or {ok: False, error}."""
+    tok = (token or "").strip()
+    if not tok or len(tok) < 16:
+        return {"ok": False, "error": "некорректная ссылка"}
+    now = time.time()
+    items = _load_tickets()
+    kept: list[dict] = []
+    found: dict | None = None
+    for t in items:
+        ttok = str(t.get("token") or "")
+        if found is None and len(ttok) == len(tok) and secrets.compare_digest(ttok, tok):
+            found = t
+            continue
+        if float(t.get("exp") or 0) > now and not t.get("used"):
+            kept.append(t)
+    _save_tickets(kept)
+    if not found:
+        return {"ok": False, "error": "ссылка не найдена или уже использована"}
+    if found.get("used") or float(found.get("exp") or 0) <= now:
+        return {"ok": False, "error": "ссылка уже использована или истекла"}
+    return {"ok": True, "session_ttl": PIHOLE_SESSION_TTL_SEC}
