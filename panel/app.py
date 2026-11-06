@@ -5625,6 +5625,16 @@ async def agent_promote(request: Request):
                 old = payload["old_master"]
                 nodes[:] = [n for n in nodes if n.get("id") != old.get("id")]
                 nodes.insert(0, old)
+            # Subscription links must advertise THIS host, not the demoted master.
+            new_host = ((st.get("settings") or {}).get("panel") or {}).get("public_host") or ""
+            old_hosts: list[str] = []
+            om = payload.get("old_master") or {}
+            if om.get("domain"):
+                old_hosts.append(str(om["domain"]))
+            inc_host = ((payload.get("settings") or {}).get("panel") or {}).get("public_host") or ""
+            if inc_host:
+                old_hosts.append(str(inc_host))
+            nodes_mod.remap_inbound_share_hosts(st, new_host=str(new_host or ""), old_hosts=old_hosts)
             ns = st.setdefault("settings", {}).setdefault("nodes", {})
             ns["agent_enabled"] = False
             ns["role"] = "master"

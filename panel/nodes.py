@@ -1275,6 +1275,31 @@ def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
         panel["public_host"] = keep_host
 
 
+def remap_inbound_share_hosts(store: dict, *, new_host: str, old_hosts: list[str] | None = None) -> int:
+    """Point inbound share_host at the new master domain after promote.
+
+    Without this, subscriptions keep advertising the old master (n/a after cutover).
+    """
+    new_host = _normalize_domain(new_host)
+    if not new_host:
+        return 0
+    old = {_normalize_domain(h) for h in (old_hosts or []) if h}
+    old.discard("")
+    n = 0
+    for ib in store.get("inbounds") or []:
+        sh = _normalize_domain(ib.get("share_host") or "")
+        if not sh:
+            ib["share_host"] = new_host
+            n += 1
+            continue
+        if sh == new_host:
+            continue
+        if not old or sh in old:
+            ib["share_host"] = new_host
+            n += 1
+    return n
+
+
 def promote_via_api(node: dict, payload: dict, timeout: int = 180) -> dict:
     """Promote a mirrored agent to master over HTTP (no SSH). Uses already-synced store + final delta."""
     url = agent_endpoint(node, "agent/promote")
@@ -1395,6 +1420,19 @@ if isinstance(incoming, dict) and incoming:
         panel['base_path'] = keep_bp
     if keep_host:
         panel['public_host'] = keep_host
+# Remap subscription share_host from old master domain to this host
+new_host = ((store.get('settings') or {}).get('panel') or {}).get('public_host') or keep_host or ''
+old_hosts = set()
+om = snap.get('old_master_domain') or ''
+if om: old_hosts.add(str(om).strip().lower())
+inc = ((snap.get('settings') or {}).get('panel') or {}).get('public_host') or ''
+if inc: old_hosts.add(str(inc).strip().lower())
+nh = str(new_host or '').strip().lower()
+if nh:
+    for ib in store.get('inbounds') or []:
+        sh = str(ib.get('share_host') or '').strip().lower()
+        if (not sh) or (sh != nh and (not old_hosts or sh in old_hosts)):
+            ib['share_host'] = nh
 ns = store.setdefault('settings', {}).setdefault('nodes', {})
 ns['agent_enabled'] = False
 ns['role'] = 'master'
