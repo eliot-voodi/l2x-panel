@@ -10,8 +10,50 @@
   <a class="btn" href="{{ bp }}/clients/new">{{ ic.icon('plus') }}{{ t('Новый клиент') }}</a>
 </div>
 {% endblock %}
+{% block head %}
+<style>
+  .clients-mobile { display: none }
+  @media (max-width: 860px) {
+    .clients-desktop { display: none }
+    .clients-mobile { display: block }
+    .client-list { list-style: none; margin: 0; padding: 0 }
+    .client-item { border-bottom: 1px solid var(--border) }
+    .client-item:last-child { border-bottom: 0 }
+    .client-row {
+      display: flex; align-items: center; gap: .65rem; width: 100%;
+      padding: .85rem 1rem; background: none; border: 0; color: inherit;
+      font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .client-row:active { background: var(--surface-2) }
+    .client-row .dot { flex-shrink: 0 }
+    .client-row .meta { flex: 1; min-width: 0 }
+    .client-row .meta b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .client-row .meta .dim { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .client-row .chev {
+      flex-shrink: 0; width: 18px; height: 18px; color: var(--dim);
+      transition: transform .18s ease;
+    }
+    .client-item.open .client-row .chev { transform: rotate(90deg); color: var(--accent) }
+    .client-detail {
+      display: none; padding: 0 1rem 1rem 2.15rem;
+      border-top: 1px dashed var(--border);
+      background: var(--surface-2);
+    }
+    .client-item.open .client-detail { display: block }
+    .client-detail .kv { display: grid; gap: .55rem; padding: .75rem 0 }
+    .client-detail .kv > div { display: flex; justify-content: space-between; gap: .75rem; align-items: baseline }
+    .client-detail .kv .lbl { color: var(--muted); font-size: .78rem; flex-shrink: 0 }
+    .client-detail .kv .val { text-align: right; font-size: .85rem; min-width: 0; word-break: break-word }
+    .client-detail .actions { padding-bottom: .15rem }
+    .client-detail .actions .btn { flex: 1 1 calc(33% - .35rem); min-width: 0 }
+    .clients-toolbar { gap: .65rem; margin-bottom: .85rem }
+    .clients-toolbar form { flex: 1; min-width: 0 }
+    .clients-toolbar input[name=q] { width: 100% !important }
+  }
+</style>
+{% endblock %}
 {% block content %}
-<div class="flex between mb0" style="flex-wrap:wrap;margin-bottom:1rem">
+<div class="flex between mb0 clients-toolbar" style="flex-wrap:wrap;margin-bottom:1rem">
   <div class="seg">
     {% for key, label in [('', t('Все')), ('online', t('Онлайн')), ('active', t('Активные')), ('expired', t('Истёкшие')), ('limited', t('Исчерпан')), ('disabled', t('Отключённые'))] %}
     <a href="?status={{ key }}&q={{ q }}" class="{% if status == key %}active{% endif %}">{{ label }}</a>
@@ -25,14 +67,16 @@
 
 <form method="post" action="{{ bp }}/clients/bulk" id="bulkform">
 <div class="card" style="padding:0">
-  <div class="flex" id="bulkbar" hidden style="padding:.7rem 1rem;border-bottom:1px solid var(--border);background:var(--accent-soft)">
+  <div class="flex" id="bulkbar" hidden style="padding:.7rem 1rem;border-bottom:1px solid var(--border);background:var(--accent-soft);flex-wrap:wrap">
     <b id="selcount">0</b> выбрано
     <button class="btn ghost sm" name="action" value="enable">Включить</button>
     <button class="btn ghost sm" name="action" value="disable">Выключить</button>
     <button class="btn ghost sm" name="action" value="reset" onclick="return confirm('Сбросить трафик выбранных?')">Сбросить трафик</button>
     <button class="btn danger sm" name="action" value="delete" onclick="return confirm('Удалить выбранных клиентов?')">Удалить</button>
   </div>
-  <div class="table-wrap">
+
+  {# —— Desktop table —— #}
+  <div class="table-wrap clients-desktop">
   <table>
     <thead><tr>
       <th style="width:32px"><input type="checkbox" id="selall"></th>
@@ -90,6 +134,51 @@
     </tbody>
   </table>
   </div>
+
+  {# —— Mobile accordion list —— #}
+  <div class="clients-mobile">
+    {% if items %}
+    <ul class="client-list">
+      {% for c in items %}
+      {% set devs = c.hwids or [] %}
+      {% set by_hwid = devs|selectattr('kind', 'undefined')|list + devs|selectattr('kind', 'equalto', 'hwid')|list %}
+      <li class="client-item" data-email="{{ c.email }}">
+        <button type="button" class="client-row" onclick="toggleClient(this)" aria-expanded="false">
+          <input type="checkbox" name="sel" value="{{ c.email }}" class="sel" onclick="event.stopPropagation()" onchange="upd()">
+          <span class="dot {% if c.online_ips %}on{% endif %}"></span>
+          <span class="meta">
+            <b>{{ c.email }}</b>
+            <span class="dim small">{% if c.comment %}{{ c.comment }}{% elif c.online_ips %}{{ c.online_ips|length }} IP онлайн{% else %}{{ ago(c.last_online) }}{% endif %}</span>
+          </span>
+          {{ m.status_badge(c.status) }}
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="client-detail" hidden>
+          <div class="kv">
+            <div><span class="lbl">Трафик</span><span class="val">{{ format_traffic(c.used) }} / {{ (c.limit_gb|string ~ ' GB') if c.limit_gb else '∞' }}</span></div>
+            <div><span class="lbl">Срок</span><span class="val">{% if c.expire_at %}{{ fmt_dt(c.expire_at, False) }}{% if c.days_left is not none %} · {% if c.days_left > 0 %}{{ '%.0f'|format(c.days_left) }} дн{% else %}истёк{% endif %}{% endif %}{% elif c.start_on_first_use %}{{ c.duration_days }} дн с 1-го подкл.{% else %}∞{% endif %}</span></div>
+            <div><span class="lbl">Устройства</span><span class="val">{% if devs %}{{ devs|length }}{% if c.limit_hwid %} / {{ c.limit_hwid }}{% endif %} · {{ by_hwid|length }} HWID{% else %}—{% if c.limit_hwid %} / {{ c.limit_hwid }}{% endif %}{% endif %}</span></div>
+            <div><span class="lbl">Inbounds</span><span class="val">{% if c.inbounds %}{{ c.inbound_tags|join(', ') }}{% else %}все ({{ c.inbound_tags|length }}){% endif %}</span></div>
+            <div><span class="lbl">Outbound</span><span class="val">{{ outbound_label(store, c.outbound) }}</span></div>
+            {% if c.tg_id %}<div><span class="lbl">Telegram</span><span class="val">{% if c.tg_username %}@{{ c.tg_username }}{% else %}{{ c.tg_id }}{% endif %}{% if c.tg_fio %} · {{ c.tg_fio }}{% endif %}</span></div>{% endif %}
+          </div>
+          <input type="hidden" id="sub-m-{{ loop.index }}" value="{{ c.sub_url }}">
+          <div class="actions">
+            <button type="button" class="btn ghost sm" onclick="copyText('sub-m-{{ loop.index }}', this)">{{ ic.icon('link') }} Sub</button>
+            <button type="button" class="btn ghost sm" onclick="showQr('{{ c.email }}', '{{ c.sub_url }}')">{{ ic.icon('qr') }} QR</button>
+            <button type="submit" class="btn ghost sm" formaction="{{ bp }}/clients/{{ c.email }}/toggle?next=/clients">{{ ic.icon('power') }}</button>
+            <button type="submit" class="btn ghost sm" formaction="{{ bp }}/clients/{{ c.email }}/reset?next=/clients" onclick="return confirm('Сбросить трафик {{ c.email }}?')">{{ ic.icon('refresh') }}</button>
+            <a class="btn ghost sm" href="{{ bp }}/clients/{{ c.email }}/edit">{{ ic.icon('edit') }} Правка</a>
+            <button type="submit" class="btn danger sm" formaction="{{ bp }}/clients/{{ c.email }}/delete" onclick="return confirm('Удалить {{ c.email }}?')">{{ ic.icon('trash') }}</button>
+          </div>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">Нет клиентов{% if q or status %} по фильтру{% endif %}</div>
+    {% endif %}
+  </div>
 </div>
 </form>
 
@@ -138,13 +227,52 @@
     document.getElementById('qr-url').value = url;
     openDlg('dlg-qr');
   }
-  var boxes = document.querySelectorAll('.sel');
+  function toggleClient(btn) {
+    var item = btn.closest('.client-item');
+    var open = !item.classList.contains('open');
+    document.querySelectorAll('.client-item.open').forEach(function (el) {
+      if (el !== item) {
+        el.classList.remove('open');
+        var d = el.querySelector('.client-detail');
+        var b = el.querySelector('.client-row');
+        if (d) d.hidden = true;
+        if (b) b.setAttribute('aria-expanded', 'false');
+      }
+    });
+    item.classList.toggle('open', open);
+    var detail = item.querySelector('.client-detail');
+    if (detail) detail.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  function activeRoot() {
+    return window.matchMedia('(max-width: 860px)').matches
+      ? document.querySelector('.clients-mobile')
+      : document.querySelector('.clients-desktop');
+  }
+  function syncClientViews() {
+    var mobile = window.matchMedia('(max-width: 860px)').matches;
+    document.querySelectorAll('.clients-desktop .sel').forEach(function (b) {
+      b.disabled = mobile; if (mobile) b.checked = false;
+    });
+    document.querySelectorAll('.clients-mobile .sel').forEach(function (b) {
+      b.disabled = !mobile; if (!mobile) b.checked = false;
+    });
+    upd();
+  }
   function upd() {
-    var n = document.querySelectorAll('.sel:checked').length;
+    var root = activeRoot() || document;
+    var n = root.querySelectorAll('.sel:checked').length;
     document.getElementById('selcount').textContent = n;
     document.getElementById('bulkbar').hidden = n === 0;
   }
-  boxes.forEach(function (b) { b.addEventListener('change', upd); });
-  document.getElementById('selall').addEventListener('change', function () { var v = this.checked; boxes.forEach(function (b) { b.checked = v; }); upd(); });
+  document.querySelectorAll('.sel').forEach(function (b) { b.addEventListener('change', upd); });
+  var selall = document.getElementById('selall');
+  if (selall) selall.addEventListener('change', function () {
+    var v = this.checked;
+    (activeRoot() || document).querySelectorAll('.sel').forEach(function (b) { if (!b.disabled) b.checked = v; });
+    upd();
+  });
+  window.addEventListener('resize', syncClientViews);
+  syncClientViews();
 </script>
 {% endblock %}
