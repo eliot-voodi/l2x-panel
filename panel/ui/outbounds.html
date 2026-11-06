@@ -36,6 +36,9 @@
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm" title="Проверить через временный Xray">{{ t('Тест') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reset"><button class="btn ghost icon" title="{{ t('Сбросить трафик') }}">{{ ic.icon('refresh') }}</button></form>
             {% if o.custom %}
+            {% if o.kind == 'pia' %}
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reconnect"><button class="btn ghost sm" title="Перерегистрировать WireGuard у PIA">Reconnect</button></form>
+            {% endif %}
             <button type="button" class="btn ghost icon" title="Редактировать" data-tag="{{ o.tag }}" onclick="obOpen(this.dataset.tag)">{{ ic.icon('edit') }}</button>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/sub"><button class="btn ghost icon" title="Показывать в подписках">{{ ic.icon('link') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
@@ -253,11 +256,22 @@
       <select name="nord_country" id="nord_country"><option value="">рекомендованный сервер</option></select>
     </div>
     <div data-m="pia" hidden>
-      <div class="hint">Private Internet Access → WireGuard outbound (userspace). Пароль не сохраняется — только ключи в конфиге Xray.</div>
-      <div class="row">
-        <div><label class="f">PIA username</label><input name="pia_user" id="pia_user" autocomplete="username" placeholder="p1234567"></div>
-        <div><label class="f">Password</label><input name="pia_pass" id="pia_pass" type="password" autocomplete="current-password"></div>
+      <div class="hint">PIA WireGuard (userspace). Логин/пароль шифруются на сервере; token обновляется сам, WG-ключи перерегистрируются по расписанию (Reconnect).</div>
+      <div id="pia-account" class="mt small" {% if not pia.logged_in %}hidden{% endif %}>
+        <span class="badge ok">сохранён</span>
+        <span class="mono" id="pia-hint">{{ pia.username_hint or pia.username }}</span>
+        {% if pia.token_expires_at %}<span class="dim"> · token до {{ pia.token_expires_at[:16]|replace('T',' ') }} UTC</span>{% endif %}
+        {% if pia.last_error %}<div class="dim" style="color:var(--danger)">{{ pia.last_error }}</div>{% endif %}
+        <div class="actions mt" style="gap:.4rem">
+          <form method="post" action="{{ bp }}/outbounds/pia/reconnect"><button class="btn ghost sm" type="submit">Reconnect все PIA</button></form>
+          <form method="post" action="{{ bp }}/outbounds/pia/logout" onsubmit="return confirm('Очистить сохранённый PIA логин?')"><button class="btn ghost sm" type="submit">Выйти</button></form>
+        </div>
       </div>
+      <div class="row">
+        <div><label class="f">PIA username</label><input name="pia_user" id="pia_user" autocomplete="username" placeholder="{{ pia.username or 'p1234567' }}" value="{{ pia.username if pia.logged_in else '' }}"></div>
+        <div><label class="f">Password</label><input name="pia_pass" id="pia_pass" type="password" autocomplete="current-password" placeholder="{{ 'сохранён — оставьте пустым' if pia.logged_in else '' }}"></div>
+      </div>
+      <label class="check"><input type="checkbox" name="pia_remember" id="pia_remember" value="1" checked> Сохранить логин/пароль и auto-reconnect</label>
       <div class="row">
         <div><label class="f">Страна / регион</label>
           <select name="pia_region" id="pia_region"><option value="">загрузка…</option></select></div>
@@ -274,6 +288,7 @@
 {% block scripts %}
 <script>
   var BP = {{ bp|tojson }}, CUSTOM = {{ custom|tojson }}, nordLoaded = false, piaLoaded = false, piaData = [], curMode = 'form';
+  var piaAccount = {{ pia|tojson }};
   var form = document.getElementById('ob-form');
   var $ = function (id) { return document.getElementById(id); };
   var v = function (id) { var el = $(id); return el.type === 'checkbox' ? el.checked : el.value.trim(); };
@@ -585,8 +600,10 @@
     }
     if ((curMode === 'form' || curMode === 'json') && !v('f-tag')) { e.preventDefault(); showErr('Укажите Tag'); }
     if (curMode === 'pia') {
-      if (!v('pia_user') || !$('pia_pass').value) { e.preventDefault(); showErr('Укажите PIA username и password'); }
-      else if (!v('pia_region')) { e.preventDefault(); showErr('Выберите регион PIA'); }
+      var hasSaved = piaAccount && piaAccount.logged_in;
+      if ((!v('pia_user') && !hasSaved) || (!$('pia_pass').value && !hasSaved)) {
+        e.preventDefault(); showErr('Укажите PIA username и password');
+      } else if (!v('pia_region')) { e.preventDefault(); showErr('Выберите регион PIA'); }
     }
   });
   refresh();

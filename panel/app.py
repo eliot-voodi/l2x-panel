@@ -140,6 +140,11 @@ def default_settings() -> dict:
             "enabled": False, "max_connected": 4, "interval_minutes": 60,
             "candidate_extra": 3, "dl_bytes": 8_000_000, "ul_bytes": 2_000_000,
         },
+        "pia": {
+            "username": "", "password_enc": "", "token_enc": "", "token_expires_at": "",
+            "auto_refresh": True, "reconnect_hours": 24, "last_refresh_at": "",
+            "last_reconnect_at": "", "last_error": "", "last_ok_at": "",
+        },
         "security": {"totp_enabled": False, "totp_secret": ""},
         "api_tokens": [],
         "geo_custom": [],
@@ -1467,7 +1472,7 @@ def _startup():
     _ensure_base_path()
     _refresh_settings_cache()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
-                   _l2tp_auto_loop, _nodes_sync_loop):
+                   _l2tp_auto_loop, _nodes_sync_loop, _pia_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -2692,6 +2697,227 @@ def l2tp_delete(name: str, request: Request):
     return go("/l2tp")
 
 
+# ================================================================ PIA account + auto reconnect
+
+def _pia_settings(store: dict | None = None) -> dict:
+    s = (store or _load_store())["settings"].setdefault("pia", {})
+    for k, v in default_settings()["pia"].items():
+        s.setdefault(k, v)
+    return s
+
+
+def _pia_account_view(cfg: dict | None = None) -> dict:
+    cfg = cfg or _pia_settings()
+    user = str(cfg.get("username") or "").strip()
+    hint = (user[:2] + "…" + user[-2:]) if len(user) > 4 else (user or "")
+    return {
+        "logged_in": bool(user and cfg.get("password_enc")),
+        "username": user,
+        "username_hint": hint,
+        "has_token": bool(cfg.get("token_enc")),
+        "token_expires_at": cfg.get("token_expires_at") or "",
+        "auto_refresh": bool(cfg.get("auto_refresh", True)),
+        "reconnect_hours": float(cfg.get("reconnect_hours") or 24),
+        "last_refresh_at": cfg.get("last_refresh_at") or "",
+        "last_reconnect_at": cfg.get("last_reconnect_at") or "",
+        "last_error": cfg.get("last_error") or "",
+        "last_ok_at": cfg.get("last_ok_at") or "",
+    }
+
+
+def _pia_save_credentials(store: dict, username: str, password: str, *, token: str = "",
+                          token_ttl: int | None = None) -> None:
+    import pia as pia_mod
+
+    cfg = _pia_settings(store)
+    user = (username or "").strip()
+    if user:
+        cfg["username"] = user
+    if password:
+        cfg["password_enc"] = _enc(password)
+    if token:
+        cfg["token_enc"] = _enc(token)
+        ttl = int(token_ttl if token_ttl is not None else pia_mod.TOKEN_TTL_SECONDS)
+        cfg["token_expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
+        cfg["last_refresh_at"] = datetime.now(timezone.utc).isoformat()
+        cfg["last_error"] = ""
+        cfg["last_ok_at"] = cfg["last_refresh_at"]
+
+
+def _pia_clear_account(store: dict) -> None:
+    cfg = _pia_settings(store)
+    cfg["username"] = ""
+    cfg["password_enc"] = ""
+    cfg["token_enc"] = ""
+    cfg["token_expires_at"] = ""
+    cfg["last_refresh_at"] = ""
+    cfg["last_reconnect_at"] = ""
+    cfg["last_ok_at"] = ""
+    cfg["last_error"] = ""
+
+
+def _pia_creds(store: dict | None = None) -> tuple[str, str]:
+    cfg = _pia_settings(store)
+    user = str(cfg.get("username") or "").strip()
+    pwd = ""
+    if cfg.get("password_enc"):
+        try:
+            pwd = _dec(cfg["password_enc"])
+        except Exception:
+            pwd = ""
+    return user, pwd
+
+
+def _pia_token_valid(cfg: dict) -> bool:
+    import pia as pia_mod
+
+    if not cfg.get("token_enc"):
+        return False
+    exp_raw = cfg.get("token_expires_at") or ""
+    if not exp_raw:
+        return False
+    try:
+        exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+    return datetime.now(timezone.utc) + timedelta(seconds=pia_mod.TOKEN_REFRESH_SKEW_SECONDS) < exp
+
+
+def _pia_ensure_token(store: dict, *, force: bool = False) -> dict:
+    """Return {ok, token} using cached token or re-login with stored credentials."""
+    cfg = _pia_settings(store)
+    user, pwd = _pia_creds(store)
+    if not force and _pia_token_valid(cfg):
+        try:
+            return {"ok": True, "token": _dec(cfg["token_enc"]), "refreshed": False}
+        except Exception:
+            pass
+    if not user or not pwd:
+        return {"ok": False, "error": "PIA: нет сохранённого логина/пароля"}
+    auth = ops.pia_authenticate(user, pwd)
+    if not auth.get("ok"):
+        cfg["last_error"] = str(auth.get("error") or "auth failed")
+        return auth
+    _pia_save_credentials(store, user, pwd, token=auth["token"])
+    return {"ok": True, "token": auth["token"], "refreshed": True}
+
+
+def _pia_outbound_meta(o: dict) -> tuple[str, str]:
+    """(region_id, hostname) for a stored PIA outbound."""
+    cfg = o.get("config") or {}
+    host = str(o.get("pia_hostname") or cfg.get("piaHostname") or "").strip()
+    region = str(o.get("pia_region") or "").strip()
+    if not host:
+        # tag: pia-<region>-<hostlabel>
+        parts = str(o.get("tag") or "").split("-")
+        if len(parts) >= 3 and parts[0] == "pia":
+            region = region or "-".join(parts[1:-1])
+            host = parts[-1]
+    return region, host
+
+
+def _pia_reconnect_outbounds(store: dict, *, force: bool = False) -> dict:
+    """Refresh token if needed and re-register WireGuard peers for all PIA outbounds."""
+    cfg = _pia_settings(store)
+    if not cfg.get("auto_refresh", True) and not force:
+        return {"ok": True, "skipped": True, "reason": "auto_refresh off"}
+    hours = float(cfg.get("reconnect_hours") or 24)
+    last = cfg.get("last_reconnect_at") or ""
+    if not force and last and hours > 0:
+        try:
+            ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - ts < timedelta(hours=hours):
+                # Still refresh token if near expiry
+                tok = _pia_ensure_token(store, force=False)
+                return {"ok": bool(tok.get("ok")), "skipped": True, "token": tok}
+        except Exception:
+            pass
+    tok = _pia_ensure_token(store, force=force)
+    if not tok.get("ok"):
+        return tok
+    token = tok["token"]
+    updated = 0
+    errors: list[str] = []
+    for o in store.get("outbounds_custom") or []:
+        is_pia = o.get("kind") == "pia" or str(o.get("tag") or "").startswith("pia-")
+        if not is_pia:
+            continue
+        o["kind"] = "pia"
+        region, host = _pia_outbound_meta(o)
+        if not host and not region:
+            errors.append(f"{o.get('tag')}: нет hostname")
+            continue
+        res = ops.pia_provision(token, region_id=region, hostname=host)
+        if not res.get("ok") and "token" in str(res.get("error") or "").lower():
+            tok2 = _pia_ensure_token(store, force=True)
+            if tok2.get("ok"):
+                token = tok2["token"]
+                res = ops.pia_provision(token, region_id=region, hostname=host)
+        if not res.get("ok"):
+            errors.append(f"{o.get('tag')}: {res.get('error')}")
+            continue
+        cfg_ob = res["config"]
+        cfg_ob.pop("tag", None)
+        o["config"] = cfg_ob
+        o["info"] = res.get("info") or o.get("info")
+        o["pia_hostname"] = res.get("hostname") or host
+        o["pia_region"] = res.get("region_id") or region
+        o["kind"] = "pia"
+        o.pop("last_test", None)
+        updated += 1
+    now = datetime.now(timezone.utc).isoformat()
+    if updated:
+        cfg["last_reconnect_at"] = now
+        cfg["last_ok_at"] = now
+        cfg["last_error"] = ""
+    if errors:
+        cfg["last_error"] = "; ".join(errors)[:500]
+    return {"ok": not errors or updated > 0, "updated": updated, "errors": errors}
+
+
+def _pia_loop() -> None:
+    """Keep PIA token fresh and periodically re-register WireGuard peers."""
+    while not _stop.wait(900):  # 15 min
+        try:
+            with mutate() as store:
+                cfg = _pia_settings(store)
+                if not cfg.get("username") or not cfg.get("password_enc"):
+                    continue
+                if not cfg.get("auto_refresh", True):
+                    continue
+                need_reconnect = False
+                hours = float(cfg.get("reconnect_hours") or 24)
+                last = cfg.get("last_reconnect_at") or ""
+                if hours > 0:
+                    if not last:
+                        need_reconnect = True
+                    else:
+                        try:
+                            ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            need_reconnect = datetime.now(timezone.utc) - ts >= timedelta(hours=hours)
+                        except Exception:
+                            need_reconnect = True
+                if need_reconnect:
+                    res = _pia_reconnect_outbounds(store, force=True)
+                else:
+                    res = _pia_ensure_token(store, force=False)
+                apply = bool(need_reconnect and res.get("updated"))
+            if apply:
+                _apply_xray(_load_store())
+                if res.get("updated"):
+                    BOT.send(f"PIA: обновлены WireGuard ключи ({res['updated']} outbound)")
+            elif isinstance(res, dict) and not res.get("ok") and res.get("error"):
+                BOT.send(f"PIA auto: {res.get('error')}")
+        except Exception:
+            pass
+
+
 # ================================================================ outbounds
 
 @app.get("/outbounds", response_class=HTMLResponse)
@@ -2716,7 +2942,8 @@ def outbounds_page(request: Request):
     custom = {o["tag"]: {"config": o.get("config") or {}, "remark": o.get("remark") or "", "country": o.get("country") or ""}
               for o in store["outbounds_custom"]}
     return page(request, "outbounds.html", active="outbounds", items=rows, nord_countries=[], custom=custom,
-                dialer_tags=[r["tag"] for r in rows], ss_methods=P.SS_METHODS, fingerprints=P.FINGERPRINTS)
+                dialer_tags=[r["tag"] for r in rows], ss_methods=P.SS_METHODS, fingerprints=P.FINGERPRINTS,
+                pia=_pia_account_view())
 
 
 @app.post("/outbounds/parse")
@@ -2800,19 +3027,36 @@ async def outbound_add(request: Request):
             country = country or (srv.get("code") or "")
             tag = tag or f"nord_{(srv.get('code') or 'xx').lower()}"
         elif mode == "pia":
-            res = ops.pia_create_outbound(
-                str(form.get("pia_user") or "").strip(),
-                str(form.get("pia_pass") or ""),
-                region_id=str(form.get("pia_region") or "").strip(),
-                hostname=str(form.get("pia_hostname") or "").strip(),
-            )
+            form_user = str(form.get("pia_user") or "").strip()
+            form_pass = str(form.get("pia_pass") or "")
+            region_id = str(form.get("pia_region") or "").strip()
+            hostname = str(form.get("pia_hostname") or "").strip()
+            remember = form.get("pia_remember") != "0"
+            with mutate() as st0:
+                saved_user, saved_pass = _pia_creds(st0)
+                user = form_user or saved_user
+                pwd = form_pass or saved_pass
+                if not user or not pwd:
+                    raise ValueError("Укажите PIA username и password (сохранятся для auto-reconnect)")
+                if remember:
+                    _pia_save_credentials(st0, user, pwd)
+            with mutate() as st1:
+                tok = _pia_ensure_token(st1, force=bool(form_pass))
+                if not tok.get("ok"):
+                    raise ValueError(tok.get("error") or "PIA auth")
+                token = tok["token"]
+            res = ops.pia_create_outbound(user, pwd, region_id=region_id, hostname=hostname, token=token)
             if not res.get("ok"):
                 raise ValueError(res.get("error") or "PIA ошибка")
+            if remember and res.get("token"):
+                with mutate() as st3:
+                    _pia_save_credentials(st3, user, pwd, token=res["token"])
             config = res["config"]
             info = res.get("info") or "PIA WireGuard"
             remark = remark or res.get("remark") or "PIA"
             country = country or (res.get("country") or "")
             tag = tag or res.get("tag") or "pia"
+            pia_meta = {"pia_hostname": res.get("hostname") or hostname, "pia_region": res.get("region_id") or region_id}
         else:
             raise ValueError("неизвестный режим")
     except Exception as exc:  # noqa: BLE001
@@ -2825,13 +3069,23 @@ async def outbound_add(request: Request):
             if o:
                 config.pop("tag", None)
                 o.update({"config": config, "remark": remark or edit_tag, "country": country.upper(), "info": info})
+                if mode == "pia":
+                    o["kind"] = "pia"
+                    o.update(pia_meta)
                 o.pop("last_test", None)
                 err = None
             else:
                 err = "Outbound не найден"
             tag = edit_tag
         else:
-            err = _add_custom_outbound(store, tag, remark, config, "custom" if mode == "form" else mode, info, country)
+            kind = "pia" if mode == "pia" else ("custom" if mode == "form" else mode)
+            err = _add_custom_outbound(store, tag, remark, config, kind, info, country)
+            if not err and mode == "pia":
+                o = next((x for x in store["outbounds_custom"] if x["tag"] == tag), None)
+                if o:
+                    o.update(pia_meta)
+                    cfg = _pia_settings(store)
+                    cfg["last_reconnect_at"] = datetime.now(timezone.utc).isoformat()
     if err:
         flash(request, err, "error")
         return go("/outbounds")
@@ -2857,6 +3111,41 @@ def pia_countries(request: Request):
     if not _user(request):
         return JSONResponse([], status_code=401)
     return ops.pia_countries()
+
+
+@app.get("/outbounds/pia/status")
+def pia_status(request: Request):
+    if not _user(request):
+        return JSONResponse({"ok": False}, status_code=401)
+    return {"ok": True, **_pia_account_view()}
+
+
+@app.post("/outbounds/pia/logout")
+def pia_logout(request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        _pia_clear_account(store)
+    flash(request, "PIA: логин и token очищены (outbounds не тронуты)", "info")
+    return go("/outbounds")
+
+
+@app.post("/outbounds/pia/reconnect")
+def pia_reconnect(request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        res = _pia_reconnect_outbounds(store, force=True)
+    if res.get("updated"):
+        xr = _apply_xray(_load_store())
+        if not xr.get("ok"):
+            flash(request, f"PIA reconnect: Xray — {xr.get('error')}", "error")
+            return go("/outbounds")
+    if res.get("ok"):
+        flash(request, f"PIA reconnect: обновлено {res.get('updated', 0)} outbound", "info")
+    else:
+        flash(request, f"PIA reconnect: {res.get('error') or res.get('errors')}", "error")
+    return go("/outbounds")
 
 
 @app.get("/api/keys/wg")
@@ -2922,6 +3211,32 @@ def outbound_action(tag: str, action: str, request: Request):
                 o["enabled"] = not o.get("enabled", True)
             elif action == "sub":
                 o["in_sub"] = not o.get("in_sub", True)
+            elif action == "reconnect":
+                if o.get("kind") != "pia" and not str(tag).startswith("pia-"):
+                    flash(request, "Reconnect только для PIA outbounds", "error")
+                    return go("/outbounds")
+                tok = _pia_ensure_token(store, force=False)
+                if not tok.get("ok"):
+                    flash(request, tok.get("error") or "PIA token", "error")
+                    return go("/outbounds")
+                region, host = _pia_outbound_meta(o)
+                res = ops.pia_provision(tok["token"], region_id=region, hostname=host)
+                if not res.get("ok") and "token" in str(res.get("error") or "").lower():
+                    tok = _pia_ensure_token(store, force=True)
+                    if tok.get("ok"):
+                        res = ops.pia_provision(tok["token"], region_id=region, hostname=host)
+                if not res.get("ok"):
+                    flash(request, f"PIA reconnect {tag}: {res.get('error')}", "error")
+                    return go("/outbounds")
+                cfg_ob = res["config"]
+                cfg_ob.pop("tag", None)
+                o["config"] = cfg_ob
+                o["info"] = res.get("info") or o.get("info")
+                o["kind"] = "pia"
+                o["pia_hostname"] = res.get("hostname") or host
+                o["pia_region"] = res.get("region_id") or region
+                o.pop("last_test", None)
+                _pia_settings(store)["last_reconnect_at"] = datetime.now(timezone.utc).isoformat()
             elif action == "delete":
                 used = [c["email"] for c in store["clients"] if c.get("outbound") == tag]
                 if used:

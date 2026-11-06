@@ -23,6 +23,9 @@ TOKEN_URL = "https://www.privateinternetaccess.com/api/client/v2/token"
 SERVERLIST_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
 ADDKEY_PORT = 1337
 UA = "l2xpanel-pia/1.0"
+# PIA tokens are typically valid ~24h; refresh earlier to avoid edge expiry.
+TOKEN_TTL_SECONDS = 20 * 3600
+TOKEN_REFRESH_SKEW_SECONDS = 2 * 3600
 
 _REGION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
@@ -300,23 +303,24 @@ def build_outbound(*, secret_key: str, peer_ip: str, server_key: str, endpoint: 
     return cfg
 
 
-def create_outbound(username: str, password: str, *, region_id: str = "", hostname: str = "",
-                    xray_bin: Path | None = None) -> dict:
-    """Full flow: auth → pick server → WG keys → addKey → outbound config."""
-    auth = authenticate(username, password)
-    if not auth.get("ok"):
-        return auth
-    catalog = list_regions()
-    if not catalog.get("ok"):
-        return catalog
-    hit = find_server(catalog["regions"], region_id=region_id, hostname=hostname)
+def provision_outbound(token: str, *, region_id: str = "", hostname: str = "",
+                       xray_bin: Path | None = None, regions: list[dict] | None = None) -> dict:
+    """Register a fresh WireGuard peer for a PIA server using an auth token."""
+    if not (token or "").strip():
+        return {"ok": False, "error": "PIA: нет token"}
+    if regions is None:
+        catalog = list_regions()
+        if not catalog.get("ok"):
+            return catalog
+        regions = catalog["regions"]
+    hit = find_server(regions, region_id=region_id, hostname=hostname)
     if not hit:
         return {"ok": False, "error": "PIA: сервер не найден (region/hostname)"}
     region, server = hit["region"], hit["server"]
     keys = _wg_keys(xray_bin or Path("/usr/local/bin/xray"))
     if not keys.get("ok"):
         return keys
-    reg = register_key(auth["token"], {**server, "public_key": keys["public_key"]})
+    reg = register_key(token, {**server, "public_key": keys["public_key"]})
     if not reg.get("ok"):
         return reg
     tag = outbound_tag(region["id"], server["hostname"])
@@ -334,7 +338,36 @@ def create_outbound(username: str, password: str, *, region_id: str = "", hostna
         "config": config,
         "region": region,
         "server": server,
+        "region_id": region["id"],
+        "hostname": server["hostname"],
         "info": f"PIA {region['name']} {server['hostname']} {endpoint}",
         "remark": f"PIA {region['name']}",
         "country": region["country"],
     }
+
+
+def create_outbound(username: str, password: str, *, region_id: str = "", hostname: str = "",
+                    xray_bin: Path | None = None, token: str = "") -> dict:
+    """Auth (unless token given) → pick server → WG keys → addKey → outbound config."""
+    tok = (token or "").strip()
+    if not tok:
+        auth = authenticate(username, password)
+        if not auth.get("ok"):
+            return auth
+        tok = auth["token"]
+        auth_meta = {"token": tok, "username": auth.get("username") or username}
+    else:
+        auth_meta = {"token": tok}
+    res = provision_outbound(tok, region_id=region_id, hostname=hostname, xray_bin=xray_bin)
+    if not res.get("ok"):
+        # Token may have expired mid-flight — one retry with fresh login
+        if username and password and "token" in str(res.get("error") or "").lower():
+            auth = authenticate(username, password)
+            if auth.get("ok"):
+                res = provision_outbound(auth["token"], region_id=region_id, hostname=hostname, xray_bin=xray_bin)
+                if res.get("ok"):
+                    auth_meta = {"token": auth["token"], "username": auth.get("username") or username}
+        if not res.get("ok"):
+            return res
+    res.update(auth_meta)
+    return res

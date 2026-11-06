@@ -520,12 +520,25 @@ def pia_countries() -> list[dict]:
     return pia_mod.countries_from_regions(res.get("regions") or [])
 
 
-def pia_create_outbound(username: str, password: str, *, region_id: str = "", hostname: str = "") -> dict:
+def pia_create_outbound(username: str, password: str, *, region_id: str = "", hostname: str = "",
+                        token: str = "") -> dict:
     import pia as pia_mod
 
     return pia_mod.create_outbound(
-        username, password, region_id=region_id, hostname=hostname, xray_bin=XRAY_BIN,
+        username, password, region_id=region_id, hostname=hostname, xray_bin=XRAY_BIN, token=token,
     )
+
+
+def pia_provision(token: str, *, region_id: str = "", hostname: str = "") -> dict:
+    import pia as pia_mod
+
+    return pia_mod.provision_outbound(token, region_id=region_id, hostname=hostname, xray_bin=XRAY_BIN)
+
+
+def pia_authenticate(username: str, password: str) -> dict:
+    import pia as pia_mod
+
+    return pia_mod.authenticate(username, password)
 
 
 def speedtest(bytes_: int = 25_000_000) -> dict:
