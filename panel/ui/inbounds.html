@@ -12,9 +12,51 @@
   <button class="btn">{{ ic.icon('plus') }}{{ t('Новый inbound') }}</button>
 </form>
 {% endblock %}
+{% block head %}
+<style>
+  .inbounds-mobile { display: none }
+  @media (max-width: 860px) {
+    .inbounds-desktop { display: none }
+    .inbounds-mobile { display: block }
+    .ib-list { list-style: none; margin: 0; padding: 0 }
+    .ib-item { border-bottom: 1px solid var(--border) }
+    .ib-item:last-child { border-bottom: 0 }
+    .ib-row {
+      display: flex; align-items: center; gap: .65rem; width: 100%;
+      padding: .85rem 1rem; background: none; border: 0; color: inherit;
+      font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .ib-row:active { background: var(--surface-2) }
+    .ib-row .dot { flex-shrink: 0 }
+    .ib-row .meta { flex: 1; min-width: 0 }
+    .ib-row .meta b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .ib-row .meta .dim { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .ib-row .chev {
+      flex-shrink: 0; width: 18px; height: 18px; color: var(--dim);
+      transition: transform .18s ease;
+    }
+    .ib-item.open .ib-row .chev { transform: rotate(90deg); color: var(--accent) }
+    .ib-detail {
+      display: none; padding: 0 1rem 1rem 2.15rem;
+      border-top: 1px dashed var(--border);
+      background: var(--surface-2);
+    }
+    .ib-item.open .ib-detail { display: block }
+    .ib-detail .kv { display: grid; gap: .55rem; padding: .75rem 0 }
+    .ib-detail .kv > div { display: flex; justify-content: space-between; gap: .75rem; align-items: baseline }
+    .ib-detail .kv .lbl { color: var(--muted); font-size: .78rem; flex-shrink: 0 }
+    .ib-detail .kv .val { text-align: right; font-size: .85rem; min-width: 0; word-break: break-word }
+    .ib-detail .actions { padding-bottom: .15rem }
+    .ib-detail .actions .btn { flex: 1 1 calc(33% - .35rem); min-width: 0 }
+    .topbar-actions form.actions { width: 100% }
+    .topbar-actions select { flex: 1; min-width: 0 }
+  }
+</style>
+{% endblock %}
 {% block content %}
-<div class="card">
-  <div class="table-wrap">
+<div class="card" style="padding:0">
+  {# —— Desktop —— #}
+  <div class="table-wrap inbounds-desktop" style="padding:0">
   <table>
     <thead><tr>
       <th></th><th>Remark / tag</th><th>Протокол</th><th>Порт</th><th>Транспорт</th><th>Клиенты</th><th>{{ t('Трафик') }}</th><th>{{ t('Срок') }}</th><th>Outbound</th><th class="right">{{ t('Действия') }}</th>
@@ -56,6 +98,72 @@
     </tbody>
   </table>
   </div>
+
+  {# —— Mobile accordion —— #}
+  <div class="inbounds-mobile">
+    {% if items %}
+    <ul class="ib-list">
+      {% for ib in items %}
+      {% set fm = P.front_mode(ib) %}
+      <li class="ib-item">
+        <button type="button" class="ib-row" onclick="toggleInbound(this)" aria-expanded="false">
+          <span class="dot {% if ib.enabled and ib.ok %}on{% endif %}"></span>
+          <span class="meta">
+            <b>{{ ib.remark or ib.tag }}</b>
+            <span class="dim small mono">{{ ib.tag }} · {{ ib.protocol }}{% if ib.protocol in P.USER_PROTOCOLS %} / {{ ib.stream.network }}{% endif %}</span>
+          </span>
+          <span class="badge accent">{{ ib.protocol }}</span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="ib-detail" hidden>
+          <div class="kv">
+            <div><span class="lbl">Порт</span><span class="val mono">{% if fm %}443 → {% endif %}{{ ib.port }}</span></div>
+            {% if fm == 'http' and ib.share_host %}
+            <div><span class="lbl">Path</span><span class="val mono">{{ ib.share_host }}{{ P.front_http_path(ib) }}</span></div>
+            {% endif %}
+            <div><span class="lbl">Транспорт</span><span class="val">{% if ib.protocol in P.USER_PROTOCOLS %}{{ ib.stream.network }}{% if ib.stream.security and ib.stream.security != 'none' %} · {{ ib.stream.security }}{% endif %}{% if ib.fallbacks %} · fallback×{{ ib.fallbacks|length }}{% endif %}{% else %}—{% endif %}</span></div>
+            <div><span class="lbl">Клиенты</span><span class="val">{{ ib.n_clients if ib.protocol not in ('dokodemo-door',) else '—' }}</span></div>
+            <div><span class="lbl">Трафик</span><span class="val">{{ format_traffic(ib.used) }}{% if ib.total_gb %} / {{ ib.total_gb }} GB{% endif %} · ↑{{ format_traffic(ib.traffic.up) }} ↓{{ format_traffic(ib.traffic.down) }}</span></div>
+            <div><span class="lbl">Срок</span><span class="val">{{ fmt_dt(ib.expire_at, False) if ib.expire_at else '∞' }}{% if not ib.ok %} · блок{% endif %}</span></div>
+            <div><span class="lbl">Outbound</span><span class="val">{{ outbound_label(store, ib.outbound) if store is defined else ib.outbound }}</span></div>
+          </div>
+          <div class="actions">
+            <a class="btn ghost sm" href="{{ bp }}/inbounds/{{ ib.id }}/edit">{{ ic.icon('edit') }} Правка</a>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/clone"><button class="btn ghost sm">{{ ic.icon('copy') }}</button></form>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/reset" onsubmit="return confirm('Сбросить трафик inbound?')"><button class="btn ghost sm">{{ ic.icon('refresh') }}</button></form>
+            <a class="btn ghost sm" href="{{ bp }}/inbounds/{{ ib.id }}/export" target="_blank">{}</a>
+            <form method="post" action="{{ bp }}/inbounds/{{ ib.id }}/delete" onsubmit="return confirm('Удалить inbound {{ ib.tag }}?')"><button class="btn danger sm">{{ ic.icon('trash') }}</button></form>
+          </div>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">Нет inbounds</div>
+    {% endif %}
+  </div>
 </div>
-<div class="hint">Один клиент может работать сразу в нескольких inbounds — выбор в карточке клиента. Для socks/http/dokodemo трафик идёт в outbound inbound'а.</div>
+<div class="hint" style="padding:0 0.25rem">Один клиент может работать сразу в нескольких inbounds — выбор в карточке клиента. Для socks/http/dokodemo трафик идёт в outbound inbound'а.</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  function toggleInbound(btn) {
+    var item = btn.closest('.ib-item');
+    var open = !item.classList.contains('open');
+    document.querySelectorAll('.ib-item.open').forEach(function (el) {
+      if (el !== item) {
+        el.classList.remove('open');
+        var d = el.querySelector('.ib-detail');
+        var b = el.querySelector('.ib-row');
+        if (d) d.hidden = true;
+        if (b) b.setAttribute('aria-expanded', 'false');
+      }
+    });
+    item.classList.toggle('open', open);
+    var detail = item.querySelector('.ib-detail');
+    if (detail) detail.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+</script>
 {% endblock %}
