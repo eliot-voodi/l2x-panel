@@ -5,10 +5,52 @@
 {% block page_title %}{{ t('Маршрутизация') }}{% endblock %}
 {% block page_sub %}Правила проверяются сверху вниз, первое совпавшее выигрывает{% endblock %}
 {% block top_actions %}<button class="btn" type="button" onclick="openDlg('dlg-add')">{{ ic.icon('plus') }}Правило</button>{% endblock %}
+{% block head %}
+<style>
+  .rt-mobile { display: none }
+  @media (max-width: 860px) {
+    .rt-desktop { display: none }
+    .rt-mobile { display: block }
+    .rt-presets { flex-wrap: wrap }
+    .rt-list { list-style: none; margin: 0; padding: 0 }
+    .rt-item { border-bottom: 1px solid var(--border) }
+    .rt-item:last-child { border-bottom: 0 }
+    .rt-item.disabled { opacity: .55 }
+    .rt-row {
+      display: flex; align-items: center; gap: .65rem; width: 100%;
+      padding: .85rem 1rem; background: none; border: 0; color: inherit;
+      font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .rt-row:active { background: var(--surface-2) }
+    .rt-row .idx { color: var(--dim); font-size: .8rem; width: 1.4rem; flex-shrink: 0 }
+    .rt-row .meta { flex: 1; min-width: 0 }
+    .rt-row .meta b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .rt-row .meta .dim { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .rt-row .chev {
+      flex-shrink: 0; width: 18px; height: 18px; color: var(--dim);
+      transition: transform .18s ease;
+    }
+    .rt-item.open .rt-row .chev { transform: rotate(90deg); color: var(--accent) }
+    .rt-detail {
+      display: none; padding: 0 1rem 1rem 2.9rem;
+      border-top: 1px dashed var(--border);
+      background: var(--surface-2);
+    }
+    .rt-item.open .rt-detail { display: block }
+    .rt-detail .kv { display: grid; gap: .55rem; padding: .75rem 0 }
+    .rt-detail .kv > div { display: flex; justify-content: space-between; gap: .75rem; align-items: baseline }
+    .rt-detail .kv .lbl { color: var(--muted); font-size: .78rem; flex-shrink: 0 }
+    .rt-detail .kv .val { text-align: right; font-size: .85rem; min-width: 0; word-break: break-word }
+    .rt-detail .cond { font-size: .8rem; margin: 0 0 .75rem; display: grid; gap: .25rem }
+    .rt-detail .actions .btn { flex: 1 1 calc(25% - .35rem); min-width: 0 }
+    #dlg-add { width: calc(100% - 1rem); margin: .5rem; max-height: calc(100dvh - 1rem) }
+  }
+</style>
+{% endblock %}
 {% block content %}
 <div class="card">
   <div class="card-head"><h3>Готовые шаблоны</h3></div>
-  <div class="actions">
+  <div class="actions rt-presets">
     {% for key, p in presets.items() %}
       {% set exists = routes|selectattr('name', 'equalto', p.name)|list %}
       <form method="post" action="{{ bp }}/routing/preset/{{ key }}"><button class="btn ghost sm" {% if exists %}disabled style="opacity:.45"{% endif %}>
@@ -19,6 +61,8 @@
 </div>
 
 <div class="card" style="padding:0">
+  {# —— Desktop —— #}
+  <div class="table-wrap rt-desktop">
   <table>
     <thead><tr><th style="width:44px">#</th><th>Правило</th><th>Условия</th><th>→ Outbound</th><th class="right">{{ t('Действия') }}</th></tr></thead>
     <tbody>
@@ -48,6 +92,48 @@
     {% endfor %}
     </tbody>
   </table>
+  </div>
+
+  {# —— Mobile accordion —— #}
+  <div class="rt-mobile">
+    {% if routes %}
+    <ul class="rt-list">
+      {% for r in routes %}
+      <li class="rt-item{% if r.enabled is defined and not r.enabled %} disabled{% endif %}">
+        <button type="button" class="rt-row" onclick="toggleRoute(this)" aria-expanded="false">
+          <span class="idx">{{ loop.index }}</span>
+          <span class="meta">
+            <b>{{ r.name }}</b>
+            <span class="dim small">{{ outbound_label(store, r.outbound or r.outbound_tag or 'direct') }}</span>
+          </span>
+          {% if r.enabled is defined and not r.enabled %}<span class="badge">выкл</span>{% endif %}
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="rt-detail" hidden>
+          <div class="cond">
+            {% for key, label in [('domain', 'domain'), ('ip', 'ip'), ('user', 'user'), ('source', 'source'), ('protocol', 'protocol'), ('inbound_tags', 'inbound')] %}
+              {% set v = r.get(key) %}{% if v %}<div><span class="dim">{{ label }}:</span> <span class="mono">{{ (v if v is string else v|join(', '))|truncate(160) }}</span></div>{% endif %}
+            {% endfor %}
+            {% if r.network %}<div><span class="dim">network:</span> {{ r.network }}</div>{% endif %}
+            {% if r.port %}<div><span class="dim">port:</span> {{ r.port }}</div>{% endif %}
+          </div>
+          <div class="kv">
+            <div><span class="lbl">Outbound</span><span class="val">{{ outbound_label(store, r.outbound or r.outbound_tag or 'direct') }}</span></div>
+          </div>
+          <div class="actions">
+            <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/up"><button class="btn ghost sm" {% if loop.first %}disabled{% endif %}>{{ ic.icon('up') }}</button></form>
+            <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/down"><button class="btn ghost sm" {% if loop.last %}disabled{% endif %}>{{ ic.icon('down') }}</button></form>
+            <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/delete" onsubmit="return confirm('Удалить правило {{ r.name }}?')"><button class="btn danger sm">{{ ic.icon('trash') }}</button></form>
+          </div>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">Своих правил нет: клиенты идут в свой outbound, остальное — direct</div>
+    {% endif %}
+  </div>
 </div>
 <div class="hint">Порядок итогового конфига: API → эти правила → маршруты подписок по странам → outbound клиента → outbound inbound'а → direct.</div>
 
@@ -78,4 +164,25 @@
     <div class="actions mt"><button class="btn">{{ t('Добавить') }}</button></div>
   </form>
 </dialog>
+{% endblock %}
+{% block scripts %}
+<script>
+  function toggleRoute(btn) {
+    var item = btn.closest('.rt-item');
+    var open = !item.classList.contains('open');
+    document.querySelectorAll('.rt-item.open').forEach(function (el) {
+      if (el !== item) {
+        el.classList.remove('open');
+        var d = el.querySelector('.rt-detail');
+        var b = el.querySelector('.rt-row');
+        if (d) d.hidden = true;
+        if (b) b.setAttribute('aria-expanded', 'false');
+      }
+    });
+    item.classList.toggle('open', open);
+    var detail = item.querySelector('.rt-detail');
+    if (detail) detail.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+</script>
 {% endblock %}
