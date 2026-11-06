@@ -334,6 +334,8 @@ def _custom_outbounds(store: dict) -> list[dict]:
         if not o.get("enabled", True):
             continue
         cfg = copy.deepcopy(o.get("config") or {})
+        # Panel-only markers (not part of Xray schema)
+        cfg.pop("piaHostname", None)
         cfg["tag"] = o["tag"]
         out.append(cfg)
     return out

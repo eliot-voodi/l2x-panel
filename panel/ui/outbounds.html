@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}Outbounds · {{ app_name }}{% endblock %}
 {% block page_title %}Outbounds{% endblock %}
-{% block page_sub %}Выходы трафика: direct, L2TP-туннели, свои прокси, WARP, NordVPN{% endblock %}
+{% block page_sub %}Выходы трафика: direct, L2TP-туннели, свои прокси, WARP, NordVPN, PIA{% endblock %}
 {% block top_actions %}<button class="btn" type="button" onclick="obOpen()">{{ ic.icon('plus') }}{{ t('Добавить') }}</button>{% endblock %}
 {% block head %}
 <style>
@@ -56,6 +56,7 @@
   <div class="tabs" id="otabs">
     <a href="#" data-mode="form" class="active">Форма</a><a href="#" data-mode="json">JSON</a>
     <a href="#" data-mode="warp" data-new>Cloudflare WARP</a><a href="#" data-mode="nord" data-new>NordVPN</a>
+    <a href="#" data-mode="pia" data-new>PIA</a>
   </div>
   <form method="post" action="{{ bp }}/outbounds/add" id="ob-form">
     <input type="hidden" name="mode" id="mode" value="form">
@@ -251,6 +252,19 @@
       <label class="f">Страна</label>
       <select name="nord_country" id="nord_country"><option value="">рекомендованный сервер</option></select>
     </div>
+    <div data-m="pia" hidden>
+      <div class="hint">Private Internet Access → WireGuard outbound (userspace). Пароль не сохраняется — только ключи в конфиге Xray.</div>
+      <div class="row">
+        <div><label class="f">PIA username</label><input name="pia_user" id="pia_user" autocomplete="username" placeholder="p1234567"></div>
+        <div><label class="f">Password</label><input name="pia_pass" id="pia_pass" type="password" autocomplete="current-password"></div>
+      </div>
+      <div class="row">
+        <div><label class="f">Страна / регион</label>
+          <select name="pia_region" id="pia_region"><option value="">загрузка…</option></select></div>
+        <div><label class="f">Сервер</label>
+          <select name="pia_hostname" id="pia_hostname"><option value="">первый в регионе</option></select></div>
+      </div>
+    </div>
     <div id="ob-err" hidden></div>
     <div class="actions mt"><button class="btn" id="ob-submit">{{ t('Добавить') }}</button>
       <button type="button" class="btn ghost" onclick="this.closest('dialog').close()">{{ t('Отмена') }}</button></div>
@@ -259,7 +273,7 @@
 {% endblock %}
 {% block scripts %}
 <script>
-  var BP = {{ bp|tojson }}, CUSTOM = {{ custom|tojson }}, nordLoaded = false, curMode = 'form';
+  var BP = {{ bp|tojson }}, CUSTOM = {{ custom|tojson }}, nordLoaded = false, piaLoaded = false, piaData = [], curMode = 'form';
   var form = document.getElementById('ob-form');
   var $ = function (id) { return document.getElementById(id); };
   var v = function (id) { var el = $(id); return el.type === 'checkbox' ? el.checked : el.value.trim(); };
@@ -463,7 +477,46 @@
         items.forEach(function (c) { var op = document.createElement('option'); op.value = c.id; op.textContent = c.name + ' (' + c.code + ')'; sel.appendChild(op); });
       });
     }
+    if (mode === 'pia' && !piaLoaded) {
+      piaLoaded = true;
+      fetch(BP + '/outbounds/pia/countries').then(function (r) { return r.json(); }).then(function (items) {
+        piaData = items || [];
+        var sel = $('pia_region');
+        sel.innerHTML = '';
+        if (!piaData.length) {
+          var op = document.createElement('option'); op.value = ''; op.textContent = 'не удалось загрузить список'; sel.appendChild(op); return;
+        }
+        piaData.forEach(function (c) {
+          (c.regions || []).forEach(function (r) {
+            var op = document.createElement('option');
+            op.value = r.id;
+            op.textContent = c.code + ' — ' + r.name + (r.port_forward ? ' (PF)' : '');
+            sel.appendChild(op);
+          });
+        });
+        piaFillServers();
+      }).catch(function () {
+        $('pia_region').innerHTML = '<option value="">ошибка загрузки</option>';
+      });
+    }
   }
+
+  function piaFillServers() {
+    var rid = v('pia_region'), hostSel = $('pia_hostname');
+    hostSel.innerHTML = '<option value="">первый в регионе</option>';
+    piaData.forEach(function (c) {
+      (c.regions || []).forEach(function (r) {
+        if (r.id !== rid) return;
+        (r.servers || []).forEach(function (s) {
+          var op = document.createElement('option');
+          op.value = s.hostname;
+          op.textContent = s.hostname + ' (' + s.ip + ')';
+          hostSel.appendChild(op);
+        });
+      });
+    });
+  }
+  $('pia_region').addEventListener('change', piaFillServers);
 
   window.obOpen = function (tag) {
     var item = tag ? CUSTOM[tag] : null;
@@ -531,6 +584,10 @@
       $('ob-json-out').value = $('ob-json').value;
     }
     if ((curMode === 'form' || curMode === 'json') && !v('f-tag')) { e.preventDefault(); showErr('Укажите Tag'); }
+    if (curMode === 'pia') {
+      if (!v('pia_user') || !$('pia_pass').value) { e.preventDefault(); showErr('Укажите PIA username и password'); }
+      else if (!v('pia_region')) { e.preventDefault(); showErr('Выберите регион PIA'); }
+    }
   });
   refresh();
 </script>

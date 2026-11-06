@@ -189,7 +189,7 @@ POST-запросы должны иметь `Content-Type: application/json`. Е
 | `l2tp_<name>` | L2TP-туннель с именем `<name>` (страница L2TP) |
 | `lb_least_ping` | Балансировщик по минимальному пингу между туннелями |
 | `lb_least_load` | Балансировщик по наименьшей нагрузке |
-| `<custom>` | Пользовательские outbounds (WireGuard, WARP, NordVPN, VLESS / VMess / Trojan / Shadowsocks, SOCKS, HTTP) |
+| `<custom>` | Пользовательские outbounds (WireGuard, WARP, NordVPN, PIA, VLESS / VMess / Trojan / Shadowsocks, SOCKS, HTTP) |
 
 Актуальный список — `GET outbounds/list` → `obj.tags`.
 

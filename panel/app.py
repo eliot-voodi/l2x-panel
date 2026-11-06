@@ -2799,6 +2799,20 @@ async def outbound_add(request: Request):
             remark = remark or f"NordVPN {srv['country']}"
             country = country or (srv.get("code") or "")
             tag = tag or f"nord_{(srv.get('code') or 'xx').lower()}"
+        elif mode == "pia":
+            res = ops.pia_create_outbound(
+                str(form.get("pia_user") or "").strip(),
+                str(form.get("pia_pass") or ""),
+                region_id=str(form.get("pia_region") or "").strip(),
+                hostname=str(form.get("pia_hostname") or "").strip(),
+            )
+            if not res.get("ok"):
+                raise ValueError(res.get("error") or "PIA ошибка")
+            config = res["config"]
+            info = res.get("info") or "PIA WireGuard"
+            remark = remark or res.get("remark") or "PIA"
+            country = country or (res.get("country") or "")
+            tag = tag or res.get("tag") or "pia"
         else:
             raise ValueError("неизвестный режим")
     except Exception as exc:  # noqa: BLE001
@@ -2836,6 +2850,13 @@ def nord_countries(request: Request):
     if not _user(request):
         return JSONResponse([], status_code=401)
     return ops.nord_countries()
+
+
+@app.get("/outbounds/pia/countries")
+def pia_countries(request: Request):
+    if not _user(request):
+        return JSONResponse([], status_code=401)
+    return ops.pia_countries()
 
 
 @app.get("/api/keys/wg")

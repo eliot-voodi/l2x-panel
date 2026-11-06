@@ -447,8 +447,9 @@ def warp_register() -> dict:
             "peers": [{"publicKey": peer.get("public_key") or "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
                        "endpoint": endpoint, "allowedIPs": ["0.0.0.0/0", "::/0"]}],
             "mtu": 1280,
+            "noKernelTun": True,
             **({"reserved": reserved} if reserved else {}),
-            "domainStrategy": "ForceIP",
+            "domainStrategy": "ForceIPv4v6",
         },
     }
     return {"ok": True, "config": outbound, "account": {"id": resp.get("id"), "token": resp.get("token")}}
@@ -502,9 +503,29 @@ def nord_outbound(private_key: str, server: dict) -> dict:
             "address": ["10.5.0.2/32"],
             "peers": [{"publicKey": server["public_key"], "endpoint": f"{server['station']}:51820", "allowedIPs": ["0.0.0.0/0", "::/0"]}],
             "mtu": 1420,
+            "noKernelTun": True,
             "domainStrategy": "ForceIPv4",
         },
     }
+
+
+# ---------------------------------------------------------------- PIA (Private Internet Access)
+
+def pia_countries() -> list[dict]:
+    import pia as pia_mod
+
+    res = pia_mod.list_regions()
+    if not res.get("ok"):
+        return []
+    return pia_mod.countries_from_regions(res.get("regions") or [])
+
+
+def pia_create_outbound(username: str, password: str, *, region_id: str = "", hostname: str = "") -> dict:
+    import pia as pia_mod
+
+    return pia_mod.create_outbound(
+        username, password, region_id=region_id, hostname=hostname, xray_bin=XRAY_BIN,
+    )
 
 
 def speedtest(bytes_: int = 25_000_000) -> dict:

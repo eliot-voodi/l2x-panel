@@ -102,7 +102,7 @@ internal/
   xraycfg/         # build_config, apply, test, clean errors
   protocols/       # share links, inbound builders
   l2tp/            # connect/disconnect/status/secrets
-  outbounds/       # parse URI, WARP, Nord, WG keys
+  outbounds/       # parse URI, WARP, Nord, PIA, WG keys
   front/           # nginx stage/commit/rollback
   nodes/           # provision, push, promote, mirror, schedule
   ops/             # install xray, geo, panel self-update, jobs
