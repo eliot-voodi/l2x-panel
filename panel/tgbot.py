@@ -1,15 +1,19 @@
 """Telegram bot: admin notifications, reports, backups and lookup commands (long polling)."""
 from __future__ import annotations
 
+import html
 import json
+import logging
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from typing import Callable
 
 API = "https://api.telegram.org/bot{token}/{method}"
+log = logging.getLogger("l2x.tgbot")
 
 
 def default_settings() -> dict:
@@ -17,6 +21,8 @@ def default_settings() -> dict:
         "enabled": False,
         "token": "",
         "admin_ids": [],
+        # Long-poll commands on this node (disable on standby if the same bot token is shared)
+        "receive_commands": True,
         "notify_login": True,
         "notify_quota": True,
         "notify_expire_days": 3,
@@ -28,12 +34,19 @@ def default_settings() -> dict:
     }
 
 
+def escape(text: str) -> str:
+    return html.escape(str(text or ""), quote=False)
+
+
 class Bot:
     """Thread-safe-ish wrapper; `hooks` supply data from the panel without import cycles."""
 
-    def __init__(self, get_settings: Callable[[], dict], hooks: dict[str, Callable]):
+    def __init__(self, get_settings: Callable[[], dict], hooks: dict[str, Callable],
+                 *, should_poll: Callable[[], bool] | None = None):
         self.get_settings = get_settings
         self.hooks = hooks
+        # Optional gate: only one node in a cluster should long-poll (usually master)
+        self.should_poll = should_poll or (lambda: True)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._offset = 0
@@ -42,17 +55,30 @@ class Bot:
         self._last_cpu_alert = 0.0
         self._username: str = ""
         self._username_checked: float = 0.0
+        self._webhook_cleared = False
 
     # ------------------------------------------------------------ transport
     def _call(self, method: str, params: dict | None = None, timeout: int = 30) -> dict:
         s = self.get_settings()
         if not s.get("token"):
-            return {"ok": False}
+            return {"ok": False, "error": "no token"}
         data = urllib.parse.urlencode(params or {}).encode()
         req = urllib.request.Request(API.format(token=s["token"], method=method), data=data)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            try:
+                parsed = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            err = str(parsed.get("description") or body or f"HTTP {exc.code}")
+            return {"ok": False, "error": err, "status": exc.code, "description": err}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
@@ -77,19 +103,43 @@ class Bot:
             return ""
         return f"https://t.me/{name}?start={urllib.parse.quote(payload)}"
 
-    def send(self, text: str, chat_id: str | int | None = None) -> None:
+    def send(self, text: str, chat_id: str | int | None = None) -> bool:
         s = self.get_settings()
         if not s.get("enabled") or not s.get("token"):
-            return
-        targets = [chat_id] if chat_id else s.get("admin_ids") or []
+            return False
+        targets = [chat_id] if chat_id is not None else (s.get("admin_ids") or [])
+        ok_any = False
         for cid in targets:
-            self._call("sendMessage", {"chat_id": cid, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": "true"})
+            if cid is None or cid == "":
+                continue
+            # Prefer HTML; on Telegram 400 fall back to plain text
+            res = self._call("sendMessage", {
+                "chat_id": cid,
+                "text": text[:4000],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            })
+            if not res.get("ok"):
+                plain = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+                plain = plain.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+                res = self._call("sendMessage", {
+                    "chat_id": cid,
+                    "text": plain[:4000],
+                    "disable_web_page_preview": "true",
+                })
+            if res.get("ok"):
+                ok_any = True
+            else:
+                log.warning("sendMessage failed chat=%s: %s", cid, res.get("error") or res.get("description"))
+        return ok_any
 
     def send_document(self, filename: str, blob: bytes, caption: str = "", chat_id: str | int | None = None) -> None:
         s = self.get_settings()
         if not s.get("enabled") or not s.get("token"):
             return
-        for cid in ([chat_id] if chat_id else s.get("admin_ids") or []):
+        for cid in ([chat_id] if chat_id is not None else (s.get("admin_ids") or [])):
+            if cid is None or cid == "":
+                continue
             boundary = uuid.uuid4().hex
             parts = []
             for k, v in (("chat_id", str(cid)), ("caption", caption)):
@@ -106,45 +156,94 @@ class Bot:
             )
             try:
                 urllib.request.urlopen(req, timeout=60).read()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log.warning("sendDocument failed: %s", exc)
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
+        """Start or restart the polling thread."""
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._webhook_cleared = False
         self._thread = threading.Thread(target=self._loop, name="l2x-tgbot", daemon=True)
         self._thread.start()
+        log.info("tgbot thread started")
+
+    def restart(self) -> None:
+        """Force restart after settings change (token / enabled / admin_ids)."""
+        self.stop()
+        # Give previous long-poll a moment to exit
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+        self._offset = 0
+        self._username = ""
+        self._username_checked = 0.0
+        self.start()
 
     def stop(self) -> None:
         self._stop.set()
 
     def _is_admin(self, chat_id) -> bool:
-        return str(chat_id) in {str(x) for x in self.get_settings().get("admin_ids") or []}
+        admins = {str(x).strip() for x in (self.get_settings().get("admin_ids") or []) if str(x).strip()}
+        return str(chat_id).strip() in admins
+
+    def _ensure_polling_mode(self) -> None:
+        if self._webhook_cleared:
+            return
+        res = self._call("deleteWebhook", {"drop_pending_updates": "false"}, timeout=15)
+        if res.get("ok") or "Webhook is already deleted" in str(res.get("description") or ""):
+            self._webhook_cleared = True
+            log.info("telegram webhook cleared for long-polling")
+        else:
+            log.warning("deleteWebhook: %s", res.get("error") or res.get("description"))
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             s = self.get_settings()
             if not s.get("enabled") or not s.get("token"):
+                self._stop.wait(5)
+                continue
+            if not self.should_poll() or s.get("receive_commands", True) is False:
+                # Standby / agent / explicitly disabled: do not steal getUpdates
+                self._stop.wait(10)
+                continue
+            self._ensure_polling_mode()
+            # Short long-poll: some hosts RST 25s holds to api.telegram.org
+            res = self._call("getUpdates", {"offset": self._offset, "timeout": 8}, timeout=20)
+            if res.get("status") == 409:
+                # Another process is polling this token — back off
+                log.warning("getUpdates 409 Conflict — another poller has this token")
                 self._stop.wait(15)
                 continue
-            res = self._call("getUpdates", {"offset": self._offset, "timeout": 25}, timeout=35)
             for upd in res.get("result") or []:
-                self._offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
+                self._offset = int(upd.get("update_id") or 0) + 1
+                msg = upd.get("message") or upd.get("edited_message") or {}
                 text = (msg.get("text") or "").strip()
                 chat_id = (msg.get("chat") or {}).get("id")
-                if text and chat_id:
+                if text and chat_id is not None:
                     try:
                         self._handle(chat_id, text)
                     except Exception as exc:  # noqa: BLE001
-                        self.send(f"Ошибка: {exc}", chat_id)
-            self._periodic()
+                        log.exception("handle failed")
+                        self.send(f"Ошибка: {escape(exc)}", chat_id)
+            try:
+                self._periodic()
+            except Exception:
+                log.exception("periodic failed")
             if not res.get("ok"):
-                self._stop.wait(10)
+                err = res.get("error") or res.get("description") or "getUpdates failed"
+                log.warning("getUpdates: %s", err)
+                # Network blips (RST / timeout) — brief pause then retry
+                self._stop.wait(2)
+            else:
+                # Tiny yield so a tight timeout=0 style loop cannot spin CPU
+                self._stop.wait(0.2)
 
     def _periodic(self) -> None:
+        if not self.should_poll():
+            return
         s = self.get_settings()
         now = time.time()
         if s.get("report_hours") and now - self._last_report >= float(s["report_hours"]) * 3600:
@@ -165,6 +264,7 @@ class Bot:
         cmd = cmd.split("@")[0].lower()
         arg = arg.strip()
         chat = str(chat_id)
+        is_admin = self._is_admin(chat_id)
 
         if cmd == "/start":
             if arg.startswith("bind_"):
@@ -172,6 +272,13 @@ class Bot:
                 self.send(msg, chat_id)
                 return
             linked = self.hooks["client_by_tg"](chat)
+            if is_admin:
+                self.send(
+                    f"Админ-бот L2X. Ваш chat id: <code>{escape(chat_id)}</code>\n"
+                    "Команды: /help /status /online /clients /tunnels /usage /backup /restart_xray",
+                    chat_id,
+                )
+                return
             if linked:
                 self.send(
                     "✅ Подписка привязана.\n\n" + linked
@@ -180,7 +287,7 @@ class Bot:
                 )
             else:
                 self.send(
-                    f"Ваш chat id: <code>{chat_id}</code>\n"
+                    f"Ваш chat id: <code>{escape(chat_id)}</code>\n"
                     "Привяжите аккаунт на странице подписки (кнопка Telegram) "
                     "или добавьте id в карточку клиента / в Настройки → Telegram (админ).",
                     chat_id,
@@ -188,7 +295,7 @@ class Bot:
             return
 
         if cmd == "/id":
-            self.send(f"Ваш chat id: <code>{chat_id}</code>", chat_id)
+            self.send(f"Ваш chat id: <code>{escape(chat_id)}</code>", chat_id)
             return
 
         if cmd == "/unlink":
@@ -196,7 +303,7 @@ class Bot:
             self.send(msg, chat_id)
             return
 
-        if not self._is_admin(chat_id):
+        if not is_admin:
             if cmd in ("/status", "/sub", "/help") or not cmd.startswith("/"):
                 client_info = self.hooks["client_by_tg"](chat)
                 if client_info:
@@ -205,18 +312,20 @@ class Bot:
                     self.send(
                         "Подписка не привязана. Откройте страницу подписки в браузере "
                         "и нажмите «Привязать Telegram».\nВаш id: <code>"
-                        + chat + "</code>",
+                        + escape(chat) + "</code>",
                         chat_id,
                     )
                 return
-            self.send("Нет доступа. Ваш id: " + chat, chat_id)
+            self.send("Нет доступа. Ваш id: <code>" + escape(chat) + "</code>", chat_id)
             return
 
         if cmd == "/help":
             self.send(
                 "/status — состояние сервера\n/online — клиенты онлайн\n/usage email — трафик клиента\n"
                 "/clients — список клиентов\n/tunnels — L2TP туннели\n/backup — бэкап\n"
-                "/restart_xray — перезапуск Xray\n/report — отчёт", chat_id)
+                "/restart_xray — перезапуск Xray\n/report — отчёт\n/id — ваш chat id",
+                chat_id,
+            )
         elif cmd == "/status" or cmd == "/report":
             self.send(self.hooks["report"](), chat_id)
         elif cmd == "/online":
@@ -230,6 +339,7 @@ class Bot:
         elif cmd == "/backup":
             name, blob = self.hooks["backup"]()
             self.send_document(name, blob, "Бэкап L2X Panel", chat_id)
+            self.send("Бэкап отправлен.", chat_id)
         elif cmd == "/restart_xray":
             self.send(self.hooks["restart_xray"](), chat_id)
         else:

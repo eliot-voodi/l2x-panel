@@ -881,12 +881,20 @@ def _tg_restart_xray() -> str:
     return "Xray перезапущен" if r["ok"] else f"Ошибка: {r['stderr']}"
 
 
+def _bot_should_poll() -> bool:
+    """Only the master long-polls Telegram — avoids 409 Conflict when several nodes share a token."""
+    try:
+        return nodes_mod.is_master(_load_store())
+    except Exception:
+        return True
+
+
 BOT = tgbot.Bot(_bot_settings, {
     "report": _tg_report, "usage": _tg_usage, "online": _tg_online, "clients": _tg_clients,
     "tunnels": _tg_tunnels, "backup": _tg_backup, "restart_xray": _tg_restart_xray,
     "cpu": sysmon.cpu_percent, "client_by_tg": _tg_client_by_tg,
     "bind_tg": _tg_bind, "unlink_tg": _tg_unlink,
-})
+}, should_poll=_bot_should_poll)
 
 # Low-traffic threshold for one-shot user Telegram alert (GB remaining)
 TG_LOW_GB = 5.0
@@ -1513,7 +1521,13 @@ def _sub_response(request: Request, token: str) -> Response:
     if fmt == "html":
         links = [P.endpoint_to_link(e) for e in eps]
         tg_s = store["settings"].get("tg") or {}
-        tg_enabled = bool(tg_s.get("enabled") and tg_s.get("token") and BOT.username())
+        tg_bot = ""
+        try:
+            tg_bot = BOT.username() if (tg_s.get("enabled") and tg_s.get("token")) else ""
+        except Exception:
+            tg_bot = ""
+        # Bind works only with enabled bot + resolvable @username; section always shown
+        tg_ready = bool(tg_s.get("enabled") and tg_s.get("token") and tg_bot)
         rem_gb = xray.client_remaining_gb(client)
         rem_bytes = xray.client_remaining_bytes(client)
         return templates.TemplateResponse("sub_page.html", {
@@ -1521,8 +1535,9 @@ def _sub_response(request: Request, token: str) -> Response:
             "status": xray.client_status(client), "used": xray.client_used_bytes(client), "settings": s,
             "app_name": app_title(), "qr_svg": qr_svg, "format_traffic": xray.format_traffic, "fmt_dt": fmt_dt,
             "days_left": xray.days_left(client), "theme": "dark", "bp": "", "hwid": hwid.status(client),
-            "tg_enabled": tg_enabled, "tg_linked": bool(client.get("tg_id")),
-            "tg_bot": BOT.username(), "remaining_gb": rem_gb, "remaining_bytes": rem_bytes,
+            "tg_ready": tg_ready, "tg_configured": bool(tg_s.get("enabled") and tg_s.get("token")),
+            "tg_linked": bool(client.get("tg_id")),
+            "tg_bot": tg_bot, "remaining_gb": rem_gb, "remaining_bytes": rem_bytes,
             "sub_token": client.get("sub_token") or token,
         }, headers={"cache-control": "no-store"})
     if not xray.client_access_ok(client):
@@ -3295,9 +3310,14 @@ async def settings_save(request: Request):
                 ns["agent_token"] = secrets.token_urlsafe(32)
         elif section == "tg":
             tg = s["tg"]
+            new_token = str(form.get("token") or "").strip()
+            # Password field: empty means "keep previous token"
+            if not new_token:
+                new_token = str(tg.get("token") or "")
             tg.update({
-                "enabled": form.get("enabled") == "1", "token": str(form.get("token") or "").strip(),
+                "enabled": form.get("enabled") == "1", "token": new_token,
                 "admin_ids": [x for x in _split_lines(str(form.get("admin_ids") or "").replace(" ", "\n"))],
+                "receive_commands": form.get("receive_commands") == "1",
                 "notify_login": form.get("notify_login") == "1", "notify_quota": form.get("notify_quota") == "1",
                 "notify_iplimit": form.get("notify_iplimit") == "1", "notify_tunnel": form.get("notify_tunnel") == "1",
                 "notify_expire_days": _float(form.get("notify_expire_days"), 3),
@@ -3309,7 +3329,8 @@ async def settings_save(request: Request):
     _refresh_settings_cache()
     _sync_servers()
     if section == "tg":
-        BOT.start()
+        # Force restart so token/enabled/admin_ids take effect immediately
+        BOT.restart()
     if section == "panel":
         flash(request, *_ok_msg("Настройки сохранены, HTTPS :443 обновлён", _apply_xray(_load_store())))
     else:

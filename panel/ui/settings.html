@@ -110,8 +110,10 @@
 <form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
   <input type="hidden" name="section" value="tg">
   {{ m.check('enabled', tg.enabled, 'Telegram-бот включён') }}
+  {{ m.check('receive_commands', tg.receive_commands if tg.receive_commands is defined else True, 'Принимать команды (long polling) на этой панели') }}
+  <div class="hint">Если один и тот же токен включён на нескольких нодах — оставьте polling только на master, иначе Telegram отвечает 409 Conflict и бот «молчит».</div>
   <div class="row">
-    <div><label class="f">Токен бота</label><input name="token" value="{{ tg.token }}" type="password" autocomplete="off" placeholder="123456:ABC…"></div>
+    <div><label class="f">Токен бота</label><input name="token" value="{{ tg.token }}" type="password" autocomplete="off" placeholder="123456:ABC… (пусто = не менять)"></div>
     <div><label class="f">Chat ID администраторов</label><input name="admin_ids" value="{{ tg.admin_ids|join(', ') }}" placeholder="узнать: /id в боте"></div>
   </div>
   <h3 class="mt">Уведомления</h3>
