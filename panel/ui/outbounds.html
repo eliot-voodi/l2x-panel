@@ -256,7 +256,7 @@
       <select name="nord_country" id="nord_country"><option value="">рекомендованный сервер</option></select>
     </div>
     <div data-m="pia" hidden>
-      <div class="hint">PIA WireGuard (userspace). Логин/пароль шифруются на сервере; token обновляется сам, WG-ключи перерегистрируются по расписанию (Reconnect).</div>
+      <div class="hint">PIA WireGuard (userspace). Логин/пароль шифруются; token обновляется сам. Reconnect нескольких серверов — <b>по очереди</b> (один apply за раз), чтобы другой PIA оставался онлайн.</div>
       <div id="pia-account" class="mt small" {% if not pia.logged_in %}hidden{% endif %}>
         <span class="badge ok">сохранён</span>
         <span class="mono" id="pia-hint">{{ pia.username_hint or pia.username }}</span>

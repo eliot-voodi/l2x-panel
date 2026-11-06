@@ -2818,48 +2818,55 @@ def _pia_outbound_meta(o: dict) -> tuple[str, str]:
     return region, host
 
 
-def _pia_reconnect_outbounds(store: dict, *, force: bool = False) -> dict:
-    """Refresh token if needed and re-register WireGuard peers for all PIA outbounds."""
-    cfg = _pia_settings(store)
-    if not cfg.get("auto_refresh", True) and not force:
-        return {"ok": True, "skipped": True, "reason": "auto_refresh off"}
-    hours = float(cfg.get("reconnect_hours") or 24)
-    last = cfg.get("last_reconnect_at") or ""
-    if not force and last and hours > 0:
-        try:
-            ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - ts < timedelta(hours=hours):
-                # Still refresh token if near expiry
-                tok = _pia_ensure_token(store, force=False)
-                return {"ok": bool(tok.get("ok")), "skipped": True, "token": tok}
-        except Exception:
-            pass
-    tok = _pia_ensure_token(store, force=force)
-    if not tok.get("ok"):
-        return tok
-    token = tok["token"]
-    updated = 0
-    errors: list[str] = []
-    for o in store.get("outbounds_custom") or []:
-        is_pia = o.get("kind") == "pia" or str(o.get("tag") or "").startswith("pia-")
-        if not is_pia:
-            continue
-        o["kind"] = "pia"
+def _pia_is_outbound(o: dict) -> bool:
+    return o.get("kind") == "pia" or str(o.get("tag") or "").startswith("pia-")
+
+
+def _pia_due_for_reconnect(o: dict, hours: float) -> bool:
+    if hours <= 0:
+        return True
+    last = o.get("pia_reconnected_at") or ""
+    if not last:
+        return True
+    try:
+        ts = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - ts >= timedelta(hours=hours)
+    except Exception:
+        return True
+
+
+def _pia_reconnect_one(tag: str, *, token: str | None = None) -> dict:
+    """Re-register WireGuard for a single PIA outbound, apply Xray, keep others untouched.
+
+    Order matters when several PIA exits exist: call one-by-one so at least one
+    peer stays on the previous keys while another is being rotated.
+    """
+    import copy
+
+    with mutate() as store:
+        o = next((x for x in store.get("outbounds_custom") or [] if x.get("tag") == tag), None)
+        if not o or not _pia_is_outbound(o):
+            return {"ok": False, "error": f"{tag}: не PIA outbound"}
+        tok = {"ok": True, "token": token} if token else _pia_ensure_token(store, force=False)
+        if not tok.get("ok"):
+            return tok
+        use_token = tok["token"]
         region, host = _pia_outbound_meta(o)
         if not host and not region:
-            errors.append(f"{o.get('tag')}: нет hostname")
-            continue
-        res = ops.pia_provision(token, region_id=region, hostname=host)
+            return {"ok": False, "error": f"{tag}: нет hostname"}
+        prev = copy.deepcopy(o.get("config") or {})
+        res = ops.pia_provision(use_token, region_id=region, hostname=host)
         if not res.get("ok") and "token" in str(res.get("error") or "").lower():
             tok2 = _pia_ensure_token(store, force=True)
-            if tok2.get("ok"):
-                token = tok2["token"]
-                res = ops.pia_provision(token, region_id=region, hostname=host)
+            if not tok2.get("ok"):
+                return tok2
+            use_token = tok2["token"]
+            res = ops.pia_provision(use_token, region_id=region, hostname=host)
         if not res.get("ok"):
-            errors.append(f"{o.get('tag')}: {res.get('error')}")
-            continue
+            _pia_settings(store)["last_error"] = f"{tag}: {res.get('error')}"
+            return {"ok": False, "error": f"{tag}: {res.get('error')}", "token": use_token}
         cfg_ob = res["config"]
         cfg_ob.pop("tag", None)
         o["config"] = cfg_ob
@@ -2867,53 +2874,119 @@ def _pia_reconnect_outbounds(store: dict, *, force: bool = False) -> dict:
         o["pia_hostname"] = res.get("hostname") or host
         o["pia_region"] = res.get("region_id") or region
         o["kind"] = "pia"
+        o["pia_reconnected_at"] = datetime.now(timezone.utc).isoformat()
         o.pop("last_test", None)
-        updated += 1
-    now = datetime.now(timezone.utc).isoformat()
-    if updated:
-        cfg["last_reconnect_at"] = now
-        cfg["last_ok_at"] = now
-        cfg["last_error"] = ""
-    if errors:
-        cfg["last_error"] = "; ".join(errors)[:500]
-    return {"ok": not errors or updated > 0, "updated": updated, "errors": errors}
+    xr = _apply_xray(_load_store())
+    if not xr.get("ok"):
+        with mutate() as store:
+            o = next((x for x in store.get("outbounds_custom") or [] if x.get("tag") == tag), None)
+            if o:
+                o["config"] = prev
+                o.pop("pia_reconnected_at", None)
+            _pia_settings(store)["last_error"] = f"{tag}: Xray {xr.get('error')}"
+        _apply_xray(_load_store())
+        return {"ok": False, "error": f"{tag}: Xray отклонил конфиг — откат", "token": use_token}
+    # brief settle so this peer is up before rotating the next one
+    time.sleep(2)
+    probe = xray.test_outbound(_load_store(), tag)
+    with mutate() as store:
+        o = next((x for x in store.get("outbounds_custom") or [] if x.get("tag") == tag), None)
+        if o:
+            o["last_test"] = {"ok": probe.get("ok"), "ms": probe.get("ms"), "at": xray.now_utc().isoformat()}
+        cfg = _pia_settings(store)
+        if probe.get("ok"):
+            cfg["last_ok_at"] = datetime.now(timezone.utc).isoformat()
+            if cfg.get("last_error", "").startswith(f"{tag}:"):
+                cfg["last_error"] = ""
+        else:
+            # Keep new keys (old peer may already be replaced on PIA side); others still online.
+            cfg["last_error"] = f"{tag}: reconnect ok, probe fail: {probe.get('error') or ''}"[:500]
+    return {"ok": True, "tag": tag, "probe_ok": bool(probe.get("ok")), "token": use_token,
+            "ms": probe.get("ms")}
+
+
+def _pia_reconnect_outbounds(*, force: bool = False, only_tag: str | None = None) -> dict:
+    """Rotate PIA WireGuard peers one-by-one (apply after each) so one exit stays live."""
+    store = _load_store()
+    cfg = _pia_settings(store)
+    if not cfg.get("auto_refresh", True) and not force:
+        return {"ok": True, "skipped": True, "reason": "auto_refresh off"}
+    hours = float(cfg.get("reconnect_hours") or 24)
+    targets: list[str] = []
+    for o in store.get("outbounds_custom") or []:
+        if not _pia_is_outbound(o):
+            continue
+        if not o.get("enabled", True):
+            continue
+        tag = str(o.get("tag") or "")
+        if only_tag and tag != only_tag:
+            continue
+        if only_tag or force or _pia_due_for_reconnect(o, hours):
+            targets.append(tag)
+    if not targets:
+        with mutate() as st:
+            tok = _pia_ensure_token(st, force=False)
+        return {"ok": bool(tok.get("ok")), "skipped": True, "updated": 0, "token_ok": tok.get("ok")}
+
+    with mutate() as st:
+        tok = _pia_ensure_token(st, force=force)
+    if not tok.get("ok"):
+        return tok
+    token = tok["token"]
+    updated: list[str] = []
+    errors: list[str] = []
+    for i, tag in enumerate(targets):
+        res = _pia_reconnect_one(tag, token=token)
+        if res.get("token"):
+            token = res["token"]
+        if res.get("ok"):
+            updated.append(tag)
+        else:
+            errors.append(str(res.get("error") or tag))
+            # continue with remaining — other exits stay on previous keys
+        # pause between rotations so traffic can stay on untouched peers
+        if i + 1 < len(targets):
+            time.sleep(3)
+    with mutate() as st:
+        cfg = _pia_settings(st)
+        if updated:
+            cfg["last_reconnect_at"] = datetime.now(timezone.utc).isoformat()
+            cfg["last_ok_at"] = cfg["last_reconnect_at"]
+        if errors:
+            cfg["last_error"] = "; ".join(errors)[:500]
+        elif updated:
+            cfg["last_error"] = ""
+    return {"ok": bool(updated) or not errors, "updated": len(updated), "tags": updated, "errors": errors}
 
 
 def _pia_loop() -> None:
-    """Keep PIA token fresh and periodically re-register WireGuard peers."""
+    """Keep PIA token fresh; rotate due WireGuard peers one-at-a-time (never all at once)."""
     while not _stop.wait(900):  # 15 min
         try:
-            with mutate() as store:
-                cfg = _pia_settings(store)
-                if not cfg.get("username") or not cfg.get("password_enc"):
-                    continue
-                if not cfg.get("auto_refresh", True):
-                    continue
-                need_reconnect = False
-                hours = float(cfg.get("reconnect_hours") or 24)
-                last = cfg.get("last_reconnect_at") or ""
-                if hours > 0:
-                    if not last:
-                        need_reconnect = True
-                    else:
-                        try:
-                            ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
-                            if ts.tzinfo is None:
-                                ts = ts.replace(tzinfo=timezone.utc)
-                            need_reconnect = datetime.now(timezone.utc) - ts >= timedelta(hours=hours)
-                        except Exception:
-                            need_reconnect = True
-                if need_reconnect:
-                    res = _pia_reconnect_outbounds(store, force=True)
-                else:
-                    res = _pia_ensure_token(store, force=False)
-                apply = bool(need_reconnect and res.get("updated"))
-            if apply:
-                _apply_xray(_load_store())
+            store = _load_store()
+            cfg = _pia_settings(store)
+            if not cfg.get("username") or not cfg.get("password_enc"):
+                continue
+            if not cfg.get("auto_refresh", True):
+                continue
+            hours = float(cfg.get("reconnect_hours") or 24)
+            due = [
+                o.get("tag") for o in (store.get("outbounds_custom") or [])
+                if _pia_is_outbound(o) and o.get("enabled", True) and _pia_due_for_reconnect(o, hours)
+            ]
+            if due:
+                # One outbound per tick when several are due — keeps others online
+                res = _pia_reconnect_outbounds(force=True, only_tag=due[0])
                 if res.get("updated"):
-                    BOT.send(f"PIA: обновлены WireGuard ключи ({res['updated']} outbound)")
-            elif isinstance(res, dict) and not res.get("ok") and res.get("error"):
-                BOT.send(f"PIA auto: {res.get('error')}")
+                    BOT.send(f"PIA reconnect (по очереди): {', '.join(res.get('tags') or [])}"
+                             + (f" · осталось {len(due) - 1}" if len(due) > 1 else ""))
+                elif not res.get("ok") and (res.get("error") or res.get("errors")):
+                    BOT.send(f"PIA auto: {res.get('error') or res.get('errors')}")
+            else:
+                with mutate() as st:
+                    res = _pia_ensure_token(st, force=False)
+                if isinstance(res, dict) and not res.get("ok") and res.get("error"):
+                    BOT.send(f"PIA auto: {res.get('error')}")
         except Exception:
             pass
 
@@ -3084,8 +3157,9 @@ async def outbound_add(request: Request):
                 o = next((x for x in store["outbounds_custom"] if x["tag"] == tag), None)
                 if o:
                     o.update(pia_meta)
+                    o["pia_reconnected_at"] = datetime.now(timezone.utc).isoformat()
                     cfg = _pia_settings(store)
-                    cfg["last_reconnect_at"] = datetime.now(timezone.utc).isoformat()
+                    cfg["last_reconnect_at"] = o["pia_reconnected_at"]
     if err:
         flash(request, err, "error")
         return go("/outbounds")
@@ -3134,15 +3208,15 @@ def pia_logout(request: Request):
 def pia_reconnect(request: Request):
     if redir := _require(request):
         return redir
-    with mutate() as store:
-        res = _pia_reconnect_outbounds(store, force=True)
-    if res.get("updated"):
-        xr = _apply_xray(_load_store())
-        if not xr.get("ok"):
-            flash(request, f"PIA reconnect: Xray — {xr.get('error')}", "error")
-            return go("/outbounds")
+    # Sequential: one outbound → apply → next (others stay online)
+    res = _pia_reconnect_outbounds(force=True)
     if res.get("ok"):
-        flash(request, f"PIA reconnect: обновлено {res.get('updated', 0)} outbound", "info")
+        msg = f"PIA reconnect по очереди: {res.get('updated', 0)}"
+        if res.get("tags"):
+            msg += f" ({', '.join(res['tags'])})"
+        if res.get("errors"):
+            msg += f" · ошибки: {'; '.join(res['errors'])}"
+        flash(request, msg, "info" if res.get("updated") else "error")
     else:
         flash(request, f"PIA reconnect: {res.get('error') or res.get('errors')}", "error")
     return go("/outbounds")
@@ -3199,6 +3273,14 @@ def outbound_action(tag: str, action: str, request: Request):
         flash(request, f"{tag}: {'OK ' + str(res.get('ms')) + ' мс' if res['ok'] else 'ошибка ' + str(res.get('error'))}",
               "info" if res["ok"] else "error")
         return go("/outbounds")
+    if action == "reconnect":
+        res = _pia_reconnect_one(tag)
+        if res.get("ok"):
+            probe = "probe OK" if res.get("probe_ok") else "probe fail"
+            flash(request, f"PIA reconnect {tag}: ok · {probe}", "info")
+        else:
+            flash(request, f"PIA reconnect {tag}: {res.get('error')}", "error")
+        return go("/outbounds")
     with mutate() as store:
         if action == "reset":
             store.setdefault("outbound_traffic", {}).setdefault(tag, {}).update({"up": 0, "down": 0})
@@ -3211,32 +3293,6 @@ def outbound_action(tag: str, action: str, request: Request):
                 o["enabled"] = not o.get("enabled", True)
             elif action == "sub":
                 o["in_sub"] = not o.get("in_sub", True)
-            elif action == "reconnect":
-                if o.get("kind") != "pia" and not str(tag).startswith("pia-"):
-                    flash(request, "Reconnect только для PIA outbounds", "error")
-                    return go("/outbounds")
-                tok = _pia_ensure_token(store, force=False)
-                if not tok.get("ok"):
-                    flash(request, tok.get("error") or "PIA token", "error")
-                    return go("/outbounds")
-                region, host = _pia_outbound_meta(o)
-                res = ops.pia_provision(tok["token"], region_id=region, hostname=host)
-                if not res.get("ok") and "token" in str(res.get("error") or "").lower():
-                    tok = _pia_ensure_token(store, force=True)
-                    if tok.get("ok"):
-                        res = ops.pia_provision(tok["token"], region_id=region, hostname=host)
-                if not res.get("ok"):
-                    flash(request, f"PIA reconnect {tag}: {res.get('error')}", "error")
-                    return go("/outbounds")
-                cfg_ob = res["config"]
-                cfg_ob.pop("tag", None)
-                o["config"] = cfg_ob
-                o["info"] = res.get("info") or o.get("info")
-                o["kind"] = "pia"
-                o["pia_hostname"] = res.get("hostname") or host
-                o["pia_region"] = res.get("region_id") or region
-                o.pop("last_test", None)
-                _pia_settings(store)["last_reconnect_at"] = datetime.now(timezone.utc).isoformat()
             elif action == "delete":
                 used = [c["email"] for c in store["clients"] if c.get("outbound") == tag]
                 if used:
