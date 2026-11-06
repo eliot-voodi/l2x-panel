@@ -9,6 +9,47 @@
 <form method="post" action="{{ bp }}/nodes/sync-all" style="display:inline"><button class="btn ghost" {% if job_running %}disabled{% endif %}>Синхронизировать все</button></form>
 {% endif %}
 {% endblock %}
+{% block head %}
+<style>
+  .nodes-mobile { display: none }
+  @media (max-width: 860px) {
+    .nodes-desktop { display: none }
+    .nodes-mobile { display: block }
+    .nd-list { list-style: none; margin: 0; padding: 0 }
+    .nd-item { border-bottom: 1px solid var(--border) }
+    .nd-item:last-child { border-bottom: 0 }
+    .nd-row {
+      display: flex; align-items: center; gap: .65rem; width: 100%;
+      padding: .85rem 1rem; background: none; border: 0; color: inherit;
+      font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .nd-row:active { background: var(--surface-2) }
+    .nd-row .meta { flex: 1; min-width: 0 }
+    .nd-row .meta b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .nd-row .meta .dim { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .nd-row .chev {
+      flex-shrink: 0; width: 18px; height: 18px; color: var(--dim);
+      transition: transform .18s ease;
+    }
+    .nd-item.open .nd-row .chev { transform: rotate(90deg); color: var(--accent) }
+    .nd-detail {
+      display: none; padding: 0 1rem 1rem 1rem;
+      border-top: 1px dashed var(--border);
+      background: var(--surface-2);
+    }
+    .nd-item.open .nd-detail { display: block }
+    .nd-detail .kv { display: grid; gap: .55rem; padding: .75rem 0 }
+    .nd-detail .kv > div { display: flex; justify-content: space-between; gap: .75rem; align-items: baseline }
+    .nd-detail .kv .lbl { color: var(--muted); font-size: .78rem; flex-shrink: 0 }
+    .nd-detail .kv .val { text-align: right; font-size: .85rem; min-width: 0; word-break: break-word }
+    .nd-detail .actions { padding-bottom: .15rem }
+    .nd-detail .actions .btn { flex: 1 1 calc(45% - .35rem); min-width: 0 }
+    .nd-detail .actions form.flex { flex: 1 1 100%; width: 100% }
+    .nd-detail .actions form.flex input { flex: 1; min-width: 0; width: auto !important }
+    .nd-detail .err { margin: .35rem 0 .5rem; word-break: break-word }
+  }
+</style>
+{% endblock %}
 {% block content %}
 <div class="card">
   <h3>Как это работает</h3>
@@ -34,7 +75,8 @@
 
 {% if is_master %}
 <div class="card" style="padding:0">
-  <div class="table-wrap">
+  {# —— Desktop —— #}
+  <div class="table-wrap nodes-desktop">
   <table>
     <thead><tr>
       <th>Нода</th><th>Domain / URL</th><th>Версия</th><th>Outbound</th><th>Зеркало</th><th>Статус</th><th>Sync / расписание</th><th class="right">{{ t('Действия') }}</th>
@@ -94,6 +136,71 @@
     {% endfor %}
     </tbody>
   </table>
+  </div>
+
+  {# —— Mobile accordion —— #}
+  <div class="nodes-mobile">
+    {% if items %}
+    <ul class="nd-list">
+      {% for n in items %}
+      <li class="nd-item">
+        <button type="button" class="nd-row" onclick="toggleNode(this)" aria-expanded="false">
+          <span class="meta">
+            <b>{{ n.name }}</b>
+            <span class="dim small mono">{{ n.domain or n.url }}</span>
+          </span>
+          {% if not n.enabled %}<span class="badge">выкл</span>
+          {% elif n.last_ok %}<span class="badge ok">ok</span>
+          {% elif n.last_error %}<span class="badge err">ошибка</span>
+          {% else %}<span class="badge">—</span>{% endif %}
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="nd-detail" hidden>
+          <div class="kv">
+            <div><span class="lbl">ID</span><span class="val mono">{{ n.id[:8] }}</span></div>
+            <div><span class="lbl">Domain</span><span class="val mono">{{ n.domain or n.url }}{% if n.base_path %}/{{ n.base_path }}/{% endif %}</span></div>
+            <div><span class="lbl">Версия</span><span class="val">{% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn"{% endif %}>{{ n.panel_version }}</span>{% else %}?{% endif %}</span></div>
+            <div><span class="lbl">Outbound</span><span class="val">{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}—{% endif %}</span></div>
+            <div><span class="lbl">Зеркало</span><span class="val">{% if n.mirror %}<span class="badge ok">standby</span>{% else %}—{% endif %}</span></div>
+            <div><span class="lbl">Sync</span><span class="val">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}</span></div>
+          </div>
+          {% if n.last_error %}<div class="badge err err" title="{{ n.last_error }}">{{ n.last_error[:120] }}</div>{% endif %}
+          <form method="post" action="{{ bp }}/nodes/{{ n.id }}/schedule" class="flex" style="gap:.5rem;margin:.5rem 0 .75rem;align-items:center">
+            <span class="dim small">Расписание</span>
+            <select name="sync_interval_min" style="flex:1;padding:.35rem .5rem;font-size:.8rem" onchange="this.form.submit()">
+              {% for mins, label in sync_intervals %}
+              <option value="{{ mins }}" {% if (n.sync_interval_min or 0)|int == mins %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </form>
+          <div class="actions">
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/mirror"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>{% if n.mirror %}Зеркало ✓{% else %}+ Зеркало{% endif %}</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.35rem"
+                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }} до последнего релиза?')">
+              <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password">
+              <button class="btn sm" {% if job_running %}disabled{% endif %}>{{ t('Обновить') }}</button>
+            </form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/token" class="flex" style="gap:.35rem">
+              <input type="text" name="token" placeholder="token" value="{{ n.token }}" required class="mono">
+              <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Token</button>
+            </form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/promote" class="flex" style="gap:.35rem"
+                  onsubmit="return confirm('Передать роль MASTER ноде {{ n.name }}?\nЭта панель станет агентом.{% if n.mirror %}\nЗеркало: данные уже на ноде — SSH не обязателен.{% endif %}')">
+              <input type="password" name="password" placeholder="{% if n.mirror %}SSH (опц.){% else %}SSH pass{% endif %}" {% if not n.mirror %}required{% endif %} autocomplete="new-password">
+              <button class="btn sm" {% if job_running %}disabled{% endif %}>→ Master</button>
+            </form>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду?')"><button class="btn danger sm">{{ ic.icon('trash') }} Удалить</button></form>
+          </div>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty">Нод пока нет — установите первую по SSH ниже</div>
+    {% endif %}
   </div>
 </div>
 
@@ -158,4 +265,25 @@
   <div class="hint">В Settings → Nodes agent должен быть включён приём конфига. Outbound-bridge и клиенты приходят с мастера автоматически. Если включено зеркало — на диске лежит полная копия для failover.</div>
 </div>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+  function toggleNode(btn) {
+    var item = btn.closest('.nd-item');
+    var open = !item.classList.contains('open');
+    document.querySelectorAll('.nd-item.open').forEach(function (el) {
+      if (el !== item) {
+        el.classList.remove('open');
+        var d = el.querySelector('.nd-detail');
+        var b = el.querySelector('.nd-row');
+        if (d) d.hidden = true;
+        if (b) b.setAttribute('aria-expanded', 'false');
+      }
+    });
+    item.classList.toggle('open', open);
+    var detail = item.querySelector('.nd-detail');
+    if (detail) detail.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+</script>
 {% endblock %}
