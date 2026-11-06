@@ -344,8 +344,9 @@
         {% if pia.token_expires_at %}<span class="dim"> · token до {{ pia.token_expires_at[:16]|replace('T',' ') }} UTC</span>{% endif %}
         {% if pia.last_error %}<div class="dim" style="color:var(--danger)">{{ pia.last_error }}</div>{% endif %}
         <div class="actions mt" style="gap:.4rem">
-          <form method="post" action="{{ bp }}/outbounds/pia/reconnect"><button class="btn ghost sm" type="submit">Reconnect все PIA</button></form>
-          <form method="post" action="{{ bp }}/outbounds/pia/logout" onsubmit="return confirm('Очистить сохранённый PIA логин?')"><button class="btn ghost sm" type="submit">Выйти</button></form>
+          {# Nested <form> is illegal HTML and closes #ob-form early — Добавить stops working #}
+          <button class="btn ghost sm" type="submit" formaction="{{ bp }}/outbounds/pia/reconnect" formmethod="post">Reconnect все PIA</button>
+          <button class="btn ghost sm" type="submit" formaction="{{ bp }}/outbounds/pia/logout" formmethod="post" onclick="return confirm('Очистить сохранённый PIA логин?')">Выйти</button>
         </div>
       </div>
       <div class="row">
@@ -361,7 +362,7 @@
       </div>
     </div>
     <div id="ob-err" hidden></div>
-    <div class="actions mt"><button class="btn" id="ob-submit">{{ t('Добавить') }}</button>
+    <div class="actions mt"><button class="btn" type="submit" id="ob-submit" form="ob-form">{{ t('Добавить') }}</button>
       <button type="button" class="btn ghost" onclick="this.closest('dialog').close()">{{ t('Отмена') }}</button></div>
   </form>
 </dialog>
@@ -690,18 +691,24 @@
   form.addEventListener('change', refresh);
   form.addEventListener('submit', function (e) {
     showErr('');
-    if (curMode === 'form') {
-      $('ob-json-out').value = JSON.stringify(buildOb());
-    } else if (curMode === 'json') {
-      try { JSON.parse($('ob-json').value); } catch (err) { e.preventDefault(); showErr('JSON с ошибкой: ' + err.message); return; }
-      $('ob-json-out').value = $('ob-json').value;
-    }
-    if ((curMode === 'form' || curMode === 'json') && !v('f-tag')) { e.preventDefault(); showErr('Укажите Tag'); }
-    if (curMode === 'pia') {
-      var hasSaved = piaAccount && piaAccount.logged_in;
-      if ((!v('pia_user') && !hasSaved) || (!$('pia_pass').value && !hasSaved)) {
-        e.preventDefault(); showErr('Укажите PIA username и password');
-      } else if (!v('pia_region')) { e.preventDefault(); showErr('Выберите регион PIA'); }
+    try {
+      if (curMode === 'form') {
+        $('ob-json-out').value = JSON.stringify(buildOb());
+      } else if (curMode === 'json') {
+        try { JSON.parse($('ob-json').value); } catch (err) { e.preventDefault(); showErr('JSON с ошибкой: ' + err.message); return; }
+        $('ob-json-out').value = $('ob-json').value;
+      }
+      if ((curMode === 'form' || curMode === 'json') && !v('f-tag')) { e.preventDefault(); showErr('Укажите Tag'); return; }
+      if (curMode === 'pia') {
+        var hasSaved = piaAccount && piaAccount.logged_in;
+        if ((!v('pia_user') && !hasSaved) || (!$('pia_pass').value && !hasSaved)) {
+          e.preventDefault(); showErr('Укажите PIA username и password'); return;
+        }
+        if (!v('pia_region')) { e.preventDefault(); showErr('Выберите регион PIA'); }
+      }
+    } catch (err) {
+      e.preventDefault();
+      showErr(String(err && err.message || err));
     }
   });
   refresh();
