@@ -59,7 +59,7 @@
   <div class="row mt" style="gap:1rem;flex-wrap:wrap">
     <div><span class="dim small">Роль</span><div><span class="badge {% if snap.role=='master' %}ok{% else %}warn{% endif %}">{{ snap.role or '?' }}</span></div></div>
     <div><span class="dim small">Версия</span><div class="mono">{{ snap.version or '?' }}</div></div>
-    <div><span class="dim small">Xray</span><div>{% if (snap.xray or {}).running %}<span class="badge ok">up {{ (snap.xray or {}).version }}</span>{% else %}<span class="badge err">down</span>{% endif %}</div></div>
+    <div><span class="dim small">Xray</span><div>{% if (snap.xray or {}).active %}<span class="badge ok">up {{ (snap.xray or {}).version }}</span>{% else %}<span class="badge err">down{% if (snap.xray or {}).state %} · {{ (snap.xray or {}).state }}{% endif %}</span>{% endif %}</div></div>
     <div><span class="dim small">Клиенты</span><div class="mono">{{ (snap.counts or {}).clients or 0 }}</div></div>
     <div><span class="dim small">L2TP</span><div class="mono">{{ (snap.counts or {}).l2tp_up or 0 }}/{{ (snap.counts or {}).l2tp or 0 }}</div></div>
     <div><span class="dim small">Outbounds</span><div class="mono">{{ (snap.counts or {}).custom or 0 }}</div></div>
