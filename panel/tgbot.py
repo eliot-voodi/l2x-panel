@@ -38,6 +38,25 @@ def escape(text: str) -> str:
     return html.escape(str(text or ""), quote=False)
 
 
+def user_profile(from_user: dict | None, *, fallback_id: str | int = "") -> dict:
+    """Normalize Telegram message.from into {id, username, first_name, last_name, fio, display}."""
+    u = from_user or {}
+    uid = str(u.get("id") or fallback_id or "").strip()
+    username = str(u.get("username") or "").strip().lstrip("@")
+    first = str(u.get("first_name") or "").strip()
+    last = str(u.get("last_name") or "").strip()
+    fio = " ".join(x for x in (first, last) if x).strip()
+    display = fio or (f"@{username}" if username else uid) or "—"
+    return {
+        "id": uid,
+        "username": username,
+        "first_name": first,
+        "last_name": last,
+        "fio": fio,
+        "display": display,
+    }
+
+
 class Bot:
     """Thread-safe-ish wrapper; `hooks` supply data from the panel without import cycles."""
 
@@ -222,9 +241,10 @@ class Bot:
                 msg = upd.get("message") or upd.get("edited_message") or {}
                 text = (msg.get("text") or "").strip()
                 chat_id = (msg.get("chat") or {}).get("id")
+                from_user = msg.get("from") if isinstance(msg.get("from"), dict) else {}
                 if text and chat_id is not None:
                     try:
-                        self._handle(chat_id, text)
+                        self._handle(chat_id, text, from_user=from_user)
                     except Exception as exc:  # noqa: BLE001
                         log.exception("handle failed")
                         self.send(f"Ошибка: {escape(exc)}", chat_id)
@@ -259,23 +279,33 @@ class Bot:
             self.send(f"⚠️ CPU {cpu:.0f}% (порог {s['cpu_threshold']}%)")
 
     # ------------------------------------------------------------ commands
-    def _handle(self, chat_id, text: str) -> None:
+    def _handle(self, chat_id, text: str, *, from_user: dict | None = None) -> None:
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@")[0].lower()
         arg = arg.strip()
         chat = str(chat_id)
         is_admin = self._is_admin(chat_id)
+        profile = user_profile(from_user or {}, fallback_id=chat)
+
+        # Keep linked client profile fresh on any message
+        try:
+            self.hooks.get("touch_tg_profile", lambda *_a, **_k: None)(chat, profile)
+        except Exception:
+            pass
 
         if cmd == "/start":
             if arg.startswith("bind_"):
-                _ok, msg = self.hooks["bind_tg"](arg[5:], chat)
+                _ok, msg = self.hooks["bind_tg"](arg[5:], chat, profile)
                 self.send(msg, chat_id)
                 return
             linked = self.hooks["client_by_tg"](chat)
             if is_admin:
+                admins = self.get_settings().get("admin_ids") or []
                 self.send(
                     f"Админ-бот L2X. Ваш chat id: <code>{escape(chat_id)}</code>\n"
-                    "Команды: /help /status /online /clients /tunnels /usage /backup /restart_xray",
+                    f"Профиль: {escape(profile.get('display') or '—')}\n"
+                    f"Админов в настройках: <b>{len(admins)}</b>\n"
+                    "Команды: /help /status /online /clients /tunnels /usage /backup /restart_xray /admins",
                     chat_id,
                 )
                 return
@@ -288,6 +318,7 @@ class Bot:
             else:
                 self.send(
                     f"Ваш chat id: <code>{escape(chat_id)}</code>\n"
+                    f"Профиль: {escape(profile.get('display') or '—')}\n"
                     "Привяжите аккаунт на странице подписки (кнопка Telegram) "
                     "или добавьте id в карточку клиента / в Настройки → Telegram (админ).",
                     chat_id,
@@ -295,7 +326,12 @@ class Bot:
             return
 
         if cmd == "/id":
-            self.send(f"Ваш chat id: <code>{escape(chat_id)}</code>", chat_id)
+            self.send(
+                f"Chat id: <code>{escape(chat_id)}</code>\n"
+                f"Username: <code>{escape(profile.get('username') or '—')}</code>\n"
+                f"Имя: {escape(profile.get('fio') or '—')}",
+                chat_id,
+            )
             return
 
         if cmd == "/unlink":
@@ -323,9 +359,17 @@ class Bot:
             self.send(
                 "/status — состояние сервера\n/online — клиенты онлайн\n/usage email — трафик клиента\n"
                 "/clients — список клиентов\n/tunnels — L2TP туннели\n/backup — бэкап\n"
-                "/restart_xray — перезапуск Xray\n/report — отчёт\n/id — ваш chat id",
+                "/restart_xray — перезапуск Xray\n/report — отчёт\n"
+                "/admins — список admin chat id\n/id — ваш chat id / username / имя",
                 chat_id,
             )
+        elif cmd == "/admins":
+            admins = [str(x).strip() for x in (self.get_settings().get("admin_ids") or []) if str(x).strip()]
+            if not admins:
+                self.send("Список админов пуст. Добавьте chat id в Настройки → Telegram (по одному на строку).", chat_id)
+            else:
+                lines = "\n".join(f"• <code>{escape(a)}</code>" for a in admins)
+                self.send(f"Админы бота ({len(admins)}):\n{lines}", chat_id)
         elif cmd == "/status" or cmd == "/report":
             self.send(self.hooks["report"](), chat_id)
         elif cmd == "/online":

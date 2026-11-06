@@ -1,0 +1,16 @@
+---
+description: Every completed change must be pushed to GitHub main and published as a Release
+alwaysApply: true
+---
+
+# GitHub main + Release (обязательно)
+
+После **каждого** завершённого изменения в L2X Panel:
+
+1. Поднять `VERSION` / `panel/VERSION` (semver), если это поставка панели.
+2. Закоммитить в ветку `main`.
+3. `git push origin main`.
+4. Создать GitHub Release с тегом версии (`vX.Y.Z`), title и кратким описанием изменений.
+5. Не считать задачу закрытой, пока push и release не прошли успешно.
+
+Не ждать отдельной просьбы «запушь» / «сделай релиз» — это часть стандартного завершения работы.

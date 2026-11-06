@@ -21,9 +21,8 @@
     <h3>Профиль</h3>
     <div class="row">
       <div><label class="f">Email / имя</label><input name="email" value="{{ c.email }}" required pattern="[^\s~]+" autofocus></div>
-      <div><label class="f">Telegram ID</label><input name="tg_id" value="{{ c.tg_id }}" placeholder="для бота и уведомлений"></div>
+      <div><label class="f">Комментарий</label><input name="comment" value="{{ c.comment }}"></div>
     </div>
-    <label class="f">Комментарий</label><input name="comment" value="{{ c.comment }}">
     <label class="f">Outbound по умолчанию (основная ссылка)</label>
     <select name="outbound">
       <option value="direct" {% if c.outbound == 'direct' %}selected{% endif %}>🏠 Direct</option>
@@ -33,6 +32,29 @@
       <input type="hidden" name="enabled" value="0">{{ m.check('enabled', c.enabled, t('Включён')) }}
       <input type="hidden" name="sub_enabled" value="0">{{ m.check('sub_enabled', c.sub_enabled, 'Подписка доступна') }}
     </div>
+  </div>
+
+  <div class="card">
+    <h3>Telegram</h3>
+    <div class="hint">Заполняется при привязке со страницы подписки. Можно править вручную.</div>
+    <div class="row">
+      <div><label class="f">Telegram ID</label><input name="tg_id" value="{{ c.tg_id }}" class="mono" placeholder="chat id"></div>
+      <div><label class="f">Username</label><input name="tg_username" value="{{ c.tg_username or '' }}" placeholder="@username"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Имя</label><input name="tg_first_name" value="{{ c.tg_first_name or '' }}"></div>
+      <div><label class="f">Фамилия</label><input name="tg_last_name" value="{{ c.tg_last_name or '' }}"></div>
+    </div>
+    <label class="f">ФИО (как в Telegram)</label>
+    <input name="tg_fio" value="{{ c.tg_fio or '' }}" placeholder="Имя Фамилия">
+    {% if c.tg_id %}
+    <div class="mt small">
+      <span class="badge ok">привязан</span>
+      <span class="mono">id {{ c.tg_id }}</span>
+      {% if c.tg_username %} · @{{ c.tg_username }}{% endif %}
+      {% if c.tg_fio %} · {{ c.tg_fio }}{% endif %}
+    </div>
+    {% endif %}
   </div>
 
   <div class="card">

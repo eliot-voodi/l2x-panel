@@ -813,7 +813,29 @@ def _tg_client_by_tg(chat_id: str) -> str:
     return _client_summary(c) if c else ""
 
 
-def _tg_bind(bind_token: str, chat_id: str) -> tuple[bool, str]:
+def _apply_tg_profile(client: dict, chat_id: str, profile: dict | None = None) -> None:
+    """Persist Telegram id + username + FIO on a client record."""
+    p = profile or {}
+    client["tg_id"] = str(p.get("id") or chat_id or "").strip()
+    client["tg_username"] = str(p.get("username") or "").strip().lstrip("@")
+    client["tg_first_name"] = str(p.get("first_name") or "").strip()
+    client["tg_last_name"] = str(p.get("last_name") or "").strip()
+    fio = str(p.get("fio") or "").strip()
+    if not fio:
+        fio = " ".join(x for x in (client["tg_first_name"], client["tg_last_name"]) if x).strip()
+    client["tg_fio"] = fio
+
+
+def _clear_tg_profile(client: dict) -> None:
+    client["tg_id"] = ""
+    client["tg_username"] = ""
+    client["tg_first_name"] = ""
+    client["tg_last_name"] = ""
+    client["tg_fio"] = ""
+    client.pop("tg_bind", None)
+
+
+def _tg_bind(bind_token: str, chat_id: str, profile: dict | None = None) -> tuple[bool, str]:
     token = (bind_token or "").strip()
     if not token or len(token) < 8:
         return False, "Некорректная ссылка привязки. Откройте страницу подписки снова."
@@ -835,12 +857,17 @@ def _tg_bind(bind_token: str, chat_id: str) -> tuple[bool, str]:
         # One Telegram account → one client
         for c in store.get("clients") or []:
             if c is not target and str(c.get("tg_id") or "") == str(chat_id):
-                c["tg_id"] = ""
-        target["tg_id"] = str(chat_id)
+                _clear_tg_profile(c)
+        _apply_tg_profile(target, chat_id, profile)
         target.pop("tg_bind", None)
         email = target.get("email") or ""
+        uname = target.get("tg_username") or ""
+        fio = target.get("tg_fio") or ""
         summary = _client_summary(target)
-    return True, f"✅ Telegram привязан к <b>{email}</b>\n\n{summary}\n\n/status — статус · /unlink — отвязать"
+    extra = ""
+    if uname or fio:
+        extra = f"\nАккаунт: {('@' + uname) if uname else '—'} · {fio or '—'}"
+    return True, f"✅ Telegram привязан к <b>{email}</b>{extra}\n\n{summary}\n\n/status — статус · /unlink — отвязать"
 
 
 def _tg_unlink(chat_id: str) -> tuple[bool, str]:
@@ -848,12 +875,23 @@ def _tg_unlink(chat_id: str) -> tuple[bool, str]:
         found = False
         for c in store.get("clients") or []:
             if str(c.get("tg_id") or "") == str(chat_id):
-                c["tg_id"] = ""
-                c.pop("tg_bind", None)
+                _clear_tg_profile(c)
                 found = True
         if not found:
             return False, "К этому Telegram ничего не привязано."
     return True, "Telegram отвязан от подписки."
+
+
+def _tg_touch_profile(chat_id: str, profile: dict | None = None) -> None:
+    """Refresh username/FIO for an already linked client (best-effort)."""
+    if not chat_id or not profile:
+        return
+    with mutate() as store:
+        for c in store.get("clients") or []:
+            if str(c.get("tg_id") or "") != str(chat_id):
+                continue
+            _apply_tg_profile(c, chat_id, profile)
+            break
 
 
 def _tg_online() -> str:
@@ -893,7 +931,7 @@ BOT = tgbot.Bot(_bot_settings, {
     "report": _tg_report, "usage": _tg_usage, "online": _tg_online, "clients": _tg_clients,
     "tunnels": _tg_tunnels, "backup": _tg_backup, "restart_xray": _tg_restart_xray,
     "cpu": sysmon.cpu_percent, "client_by_tg": _tg_client_by_tg,
-    "bind_tg": _tg_bind, "unlink_tg": _tg_unlink,
+    "bind_tg": _tg_bind, "unlink_tg": _tg_unlink, "touch_tg_profile": _tg_touch_profile,
 }, should_poll=_bot_should_poll)
 
 # Low-traffic threshold for one-shot user Telegram alert (GB remaining)
@@ -2209,6 +2247,15 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     client["enabled"] = form.get("enabled", "1") == "1"
     client["comment"] = str(form.get("comment") or "").strip()
     client["tg_id"] = str(form.get("tg_id") or "").strip()
+    client["tg_username"] = str(form.get("tg_username") or "").strip().lstrip("@")
+    client["tg_first_name"] = str(form.get("tg_first_name") or "").strip()
+    client["tg_last_name"] = str(form.get("tg_last_name") or "").strip()
+    fio = str(form.get("tg_fio") or "").strip()
+    if not fio:
+        fio = " ".join(x for x in (client["tg_first_name"], client["tg_last_name"]) if x).strip()
+    client["tg_fio"] = fio
+    if not client["tg_id"]:
+        client["tg_username"] = client["tg_first_name"] = client["tg_last_name"] = client["tg_fio"] = ""
     client["limit_gb"] = _float(form.get("limit_gb"))
     client["limit_ip"] = _int(form.get("limit_ip"))
     client["limit_hwid"] = _int(form.get("limit_hwid"))
@@ -3314,9 +3361,18 @@ async def settings_save(request: Request):
             # Password field: empty means "keep previous token"
             if not new_token:
                 new_token = str(tg.get("token") or "")
+            raw_admins = str(form.get("admin_ids") or "")
+            admin_ids: list[str] = []
+            seen: set[str] = set()
+            for part in re.split(r"[\s,;]+", raw_admins):
+                aid = part.strip().lstrip("@")
+                if not aid or aid in seen:
+                    continue
+                seen.add(aid)
+                admin_ids.append(aid)
             tg.update({
                 "enabled": form.get("enabled") == "1", "token": new_token,
-                "admin_ids": [x for x in _split_lines(str(form.get("admin_ids") or "").replace(" ", "\n"))],
+                "admin_ids": admin_ids,
                 "receive_commands": form.get("receive_commands") == "1",
                 "notify_login": form.get("notify_login") == "1", "notify_quota": form.get("notify_quota") == "1",
                 "notify_iplimit": form.get("notify_iplimit") == "1", "notify_tunnel": form.get("notify_tunnel") == "1",
@@ -3496,6 +3552,8 @@ def _public_client(store: dict, c: dict) -> dict:
         "limit_hwid": c.get("limit_hwid"), "hwid": hwid.status(c),
         "up": c["traffic"].get("up"), "down": c["traffic"].get("down"), "online": c["email"] in ONLINE,
         "last_online": c.get("last_online"), "comment": c.get("comment"), "tg_id": c.get("tg_id"),
+        "tg_username": c.get("tg_username"), "tg_fio": c.get("tg_fio"),
+        "tg_first_name": c.get("tg_first_name"), "tg_last_name": c.get("tg_last_name"),
         "sub_url": sub_url(c), "reset_period": c.get("reset_period"), "outbound_limits": c.get("outbound_limits"),
         "allowed_tags": c.get("allowed_tags"),
     }

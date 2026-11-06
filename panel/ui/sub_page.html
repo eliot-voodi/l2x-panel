@@ -37,10 +37,9 @@
     </div>
   </div>
 
-  {% if tg_enabled %}
   <div class="card">
     <h3>Telegram</h3>
-    {% if tg_linked %}
+    {% if tg_linked and tg_ready %}
     <div class="flex between" style="flex-wrap:wrap;gap:.75rem;align-items:center">
       <div>
         <span class="badge ok">привязан</span>
@@ -52,14 +51,19 @@
         <button class="btn ghost sm">Отвязать</button>
       </form>
     </div>
-    {% else %}
+    {% elif tg_ready %}
     <div class="hint">Привяжите Telegram, чтобы следить за сроком и трафиком и получать напоминания.</div>
     <form method="post" action="{{ sub_link.rstrip('/') }}/tg/link" class="mt">
       <button class="btn">Привязать Telegram{% if tg_bot %} · @{{ tg_bot }}{% endif %}</button>
     </form>
+    {% elif tg_configured %}
+    <div class="badge warn">бот не отвечает</div>
+    <div class="hint mt">Токен задан, но username бота не получен. Проверьте токен в панели: Настройки → Telegram.</div>
+    {% else %}
+    <div class="badge warn">бот не настроен</div>
+    <div class="hint mt">Администратор должен включить бота и указать токен: <b>Настройки → Telegram</b> — тогда здесь появится кнопка привязки.</div>
     {% endif %}
   </div>
-  {% endif %}
 
   <div class="card">
     <h3>Добавить в приложение</h3>

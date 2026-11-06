@@ -112,10 +112,11 @@
   {{ m.check('enabled', tg.enabled, 'Telegram-бот включён') }}
   {{ m.check('receive_commands', tg.receive_commands if tg.receive_commands is defined else True, 'Принимать команды (long polling) на этой панели') }}
   <div class="hint">Если один и тот же токен включён на нескольких нодах — оставьте polling только на master, иначе Telegram отвечает 409 Conflict и бот «молчит».</div>
-  <div class="row">
-    <div><label class="f">Токен бота</label><input name="token" value="{{ tg.token }}" type="password" autocomplete="off" placeholder="123456:ABC… (пусто = не менять)"></div>
-    <div><label class="f">Chat ID администраторов</label><input name="admin_ids" value="{{ tg.admin_ids|join(', ') }}" placeholder="узнать: /id в боте"></div>
-  </div>
+  <label class="f">Токен бота</label>
+  <input name="token" value="{{ tg.token }}" type="password" autocomplete="off" placeholder="123456:ABC… (пусто = не менять)" style="max-width:520px">
+  <label class="f">Chat ID администраторов (несколько)</label>
+  <textarea name="admin_ids" class="mono" rows="4" placeholder="По одному на строку или через запятую&#10;539690033&#10;123456789">{{ tg.admin_ids|join('\n') }}</textarea>
+  <div class="hint">Несколько админов: каждый пишет боту <code>/id</code> и присылает свой chat id. Все получают уведомления и могут команды. В боте: <code>/admins</code>.</div>
   <h3 class="mt">Уведомления</h3>
   {{ m.check('notify_login', tg.notify_login, 'Входы в панель') }}
   {{ m.check('notify_quota', tg.notify_quota, 'Истечение срока / исчерпание трафика / авто-сброс') }}

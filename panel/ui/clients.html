@@ -45,7 +45,7 @@
         <td>
           <div class="flex"><span class="dot {% if c.online_ips %}on{% endif %}" title="{{ c.online_ips|join(', ') if c.online_ips else 'был: ' ~ ago(c.last_online) }}"></span>
             <a href="{{ bp }}/clients/{{ c.email }}/edit"><b>{{ c.email }}</b></a></div>
-          <div class="dim small">{% if c.comment %}{{ c.comment }} · {% endif %}{% if c.online_ips %}{{ c.online_ips|length }} IP онлайн{% else %}{{ ago(c.last_online) }}{% endif %}{% if c.limit_ip %} · IP ≤ {{ c.limit_ip }}{% endif %}{% if c.tg_id %} · tg{% endif %}</div>
+          <div class="dim small">{% if c.comment %}{{ c.comment }} · {% endif %}{% if c.online_ips %}{{ c.online_ips|length }} IP онлайн{% else %}{{ ago(c.last_online) }}{% endif %}{% if c.limit_ip %} · IP ≤ {{ c.limit_ip }}{% endif %}{% if c.tg_id %} · tg {% if c.tg_username %}@{{ c.tg_username }}{% else %}{{ c.tg_id }}{% endif %}{% if c.tg_fio %} ({{ c.tg_fio }}){% endif %}{% endif %}</div>
         </td>
         <td>{{ m.status_badge(c.status) }}{% if c.reset_period %} <span class="badge" title="авто-сброс">↻ {{ c.reset_period }}</span>{% endif %}</td>
         <td class="small">
