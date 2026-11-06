@@ -29,12 +29,37 @@
       </div>
       <div class="grid g2" style="flex:1.4;min-width:280px">
         <div><div class="muted small">Трафик</div><div style="font-weight:650">{{ format_traffic(used) }} <span class="dim">/ {{ (client.limit_gb|string ~ ' GB') if client.limit_gb else '∞' }}</span></div>
-          {% if limit %}{% set pct = [100, (100 * used / limit)|int]|min %}<div class="bar {% if pct >= 90 %}danger{% elif pct >= 75 %}warn{% endif %}"><span style="width:{{ pct }}%"></span></div>{% endif %}</div>
+          {% if limit %}{% set pct = [100, (100 * used / limit)|int]|min %}<div class="bar {% if pct >= 90 %}danger{% elif pct >= 75 %}warn{% endif %}"><span style="width:{{ pct }}%"></span></div>{% endif %}
+          {% if remaining_gb is not none %}<div class="dim small">осталось {{ '%.2f'|format(remaining_gb) }} ГБ</div>{% endif %}</div>
         <div><div class="muted small">Действует до</div><div style="font-weight:650">{% if client.expire_at %}{{ fmt_dt(client.expire_at, False) }}{% elif client.start_on_first_use %}{{ client.duration_days }} дн с 1-го подключения{% else %}бессрочно{% endif %}</div>
           {% if days_left is not none and days_left > 0 %}<div class="dim small">осталось {{ '%.0f'|format(days_left) }} дн</div>{% endif %}</div>
       </div>
     </div>
   </div>
+
+  {% if tg_enabled %}
+  <div class="card">
+    <h3>Telegram</h3>
+    {% if tg_linked %}
+    <div class="flex between" style="flex-wrap:wrap;gap:.75rem;align-items:center">
+      <div>
+        <span class="badge ok">привязан</span>
+        <div class="hint mt" style="margin:0">В боте {% if tg_bot %}@{{ tg_bot }}{% endif %} смотрите срок и оставшиеся ГБ (/status).
+          Уведомления: за 3 дня до конца срока — раз в день; если осталось &lt; 5 ГБ — один раз.</div>
+      </div>
+      <form method="post" action="{{ sub_link.rstrip('/') }}/tg/unlink"
+            onsubmit="return confirm('Отвязать Telegram от этой подписки?')">
+        <button class="btn ghost sm">Отвязать</button>
+      </form>
+    </div>
+    {% else %}
+    <div class="hint">Привяжите Telegram, чтобы следить за сроком и трафиком и получать напоминания.</div>
+    <form method="post" action="{{ sub_link.rstrip('/') }}/tg/link" class="mt">
+      <button class="btn">Привязать Telegram{% if tg_bot %} · @{{ tg_bot }}{% endif %}</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
 
   <div class="card">
     <h3>Добавить в приложение</h3>

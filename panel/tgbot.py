@@ -40,6 +40,8 @@ class Bot:
         self._last_report = time.time()
         self._last_backup = time.time()
         self._last_cpu_alert = 0.0
+        self._username: str = ""
+        self._username_checked: float = 0.0
 
     # ------------------------------------------------------------ transport
     def _call(self, method: str, params: dict | None = None, timeout: int = 30) -> dict:
@@ -53,6 +55,27 @@ class Bot:
                 return json.loads(r.read())
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
+
+    def username(self) -> str:
+        """Bot @username from getMe (cached ~1h). Empty if bot disabled / unreachable."""
+        s = self.get_settings()
+        if not s.get("enabled") or not s.get("token"):
+            self._username = ""
+            return ""
+        now = time.time()
+        if self._username and now - self._username_checked < 3600:
+            return self._username
+        res = self._call("getMe", timeout=15)
+        user = (res.get("result") or {}) if res.get("ok") else {}
+        self._username = str(user.get("username") or "")
+        self._username_checked = now
+        return self._username
+
+    def deep_link(self, payload: str) -> str:
+        name = self.username()
+        if not name:
+            return ""
+        return f"https://t.me/{name}?start={urllib.parse.quote(payload)}"
 
     def send(self, text: str, chat_id: str | int | None = None) -> None:
         s = self.get_settings()
@@ -140,13 +163,55 @@ class Bot:
     def _handle(self, chat_id, text: str) -> None:
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@")[0].lower()
-        if cmd == "/start" or cmd == "/id":
-            self.send(f"Ваш chat id: <code>{chat_id}</code>\nДобавьте его в Настройки → Telegram, чтобы получать уведомления.", chat_id)
+        arg = arg.strip()
+        chat = str(chat_id)
+
+        if cmd == "/start":
+            if arg.startswith("bind_"):
+                _ok, msg = self.hooks["bind_tg"](arg[5:], chat)
+                self.send(msg, chat_id)
+                return
+            linked = self.hooks["client_by_tg"](chat)
+            if linked:
+                self.send(
+                    "✅ Подписка привязана.\n\n" + linked
+                    + "\n\nКоманды: /status — трафик и срок · /unlink — отвязать",
+                    chat_id,
+                )
+            else:
+                self.send(
+                    f"Ваш chat id: <code>{chat_id}</code>\n"
+                    "Привяжите аккаунт на странице подписки (кнопка Telegram) "
+                    "или добавьте id в карточку клиента / в Настройки → Telegram (админ).",
+                    chat_id,
+                )
             return
+
+        if cmd == "/id":
+            self.send(f"Ваш chat id: <code>{chat_id}</code>", chat_id)
+            return
+
+        if cmd == "/unlink":
+            _ok, msg = self.hooks["unlink_tg"](chat)
+            self.send(msg, chat_id)
+            return
+
         if not self._is_admin(chat_id):
-            client_info = self.hooks["client_by_tg"](str(chat_id))
-            self.send(client_info or "Нет доступа. Ваш id: " + str(chat_id), chat_id)
+            if cmd in ("/status", "/sub", "/help") or not cmd.startswith("/"):
+                client_info = self.hooks["client_by_tg"](chat)
+                if client_info:
+                    self.send(client_info + "\n\n/status · /unlink", chat_id)
+                else:
+                    self.send(
+                        "Подписка не привязана. Откройте страницу подписки в браузере "
+                        "и нажмите «Привязать Telegram».\nВаш id: <code>"
+                        + chat + "</code>",
+                        chat_id,
+                    )
+                return
+            self.send("Нет доступа. Ваш id: " + chat, chat_id)
             return
+
         if cmd == "/help":
             self.send(
                 "/status — состояние сервера\n/online — клиенты онлайн\n/usage email — трафик клиента\n"
@@ -157,7 +222,7 @@ class Bot:
         elif cmd == "/online":
             self.send(self.hooks["online"]() or "Никого онлайн", chat_id)
         elif cmd == "/usage":
-            self.send(self.hooks["usage"](arg.strip()) if arg.strip() else "Формат: /usage email", chat_id)
+            self.send(self.hooks["usage"](arg) if arg else "Формат: /usage email", chat_id)
         elif cmd == "/clients":
             self.send(self.hooks["clients"](), chat_id)
         elif cmd == "/tunnels":

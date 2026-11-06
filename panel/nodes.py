@@ -420,6 +420,69 @@ def agent_update_url(node: dict) -> str:
     return agent_endpoint(node, "agent/update")
 
 
+def agent_manage_url(node: dict) -> str:
+    return agent_endpoint(node, "agent/manage")
+
+
+def panel_login_url(node: dict) -> str:
+    """Public login URL for a registered node panel."""
+    base = (node.get("url") or "").rstrip("/")
+    if not base:
+        domain = (node.get("domain") or "").strip()
+        base = f"https://{domain}" if domain else ""
+    if not base:
+        return ""
+    bp = (node.get("base_path") or "").strip().strip("/")
+    return f"{base}/{bp}/login" if bp else f"{base}/login"
+
+
+def manage_request(node: dict, *, action: str = "", params: dict | None = None, timeout: int = 90) -> dict:
+    """Call remote /agent/manage (GET snapshot or POST action). Works on agent and master peers."""
+    url = agent_manage_url(node)
+    token = node.get("token") or ""
+    if not url or not token:
+        return {"ok": False, "error": "нет url/token ноды"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "L2XPanel-NodeManage/1.0",
+        "Accept": "application/json",
+    }
+    try:
+        if action:
+            body = json.dumps({"action": action, **(params or {})}, ensure_ascii=False).encode()
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                **headers, "Content-Type": "application/json",
+            })
+        else:
+            req = urllib.request.Request(url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return {"ok": resp.status < 300, "raw": raw[:800]}
+            if isinstance(parsed, dict):
+                parsed.setdefault("ok", resp.status < 300)
+                return parsed
+            return {"ok": True, "data": parsed}
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:800]
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        err = str(parsed.get("error") or body or f"HTTP {exc.code}")
+        if exc.code == 404:
+            err = "агент без /agent/manage — обновите панель на ноде"
+        return {"ok": False, "error": err, "status": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 def health_url(node: dict) -> str:
     """Public /health is outside the secret base_path."""
     base = (node.get("url") or "").rstrip("/")
@@ -1007,12 +1070,27 @@ def _remap_inbounds_drop_tags(inbounds: list[dict], drop_tags: set[str]) -> list
     return out
 
 
-def promote_snapshot(store: dict, target_node: dict) -> dict:
+def promote_l2tp_entries(store: dict) -> list[dict]:
+    """Copy L2TP tunnel configs for the new master (disconnected — ifaces are host-local)."""
+    out = []
+    for t in store.get("l2tp") or []:
+        item = json.loads(json.dumps(t))
+        item["status"] = "disconnected"
+        item["last_error"] = ""
+        for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf"):
+            item[k] = ""
+        item.pop("metrics", None)
+        out.append(item)
+    return out
+
+
+def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | None = None) -> dict:
     """Full master copy for the new master.
 
-    Transfers all outbounds/clients/routes/… except the outbound that pointed at
+    Transfers all outbounds/clients/routes/L2TP/… except the outbound that pointed at
     the target node itself (node_<slug>) — that tag is removed and every reference
-    to it is rewritten to ``direct``.
+    to it is rewritten to ``direct``. L2TP tunnels arrive disconnected; secrets are
+    passed plaintext in ``l2tp_secrets`` so the new host can re-encrypt with its key.
     """
     drop = {node_outbound_tag(target_node)}
     # Also drop by node_id match (tag may have been renamed)
@@ -1025,6 +1103,15 @@ def promote_snapshot(store: dict, target_node: dict) -> dict:
                 drop.add(tag)
             continue
         customs.append(json.loads(json.dumps(o)))  # deep copy
+    l2tp = promote_l2tp_entries(store)
+    secrets = {}
+    for name, sec in (l2tp_secrets or {}).items():
+        if not name or not isinstance(sec, dict):
+            continue
+        secrets[str(name)] = {
+            "password": str(sec.get("password") or ""),
+            "psk": str(sec.get("psk") or ""),
+        }
     return {
         "clients": _remap_clients_drop_tags(store.get("clients") or [], drop),
         "inbounds": _remap_inbounds_drop_tags(store.get("inbounds") or [], drop),
@@ -1033,9 +1120,11 @@ def promote_snapshot(store: dict, target_node: dict) -> dict:
         "outbounds_custom": customs,
         "dns": json.loads(json.dumps(store.get("dns") or {})),
         "xray_settings": json.loads(json.dumps(store.get("xray_settings") or {})),
-        # L2TP stays host-local — configs without running tunnels would break Xray
-        "l2tp": [],
+        "l2tp": l2tp,
+        "l2tp_secrets": secrets,
         "drop_outbound_tags": sorted(drop),
+        "transferred_custom": len(customs),
+        "transferred_l2tp": len(l2tp),
     }
 
 
@@ -1051,6 +1140,8 @@ def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_no
         "routes": master_store_snapshot.get("routes") or [],
         "balancers": master_store_snapshot.get("balancers") or {},
         "outbounds_custom": master_store_snapshot.get("outbounds_custom") or [],
+        "l2tp": master_store_snapshot.get("l2tp") or [],
+        "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
         "dns": master_store_snapshot.get("dns") or {},
         "xray_settings": master_store_snapshot.get("xray_settings") or {},
         "nodes": peers,
@@ -1115,7 +1206,7 @@ def promote_via_ssh(
         return {"ok": False, "error": f"SSH: {exc}"}
 
     try:
-        # Merge snapshot into remote store (clients/inbounds/routes/balancers/nodes)
+        # Merge snapshot into remote store (clients/inbounds/routes/balancers/l2tp/nodes)
         snap = {
             "clients": master_store_snapshot.get("clients") or [],
             "inbounds": master_store_snapshot.get("inbounds") or [],
@@ -1124,20 +1215,21 @@ def promote_via_ssh(
             "outbounds_custom": master_store_snapshot.get("outbounds_custom") or [],
             "dns": master_store_snapshot.get("dns") or {},
             "xray_settings": master_store_snapshot.get("xray_settings") or {},
-            "l2tp": [],  # L2TP stays local to each host
+            "l2tp": master_store_snapshot.get("l2tp") or [],
+            "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
             "nodes": [old_master_node],
         }
         sftp = client.open_sftp()
         with sftp.file("/tmp/l2x_promote.json", "w") as f:
             f.write(json.dumps(snap, ensure_ascii=False))
         promote_py = """
-import json, sys
+import base64, hashlib, json, os
 from pathlib import Path
+from cryptography.fernet import Fernet
 snap = json.loads(Path('/tmp/l2x_promote.json').read_text())
 store_path = Path('/var/lib/l2xpanel/store.json')
 store = json.loads(store_path.read_text()) if store_path.exists() else {}
-prev = dict((store.get('settings') or {}).get('nodes') or {})
-for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes'):
+for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes','l2tp'):
     if k in snap:
         store[k] = snap[k]
 ns = store.setdefault('settings', {}).setdefault('nodes', {})
@@ -1148,7 +1240,31 @@ ns['runtime_preserve'] = False
 tmp = store_path.with_suffix('.tmp')
 tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2))
 tmp.replace(store_path)
-print('promoted')
+secrets = snap.get('l2tp_secrets') or {}
+if secrets:
+    sk = (os.environ.get('SECRET_KEY') or '').strip()
+    if not sk:
+        for _p in (Path('/var/lib/l2xpanel/secret_key'), Path('/opt/l2xpanel/data/secret_key')):
+            if _p.exists():
+                sk = _p.read_text(encoding='utf-8').strip()
+                if sk:
+                    break
+    if not sk:
+        raise SystemExit('SECRET_KEY missing for l2tp_secrets')
+    f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(sk.encode()).digest()))
+    d = Path('/var/lib/l2xpanel/l2tp_secrets')
+    d.mkdir(parents=True, exist_ok=True)
+    for name, sec in secrets.items():
+        if not isinstance(sec, dict):
+            continue
+        payload = {
+            'password': f.encrypt((sec.get('password') or '').encode()).decode() if sec.get('password') else '',
+            'psk': f.encrypt((sec.get('psk') or '').encode()).decode() if sec.get('psk') else '',
+        }
+        p = d / f'{name}.json'
+        p.write_text(json.dumps(payload))
+        os.chmod(p, 0o600)
+print('promoted', 'l2tp', len(store.get('l2tp') or []), 'custom', len(store.get('outbounds_custom') or []))
 """
         with sftp.file("/tmp/l2x_promote.py", "w") as f:
             f.write(promote_py)

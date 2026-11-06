@@ -583,6 +583,21 @@ def client_used_bytes(client: dict) -> int:
     return int(t.get("up") or 0) + int(t.get("down") or 0)
 
 
+def client_remaining_bytes(client: dict) -> int | None:
+    """Bytes left until limit_gb; None if unlimited."""
+    limit = gb_to_bytes(client.get("limit_gb"))
+    if not limit:
+        return None
+    return max(0, int(limit) - client_used_bytes(client))
+
+
+def client_remaining_gb(client: dict) -> float | None:
+    left = client_remaining_bytes(client)
+    if left is None:
+        return None
+    return left / (1024 ** 3)
+
+
 def client_tag_used_bytes(client: dict, tag: str) -> int:
     by = ensure_client(client)["traffic"].get("by_email") or {}
     email = client.get("email") or ""
@@ -1272,6 +1287,8 @@ def reset_client_traffic(client: dict) -> None:
     client["traffic"]["up"] = client["traffic"]["down"] = 0
     client["quota_exceeded"] = False
     client["tag_exceeded"] = {}
+    # Allow a fresh one-shot low-traffic Telegram alert after reset
+    client.pop("tg_notify_low_gb", None)
 
 
 def _period_delta(period: str, base: datetime) -> datetime:

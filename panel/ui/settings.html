@@ -125,7 +125,9 @@
     <div><label class="f">Отчёт каждые, ч (0 — нет)</label><input name="report_hours" type="number" step="0.5" value="{{ tg.report_hours }}"></div>
     <div><label class="f">Бэкап каждые, ч (0 — нет)</label><input name="backup_hours" type="number" step="0.5" value="{{ tg.backup_hours }}"></div>
   </div>
-  <div class="hint">Команды: /status /report /online /clients /tunnels /usage &lt;email&gt; /backup /restart_xray. Клиент с указанным Telegram ID видит в боте свой трафик и срок.</div>
+  <div class="hint">Команды админа: /status /report /online /clients /tunnels /usage &lt;email&gt; /backup /restart_xray.
+    Клиент может <b>привязать Telegram на странице подписки</b> — в боте /status (срок, оставшиеся ГБ), /unlink.
+    Уведомления пользователю: за N дней до конца срока — раз в день; если осталось &lt; 5 ГБ — один раз (до сброса трафика).</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 

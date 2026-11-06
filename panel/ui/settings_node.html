@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Settings Node · {{ app_name }}{% endblock %}
+{% block page_title %}Settings Node{% endblock %}
+{% block page_sub %}Удалённое управление другой нодой: L2TP, Xray, настройки, логи, обновление{% endblock %}
+{% block content %}
+
+{% if not is_master %}
+<div class="card">
+  <div class="badge warn">Доступно только на master. Эта панель — agent.</div>
+</div>
+{% else %}
+
+<div class="card">
+  <h3>Выбор ноды</h3>
+  <div class="hint">Управление идёт по agent token ноды (работает и если удалённая панель сейчас master). Нужна версия ≥ 1.6.6.</div>
+  <form method="get" action="{{ bp }}/settings-node" class="row mt" style="align-items:end;max-width:720px">
+    <div style="flex:2">
+      <label class="f">Нода</label>
+      <select name="id" required onchange="this.form.submit()">
+        <option value="">— выберите —</option>
+        {% for n in items %}
+        <option value="{{ n.id }}" {% if node and node.id == n.id %}selected{% endif %}>
+          {{ n.name }} · {{ n.domain or n.url }}{% if n.panel_version %} · v{{ n.panel_version }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div><button class="btn ghost">Открыть</button></div>
+  </form>
+  {% if not items %}
+  <div class="empty mt">Нод нет — сначала добавьте на странице Nodes.</div>
+  {% endif %}
+</div>
+
+{% if node %}
+{% set snap = remote or {} %}
+{% set ok = snap.get('ok') %}
+{% set err = snap.get('error') %}
+
+<div class="card">
+  <div class="flex between" style="flex-wrap:wrap;gap:.75rem;align-items:center">
+    <div>
+      <h3 style="margin:0">{{ node.name }}</h3>
+      <div class="dim small mono">{{ node.domain or node.url }}{% if node.base_path %} · /{{ node.base_path }}/{% endif %}</div>
+    </div>
+    <div class="actions" style="flex-wrap:wrap">
+      {% if login_url %}
+      <a class="btn ghost sm" href="{{ login_url }}" target="_blank" rel="noopener">Открыть панель ↗</a>
+      {% endif %}
+      <form method="get" action="{{ bp }}/settings-node"><input type="hidden" name="id" value="{{ node.id }}"><button class="btn ghost sm">{{ ic.icon('refresh') }} Обновить</button></form>
+      <a class="btn ghost sm" href="{{ bp }}/nodes">Nodes</a>
+    </div>
+  </div>
+  {% if not ok %}
+  <div class="badge err mt" style="display:inline-block">{{ err or 'нет связи' }}</div>
+  {% else %}
+  <div class="row mt" style="gap:1rem;flex-wrap:wrap">
+    <div><span class="dim small">Роль</span><div><span class="badge {% if snap.role=='master' %}ok{% else %}warn{% endif %}">{{ snap.role or '?' }}</span></div></div>
+    <div><span class="dim small">Версия</span><div class="mono">{{ snap.version or '?' }}</div></div>
+    <div><span class="dim small">Xray</span><div>{% if (snap.xray or {}).running %}<span class="badge ok">up {{ (snap.xray or {}).version }}</span>{% else %}<span class="badge err">down</span>{% endif %}</div></div>
+    <div><span class="dim small">Клиенты</span><div class="mono">{{ (snap.counts or {}).clients or 0 }}</div></div>
+    <div><span class="dim small">L2TP</span><div class="mono">{{ (snap.counts or {}).l2tp_up or 0 }}/{{ (snap.counts or {}).l2tp or 0 }}</div></div>
+    <div><span class="dim small">Outbounds</span><div class="mono">{{ (snap.counts or {}).custom or 0 }}</div></div>
+  </div>
+  {% if snap.sys %}
+  {% set mem = snap.sys.mem or {} %}{% set dsk = snap.sys.disk or {} %}
+  <div class="row mt small dim" style="gap:1.2rem">
+    <span>CPU {{ (snap.sys.cpu or 0)|round(0) }}%</span>
+    <span>RAM {% if mem.total %}{{ ((mem.used or 0) * 100 / mem.total)|round(0) }}%{% else %}—{% endif %}</span>
+    <span>Disk {% if dsk.total %}{{ ((dsk.used or 0) * 100 / dsk.total)|round(0) }}%{% else %}—{% endif %}</span>
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+
+{% if ok %}
+<div class="tabs">
+  {% for k, l in [('overview','Обзор'), ('l2tp','L2TP'), ('settings','Настройки'), ('system','Система'), ('logs','Логи')] %}
+  <a href="{{ bp }}/settings-node?id={{ node.id }}&tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
+  {% endfor %}
+</div>
+
+{% if tab == 'overview' %}
+<div class="card">
+  <h3>Быстрые действия</h3>
+  <div class="actions" style="flex-wrap:wrap">
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="restart_xray"><button class="btn">Restart Xray</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="apply_xray"><button class="btn ghost">Apply config</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="refresh_l2tp"><button class="btn ghost">Refresh L2TP status</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" onsubmit="return confirm('Запустить select-best L2TP на ноде?')"><input type="hidden" name="action" value="select_best_l2tp"><button class="btn ghost">Select best L2TP</button></form>
+    <form method="post" action="{{ bp }}/nodes/{{ node.id }}/sync"><button class="btn ghost">Sync с мастера</button></form>
+  </div>
+  <div class="hint mt">Sync пушит конфиг с этого master. Остальные кнопки выполняются на удалённой ноде.</div>
+</div>
+<div class="card">
+  <h3>Сводка</h3>
+  <div class="mono small" style="white-space:pre-wrap">{{ snap.summary or '' }}</div>
+</div>
+
+{% elif tab == 'l2tp' %}
+<div class="card" style="padding:0">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Туннель</th><th>Сервер</th><th>Статус</th><th>IP</th><th class="right">Действия</th></tr></thead>
+    <tbody>
+    {% for t in snap.l2tp or [] %}
+      <tr>
+        <td><b>{{ t.name }}</b></td>
+        <td class="small mono">{{ t.server_host }}</td>
+        <td>{% if t.status == 'connected' %}<span class="badge ok">connected</span>{% elif t.status == 'error' %}<span class="badge err">error</span>{% else %}<span class="badge">{{ t.status or '—' }}</span>{% endif %}
+          {% if t.last_error %}<div class="dim small">{{ t.last_error[:80] }}</div>{% endif %}
+        </td>
+        <td class="small mono">{{ t.public_ip or '—' }}</td>
+        <td>
+          <div class="actions" style="justify-content:flex-end">
+            <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action">
+              <input type="hidden" name="action" value="l2tp_connect"><input type="hidden" name="name" value="{{ t.name }}">
+              <button class="btn ghost sm">Connect</button>
+            </form>
+            <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action">
+              <input type="hidden" name="action" value="l2tp_disconnect"><input type="hidden" name="name" value="{{ t.name }}">
+              <button class="btn ghost sm">Disconnect</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" class="empty">На ноде нет L2TP туннелей</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+{% elif tab == 'settings' %}
+{% set p = snap.panel or {} %}
+<form class="card" method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" style="max-width:820px">
+  <input type="hidden" name="action" value="save_panel">
+  <h3>Панель на ноде</h3>
+  <div class="row">
+    <div><label class="f">Название</label><input name="title" value="{{ p.title or '' }}"></div>
+    <div><label class="f">Публичный домен</label><input name="public_host" value="{{ p.public_host or '' }}" required></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Язык</label><select name="lang"><option value="ru">Русский</option><option value="en" {% if p.lang=='en' %}selected{% endif %}>English</option></select></div>
+    <div><label class="f">Тема</label><select name="theme"><option value="dark">Тёмная</option><option value="light" {% if p.theme=='light' %}selected{% endif %}>Светлая</option></select></div>
+    <div><label class="f">Часовой пояс</label><input name="timezone" value="{{ p.timezone or '' }}"></div>
+  </div>
+  <label class="f">Секретный путь (base_path)</label>
+  <input name="base_path" value="{{ p.base_path or '' }}" class="mono" pattern="[A-Za-z0-9_-]*">
+  <div class="hint">Смена base_path меняет URL агента — обновите base_path/token у ноды в Nodes после сохранения.</div>
+  <div class="actions mt"><button class="btn">Сохранить на ноде</button></div>
+</form>
+
+<form class="card" method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" style="max-width:520px"
+      onsubmit="return confirm('Сменить пароль админа на ноде {{ node.name }}?')">
+  <input type="hidden" name="action" value="set_admin_password">
+  <h3>Пароль админа ноды</h3>
+  <div class="hint">Логин: <code>{{ snap.admin_user or 'admin' }}</code></div>
+  <label class="f">Новый пароль (≥8)</label>
+  <input name="password" type="password" minlength="8" required autocomplete="new-password">
+  <div class="actions mt"><button class="btn danger">Сменить пароль</button></div>
+</form>
+
+{% elif tab == 'system' %}
+<div class="card">
+  <h3>Система</h3>
+  <div class="actions" style="flex-wrap:wrap">
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" onsubmit="return confirm('Обновить панель на ноде до последнего релиза?')">
+      <input type="hidden" name="action" value="update_panel"><button class="btn">Обновить панель</button>
+    </form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" onsubmit="return confirm('Принудительно сделать эту ноду MASTER?')">
+      <input type="hidden" name="action" value="restore_master"><button class="btn ghost">Restore MASTER на ноде</button>
+    </form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action">
+      <input type="hidden" name="action" value="restart_panel"><button class="btn ghost">Restart l2xpanel</button>
+    </form>
+  </div>
+  <div class="hint mt">Update ставит релиз через встроенный updater ноды. Restore MASTER — аварийный возврат роли на удалённой панели.</div>
+</div>
+
+{% elif tab == 'logs' %}
+<div class="card">
+  <form method="get" action="{{ bp }}/settings-node" class="row" style="align-items:end;max-width:640px">
+    <input type="hidden" name="id" value="{{ node.id }}">
+    <input type="hidden" name="tab" value="logs">
+    <div>
+      <label class="f">Источник</label>
+      <select name="src">
+        {% for s in ['xray','panel','l2tp','access'] %}
+        <option value="{{ s }}" {% if log_src==s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div style="max-width:100px"><label class="f">Строк</label><input name="n" type="number" value="{{ log_n }}" min="50" max="2000"></div>
+    <div style="flex:1"><label class="f">Фильтр</label><input name="q" value="{{ log_q }}" placeholder="grep"></div>
+    <div><button class="btn ghost">Показать</button></div>
+  </form>
+  <pre class="mono small mt" style="max-height:480px;overflow:auto;background:var(--bg);padding:1rem;border-radius:10px;border:1px solid var(--border)">{{ log_text or '(пусто)' }}</pre>
+</div>
+{% endif %}
+{% endif %}{# ok #}
+{% endif %}{# node #}
+{% endif %}{# is_master #}
+{% endblock %}

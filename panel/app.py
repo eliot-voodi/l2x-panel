@@ -782,17 +782,78 @@ def _tg_usage(email: str) -> str:
 
 def _client_summary(c: dict) -> str:
     used = xray.client_used_bytes(c)
-    limit = f"{c['limit_gb']:g} ГБ" if c.get("limit_gb") else "∞"
-    return (f"<b>{c['email']}</b> — {xray.client_status(c)}\n"
-            f"Трафик: {xray.format_traffic(used)} / {limit}\n"
-            f"Срок: {fmt_dt(c.get('expire_at'))}\n"
-            f"Онлайн: {'да' if c['email'] in ONLINE else 'нет'} · последний {ago(c.get('last_online'))}")
+    rem = xray.client_remaining_gb(c)
+    if c.get("limit_gb"):
+        traffic = f"Трафик: {xray.format_traffic(used)} / {c['limit_gb']:g} ГБ"
+        if rem is not None:
+            traffic += f"\nОсталось: <b>{rem:.2f} ГБ</b>"
+    else:
+        traffic = f"Трафик: {xray.format_traffic(used)} / ∞"
+    left = xray.days_left(c)
+    if c.get("expire_at"):
+        expire = f"Срок: {fmt_dt(c.get('expire_at'))}"
+        if left is not None and left > 0:
+            expire += f"\nОсталось: <b>{left:.0f} дн</b>"
+        elif left is not None and left <= 0:
+            expire += "\n<b>срок истёк</b>"
+    elif c.get("start_on_first_use"):
+        expire = f"Срок: {c.get('duration_days') or '?'} дн с 1-го подключения"
+    else:
+        expire = "Срок: бессрочно"
+    return (
+        f"<b>{c['email']}</b> — {xray.client_status(c)}\n"
+        f"{traffic}\n{expire}\n"
+        f"Онлайн: {'да' if c['email'] in ONLINE else 'нет'} · последний {ago(c.get('last_online'))}"
+    )
 
 
 def _tg_client_by_tg(chat_id: str) -> str:
     store = _load_store()
     c = next((x for x in store["clients"] if str(x.get("tg_id") or "") == chat_id), None)
     return _client_summary(c) if c else ""
+
+
+def _tg_bind(bind_token: str, chat_id: str) -> tuple[bool, str]:
+    token = (bind_token or "").strip()
+    if not token or len(token) < 8:
+        return False, "Некорректная ссылка привязки. Откройте страницу подписки снова."
+    now = datetime.now(timezone.utc)
+    with mutate() as store:
+        target = None
+        for c in store.get("clients") or []:
+            b = c.get("tg_bind") or {}
+            if not b.get("token") or not secrets.compare_digest(str(b.get("token")), token):
+                continue
+            exp = xray.parse_expire_at(b.get("exp"))
+            if exp and now > exp:
+                c.pop("tg_bind", None)
+                return False, "Ссылка устарела. Нажмите «Привязать Telegram» на странице подписки ещё раз."
+            target = c
+            break
+        if not target:
+            return False, "Ссылка не найдена или уже использована."
+        # One Telegram account → one client
+        for c in store.get("clients") or []:
+            if c is not target and str(c.get("tg_id") or "") == str(chat_id):
+                c["tg_id"] = ""
+        target["tg_id"] = str(chat_id)
+        target.pop("tg_bind", None)
+        email = target.get("email") or ""
+        summary = _client_summary(target)
+    return True, f"✅ Telegram привязан к <b>{email}</b>\n\n{summary}\n\n/status — статус · /unlink — отвязать"
+
+
+def _tg_unlink(chat_id: str) -> tuple[bool, str]:
+    with mutate() as store:
+        found = False
+        for c in store.get("clients") or []:
+            if str(c.get("tg_id") or "") == str(chat_id):
+                c["tg_id"] = ""
+                c.pop("tg_bind", None)
+                found = True
+        if not found:
+            return False, "К этому Telegram ничего не привязано."
+    return True, "Telegram отвязан от подписки."
 
 
 def _tg_online() -> str:
@@ -824,7 +885,11 @@ BOT = tgbot.Bot(_bot_settings, {
     "report": _tg_report, "usage": _tg_usage, "online": _tg_online, "clients": _tg_clients,
     "tunnels": _tg_tunnels, "backup": _tg_backup, "restart_xray": _tg_restart_xray,
     "cpu": sysmon.cpu_percent, "client_by_tg": _tg_client_by_tg,
+    "bind_tg": _tg_bind, "unlink_tg": _tg_unlink,
 })
+
+# Low-traffic threshold for one-shot user Telegram alert (GB remaining)
+TG_LOW_GB = 5.0
 
 
 def _notify_events(events: list[dict]) -> None:
@@ -839,6 +904,18 @@ def _notify_events(events: list[dict]) -> None:
                 "auto_reset": f"🔄 {e['email']}: трафик сброшен по расписанию",
             }[typ]
             BOT.send(text)
+            # Also notify the linked subscriber
+            email = e.get("email")
+            if email and typ in ("expired", "quota_exceeded", "auto_reset"):
+                store = _load_store()
+                c = next((x for x in store.get("clients") or [] if x.get("email") == email), None)
+                if c and c.get("tg_id"):
+                    user_text = {
+                        "expired": f"⏰ Срок вашей подписки <b>{email}</b> истёк.",
+                        "quota_exceeded": f"📛 Трафик по подписке <b>{email}</b> исчерпан.",
+                        "auto_reset": f"🔄 Трафик по подписке <b>{email}</b> сброшен по расписанию.",
+                    }[typ]
+                    BOT.send(user_text + "\n\n" + _client_summary(c), c["tg_id"])
         elif typ == "ip_ban" and s.get("notify_iplimit"):
             BOT.send(f"🚫 {e['email']}: превышен лимит IP, заблокирован {e['ip']}")
         elif typ == "tunnel_down" and s.get("notify_tunnel"):
@@ -846,18 +923,69 @@ def _notify_events(events: list[dict]) -> None:
 
 
 def _expiry_warnings(store: dict) -> None:
+    """Daily expiry warnings (≤ N days) + one-shot low-traffic (<5 GB) to linked Telegram."""
     s = _bot_settings()
-    days = _float(s.get("notify_expire_days"), 0)
-    if not days:
+    if not s.get("enabled"):
         return
+    days = _float(s.get("notify_expire_days"), 3)
+    if days <= 0:
+        days = 3
     today = datetime.now(timezone.utc).date().isoformat()
-    for c in store["clients"]:
-        left = xray.days_left(c)
-        if left is not None and 0 < left <= days and _expiry_notified.get(c["email"]) != today:
-            _expiry_notified[c["email"]] = today
-            BOT.send(f"⌛ {c['email']}: срок истекает через {left:.1f} дн ({fmt_dt(c['expire_at'])})")
-            if c.get("tg_id"):
-                BOT.send(f"⌛ Ваша подписка истекает {fmt_dt(c['expire_at'])}", c["tg_id"])
+    pending: list[tuple[str | None, str]] = []  # (chat_id or None=admins, text)
+    with STORE_LOCK:
+        st = _load_store()
+        changed = False
+        for c in st.get("clients") or []:
+            tg = str(c.get("tg_id") or "").strip()
+            left = xray.days_left(c)
+            # --- expiry: once per day while within window ---
+            if left is not None and 0 < left <= days and c.get("tg_notify_expire_on") != today:
+                rem = xray.client_remaining_gb(c)
+                rem_txt = f"\nОсталось трафика: <b>{rem:.2f} ГБ</b>" if rem is not None else ""
+                sent = False
+                if tg:
+                    pending.append((
+                        tg,
+                        f"⌛ Подписка <b>{c['email']}</b> истекает через <b>{left:.0f} дн</b>\n"
+                        f"Дата: {fmt_dt(c.get('expire_at'))}{rem_txt}\n\n/status — актуальный статус",
+                    ))
+                    sent = True
+                if s.get("notify_quota"):
+                    pending.append((
+                        None,
+                        f"⌛ {c['email']}: срок истекает через {left:.0f} дн ({fmt_dt(c.get('expire_at'))})",
+                    ))
+                    sent = True
+                if sent:
+                    c["tg_notify_expire_on"] = today
+                    _expiry_notified[c["email"]] = today
+                    changed = True
+            # --- low traffic: once until reset / top-up ---
+            rem_gb = xray.client_remaining_gb(c)
+            if rem_gb is not None and rem_gb < TG_LOW_GB:
+                if not c.get("tg_notify_low_gb"):
+                    sent = False
+                    if tg:
+                        pending.append((
+                            tg,
+                            f"📉 По подписке <b>{c['email']}</b> осталось меньше 5 ГБ\n"
+                            f"Сейчас: <b>{rem_gb:.2f} ГБ</b>\n"
+                            f"Срок: {fmt_dt(c.get('expire_at')) or 'бессрочно'}\n\n/status — актуальный статус",
+                        ))
+                        sent = True
+                    if s.get("notify_quota"):
+                        pending.append((None, f"📉 {c['email']}: осталось {rem_gb:.2f} ГБ (&lt; {TG_LOW_GB:g})"))
+                        sent = True
+                    if sent:
+                        c["tg_notify_low_gb"] = True
+                        changed = True
+            elif rem_gb is not None and rem_gb >= TG_LOW_GB and c.get("tg_notify_low_gb"):
+                c.pop("tg_notify_low_gb", None)
+                changed = True
+        if changed:
+            _save_store(st)
+    for chat, text in pending:
+        BOT.send(text, chat)
 
 
 def _watchdog_cycle() -> None:
@@ -1384,11 +1512,18 @@ def _sub_response(request: Request, token: str) -> Response:
     eps = xray.client_endpoints(store, client, s.get("domain") or None)
     if fmt == "html":
         links = [P.endpoint_to_link(e) for e in eps]
+        tg_s = store["settings"].get("tg") or {}
+        tg_enabled = bool(tg_s.get("enabled") and tg_s.get("token") and BOT.username())
+        rem_gb = xray.client_remaining_gb(client)
+        rem_bytes = xray.client_remaining_bytes(client)
         return templates.TemplateResponse("sub_page.html", {
             "request": request, "client": client, "links": list(zip(eps, links)), "sub_link": sub_url(client),
             "status": xray.client_status(client), "used": xray.client_used_bytes(client), "settings": s,
             "app_name": app_title(), "qr_svg": qr_svg, "format_traffic": xray.format_traffic, "fmt_dt": fmt_dt,
             "days_left": xray.days_left(client), "theme": "dark", "bp": "", "hwid": hwid.status(client),
+            "tg_enabled": tg_enabled, "tg_linked": bool(client.get("tg_id")),
+            "tg_bot": BOT.username(), "remaining_gb": rem_gb, "remaining_bytes": rem_bytes,
+            "sub_token": client.get("sub_token") or token,
         }, headers={"cache-control": "no-store"})
     if not xray.client_access_ok(client):
         return PlainTextResponse(xray.client_status(client), status_code=403, headers=headers)
@@ -1439,12 +1574,75 @@ def sub_main(token: str, request: Request):
     return _sub_response(request, token)
 
 
+@app.post("/sub/{token}/tg/link")
+def sub_tg_link(token: str, request: Request):
+    """Start Telegram bind: create one-time token and redirect to t.me/bot?start=bind_…"""
+    store = _load_store()
+    s = store["settings"].get("sub") or {}
+    if not s.get("enabled", True):
+        return PlainTextResponse("subscriptions disabled", status_code=404)
+    client = _find_by_token(store, token)
+    if not client:
+        return PlainTextResponse("not found", status_code=404)
+    tg_s = store["settings"].get("tg") or {}
+    if not (tg_s.get("enabled") and tg_s.get("token")):
+        return PlainTextResponse("Telegram-бот выключен", status_code=400)
+    deep = ""
+    with mutate() as st:
+        c = _find_by_token(st, token)
+        if not c:
+            return PlainTextResponse("not found", status_code=404)
+        bind = secrets.token_urlsafe(18)
+        c["tg_bind"] = {
+            "token": bind,
+            "exp": (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat(timespec="seconds"),
+        }
+        deep = BOT.deep_link(f"bind_{bind}")
+    if not deep:
+        return PlainTextResponse(
+            "Не удалось получить username бота. Проверьте токен в Настройки → Telegram.",
+            status_code=502,
+        )
+    return RedirectResponse(deep, status_code=303)
+
+
+@app.post("/sub/{token}/tg/unlink")
+def sub_tg_unlink(token: str, request: Request):
+    store = _load_store()
+    client = _find_by_token(store, token)
+    if not client:
+        return PlainTextResponse("not found", status_code=404)
+    with mutate() as st:
+        c = _find_by_token(st, token)
+        if c:
+            c["tg_id"] = ""
+            c.pop("tg_bind", None)
+    # Back to HTML sub page
+    return RedirectResponse(sub_url(client) + "?format=html", status_code=303)
+
+
 @sub_app.get("/{path}/{token}")
 def sub_dedicated(path: str, token: str, request: Request):
     expected = ((SETTINGS_CACHE.get("sub") or {}).get("path") or "sub").strip("/")
     if path != expected:
         return PlainTextResponse("not found", status_code=404)
     return _sub_response(request, token)
+
+
+@sub_app.post("/{path}/{token}/tg/link")
+def sub_dedicated_tg_link(path: str, token: str, request: Request):
+    expected = ((SETTINGS_CACHE.get("sub") or {}).get("path") or "sub").strip("/")
+    if path != expected:
+        return PlainTextResponse("not found", status_code=404)
+    return sub_tg_link(token, request)
+
+
+@sub_app.post("/{path}/{token}/tg/unlink")
+def sub_dedicated_tg_unlink(path: str, token: str, request: Request):
+    expected = ((SETTINGS_CACHE.get("sub") or {}).get("path") or "sub").strip("/")
+    if path != expected:
+        return PlainTextResponse("not found", status_code=404)
+    return sub_tg_unlink(token, request)
 
 
 @app.get("/health")
@@ -3456,6 +3654,114 @@ def nodes_page(request: Request):
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
 
 
+@app.get("/settings-node", response_class=HTMLResponse)
+def settings_node_page(request: Request):
+    """Remote full control console for a registered node (Settings Node)."""
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    with mutate() as st:
+        nodes_mod.ensure_list(st)
+        nodes_mod.agent_token(st)
+    store = _load_store()
+    items = nodes_mod.ensure_list(store)
+    is_master = nodes_mod.is_master(store)
+    node_id = (request.query_params.get("id") or "").strip()
+    tab = (request.query_params.get("tab") or "overview").strip() or "overview"
+    node = next((n for n in items if n.get("id") == node_id), None) if node_id else None
+    remote: dict = {}
+    login_url = ""
+    log_text = log_src = log_q = ""
+    log_n = 300
+    if is_master and node:
+        login_url = nodes_mod.panel_login_url(node)
+        if tab == "logs":
+            log_src = (request.query_params.get("src") or "xray").strip() or "xray"
+            log_n = max(50, min(2000, _int(request.query_params.get("n"), 300)))
+            log_q = request.query_params.get("q") or ""
+            remote = nodes_mod.manage_request(
+                node, action="get_logs",
+                params={"src": log_src, "n": log_n, "q": log_q},
+                timeout=45,
+            )
+            log_text = remote.get("text") or remote.get("error") or ""
+            # still fetch snapshot for header
+            snap = nodes_mod.manage_request(node, timeout=25)
+            if snap.get("ok"):
+                remote = {**snap, **remote, "ok": True}
+        else:
+            remote = nodes_mod.manage_request(node, timeout=30)
+            if remote.get("ok") and remote.get("version"):
+                with mutate() as st:
+                    for n in nodes_mod.ensure_list(st):
+                        if n.get("id") == node["id"]:
+                            n["panel_version"] = str(remote.get("version") or "")
+                            break
+                node = dict(node)
+                node["panel_version"] = str(remote.get("version") or "")
+    return page(
+        request, "settings_node.html", active="settings_node",
+        items=items, node=node, remote=remote, is_master=is_master,
+        tab=tab, login_url=login_url,
+        log_text=log_text, log_src=log_src or "xray", log_n=log_n, log_q=log_q,
+    )
+
+
+@app.post("/settings-node/{node_id}/action")
+async def settings_node_action(node_id: str, request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        flash(request, "Только master может управлять нодами", "error")
+        return go("/settings-node")
+    node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
+    if not node:
+        flash(request, "Нода не найдена", "error")
+        return go("/settings-node")
+    form = await request.form()
+    action = str(form.get("action") or "").strip()
+    params = {k: str(v) for k, v in form.items() if k != "action"}
+    # Map form fields for save_panel / password
+    tab = "overview"
+    if action == "save_panel":
+        tab = "settings"
+    elif action == "set_admin_password":
+        tab = "settings"
+    elif action.startswith("l2tp") or action in ("refresh_l2tp", "select_best_l2tp"):
+        tab = "l2tp"
+    elif action in ("update_panel", "restore_master", "restart_panel"):
+        tab = "system"
+    res = nodes_mod.manage_request(node, action=action, params=params, timeout=120)
+    if res.get("ok"):
+        msg = res.get("error") or f"{action}: ok"
+        if action == "update_panel" and res.get("started"):
+            msg = "Обновление панели на ноде запущено"
+        elif action == "select_best_l2tp":
+            msg = "Select-best L2TP запущен на ноде"
+        elif action == "set_admin_password":
+            msg = "Пароль админа на ноде обновлён"
+        elif action == "save_panel":
+            msg = "Настройки панели на ноде сохранены"
+            # keep local registry base_path in sync if changed
+            new_bp = str(params.get("base_path") or "").strip().strip("/")
+            new_host = str(params.get("public_host") or "").strip()
+            with mutate() as st:
+                for n in nodes_mod.ensure_list(st):
+                    if n.get("id") != node_id:
+                        continue
+                    if new_bp:
+                        n["base_path"] = new_bp
+                    if new_host:
+                        n["domain"] = new_host
+                        n["url"] = f"https://{new_host}"
+                    break
+        flash(request, msg if msg != f"{action}: ok" else f"Нода {node.get('name')}: {action} — ok", "info")
+    else:
+        flash(request, f"{node.get('name')}: {res.get('error') or 'ошибка'}", "error")
+    return go(f"/settings-node?id={node_id}&tab={tab}")
+
+
 @app.post("/nodes/add")
 async def nodes_add(request: Request):
     """Manual add (URL + token) — kept for already-installed agents."""
@@ -3778,12 +4084,22 @@ async def nodes_action(node_id: str, action: str, request: Request):
             }
             nodes_mod.ensure_bridge(old)
             # Full master data → new master; outbound to THIS node remapped to direct
-            snap = nodes_mod.promote_snapshot(store, node)
+            l2tp_secrets = {}
+            for t in store.get("l2tp") or []:
+                tname = t.get("name")
+                if not tname:
+                    continue
+                pw, psk = _load_l2tp_secrets(tname)
+                if pw or psk:
+                    l2tp_secrets[tname] = {"password": pw, "psk": psk}
+            snap = nodes_mod.promote_snapshot(store, node, l2tp_secrets=l2tp_secrets)
             peers = [nodes_mod._peer_node_export(n) for n in nodes if n.get("id") != node.get("id")]
             node_copy = dict(node)
             use_api = bool(node.get("mirror")) and not ssh_password
             name = node["name"]
             drop_tags = snap.get("drop_outbound_tags") or [nodes_mod.node_outbound_tag(node)]
+            n_custom = int(snap.get("transferred_custom") or 0)
+            n_l2tp = int(snap.get("transferred_l2tp") or 0)
 
         def job():
             import time as _time
@@ -3829,7 +4145,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "ok": True,
                 "log": "\n".join(x for x in log_lines if x)
                 + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."
-                + f"\nOutbound {', '.join(drop_tags)} → direct; остальные outbounds перенесены."
+                + f"\nOutbound {', '.join(drop_tags)} → direct;"
+                + f" перенесено custom={n_custom}, l2tp={n_l2tp} (туннели disconnected — Connect на новом master)."
                 + "\nСтарый master стал agent с runtime_preserve (трафик не срезается).",
             }
 
@@ -3913,6 +4230,239 @@ def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
     return store, None
 
 
+def _agent_manage_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Bearer agent_token auth for remote management — works even when this host is master."""
+    store = _load_store()
+    ns = store["settings"].get("nodes") or {}
+    auth = request.headers.get("authorization") or ""
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    expected = ns.get("agent_token") or ""
+    if not expected or not token or not secrets.compare_digest(token, expected):
+        return None, JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return store, None
+
+
+def _manage_snapshot(store: dict) -> dict:
+    """Compact remote state for Settings Node console."""
+    # Live iface status into a working copy (do not persist here)
+    store = json.loads(json.dumps(store))
+    try:
+        refresh_statuses(store)
+    except Exception:
+        pass
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    panel = (store.get("settings") or {}).get("panel") or {}
+    l2tp_rows = []
+    for t in store.get("l2tp") or []:
+        l2tp_rows.append({
+            "name": t.get("name"),
+            "server_host": t.get("server_host") or "",
+            "status": t.get("status") or "disconnected",
+            "public_ip": t.get("public_ip") or "",
+            "last_error": (t.get("last_error") or "")[:200],
+            "psk_set": bool(t.get("psk_set")),
+            "outbound": t.get("outbound") or f"l2tp_{t.get('name')}",
+        })
+    up = sum(1 for t in l2tp_rows if t.get("status") == "connected")
+    xs = xray.xray_status()
+    try:
+        snap_sys = sysmon.snapshot()
+    except Exception:
+        snap_sys = {}
+    bp = (panel.get("base_path") or "").strip().strip("/")
+    host = (panel.get("public_host") or public_host() or "").strip()
+    summary = (
+        f"role={ns.get('role') or ('agent' if ns.get('agent_enabled') else 'master')} "
+        f"ver={panel_version()} host={host} path=/{bp}/\n"
+        f"clients={len(store.get('clients') or [])} "
+        f"inbounds={len(store.get('inbounds') or [])} "
+        f"l2tp={up}/{len(l2tp_rows)} "
+        f"custom={len(store.get('outbounds_custom') or [])} "
+        f"routes={len(store.get('routes') or [])}"
+    )
+    return {
+        "ok": True,
+        "role": ns.get("role") or ("agent" if ns.get("agent_enabled") else "master"),
+        "agent_enabled": bool(ns.get("agent_enabled")),
+        "mirror": bool(ns.get("mirror")),
+        "runtime_preserve": bool(ns.get("runtime_preserve")),
+        "version": panel_version(),
+        "panel": {
+            "title": panel.get("title") or "",
+            "public_host": host,
+            "base_path": bp,
+            "lang": panel.get("lang") or "ru",
+            "theme": panel.get("theme") or "dark",
+            "timezone": panel.get("timezone") or "",
+        },
+        "admin_user": (_admin() or {}).get("username") or "admin",
+        "counts": {
+            "clients": len(store.get("clients") or []),
+            "inbounds": len(store.get("inbounds") or []),
+            "l2tp": len(l2tp_rows),
+            "l2tp_up": up,
+            "custom": len(store.get("outbounds_custom") or []),
+            "routes": len(store.get("routes") or []),
+        },
+        "l2tp": l2tp_rows,
+        "xray": xs,
+        "sys": snap_sys,
+        "summary": summary,
+    }
+
+
+def _manage_action(action: str, payload: dict) -> dict:
+    """Execute a remote-management action on this host."""
+    action = (action or "").strip()
+    if action in ("", "snapshot", "status"):
+        return _manage_snapshot(_load_store())
+
+    if action == "restart_xray":
+        r = ops.xray_control("restart")
+        return {"ok": bool(r.get("ok")), "error": "" if r.get("ok") else (r.get("stderr") or "restart failed"), "result": r}
+
+    if action == "apply_xray":
+        res = _apply_xray(_load_store())
+        return {"ok": bool(res.get("ok")), "error": res.get("error") or ""}
+
+    if action == "refresh_l2tp":
+        with mutate() as st:
+            refresh_statuses(st)
+        return _manage_snapshot(_load_store())
+
+    if action == "l2tp_connect":
+        name = str(payload.get("name") or "").strip()
+        store = _load_store()
+        item = next((x for x in store.get("l2tp") or [] if x.get("name") == name), None)
+        if not item:
+            return {"ok": False, "error": f"l2tp {name} not found"}
+        result = connect_l2tp(item)
+        with mutate() as fresh:
+            it = next((x for x in fresh["l2tp"] if x["name"] == name), None)
+            if it:
+                if result.get("ok"):
+                    it.update({k: item.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf")})
+                    it["status"], it["last_error"] = "connected", ""
+                else:
+                    it["status"], it["last_error"] = "disconnected", result.get("error", "connect failed")
+        if result.get("ok"):
+            _apply_xray(_load_store())
+        return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "name": name}
+
+    if action == "l2tp_disconnect":
+        name = str(payload.get("name") or "").strip()
+        with mutate() as store:
+            item = next((x for x in store.get("l2tp") or [] if x.get("name") == name), None)
+            if not item:
+                return {"ok": False, "error": f"l2tp {name} not found"}
+            result = disconnect_l2tp(item, store)
+            item["status"] = "disconnected"
+            for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
+                item[key] = ""
+            item["last_error"] = "" if result.get("ok") else result.get("error", "")
+        _apply_xray(_load_store())
+        return {"ok": True, "error": "", "name": name}
+
+    if action == "select_best_l2tp":
+        def job():
+            return select_best_l2tp(force=True)
+        jid = ops.start_job("remote-l2tp-best", job)
+        return {"ok": True, "job_id": jid, "error": ""}
+
+    if action == "save_panel":
+        with mutate() as st:
+            p = st.setdefault("settings", {}).setdefault("panel", {})
+            if "title" in payload:
+                p["title"] = str(payload.get("title") or "").strip()
+            if "public_host" in payload:
+                host = str(payload.get("public_host") or "").strip()
+                if host:
+                    p["public_host"] = host
+            if "lang" in payload:
+                p["lang"] = str(payload.get("lang") or "ru")
+            if "theme" in payload:
+                p["theme"] = str(payload.get("theme") or "dark")
+            if "timezone" in payload:
+                p["timezone"] = str(payload.get("timezone") or "").strip()
+            if "base_path" in payload:
+                bp = str(payload.get("base_path") or "").strip().strip("/")
+                if bp and SLUG_RE.match(bp):
+                    p["base_path"] = bp
+        _refresh_settings_cache()
+        try:
+            _sync_servers()
+        except Exception:
+            pass
+        return {"ok": True, "error": "", **_manage_snapshot(_load_store())}
+
+    if action == "set_admin_password":
+        password = str(payload.get("password") or "")
+        if len(password) < 8:
+            return {"ok": False, "error": "пароль минимум 8 символов"}
+        admin = _admin()
+        admin["password_hash"] = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        _save_admin(admin)
+        return {"ok": True, "error": ""}
+
+    if action == "update_panel":
+        running = PANEL_UPDATE_JOB.get("id")
+        if running and ops.JOBS.get(running, {}).get("status") == "running":
+            return {"ok": True, "started": False, "already": True, "current": panel_version()}
+        PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-remote", ops.update_panel)
+        return {"ok": True, "started": True, "current": panel_version()}
+
+    if action == "restore_master":
+        with mutate() as st:
+            ns = st.setdefault("settings", {}).setdefault("nodes", {})
+            ns["agent_enabled"] = False
+            ns["role"] = "master"
+            ns["runtime_preserve"] = False
+            ns["mirror"] = False
+        xr = _apply_xray(_load_store())
+        return {"ok": bool(xr.get("ok")), "error": xr.get("error") or "", "role": "master"}
+
+    if action == "restart_panel":
+        # Delayed restart so the HTTP response can leave
+        def _restart():
+            import time as _t
+            _t.sleep(1.5)
+            return ops._run(["systemctl", "restart", "l2xpanel"], 30)
+        ops.start_job("panel-restart-remote", _restart)
+        return {"ok": True, "error": "", "restarting": True}
+
+    if action == "get_logs":
+        src = str(payload.get("src") or "xray")
+        lines = max(50, min(2000, _int(payload.get("n"), 300)))
+        grep = str(payload.get("q") or "")
+        if src == "access":
+            text = ops.tail(str(xray.XRAY_LOG_DIR / "access.log"), lines)
+            if grep:
+                text = "\n".join(line for line in text.splitlines() if grep in line)
+        else:
+            text = ops.journal({"xray": "xray", "panel": "l2xpanel", "l2tp": "xl2tpd"}.get(src, "xray"), lines, grep)
+        return {"ok": True, "text": text, "src": src, "n": lines, "q": grep}
+
+    return {"ok": False, "error": f"unknown action: {action}"}
+
+
+@app.api_route("/agent/manage", methods=["GET", "POST"])
+async def agent_manage(request: Request):
+    """Remote control channel for Settings Node (token auth, role-independent)."""
+    store, err = _agent_manage_auth(request)
+    if err:
+        return err
+    if request.method == "GET":
+        return _manage_snapshot(store)
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    action = str(payload.get("action") or "").strip()
+    return _manage_action(action, payload)
+
+
 @app.post("/agent/update")
 async def agent_update(request: Request):
     """Master triggers panel self-update on this agent node (one node at a time from UI)."""
@@ -3961,7 +4511,7 @@ async def agent_promote(request: Request):
             "role": ns.get("role") or "agent",
             "mirror": bool(ns.get("mirror")),
         }
-        for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings"):
+        for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "l2tp"):
             if key in payload and payload[key] is not None:
                 st[key] = payload[key]
         if payload.get("nodes") is not None:
@@ -3975,6 +4525,11 @@ async def agent_promote(request: Request):
         ns["role"] = "master"
         ns["mirror"] = False
         ns["runtime_preserve"] = False
+    # Re-encrypt L2TP secrets with this host's SECRET_KEY (plaintext over agent TLS + Bearer)
+    for tname, sec in (payload.get("l2tp_secrets") or {}).items():
+        if not tname or not isinstance(sec, dict):
+            continue
+        _save_l2tp_secrets(str(tname), str(sec.get("password") or ""), str(sec.get("psk") or ""))
     res = _apply_xray(_load_store())
     if not res.get("ok"):
         with mutate() as st:
@@ -3988,7 +4543,12 @@ async def agent_promote(request: Request):
         except Exception:
             pass
         return JSONResponse({"ok": False, "error": err_txt, "rolled_back": True}, status_code=500)
-    return {"ok": True, "error": "", "role": "master", "version": panel_version()}
+    n_l2tp = len(payload.get("l2tp") or [])
+    n_custom = len(payload.get("outbounds_custom") or [])
+    return {
+        "ok": True, "error": "", "role": "master", "version": panel_version(),
+        "transferred_l2tp": n_l2tp, "transferred_custom": n_custom,
+    }
 
 
 @app.post("/agent/apply")
