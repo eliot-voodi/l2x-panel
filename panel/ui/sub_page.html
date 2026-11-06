@@ -65,6 +65,14 @@
     {% endif %}
   </div>
 
+  {% if doh_url %}
+  <div class="card">
+    <h3>DoH (DNS over HTTPS)</h3>
+    <div class="hint">{% if doh_in_tunnel %}В подписке DNS идёт через этот URL внутри туннеля.{% else %}Можно добавить на устройство как системный DoH (без VPN).{% endif %}</div>
+    <div class="copy"><input id="dohlink" value="{{ doh_url }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('dohlink', this)">Копировать</button></div>
+  </div>
+  {% endif %}
+
   <div class="card">
     <h3>Добавить в приложение</h3>
     <div class="flex" style="align-items:flex-start;gap:1.25rem;flex-wrap:wrap">

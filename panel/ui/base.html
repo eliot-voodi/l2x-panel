@@ -160,6 +160,7 @@
     <a class="nav-link {% if active=='outbounds' %}active{% endif %}" href="{{ bp }}/outbounds">{{ ic.icon('send') }}{{ t('Outbounds') }}</a>
     <a class="nav-link {% if active=='balancers' %}active{% endif %}" href="{{ bp }}/balancers">{{ ic.icon('scale') }}{{ t('Балансировщики') }}</a>
     <a class="nav-link {% if active=='routing' %}active{% endif %}" href="{{ bp }}/routing">{{ ic.icon('route') }}{{ t('Маршрутизация') }}</a>
+    <a class="nav-link {% if active=='doh' %}active{% endif %}" href="{{ bp }}/doh">{{ ic.icon('shield') }}DoH / Pi-hole</a>
     <a class="nav-link {% if active=='nodes' %}active{% endif %}" href="{{ bp }}/nodes">{{ ic.icon('globe') }}Nodes</a>
     <a class="nav-link {% if active=='settings_node' %}active{% endif %}" href="{{ bp }}/settings-node">{{ ic.icon('link') }}Settings Node</a>
     <div class="nav-group">{{ t('Система') }}</div>

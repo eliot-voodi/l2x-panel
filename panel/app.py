@@ -31,6 +31,7 @@ import l2tp_runtime as l2tp
 import nodes as nodes_mod
 import ops
 import protocols as P
+import doh as doh_mod
 import sysmon
 import tgbot
 import totp
@@ -148,6 +149,10 @@ def default_settings() -> dict:
         "security": {"totp_enabled": False, "totp_secret": ""},
         "api_tokens": [],
         "geo_custom": [],
+        "doh": {
+            "enabled": False, "path_prefix": "doh", "upstream": "127.0.0.1", "upstream_port": 53,
+            "pihole_web": "127.0.0.1:8089", "pihole_password": "", "timeout_sec": 4,
+        },
     }
 
 
@@ -1582,6 +1587,8 @@ def _sub_response(request: Request, token: str) -> Response:
             "tg_linked": bool(client.get("tg_id")),
             "tg_bot": tg_bot, "remaining_gb": rem_gb, "remaining_bytes": rem_bytes,
             "sub_token": client.get("sub_token") or token,
+            "doh_url": doh_mod.public_url(store, client) if (store["settings"].get("doh") or {}).get("enabled") else "",
+            "doh_in_tunnel": bool(client.get("doh_in_tunnel")),
         }, headers={"cache-control": "no-store"})
     if not xray.client_access_ok(client):
         return PlainTextResponse(xray.client_status(client), status_code=403, headers=headers)
@@ -1609,16 +1616,31 @@ def _sub_response(request: Request, token: str) -> Response:
                 _save_store(st)
     filename = re.sub(r"[^A-Za-z0-9_.-]", "_", client["email"])
     extras = {"fragment": s.get("json_fragment"), "noise": s.get("json_noise"), "mux": s.get("json_mux")}
+    doh_cfg = store["settings"].get("doh") or {}
+    doh_url = ""
+    doh_tunnel = False
+    if doh_cfg.get("enabled") and client.get("doh_enabled") and client.get("doh_in_tunnel"):
+        doh_url = doh_mod.public_url(store, client)
+        doh_tunnel = True
     if fmt == "json":
-        body = json.dumps([P.xray_client_config(e, extras) for e in eps if e["protocol"] != "wireguard"],
-                          ensure_ascii=False, indent=2)
+        body = json.dumps(
+            [P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_tunnel)
+             for e in eps if e["protocol"] != "wireguard"],
+            ensure_ascii=False, indent=2,
+        )
         return Response(body, media_type="application/json", headers=headers)
     if fmt == "clash":
-        body = yaml.safe_dump(P.clash_config(eps), allow_unicode=True, sort_keys=False)
+        body = yaml.safe_dump(
+            P.clash_config(eps, doh_url=doh_url, doh_in_tunnel=doh_tunnel),
+            allow_unicode=True, sort_keys=False,
+        )
         headers["content-disposition"] = f'attachment; filename="{filename}.yaml"'
         return Response(body, media_type="text/yaml; charset=utf-8", headers=headers)
     if fmt in ("singbox", "sing-box"):
-        body = json.dumps(P.singbox_config(eps), ensure_ascii=False, indent=2)
+        body = json.dumps(
+            P.singbox_config(eps, doh_url=doh_url, doh_in_tunnel=doh_tunnel),
+            ensure_ascii=False, indent=2,
+        )
         return Response(body, media_type="application/json", headers=headers)
     body = "\n".join(P.endpoint_to_link(e) for e in eps)
     if fmt != "plain":
@@ -2284,6 +2306,13 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     client["reset_period"] = period
     client["renew_on_reset"] = form.get("renew_on_reset") == "1"
     client["sub_enabled"] = form.get("sub_enabled", "1") == "1"
+    doh_mod.ensure_client_doh(client)
+    client["doh_enabled"] = form.get("doh_enabled") == "1"
+    client["doh_in_tunnel"] = form.get("doh_in_tunnel") == "1"
+    if form.get("doh_regen") == "1" or not client.get("doh_token"):
+        client["doh_token"] = doh_mod.new_token()
+    if client["doh_in_tunnel"] and not client["doh_enabled"]:
+        client["doh_enabled"] = True
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
     client["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
@@ -2311,9 +2340,11 @@ def client_new(request: Request):
         return redir
     store = _load_store()
     c = xray.ensure_client({"email": "", "sub_token": ""})
+    doh_mod.ensure_client_doh(c)
     return page(request, "client_edit.html", active="clients", c=c, row=None, is_new=True, store=store,
                 tags=xray.selectable_outbound_tags(store), inbounds=xray.client_capable_inbounds(store),
-                hwids=[], bans=[], links=[], wg_confs=[])
+                hwids=[], bans=[], links=[], wg_confs=[], doh_url="",
+                doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
 
 
 @app.get("/clients/{email}/edit", response_class=HTMLResponse)
@@ -2334,9 +2365,12 @@ def client_edit(email: str, request: Request):
     eps = xray.client_endpoints(store, c, store["settings"]["sub"].get("domain") or None)
     links = [(e, P.endpoint_to_link(e)) for e in eps]
     wg_confs = [(e, P.wireguard_conf(e)) for e in eps if e["protocol"] == "wireguard"]
+    doh_mod.ensure_client_doh(c)
     return page(request, "client_edit.html", active="clients", c=c, row=_client_row(store, c), is_new=False,
                 store=store, tags=tags, inbounds=xray.client_capable_inbounds(store), bans=bans, links=links,
-                wg_confs=wg_confs, hwids=hwid.public_list(c))
+                wg_confs=wg_confs, hwids=hwid.public_list(c),
+                doh_url=doh_mod.public_url(store, c),
+                doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
 
 
 @app.post("/clients/save")
@@ -3661,6 +3695,116 @@ def logs_page(request: Request):
     else:
         text = ops.journal({"xray": "xray", "panel": "l2xpanel", "l2tp": "xl2tpd"}.get(src, "xray"), lines, grep)
     return page(request, "logs.html", active="logs", src=src, text=text, n=lines, q=grep)
+
+
+# ================================================================ DoH (Pi-hole via nginx)
+
+@app.api_route("/doh/{token}/dns-query", methods=["GET", "POST"])
+async def doh_dns_query(token: str, request: Request):
+    """RFC 8484 DoH endpoint — reached only via nginx :443 /doh/<token>/dns-query."""
+    store = _load_store()
+    cfg = store["settings"].get("doh") or {}
+    if not cfg.get("enabled"):
+        return Response(status_code=404)
+    client = doh_mod.client_by_token(store, token)
+    if not client:
+        return Response(status_code=403)
+    try:
+        if request.method == "GET":
+            raw = str(request.query_params.get("dns") or "").strip()
+            if not raw:
+                return Response("missing dns=", status_code=400)
+            query = doh_mod.b64url_decode(raw)
+        else:
+            ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+            body = await request.body()
+            if ctype in ("application/dns-message", "application/dns-message; charset=utf-8", ""):
+                query = body
+            else:
+                return Response("unsupported content-type", status_code=415)
+        answer = doh_mod.resolve_wire(
+            query,
+            upstream=str(cfg.get("upstream") or "127.0.0.1"),
+            port=int(cfg.get("upstream_port") or 53),
+            timeout=float(cfg.get("timeout_sec") or 4),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return Response(str(exc), status_code=502)
+    return Response(answer, media_type="application/dns-message",
+                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"})
+
+
+@app.get("/doh", response_class=HTMLResponse)
+def doh_page(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    cfg = {**doh_mod.default_settings(), **(store["settings"].get("doh") or {})}
+    st = doh_mod.status(cfg)
+    clients = []
+    for c in store.get("clients") or []:
+        if not c.get("doh_enabled"):
+            continue
+        clients.append({
+            "email": c["email"], "token": c.get("doh_token"), "in_tunnel": bool(c.get("doh_in_tunnel")),
+            "url": doh_mod.public_url(store, c),
+        })
+    return page(request, "doh.html", active="doh", doh=cfg, status=st, doh_clients=clients,
+                public_host=public_host())
+
+
+@app.post("/doh/save")
+async def doh_save(request: Request):
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    with mutate() as store:
+        d = store["settings"].setdefault("doh", doh_mod.default_settings())
+        d.update({
+            "enabled": form.get("enabled") == "1",
+            "path_prefix": doh_mod.normalize_prefix(str(form.get("path_prefix") or "doh")),
+            "upstream": str(form.get("upstream") or "127.0.0.1").strip() or "127.0.0.1",
+            "upstream_port": max(1, _int(form.get("upstream_port"), 53)),
+            "pihole_web": str(form.get("pihole_web") or "127.0.0.1:8089").strip(),
+            "timeout_sec": max(1, _float(form.get("timeout_sec"), 4)),
+        })
+        pwd = str(form.get("pihole_password") or "").strip()
+        if pwd:
+            d["pihole_password"] = pwd
+    # Re-apply nginx so /doh/ location + reserved path update
+    xr = _apply_xray(_load_store())
+    flash(request, *_ok_msg("DoH настройки сохранены", xr))
+    return go("/doh")
+
+
+@app.post("/doh/install")
+def doh_install(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    pwd = str((store["settings"].get("doh") or {}).get("pihole_password") or "") or secrets.token_urlsafe(12)
+    res = doh_mod.install_pihole(password=pwd)
+    if res.get("ok"):
+        with mutate() as st:
+            st["settings"].setdefault("doh", {})["pihole_password"] = pwd
+            st["settings"]["doh"]["enabled"] = True
+            st["settings"]["doh"]["upstream"] = "127.0.0.1"
+            st["settings"]["doh"]["upstream_port"] = 53
+        _apply_xray(_load_store())
+        flash(request, "Pi-hole установлен (docker). DoH включён.", "info")
+    else:
+        flash(request, f"Pi-hole install: {res.get('error')}", "error")
+    return go("/doh")
+
+
+@app.post("/doh/stop")
+def doh_stop(request: Request):
+    if redir := _require(request):
+        return redir
+    res = doh_mod.stop_pihole()
+    flash(request, "Pi-hole остановлен" if res.get("ok") else f"stop: {res.get('error')}",
+          "info" if res.get("ok") else "error")
+    return go("/doh")
 
 
 # ================================================================ settings

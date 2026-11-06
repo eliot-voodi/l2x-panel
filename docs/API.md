@@ -191,6 +191,14 @@ POST-запросы должны иметь `Content-Type: application/json`. Е
 | `lb_least_load` | Балансировщик по наименьшей нагрузке |
 | `<custom>` | Пользовательские outbounds (WireGuard, WARP, NordVPN, PIA, VLESS / VMess / Trojan / Shadowsocks, SOCKS, HTTP) |
 
+### DoH (Pi-hole)
+
+Публичный персональный endpoint (через nginx :443):
+
+`https://<domain>/doh/<token>/dns-query` — RFC 8484 (GET `?dns=` / POST `application/dns-message`).
+
+В карточке клиента: `doh_enabled`, `doh_in_tunnel` (DNS в подписке через proxy). Управление: UI **DoH / Pi-hole**.
+
 Актуальный список — `GET outbounds/list` → `obj.tags`.
 
 ---

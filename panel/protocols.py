@@ -1010,7 +1010,7 @@ def apply_sub_json_extras(cfg: dict, extras: dict | None) -> dict:
     return cfg
 
 
-def xray_client_config(ep: dict, extras: dict | None = None) -> dict:
+def xray_client_config(ep: dict, extras: dict | None = None, *, doh_url: str = "", doh_in_tunnel: bool = False) -> dict:
     """Full client config for a JSON subscription item."""
     if ep.get("protocol") == "hysteria":
         proxy = {
@@ -1028,10 +1028,20 @@ def xray_client_config(ep: dict, extras: dict | None = None) -> dict:
         }
     else:
         proxy = endpoint_to_xray_outbound(ep, "proxy")
+    if doh_url and doh_in_tunnel:
+        # Resolve DoH host via proxy (inside tunnel)
+        dns_servers: list = [{"address": doh_url, "domains": ["geosite:geolocation-!cn"]}, "1.1.1.1"]
+        # Xray DoH as string URL uses system dial — prefer https+local for out-of-tunnel;
+        # for in-tunnel put DoH first as plain https URL (client dials through routing if supported).
+        dns_servers = [doh_url, "localhost"]
+    elif doh_url:
+        dns_servers = [doh_url.replace("https://", "https+local://", 1), "localhost"]
+    else:
+        dns_servers = ["1.1.1.1", "8.8.8.8"]
     cfg = {
         "remarks": ep.get("remark") or "",
         "log": {"loglevel": "warning"},
-        "dns": {"servers": ["1.1.1.1", "8.8.8.8"]},
+        "dns": {"servers": dns_servers},
         "inbounds": [
             {"tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"udp": True},
              "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}},
@@ -1041,10 +1051,12 @@ def xray_client_config(ep: dict, extras: dict | None = None) -> dict:
             proxy,
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "block", "protocol": "blackhole"},
+            {"tag": "dns-out", "protocol": "dns"},
         ],
         "routing": {
             "domainStrategy": "AsIs",
             "rules": [
+                {"type": "field", "inboundTag": ["socks", "http"], "port": 53, "outboundTag": "dns-out"},
                 {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
                 {"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
             ],
@@ -1109,7 +1121,7 @@ def endpoint_to_clash(ep: dict) -> dict | None:
     return p
 
 
-def clash_config(endpoints: list[dict]) -> dict:
+def clash_config(endpoints: list[dict], *, doh_url: str = "", doh_in_tunnel: bool = False) -> dict:
     proxies = [c for c in (endpoint_to_clash(e) for e in endpoints) if c]
     # names must be unique in Clash
     seen: dict[str, int] = {}
@@ -1121,7 +1133,7 @@ def clash_config(endpoints: list[dict]) -> dict:
         else:
             seen[n] = 1
     names = [p["name"] for p in proxies]
-    return {
+    cfg: dict[str, Any] = {
         "mixed-port": 7890,
         "allow-lan": False,
         "mode": "rule",
@@ -1133,6 +1145,17 @@ def clash_config(endpoints: list[dict]) -> dict:
         ],
         "rules": ["GEOIP,private,DIRECT,no-resolve", "MATCH,PROXY"],
     }
+    if doh_url:
+        # Mihomo: `#PROXY` dials DoH through the PROXY group (inside tunnel)
+        ns = f"{doh_url}#PROXY" if doh_in_tunnel else doh_url
+        cfg["dns"] = {
+            "enable": True,
+            "enhanced-mode": "fake-ip",
+            "nameserver": [ns],
+            "fallback": ["1.1.1.1", "8.8.8.8"],
+            "proxy-server-nameserver": ["1.1.1.1"],
+        }
+    return cfg
 
 
 # ---------------------------------------------------------------- sing-box
@@ -1185,7 +1208,7 @@ def endpoint_to_singbox(ep: dict) -> dict | None:
     return o
 
 
-def singbox_config(endpoints: list[dict]) -> dict:
+def singbox_config(endpoints: list[dict], *, doh_url: str = "", doh_in_tunnel: bool = False) -> dict:
     outs = [o for o in (endpoint_to_singbox(e) for e in endpoints) if o]
     seen: dict[str, int] = {}
     for o in outs:
@@ -1196,10 +1219,15 @@ def singbox_config(endpoints: list[dict]) -> dict:
         else:
             seen[n] = 1
     tags = [o["tag"] for o in outs]
+    remote: dict[str, Any] = {
+        "tag": "remote",
+        "address": doh_url or "https://1.1.1.1/dns-query",
+    }
+    if doh_in_tunnel or not doh_url:
+        remote["detour"] = "proxy"
     return {
         "log": {"level": "warn"},
-        "dns": {"servers": [{"tag": "remote", "address": "https://1.1.1.1/dns-query", "detour": "proxy"},
-                            {"tag": "local", "address": "local", "detour": "direct"}],
+        "dns": {"servers": [remote, {"tag": "local", "address": "local", "detour": "direct"}],
                 "final": "remote"},
         "inbounds": [
             {"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"], "auto_route": True, "strict_route": True, "stack": "mixed"},

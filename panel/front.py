@@ -103,7 +103,11 @@ def plan(store: dict) -> dict:
         sites.setdefault(pub, [])
 
     base = re.sub(r"[^A-Za-z0-9_-]", "", str((((store.get("settings") or {}).get("panel") or {}).get("base_path") or ""))).strip("/")
-    reserved_paths = {"/sub/", "/panel/", "/health", "/.well-known/"}
+    doh_prefix = re.sub(
+        r"[^A-Za-z0-9_-]", "",
+        str((((store.get("settings") or {}).get("doh") or {}).get("path_prefix") or "doh")),
+    ).strip("_-") or "doh"
+    reserved_paths = {"/sub/", "/panel/", "/health", "/.well-known/", f"/{doh_prefix}/"}
     if base:
         reserved_paths.add(f"/{base}/")
 
@@ -224,6 +228,19 @@ def _panel_locations(store: dict | None = None) -> list[str]:
     proxy = f"        proxy_pass http://{PANEL_UPSTREAM};\n{common}"
     base = (((store or {}).get("settings") or {}).get("panel") or {}).get("base_path") or ""
     base = re.sub(r"[^A-Za-z0-9_-]", "", str(base)).strip("/")
+    doh_prefix = re.sub(
+        r"[^A-Za-z0-9_-]", "",
+        str((((store or {}).get("settings") or {}).get("doh") or {}).get("path_prefix") or "doh"),
+    ).strip("_-") or "doh"
+    # DoH (Pi-hole frontend): client → nginx :443 → panel → Pi-hole UDP/53
+    doh_loc = (
+        f"    location ^~ /{doh_prefix}/ {{\n"
+        f"        proxy_pass http://{PANEL_UPSTREAM};\n"
+        f"{common}"
+        "        proxy_buffering off;\n"
+        "        proxy_request_buffering off;\n"
+        "    }"
+    )
     out = [
         "    location ^~ /.well-known/acme-challenge/ {\n"
         "        root /var/www/l2x-acme;\n"
@@ -231,6 +248,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         "        try_files $uri =404;\n"
         "    }",
         f"    location ^~ /sub/ {{\n{proxy}    }}",
+        doh_loc,
         f"    location ^~ /panel/api/ {{\n{proxy}    }}",
         f"    location = /health {{\n{proxy}    }}",
     ]

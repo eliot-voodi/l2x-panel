@@ -560,6 +560,10 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("allowed_tags", [])
     client.setdefault("outbound_limits", {})
     client.setdefault("sub_enabled", True)
+    client.setdefault("doh_enabled", False)
+    client.setdefault("doh_in_tunnel", False)
+    if not client.get("doh_token"):
+        client["doh_token"] = secrets.token_urlsafe(18)
     client.setdefault("last_online", "")
     client.setdefault("ips", {})
     client.setdefault("created_at", now_utc().isoformat())

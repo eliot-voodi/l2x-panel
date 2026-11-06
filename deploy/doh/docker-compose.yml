@@ -1,0 +1,20 @@
+# Managed by L2X Panel — Pi-hole for DoH upstream (UDP/53)
+# Install from panel: DoH / Pi-hole → «Установить Pi-hole»
+services:
+  pihole:
+    image: pihole/pihole:latest
+    container_name: l2x-pihole
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Moscow
+      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD}"
+      FTLCONF_dns_listeningMode: ALL
+    ports:
+      - "127.0.0.1:53:53/tcp"
+      - "127.0.0.1:53:53/udp"
+      - "127.0.0.1:8089:80/tcp"
+    volumes:
+      - ./etc-pihole:/etc/pihole
+      - ./etc-dnsmasq.d:/etc/dnsmasq.d
+    cap_add:
+      - NET_ADMIN

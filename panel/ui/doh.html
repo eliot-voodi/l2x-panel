@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}DoH · Pi-hole · {{ app_name }}{% endblock %}
+{% block page_title %}DoH / Pi-hole{% endblock %}
+{% block page_sub %}DNS-over-HTTPS через nginx :443 → панель → Pi-hole. Персональные URL для клиентов.{% endblock %}
+{% block content %}
+<div class="grid g2">
+  <form class="card" method="post" action="{{ bp }}/doh/save">
+    <h3>Сервис</h3>
+    {{ m.check('enabled', doh.enabled, 'DoH включён (nginx /' ~ (doh.path_prefix or 'doh') ~ '/…)') }}
+    <div class="row">
+      <div><label class="f">Path prefix</label><input name="path_prefix" value="{{ doh.path_prefix or 'doh' }}" pattern="[A-Za-z0-9_-]+" placeholder="doh"></div>
+      <div><label class="f">Upstream DNS</label><input name="upstream" value="{{ doh.upstream or '127.0.0.1' }}" placeholder="127.0.0.1"></div>
+      <div style="max-width:110px"><label class="f">Порт</label><input name="upstream_port" type="number" min="1" max="65535" value="{{ doh.upstream_port or 53 }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Pi-hole web (локально)</label><input name="pihole_web" value="{{ doh.pihole_web or '127.0.0.1:8089' }}"></div>
+      <div><label class="f">Timeout, с</label><input name="timeout_sec" type="number" min="1" step="0.5" value="{{ doh.timeout_sec or 4 }}"></div>
+    </div>
+    <label class="f">Пароль Pi-hole admin (пусто = не менять)</label>
+    <input name="pihole_password" type="password" autocomplete="new-password" placeholder="для docker install / смены">
+    <div class="hint">Публичный URL клиента: <code>https://{{ public_host or 'домен' }}/{{ doh.path_prefix or 'doh' }}/&lt;token&gt;/dns-query</code> — только через nginx :443.</div>
+    <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+  </form>
+
+  <div class="card">
+    <h3>Статус</h3>
+    <div class="row">
+      <div><span class="badge {% if status.dns_ok %}ok{% else %}err{% endif %}">DNS {{ 'ok' if status.dns_ok else 'нет' }}</span>
+        <div class="dim small mono">{{ status.upstream }}</div></div>
+      <div><span class="badge {% if status.docker %}ok{% endif %}">docker {{ 'есть' if status.docker else 'нет' }}</span>
+        <div class="dim small">compose {{ 'да' if status.compose_present else 'нет' }}</div></div>
+    </div>
+    {% if status.error %}<div class="hint" style="color:var(--danger)">{{ status.error }}</div>{% endif %}
+    <div class="actions mt">
+      <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:53 / :8089?')"><button class="btn">Установить Pi-hole</button></form>
+      <form method="post" action="{{ bp }}/doh/stop"><button class="btn ghost">Остановить</button></form>
+    </div>
+    <div class="hint mt">Pi-hole admin: <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code> (только localhost / SSH-туннель).</div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Клиенты с персональным DoH</h3>
+  <div class="hint">В карточке клиента: «DoH URL» — для устройств без VPN; «DoH в туннеле» — DNS в подписке (sing-box / Clash / JSON) ходит на этот URL через proxy.</div>
+  {% if doh_clients %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Клиент</th><th>Режим</th><th>URL</th></tr></thead>
+    <tbody>
+    {% for c in doh_clients %}
+      <tr>
+        <td><a href="{{ bp }}/clients/{{ c.email }}/edit">{{ c.email }}</a></td>
+        <td>{% if c.in_tunnel %}<span class="badge accent">в туннеле</span>{% else %}<span class="badge">только DoH</span>{% endif %}</td>
+        <td class="mono small"><code>{{ c.url }}</code>
+          <button type="button" class="btn ghost sm" onclick="navigator.clipboard.writeText({{ c.url|tojson }})">copy</button></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <div class="hint">Пока ни у кого не включён DoH — откройте клиента и включите опции.</div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -35,6 +35,23 @@
   </div>
 
   <div class="card">
+    <h3>DoH (Pi-hole)</h3>
+    <div class="hint">{% if doh_system_on %}Сервис DoH включён.{% else %}Сначала включите DoH в меню <a href="{{ bp }}/doh">DoH / Pi-hole</a>.{% endif %} Персональный URL идёт через nginx :443.</div>
+    <input type="hidden" name="doh_enabled" value="0">
+    <input type="hidden" name="doh_in_tunnel" value="0">
+    {{ m.check('doh_enabled', c.doh_enabled, 'Персональный DoH URL (для устройств без VPN)') }}
+    {{ m.check('doh_in_tunnel', c.doh_in_tunnel, 'DoH в туннеле — DNS в подписке через proxy') }}
+    <label class="check"><input type="checkbox" name="doh_regen" value="1"> Перевыпустить token</label>
+    {% if doh_url %}
+    <label class="f mt">URL</label>
+    <div class="import"><input class="mono" readonly value="{{ doh_url }}" id="doh_url">
+      <button type="button" class="btn ghost sm" onclick="copyText('doh_url', this)">{{ ic.icon('copy') }}</button></div>
+    {% elif c.doh_enabled %}
+    <div class="hint">URL появится после сохранения (нужен публичный домен и включённый DoH).</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
     <h3>Telegram</h3>
     <div class="hint">Заполняется при привязке со страницы подписки. Можно править вручную.</div>
     <div class="row">
