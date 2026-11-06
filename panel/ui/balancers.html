@@ -16,7 +16,7 @@
     </div>
     <div class="small muted">strategy <code>{{ b.strategy }}</code> · tag <code>{{ b.tag }}</code> · в пуле сейчас: <b>{{ act|length }}</b></div>
     {% if act %}<div class="mt">{% for tg in act %}<span class="badge accent" style="margin:0 .25rem .25rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}</div>
-    {% else %}<div class="hint">Нет активных участников — трафик идёт в fallback.</div>{% endif %}
+    {% else %}<div class="hint">Нет активных участников — {% if b.fallback == 'none' %}трафик режется (fallback none){% else %}трафик идёт в fallback{% endif %}.</div>{% endif %}
 
     <div class="mt">{{ m.check('enabled', b.enabled, t('Включён')) }}</div>
     <div class="row">
@@ -32,10 +32,13 @@
     {% endif %}
     <label class="f">Fallback (если все участники недоступны)</label>
     <select name="fallback">
-      <option value="direct" {% if b.fallback == 'direct' %}selected{% endif %}>🏠 Direct</option>
+      <option value="none" {% if b.fallback == 'none' %}selected{% endif %}>⛔ none — не уходить в direct (резать трафик)</option>
+      <option value="direct" {% if b.fallback == 'direct' or not b.fallback %}selected{% endif %}>🏠 Direct</option>
+      <option value="block" {% if b.fallback == 'block' %}selected{% endif %}>⛔ Block</option>
       {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}<option value="{{ ob }}" {% if b.fallback == ob %}selected{% endif %}>{{ outbound_label(store, ob) }} ({{ l.status }})</option>{% endfor %}
       {% for o in custom %}<option value="{{ o.tag }}" {% if b.fallback == o.tag %}selected{% endif %}>{{ outbound_label(store, o.tag) }}</option>{% endfor %}
     </select>
+    <div class="hint">none — в Xray не ставится fallbackTag; при пустом пуле маршрут идёт в blackhole, а не в direct.</div>
     <label class="f">Участники (ничего не отмечено или отмечены все L2TP = все подключённые L2TP)</label>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.1rem .5rem">
       {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}
@@ -50,5 +53,5 @@
   </form>
 {% endfor %}
 </div>
-<div class="hint">Клиент выбирает балансировщик как outbound (или получает его строкой в подписке). Observatory регулярно проверяет участников; упавший выпадает из пула, трафик уходит на следующий лучший.</div>
+<div class="hint">Клиент выбирает балансировщик как outbound (или получает его строкой в подписке). Observatory проверяет участников; упавший выпадает из пула. Если все мертвы — срабатывает Fallback (direct / другой outbound / none).</div>
 {% endblock %}

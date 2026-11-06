@@ -3329,7 +3329,8 @@ async def balancers_save(key: str, request: Request):
         b["enabled"] = form.get("enabled") == "1"
         b["probe_url"] = str(form.get("probe_url") or b["probe_url"]).strip()
         b["probe_interval"] = str(form.get("probe_interval") or b["probe_interval"]).strip()
-        b["fallback"] = str(form.get("fallback") or "direct")
+        raw_fb = str(form.get("fallback") or "direct").strip()
+        b["fallback"] = "none" if raw_fb.lower() in ("none", "-", "off") else (raw_fb or "direct")
         members = [str(x) for x in form.getlist("members")]
         all_l2tp = {t_.get("outbound") or f"l2tp_{t_['name']}" for t_ in store["l2tp"]}
         b["members"] = [] if members and set(members) == all_l2tp else members

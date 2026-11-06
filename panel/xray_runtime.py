@@ -273,6 +273,17 @@ def default_balancers() -> dict:
     }
 
 
+def balancer_fallback_tag(balancer: dict) -> str | None:
+    """Outbound used when all balancer members are down.
+
+    ``none`` / empty → no fallback to direct (omit Xray fallbackTag; empty pool → block).
+    """
+    fb = str(balancer.get("fallback") or "").strip()
+    if not fb or fb.lower() in ("none", "-", "off", "null"):
+        return None
+    return fb
+
+
 def ensure_balancers(store: dict) -> dict:
     bals = store.setdefault("balancers", {})
     for key, default in default_balancers().items():
@@ -381,8 +392,8 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
     """Map a logical tag to a routing target.
 
     Balancers are only referenced when they have live members (and thus appear in
-    the config with observatory). Otherwise fall back to the balancer's fallback
-    outbound (usually direct). Unknown outbound tags also fall back to direct.
+    the config with observatory). Otherwise use the balancer's fallback outbound
+    (``direct`` by default, ``block`` when fallback is ``none``).
     """
     tag = (tag or "direct").strip() or "direct"
     if _is_balancer_target(store, tag):
@@ -391,7 +402,8 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
                 continue
             if balancer_member_tags(store, b):
                 return {"balancerTag": tag}
-            return {"outboundTag": b.get("fallback") or "direct"}
+            fb = balancer_fallback_tag(b)
+            return {"outboundTag": fb if fb else "block"}
         return {"outboundTag": "direct"}
     if known_outbounds is not None and tag not in known_outbounds:
         return {"outboundTag": "direct"}
@@ -969,8 +981,11 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
     if ping_b.get("enabled", True):
         members = balancer_member_tags(store, ping_b)
         if members:
-            out.append({"tag": ping_b["tag"], "selector": members, "fallbackTag": ping_b.get("fallback") or "direct",
-                        "strategy": {"type": "leastPing"}})
+            entry = {"tag": ping_b["tag"], "selector": members, "strategy": {"type": "leastPing"}}
+            fb = balancer_fallback_tag(ping_b)
+            if fb:
+                entry["fallbackTag"] = fb
+            out.append(entry)
             observatory = {
                 "subjectSelector": sorted(set(members)),
                 "probeURL": ping_b.get("probe_url") or "https://www.gstatic.com/generate_204",
@@ -981,12 +996,16 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
     if load_b.get("enabled", True):
         members = balancer_member_tags(store, load_b)
         if members:
-            out.append({
-                "tag": load_b["tag"], "selector": members, "fallbackTag": load_b.get("fallback") or "direct",
+            entry = {
+                "tag": load_b["tag"], "selector": members,
                 "strategy": {"type": "leastLoad", "settings": {
                     "expected": int(load_b.get("expected") or 1), "maxRTT": load_b.get("max_rtt") or "1s",
                     "tolerance": float(load_b.get("tolerance") or 0.15), "baselines": ["1s"]}},
-            })
+            }
+            fb = balancer_fallback_tag(load_b)
+            if fb:
+                entry["fallbackTag"] = fb
+            out.append(entry)
             burst = {
                 "subjectSelector": sorted(set(members)),
                 "pingConfig": {
