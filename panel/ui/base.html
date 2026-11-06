@@ -35,9 +35,12 @@
     code, pre, .mono { font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace; font-size: .82em }
     pre { background: var(--code); border: 1px solid var(--border); border-radius: 10px; padding: .8rem; overflow: auto; max-height: 70vh; white-space: pre-wrap; word-break: break-all }
 
-    .layout { display: flex; min-height: 100vh }
+    .layout { display: flex; min-height: 100vh; min-height: 100dvh }
     .sidebar { width: 248px; flex-shrink: 0; background: var(--bg-2); border-right: 1px solid var(--border); padding: 1rem .75rem;
-      position: sticky; top: 0; height: 100vh; overflow-y: auto; display: flex; flex-direction: column; gap: .2rem }
+      position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; display: flex; flex-direction: column; gap: .2rem;
+      -webkit-overflow-scrolling: touch }
+    .sidebar-backdrop { display: none }
+    .nav-toggle, .nav-close { display: none }
     .brand { display: flex; align-items: center; gap: .6rem; padding: .35rem .6rem 1.1rem; font-weight: 700; font-size: 1.05rem; letter-spacing: .2px }
     .brand .logo { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
       display: grid; place-items: center; color: #06121b; font-weight: 800; font-size: .85rem; box-shadow: 0 0 22px rgba(34, 211, 238, .35) }
@@ -50,22 +53,22 @@
     .sidebar-footer { margin-top: auto; padding-top: 1rem; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: .4rem }
 
     .main { flex: 1; min-width: 0; display: flex; flex-direction: column }
-    .topbar { display: flex; align-items: center; gap: 1rem; padding: 1.1rem 1.75rem; border-bottom: 1px solid var(--border);
+    .topbar { display: flex; align-items: center; gap: .75rem 1rem; padding: 1.1rem 1.75rem; border-bottom: 1px solid var(--border);
       background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(8px); position: sticky; top: 0; z-index: 5 }
-    .topbar h1 { margin: 0; font-size: 1.25rem; font-weight: 650 }
-    .topbar .sub { color: var(--muted); font-size: .85rem }
+    .topbar-title { min-width: 0 }
+    .topbar h1 { margin: 0; font-size: 1.25rem; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .topbar .sub { color: var(--muted); font-size: .85rem; overflow: hidden; text-overflow: ellipsis }
     .topbar .spacer { flex: 1 }
+    .topbar-actions { display: flex; align-items: center; gap: .35rem; flex-wrap: wrap; justify-content: flex-end }
     .content { padding: 1.5rem 1.75rem 3rem; max-width: 1480px; width: 100% }
 
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.15rem 1.25rem; margin-bottom: 1rem }
     .card h2, .card h3 { margin: 0 0 .85rem; font-size: 1rem; font-weight: 650 }
-    .card-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .85rem }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .85rem; flex-wrap: wrap }
     .card-head h2, .card-head h3 { margin: 0 }
     .grid { display: grid; gap: 1rem }
     .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)) } .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)) }
     .g4 { grid-template-columns: repeat(4, minmax(0, 1fr)) }
-    @media (max-width: 1100px) { .g4 { grid-template-columns: repeat(2, 1fr) } .g3 { grid-template-columns: 1fr 1fr } }
-    @media (max-width: 760px) { .sidebar { display: none } .g2, .g3, .g4 { grid-template-columns: 1fr } .content { padding: 1rem } }
 
     .stat { position: relative; overflow: hidden }
     .stat .label { color: var(--muted); font-size: .8rem; display: flex; align-items: center; gap: .45rem }
@@ -85,7 +88,7 @@
     td { padding: .65rem; border-bottom: 1px solid var(--border); vertical-align: middle }
     tr:last-child td { border-bottom: 0 }
     tbody tr:hover { background: var(--surface-2) }
-    .table-wrap { overflow-x: auto }
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain }
 
     .badge { display: inline-flex; align-items: center; gap: .3rem; padding: .12rem .55rem; border-radius: 999px; font-size: .72rem; font-weight: 600;
       background: var(--surface-3); color: var(--muted); white-space: nowrap }
@@ -96,7 +99,7 @@
 
     label.f { display: block; font-size: .78rem; color: var(--muted); margin: .7rem 0 .3rem; font-weight: 500 }
     input, select, textarea { font: inherit; color: var(--text); background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 9px;
-      padding: .5rem .7rem; width: 100%; outline: none; transition: border-color .15s, box-shadow .15s }
+      padding: .5rem .7rem; width: 100%; outline: none; transition: border-color .15s, box-shadow .15s; max-width: 100% }
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft) }
     input[type=checkbox], input[type=radio] { width: auto; accent-color: var(--accent) }
     textarea { min-height: 5rem; resize: vertical }
@@ -106,7 +109,8 @@
 
     .btn { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; font: inherit; font-weight: 600; font-size: .85rem;
       padding: .5rem .9rem; border-radius: 9px; border: 1px solid transparent; cursor: pointer; color: #06121b; white-space: nowrap;
-      background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 60%, var(--accent-2))) }
+      background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 60%, var(--accent-2)));
+      -webkit-tap-highlight-color: transparent }
     .btn:hover { filter: brightness(1.08) }
     .btn svg { width: 16px; height: 16px }
     .btn.ghost { background: var(--surface-2); border-color: var(--border-2); color: var(--text) }
@@ -116,39 +120,95 @@
     .btn.icon { padding: .38rem; width: 32px; height: 32px }
     .actions { display: flex; gap: .35rem; flex-wrap: wrap; align-items: center } .actions form { margin: 0 }
 
-    .tabs { display: flex; gap: .25rem; border-bottom: 1px solid var(--border); margin-bottom: 1.1rem; overflow-x: auto }
+    .tabs { display: flex; gap: .25rem; border-bottom: 1px solid var(--border); margin-bottom: 1.1rem; overflow-x: auto; -webkit-overflow-scrolling: touch }
     .tabs a { padding: .6rem .95rem; color: var(--muted); border-bottom: 2px solid transparent; font-weight: 500; white-space: nowrap }
     .tabs a.active { color: var(--accent); border-color: var(--accent) }
 
     .upd-banner { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
       border-color: var(--warn); background: var(--warn-soft) }
-    .toast { position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 50; max-width: 460px; padding: .85rem 1rem; border-radius: 12px;
-      background: var(--surface-2); border: 1px solid var(--border-2); box-shadow: var(--shadow); display: flex; gap: .6rem; animation: slide .25s ease }
+    .toast { position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 50; max-width: min(460px, calc(100vw - 1.5rem)); padding: .85rem 1rem; border-radius: 12px;
+      background: var(--surface-2); border: 1px solid var(--border-2); box-shadow: var(--shadow); display: flex; gap: .6rem; animation: slide .25s ease;
+      left: auto }
     .toast.error { border-color: var(--danger) } .toast.info { border-color: var(--ok) }
     @keyframes slide { from { transform: translateY(12px); opacity: 0 } }
 
     dialog { background: var(--surface); color: var(--text); border: 1px solid var(--border-2); border-radius: 16px; padding: 1.25rem; max-width: 640px;
-      width: calc(100% - 2rem); box-shadow: var(--shadow) }
+      width: calc(100% - 2rem); box-shadow: var(--shadow); max-height: calc(100dvh - 2rem); overflow: auto }
     dialog::backdrop { background: rgba(4, 7, 12, .6); backdrop-filter: blur(3px) }
     .qr { background: #fff; border-radius: 12px; padding: .5rem; display: inline-block; line-height: 0 }
-    .copy { display: flex; gap: .4rem } .copy input { font-size: .78rem; font-family: Consolas, monospace }
+    .copy, .import { display: flex; gap: .4rem; align-items: center } .copy input, .import input { font-size: .78rem; font-family: Consolas, monospace; min-width: 0; flex: 1 }
     .muted { color: var(--muted) } .dim { color: var(--dim) } .small { font-size: .8rem } .nowrap { white-space: nowrap }
     .right { text-align: right } .flex { display: flex; align-items: center; gap: .5rem } .between { justify-content: space-between }
     .mt { margin-top: 1rem } .mb0 { margin-bottom: 0 } .w-auto { width: auto }
     .empty { text-align: center; color: var(--dim); padding: 2.2rem 1rem }
     .chart { width: 100%; height: 170px }
-    .seg { display: inline-flex; background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 2px }
-    .seg a { padding: .3rem .7rem; border-radius: 7px; color: var(--muted); font-size: .8rem; font-weight: 500 }
+    .seg { display: inline-flex; background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 2px; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch }
+    .seg a { padding: .3rem .7rem; border-radius: 7px; color: var(--muted); font-size: .8rem; font-weight: 500; flex-shrink: 0 }
     .seg a.active { background: var(--surface-3); color: var(--text) }
+
+    @media (max-width: 1100px) {
+      .g4 { grid-template-columns: repeat(2, 1fr) }
+      .g3 { grid-template-columns: 1fr 1fr }
+    }
+    @media (max-width: 860px) {
+      .nav-toggle { display: inline-flex; flex-shrink: 0; width: 40px; height: 40px }
+      .nav-close { display: inline-flex; margin-left: auto; width: 36px; height: 36px }
+      .sidebar-backdrop {
+        display: block; position: fixed; inset: 0; z-index: 30; background: rgba(4, 7, 12, .55);
+        opacity: 0; pointer-events: none; transition: opacity .2s ease;
+      }
+      body.nav-open .sidebar-backdrop { opacity: 1; pointer-events: auto }
+      body.nav-open { overflow: hidden; touch-action: none }
+      .sidebar {
+        position: fixed; left: 0; top: 0; z-index: 40; width: min(300px, 88vw);
+        transform: translateX(-105%); transition: transform .22s ease;
+        box-shadow: var(--shadow); border-right-color: var(--border-2);
+        padding-top: max(1rem, env(safe-area-inset-top));
+        padding-bottom: max(1rem, env(safe-area-inset-bottom));
+      }
+      body.nav-open .sidebar { transform: translateX(0) }
+      .brand { padding-right: .35rem }
+      .topbar {
+        flex-wrap: wrap; align-items: flex-start;
+        padding: .85rem max(.9rem, env(safe-area-inset-right)) .85rem max(.9rem, env(safe-area-inset-left));
+        gap: .55rem .65rem;
+      }
+      .topbar-title { flex: 1; min-width: 0 }
+      .topbar h1 { font-size: 1.1rem; white-space: normal }
+      .topbar .sub { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical }
+      .topbar .spacer { display: none }
+      .topbar-actions { width: 100%; justify-content: flex-start }
+      .content { padding: 1rem max(.9rem, env(safe-area-inset-right)) 2.5rem max(.9rem, env(safe-area-inset-left)) }
+      .g2, .g3, .g4 { grid-template-columns: 1fr }
+      .stat .value { font-size: 1.4rem }
+      .stat .icon { width: 32px; height: 32px; right: .75rem; top: .75rem }
+      .card { padding: 1rem; border-radius: 12px }
+      .row > * { min-width: min(100%, 160px) }
+      .btn { min-height: 40px } .btn.sm { min-height: 34px } .btn.icon { width: 36px; height: 36px }
+      .nav-link { padding: .72rem .75rem; min-height: 44px }
+      .toast { left: .75rem; right: .75rem; bottom: max(.75rem, env(safe-area-inset-bottom)); max-width: none }
+      .chart { height: 140px }
+      .copy, .import { flex-wrap: wrap }
+      .actions input[type=password], .actions input[type=text] { width: min(9rem, 42vw); max-width: 100% }
+      table .actions { max-width: 100% }
+    }
+    @media (max-width: 480px) {
+      th, td { padding: .5rem .45rem }
+      .seg a { padding: .35rem .55rem; font-size: .75rem }
+    }
   </style>
   {% block head %}{% endblock %}
 </head>
 <body>
 {% import "_icons.html" as ic %}
 {% if user %}
+<div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeNav()" hidden></div>
 <div class="layout">
-  <aside class="sidebar">
-    <div class="brand"><div class="logo">L2X</div>{{ app_name }}</div>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="logo">L2X</div>{{ app_name }}
+      <button class="btn ghost icon nav-close" type="button" onclick="closeNav()" aria-label="Закрыть меню">{{ ic.icon('x') }}</button>
+    </div>
     <div class="nav-group">{{ t('Обзор') }}</div>
     <a class="nav-link {% if active=='dashboard' %}active{% endif %}" href="{{ bp }}/">{{ ic.icon('grid') }}{{ t('Дашборд') }}</a>
     <div class="nav-group">{{ t('Пользователи') }}</div>
@@ -178,12 +238,13 @@
   </aside>
   <main class="main">
     <div class="topbar">
-      <div>
+      <button class="btn ghost icon nav-toggle" type="button" onclick="toggleNav()" aria-label="Меню" aria-controls="sidebar" aria-expanded="false" id="nav-toggle">{{ ic.icon('menu') }}</button>
+      <div class="topbar-title">
         <h1>{% block page_title %}{% endblock %}</h1>
         <div class="sub">{% block page_sub %}{% endblock %}</div>
       </div>
       <div class="spacer"></div>
-      {% block top_actions %}{% endblock %}
+      <div class="topbar-actions">{% block top_actions %}{% endblock %}</div>
     </div>
     <div class="content">
       {% if panel_update %}
@@ -238,6 +299,17 @@
     else { var ta = document.createElement('textarea'); ta.value = val; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); done(); }
   }
   function openDlg(id) { document.getElementById(id).showModal(); }
+  function setNav(open) {
+    document.body.classList.toggle('nav-open', !!open);
+    var bd = document.getElementById('sidebar-backdrop');
+    var btn = document.getElementById('nav-toggle');
+    if (bd) bd.hidden = !open;
+    if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  function toggleNav() { setNav(!document.body.classList.contains('nav-open')); }
+  function closeNav() { setNav(false); }
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeNav(); });
+  window.addEventListener('resize', function () { if (window.innerWidth > 860) closeNav(); });
 </script>
 {% block scripts %}{% endblock %}
 </body>
