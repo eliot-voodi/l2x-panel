@@ -964,6 +964,17 @@ BOT = tgbot.Bot(_bot_settings, {
 TG_LOW_GB = 5.0
 
 
+def _tg_admin(text: str, *, flag: str = "notify_changes") -> None:
+    """Send HTML message to Telegram admins if the given notify flag is on."""
+    try:
+        s = _bot_settings()
+        if not s.get("enabled") or not s.get(flag, True):
+            return
+        BOT.send(text)
+    except Exception:
+        pass
+
+
 def _notify_events(events: list[dict]) -> None:
     s = _bot_settings()
     for e in events:
@@ -2244,6 +2255,10 @@ async def inbound_save(request: Request):
             for c in store["clients"]:
                 c["inbounds"] = [ib["tag"] if x == old_tag else x for x in c.get("inbounds") or []]
     result = _apply_xray(_load_store())
+    _tg_admin(
+        f"📥 Inbound <b>{tgbot.escape(ib['tag'])}</b> {'создан' if not ib_id else 'обновлён'}",
+        flag="notify_changes",
+    )
     flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён", result))
     return go("/inbounds")
 
@@ -2468,6 +2483,8 @@ async def client_save(request: Request):
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
     result = _apply_xray(_load_store())
+    act = "создан" if not original else "обновлён"
+    _tg_admin(f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}", flag="notify_changes")
     flash(request, *_ok_msg(f"Клиент {c['email']} сохранён", result))
     return go(f"/clients/{c['email']}/edit")
 
@@ -2566,6 +2583,11 @@ def client_action(email: str, action: str, request: Request):
             flash(request, "Неизвестное действие", "error")
             return go("/clients")
     result = _apply_xray(_load_store()) if action not in ("regen_sub", "clear_ips", "clear_hwids") else {"ok": True}
+    if action in ("delete", "toggle", "reset", "regen_uuid"):
+        _tg_admin(
+            f"👤 Клиент <b>{tgbot.escape(email)}</b>: {tgbot.escape(action)}",
+            flag="notify_changes",
+        )
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
         return go("/clients")
@@ -3276,7 +3298,9 @@ async def outbound_add(request: Request):
             store["outbounds_custom"] = previous
         flash(request, f"Outbound {tag} не сохранён — Xray отклонил конфиг: {xr.get('error')}", "error")
         return go("/outbounds")
-    flash(request, f"Outbound {tag} {'обновлён' if edit_tag else 'добавлен'}", "info")
+    act = "обновлён" if edit_tag else "добавлен"
+    _tg_admin(f"📤 Outbound <b>{tgbot.escape(tag)}</b> {act}", flag="notify_changes")
+    flash(request, f"Outbound {tag} {act}", "info")
     return go("/outbounds")
 
 
@@ -3407,6 +3431,8 @@ def outbound_action(tag: str, action: str, request: Request):
                     return go("/outbounds")
                 store["outbounds_custom"].remove(o)
     xr = _apply_xray(_load_store()) if action != "reset" else {"ok": True}
+    if action in ("delete", "toggle", "sub"):
+        _tg_admin(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: {tgbot.escape(action)}", flag="notify_changes")
     flash(request, *_ok_msg(f"{tag}: {action}", xr))
     return go("/outbounds")
 
@@ -3943,8 +3969,10 @@ def doh_install(request: Request):
             st["settings"]["doh"]["upstream_port"] = 53
         _apply_xray(_load_store())
         extra = " Docker установлен автоматически." if res.get("docker_installed") else ""
+        _tg_admin(f"🛡 Pi-hole установлен на этой панели. DoH включён.{extra}", flag="notify_changes")
         flash(request, f"Pi-hole установлен (docker). DoH включён.{extra}", "info")
     else:
+        _tg_admin(f"❌ Pi-hole install: {tgbot.escape(res.get('error') or 'fail')}", flag="notify_changes")
         flash(request, f"Pi-hole install: {res.get('error')}", "error")
     return go("/doh")
 
@@ -4274,6 +4302,8 @@ async def settings_save(request: Request):
                 "receive_commands": form.get("receive_commands") == "1",
                 "notify_login": form.get("notify_login") == "1", "notify_quota": form.get("notify_quota") == "1",
                 "notify_iplimit": form.get("notify_iplimit") == "1", "notify_tunnel": form.get("notify_tunnel") == "1",
+                "notify_nodes": form.get("notify_nodes") == "1",
+                "notify_changes": form.get("notify_changes") == "1",
                 "notify_expire_days": _float(form.get("notify_expire_days"), 3),
                 "cpu_threshold": _float(form.get("cpu_threshold"), 85), "report_hours": _float(form.get("report_hours"), 24),
                 "backup_hours": _float(form.get("backup_hours"), 24),
@@ -4854,6 +4884,7 @@ async def nodes_provision(request: Request):
         return {"ok": True, "log": log}
 
     NODES_JOB["id"] = ops.start_job("node-provision", job)
+    _tg_admin(f"🚀 Provision ноды <b>{tgbot.escape(domain)}</b> запущен", flag="notify_nodes")
     flash(request, f"Установка ноды {domain} по SSH запущена (несколько минут). Смотрите фоновые задачи.", "info")
     return go("/nodes")
 
@@ -4868,8 +4899,19 @@ def _node_push_job(node_id: str, label: str, host: str):
         payload = nodes_mod.build_payload(store, node, xray.build_config)
         node_snap = dict(node)
         name = node.get("name") or node_id
+        doh_on = bool((store.get("settings") or {}).get("doh", {}).get("enabled"))
+        is_mirror = bool(node.get("mirror"))
     # Network I/O must not hold mutate()/STORE_LOCK
     res = nodes_mod.push(node_snap, payload, master_host=host, timeout=120)
+    warns = list(res.get("warnings") or [])
+    # Master-side hint when DoH is on but this was a non-mirror push (settings not sent)
+    if doh_on and not is_mirror and res.get("ok"):
+        warns.append(
+            "DoH включён на master, но нода без зеркала — настройки DoH/Pi-hole в sync не передаются. "
+            "Включите «зеркало» или установите Pi-hole на ноде перед promote."
+        )
+        if not node_snap.get("last_warning"):
+            node_snap["last_warning"] = "; ".join(warns)[:600]
     with mutate() as store:
         for n in nodes_mod.ensure_list(store):
             if n.get("id") != node_id:
@@ -4877,17 +4919,44 @@ def _node_push_job(node_id: str, label: str, host: str):
             n["last_sync"] = node_snap.get("last_sync") or n.get("last_sync")
             n["last_ok"] = bool(node_snap.get("last_ok"))
             n["last_error"] = node_snap.get("last_error") or ""
+            n["last_warning"] = node_snap.get("last_warning") or ("; ".join(warns)[:600] if warns else "")
             if node_snap.get("panel_version"):
                 n["panel_version"] = node_snap["panel_version"]
             break
         webhooks.fire(store["settings"], "node.sync", {
-            "node": name, "ok": res.get("ok"), "error": res.get("error"), "label": label,
+            "node": name, "ok": res.get("ok"), "error": res.get("error"),
+            "label": label, "warnings": warns,
         })
         xr = _apply_xray(store)
     log = f"{label}: {'OK' if res.get('ok') else res.get('error') or 'fail'}"
+    if warns:
+        log += "\n⚠ " + " | ".join(warns)
     if not xr.get("ok"):
         log += f"\nxray: {xr.get('error') or 'fail'}"
-    return {"ok": bool(res.get("ok")), "log": log, "error": "" if res.get("ok") else (res.get("error") or "push failed")}
+    # Telegram: always report failures/warnings; successes only for manual sync (not schedule)
+    is_sched = "schedule" in (label or "").lower()
+    if not res.get("ok"):
+        _tg_admin(
+            f"❌ Sync <b>{tgbot.escape(name)}</b>: {tgbot.escape(res.get('error') or 'fail')}\n"
+            f"<i>{tgbot.escape(label)}</i>",
+            flag="notify_nodes",
+        )
+    elif warns:
+        _tg_admin(
+            f"⚠️ <b>Sync {tgbot.escape(name)}</b> ({tgbot.escape(label)})\n"
+            + "\n".join(f"• {tgbot.escape(w)}" for w in warns),
+            flag="notify_nodes",
+        )
+    elif not is_sched:
+        _tg_admin(
+            f"✅ Sync <b>{tgbot.escape(name)}</b>: OK ({tgbot.escape(label)})",
+            flag="notify_nodes",
+        )
+    return {
+        "ok": bool(res.get("ok")), "log": log,
+        "error": "" if res.get("ok") else (res.get("error") or "push failed"),
+        "warnings": warns,
+    }
 
 
 @app.post("/nodes/{node_id}/{action}")
@@ -4910,13 +4979,17 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 flash(request, "Нода не найдена", "error")
                 return go("/nodes")
             if action == "delete":
+                nm = node.get("name") or node_id
                 nodes.remove(node)
                 nodes_mod.sync_all_node_outbounds(store)
+                _tg_admin(f"🗑 Нода <b>{tgbot.escape(nm)}</b> удалена", flag="notify_nodes")
                 flash(request, "Нода удалена", "info")
             elif action == "toggle":
                 node["enabled"] = not node.get("enabled", True)
                 nodes_mod.upsert_node_outbound(store, node)
-                flash(request, f"{node['name']}: {'вкл' if node['enabled'] else 'выкл'}", "info")
+                state = "вкл" if node["enabled"] else "выкл"
+                _tg_admin(f"🖥 Нода <b>{tgbot.escape(node['name'])}</b>: {state}", flag="notify_nodes")
+                flash(request, f"{node['name']}: {state}", "info")
             elif action == "schedule":
                 mins = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
                 node["sync_interval_min"] = mins
@@ -5095,6 +5168,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                                                master_store_snapshot=snap, old_master_node=old)
             log_lines.append(res.get("log") or "")
             if not res.get("ok"):
+                _tg_admin(
+                    f"❌ Promote → <b>{tgbot.escape(name)}</b>: {tgbot.escape(res.get('error') or 'fail')}",
+                    flag="notify_nodes",
+                )
                 return {"ok": False, "error": res.get("error") or "promote failed",
                         "log": "\n".join(x for x in log_lines if x)}
 
@@ -5108,6 +5185,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     verified = True
                     break
             if not verified:
+                _tg_admin(
+                    f"❌ Promote → <b>{tgbot.escape(name)}</b> не подтверждён — старый master не трогали",
+                    flag="notify_nodes",
+                )
                 return {
                     "ok": False,
                     "error": "новая нода не подтвердила роль master — старый master не трогали",
@@ -5124,6 +5205,13 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 nodes_mod.agent_token(st)
                 st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
             via = "API" if use_api else "SSH"
+            _tg_admin(
+                f"✅ Promote → <b>{tgbot.escape(name)}</b> OK ({via}). "
+                f"certs={int(snap.get('transferred_certs') or 0)}, "
+                f"doh_files={int(snap.get('transferred_doh_files') or 0)}, "
+                f"custom={n_custom}, l2tp={n_l2tp}",
+                flag="notify_nodes",
+            )
             return {
                 "ok": True,
                 "log": "\n".join(x for x in log_lines if x)
@@ -5137,6 +5225,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
             }
 
         NODES_JOB["id"] = ops.start_job("node-promote", job)
+        _tg_admin(
+            f"👑 Promote master → <b>{tgbot.escape(name)}</b> запущен ({'API' if use_api else 'SSH'})",
+            flag="notify_nodes",
+        )
         flash(request, f"Передача роли master → {name} запущена ({'API' if use_api else 'SSH'}). Все outbound переносятся, {nodes_mod.node_outbound_tag(node_copy)} → direct.", "info")
         return go("/nodes")
 
@@ -5630,7 +5722,20 @@ async def agent_apply(request: Request):
         err = xray.clean_xray_error(err) or err
     except Exception:
         pass
-    return {"ok": bool(res.get("ok")), "error": err, "mirror": mirror}
+    warnings: list[str] = []
+    try:
+        doh_cfg = (_load_store().get("settings") or {}).get("doh") or {}
+        if doh_cfg.get("enabled"):
+            ready = doh_mod.pihole_ready()
+            if not ready.get("ok"):
+                warnings.append(
+                    "DoH/Pi-hole настройки переданы sync'ом, но на ноде Pi-hole не готов: "
+                    f"{ready.get('reason') or 'не установлен'}. "
+                    "Установите Pi-hole на этой ноде (DoH / Pi-hole → Установить), иначе DNS-over-HTTPS здесь не заработает."
+                )
+    except Exception:
+        pass
+    return {"ok": bool(res.get("ok")), "error": err, "mirror": mirror, "warnings": warnings}
 
 
 @app.get("/api-docs", response_class=HTMLResponse)

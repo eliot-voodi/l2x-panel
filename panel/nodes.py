@@ -709,6 +709,13 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
     node["last_sync"] = now_iso()
     node["last_ok"] = bool(result.get("ok"))
     node["last_error"] = "" if result.get("ok") else err
+    warns = result.get("warnings") or []
+    if isinstance(warns, str):
+        warns = [warns]
+    node["last_warning"] = "; ".join(str(w) for w in warns if w)[:600]
+    # Also surface as soft warning when sync ok but Pi-hole missing
+    if result.get("ok") and node["last_warning"] and not node["last_error"]:
+        pass  # keep last_ok True — warning only
     if result.get("ok"):
         try:
             probe_health(node, timeout=5)

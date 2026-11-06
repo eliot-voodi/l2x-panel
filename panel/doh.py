@@ -190,6 +190,19 @@ def write_compose(*, password: str = "") -> Path:
     return COMPOSE_DIR
 
 
+def pihole_ready() -> dict:
+    """Whether local l2x-pihole can serve DNS for DoH on this host."""
+    if not shutil.which("docker"):
+        return {"ok": False, "reason": "docker не установлен"}
+    running = _run(["docker", "inspect", "-f", "{{.State.Running}}", "l2x-pihole"], timeout=20)
+    if not running["ok"] or "true" not in (running.get("stdout") or "").lower():
+        compose = COMPOSE_DIR / "docker-compose.yml"
+        if not compose.is_file():
+            return {"ok": False, "reason": "Pi-hole не установлен (нет compose)"}
+        return {"ok": False, "reason": "контейнер l2x-pihole не запущен"}
+    return {"ok": True, "reason": ""}
+
+
 def ensure_docker() -> dict:
     """Install Docker Engine + compose plugin if missing (Debian/Ubuntu via get.docker.com)."""
     log: list[str] = []

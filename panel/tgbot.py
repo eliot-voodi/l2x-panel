@@ -28,6 +28,8 @@ def default_settings() -> dict:
         "notify_expire_days": 3,
         "notify_iplimit": True,
         "notify_tunnel": True,
+        "notify_nodes": True,      # sync / provision / promote / node errors
+        "notify_changes": True,    # clients, inbounds, outbounds, DoH, settings
         "cpu_threshold": 85,
         "report_hours": 24,
         "backup_hours": 24,

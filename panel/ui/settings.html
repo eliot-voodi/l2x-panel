@@ -125,6 +125,8 @@
   {{ m.check('notify_quota', tg.notify_quota, 'Истечение срока / исчерпание трафика / авто-сброс') }}
   {{ m.check('notify_iplimit', tg.notify_iplimit, 'Блокировки по лимиту IP') }}
   {{ m.check('notify_tunnel', tg.notify_tunnel, 'Падение L2TP-туннелей') }}
+  {{ m.check('notify_nodes', tg.notify_nodes if tg.notify_nodes is defined else True, 'Ноды: sync (ошибки/предупреждения/ручной), provision, promote') }}
+  {{ m.check('notify_changes', tg.notify_changes if tg.notify_changes is defined else True, 'Изменения: клиенты, inbounds, outbounds, DoH/Pi-hole') }}
   <div class="row">
     <div><label class="f">Предупреждать об истечении за, дн</label><input name="notify_expire_days" type="number" step="0.5" value="{{ tg.notify_expire_days }}"></div>
     <div><label class="f">Порог CPU, %</label><input name="cpu_threshold" type="number" value="{{ tg.cpu_threshold }}"></div>
