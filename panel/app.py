@@ -3920,7 +3920,11 @@ async def doh_save(request: Request):
             return go("/doh")
     # Re-apply nginx so /doh/ location + reserved path update
     xr = _apply_xray(_load_store())
-    flash(request, *_ok_msg(f"DoH настройки сохранены.{pwd_msg}".rstrip(), xr))
+    # Soft front path remarks (e.g. grpc path occupied) are unrelated to DoH — don't flash them
+    if not xr.get("ok"):
+        flash(request, f"DoH сохранены.{pwd_msg} Ошибка front/Xray: {xr.get('error')}".strip(), "error")
+    else:
+        flash(request, f"DoH настройки сохранены.{pwd_msg}".rstrip(), "info")
     return go("/doh")
 
 
@@ -3980,6 +3984,11 @@ def doh_pihole_session_end(request: Request):
 
 
 def _pihole_session_ok(request: Request) -> bool:
+    """Panel login OR redeemed one-time link grants proxy access."""
+    if _user(request):
+        exp = request.session.get("exp", 0)
+        if not exp or time.time() <= float(exp):
+            return True
     try:
         return float(request.session.get("pihole_until") or 0) > time.time()
     except (TypeError, ValueError):
@@ -4056,10 +4065,8 @@ def _rewrite_pihole_body(body: bytes, content_type: str, mount: str) -> bytes:
 
 def _proxy_pihole(request: Request, path: str) -> Response:
     if not _pihole_session_ok(request):
-        return PlainTextResponse(
-            "Нет доступа к Pi-hole. Создайте одноразовую ссылку на странице DoH / Pi-hole.",
-            status_code=403,
-        )
+        # No scary plaintext banner — send anonymous visitors to login; admins already pass above
+        return RedirectResponse(base_path() + "/login?next=/pihole/admin/", status_code=303)
     store = _load_store()
     cfg = {**doh_mod.default_settings(), **(store["settings"].get("doh") or {})}
     host, port = doh_mod.pihole_upstream(cfg)

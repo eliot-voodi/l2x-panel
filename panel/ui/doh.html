@@ -37,25 +37,19 @@
       <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:53 / :8089?')"><button class="btn">Установить Pi-hole</button></form>
       <form method="post" action="{{ bp }}/doh/stop"><button class="btn ghost">Остановить</button></form>
     </div>
-    <div class="hint mt">Web UI слушает только <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code> — снаружи через одноразовую ссылку ниже.</div>
+    <div class="hint mt">Web UI слушает только <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code> — снаружи через прокси панели.</div>
   </div>
 </div>
 
 <div class="card">
   <h3>Доступ к Pi-hole admin</h3>
-  <div class="hint">Ссылка одноразовая: после открытия выдаётся сессия на 2 часа (прокси через панель). Порт 8089 наружу не открывается.</div>
-  {% if pihole_session and pihole_session.active %}
-  <div class="row mt">
-    <div><span class="badge ok">сессия активна</span>
-      <div class="dim small">ещё ≈ {{ (pihole_session.left_sec // 60) }} мин</div></div>
-    <div class="actions">
-      <a class="btn" href="{{ pihole_open }}" target="_blank" rel="noopener">Открыть admin</a>
-      <form method="post" action="{{ bp }}/doh/pihole-session-end"><button class="btn ghost">Закрыть сессию</button></form>
-    </div>
-  </div>
-  {% endif %}
+  <div class="hint">Пока вы вошли в панель — «Открыть admin» работает сразу. Одноразовая ссылка нужна только без входа в панель (другой браузер / устройство), 15 мин · 1 раз · затем 2 ч сессии.</div>
   <div class="actions mt">
-    <form method="post" action="{{ bp }}/doh/pihole-link"><button class="btn">Создать одноразовую ссылку</button></form>
+    <a class="btn" href="{{ pihole_open }}" target="_blank" rel="noopener">Открыть admin</a>
+    <form method="post" action="{{ bp }}/doh/pihole-link"><button class="btn ghost">Создать одноразовую ссылку</button></form>
+    {% if pihole_session and pihole_session.active %}
+    <form method="post" action="{{ bp }}/doh/pihole-session-end"><button class="btn ghost">Закрыть сессию по ссылке</button></form>
+    {% endif %}
   </div>
   {% if pihole_link %}
   <div class="mt">
