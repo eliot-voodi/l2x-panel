@@ -34,7 +34,7 @@
     </div>
     {% if status.error %}<div class="hint" style="color:var(--danger)">{{ status.error }}</div>{% endif %}
     <div class="actions mt">
-      <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:53 / :8089?')"><button class="btn">Установить Pi-hole</button></form>
+      <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:53 / :8089? Если Docker нет — он будет установлен автоматически.')"><button class="btn">Установить Pi-hole</button></form>
       <form method="post" action="{{ bp }}/doh/stop"><button class="btn ghost">Остановить</button></form>
     </div>
     <div class="hint mt">Web UI слушает только <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code> — снаружи через прокси панели.</div>

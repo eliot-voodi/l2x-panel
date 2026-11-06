@@ -3942,7 +3942,8 @@ def doh_install(request: Request):
             st["settings"]["doh"]["upstream"] = "127.0.0.1"
             st["settings"]["doh"]["upstream_port"] = 53
         _apply_xray(_load_store())
-        flash(request, "Pi-hole установлен (docker). DoH включён.", "info")
+        extra = " Docker установлен автоматически." if res.get("docker_installed") else ""
+        flash(request, f"Pi-hole установлен (docker). DoH включён.{extra}", "info")
     else:
         flash(request, f"Pi-hole install: {res.get('error')}", "error")
     return go("/doh")

@@ -190,9 +190,70 @@ def write_compose(*, password: str = "") -> Path:
     return COMPOSE_DIR
 
 
+def ensure_docker() -> dict:
+    """Install Docker Engine + compose plugin if missing (Debian/Ubuntu via get.docker.com)."""
+    log: list[str] = []
+    if shutil.which("docker"):
+        # Ensure daemon is up
+        st = _run(["docker", "info"], timeout=30)
+        if st["ok"]:
+            return {"ok": True, "installed": False, "log": "docker already present"}
+        _run(["systemctl", "enable", "--now", "docker"], timeout=60)
+        st = _run(["docker", "info"], timeout=30)
+        if st["ok"]:
+            return {"ok": True, "installed": False, "log": "docker started"}
+        return {"ok": False, "error": "docker есть, но daemon не отвечает", "log": st.get("stderr") or st.get("stdout") or ""}
+
+    geteuid = getattr(os, "geteuid", None)
+    if callable(geteuid) and geteuid() != 0:
+        return {"ok": False, "error": "нужен root для установки docker"}
+
+    # Official convenience script covers Debian/Ubuntu/CentOS
+    log.append("installing docker via get.docker.com")
+    script = Path("/tmp/l2x-get-docker.sh")
+    dl = _run(["curl", "-fsSL", "https://get.docker.com", "-o", str(script)], timeout=120)
+    if not dl["ok"]:
+        # fallback: apt packages on Debian/Ubuntu
+        log.append("get.docker.com download failed, trying apt")
+        for cmd in (
+            ["apt-get", "update", "-y"],
+            ["apt-get", "install", "-y", "docker.io", "docker-compose-v2"],
+        ):
+            r = _run(cmd, timeout=300)
+            log.append((r.get("stderr") or r.get("stdout") or "")[:400])
+            if not r["ok"] and cmd[0] != "apt-get":
+                break
+        _run(["systemctl", "enable", "--now", "docker"], timeout=60)
+    else:
+        try:
+            os.chmod(script, 0o755)
+        except OSError:
+            pass
+        r = _run(["sh", str(script)], timeout=600)
+        log.append((r.get("stdout") or "")[-800:])
+        if not r["ok"]:
+            log.append((r.get("stderr") or "")[-400:])
+            return {"ok": False, "error": "установка docker не удалась", "log": "\n".join(log)}
+        _run(["systemctl", "enable", "--now", "docker"], timeout=60)
+
+    # Wait until docker answers
+    for _ in range(15):
+        if shutil.which("docker"):
+            st = _run(["docker", "info"], timeout=20)
+            if st["ok"]:
+                # Prefer compose v2 plugin; install if missing
+                plug = _run(["docker", "compose", "version"], timeout=30)
+                if not plug["ok"]:
+                    _run(["apt-get", "install", "-y", "docker-compose-plugin", "docker-compose-v2"], timeout=180)
+                return {"ok": True, "installed": True, "log": "\n".join(log)}
+        time.sleep(2)
+    return {"ok": False, "error": "docker установлен, но не отвечает", "log": "\n".join(log)}
+
+
 def install_pihole(*, password: str = "") -> dict:
-    if not shutil.which("docker"):
-        return {"ok": False, "error": "docker не установлен"}
+    dock = ensure_docker()
+    if not dock.get("ok"):
+        return {"ok": False, "error": dock.get("error") or "docker недоступен", "log": dock.get("log")}
     pwd = password or secrets.token_urlsafe(12)
     write_compose(password=pwd)
     # Prefer docker compose v2
@@ -207,8 +268,11 @@ def install_pihole(*, password: str = "") -> dict:
     # Force recreate so FTLCONF_webserver_api_password from .env is applied
     sp = set_pihole_password(pwd, update_env=False)
     if not sp.get("ok"):
-        return {**sp, "dir": str(COMPOSE_DIR)}
-    return {"ok": True, "dir": str(COMPOSE_DIR), "password": pwd, "log": sp.get("log")}
+        return {**sp, "dir": str(COMPOSE_DIR), "docker_installed": bool(dock.get("installed"))}
+    return {
+        "ok": True, "dir": str(COMPOSE_DIR), "password": pwd, "log": sp.get("log"),
+        "docker_installed": bool(dock.get("installed")),
+    }
 
 
 def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
