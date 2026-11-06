@@ -193,7 +193,8 @@ def write_compose(*, password: str = "") -> Path:
 def install_pihole(*, password: str = "") -> dict:
     if not shutil.which("docker"):
         return {"ok": False, "error": "docker не установлен"}
-    write_compose(password=password)
+    pwd = password or secrets.token_urlsafe(12)
+    write_compose(password=pwd)
     # Prefer docker compose v2
     base = ["docker", "compose", "-f", str(COMPOSE_DIR / "docker-compose.yml")]
     r = _run([*base, "pull"], timeout=300, cwd=str(COMPOSE_DIR))
@@ -203,11 +204,60 @@ def install_pihole(*, password: str = "") -> dict:
         r = _run([*base, "pull"], timeout=300, cwd=str(COMPOSE_DIR))
     if not r["ok"]:
         return {"ok": False, "error": r["stderr"] or r["stdout"] or "pull failed", "log": r}
-    up = _run([*base, "up", "-d"], timeout=180, cwd=str(COMPOSE_DIR))
+    # Force recreate so FTLCONF_webserver_api_password from .env is applied
+    sp = set_pihole_password(pwd, update_env=False)
+    if not sp.get("ok"):
+        return {**sp, "dir": str(COMPOSE_DIR)}
+    return {"ok": True, "dir": str(COMPOSE_DIR), "password": pwd, "log": sp.get("log")}
+
+
+def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
+    """Apply admin password.
+
+    Pi-hole v6 with FTLCONF_webserver_api_password ignores ``pihole setpassword``
+    («set by environment variable»). We update ``.env`` and recreate the container
+    so the new env value is picked up; DNS volumes are kept.
+    """
+    pwd = str(password or "")
+    if not pwd:
+        return {"ok": False, "error": "пустой пароль"}
+    if not shutil.which("docker"):
+        return {"ok": False, "error": "docker не установлен"}
+    COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    if not yml.is_file():
+        write_compose(password=pwd)
+    elif update_env:
+        env = COMPOSE_DIR / ".env"
+        env.write_text(f"PIHOLE_PASSWORD={pwd}\n", encoding="utf-8")
+        try:
+            os.chmod(env, 0o600)
+        except OSError:
+            pass
+    else:
+        # Still ensure .env matches even when caller said update_env=False after write_compose
+        env = COMPOSE_DIR / ".env"
+        if not env.is_file():
+            env.write_text(f"PIHOLE_PASSWORD={pwd}\n", encoding="utf-8")
+
+    base = None
+    for cand in (
+        ["docker", "compose", "-f", str(yml)],
+        ["docker-compose", "-f", str(yml)],
+    ):
+        probe = _run([*cand, "version"], timeout=30, cwd=str(COMPOSE_DIR))
+        if probe["ok"]:
+            base = cand
+            break
+    if not base:
+        return {"ok": False, "error": "docker compose недоступен"}
+
+    # Recreate so FTLCONF_webserver_api_password is re-read from .env
+    up = _run([*base, "up", "-d", "--force-recreate", "pihole"], timeout=180, cwd=str(COMPOSE_DIR))
     if not up["ok"]:
-        return {"ok": False, "error": up["stderr"] or up["stdout"] or "up failed", "log": up}
-    time.sleep(3)
-    return {"ok": True, "dir": str(COMPOSE_DIR), "log": up["stdout"]}
+        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "recreate failed").strip(), "log": up}
+    time.sleep(2)
+    return {"ok": True, "log": (up.get("stdout") or "").strip()}
 
 
 def stop_pihole() -> dict:

@@ -3897,6 +3897,7 @@ async def doh_save(request: Request):
     if redir := _require(request):
         return redir
     form = await request.form()
+    pwd = str(form.get("pihole_password") or "").strip()
     with mutate() as store:
         d = store["settings"].setdefault("doh", doh_mod.default_settings())
         d.update({
@@ -3907,12 +3908,19 @@ async def doh_save(request: Request):
             "pihole_web": str(form.get("pihole_web") or "127.0.0.1:8089").strip(),
             "timeout_sec": max(1, _float(form.get("timeout_sec"), 4)),
         })
-        pwd = str(form.get("pihole_password") or "").strip()
         if pwd:
             d["pihole_password"] = pwd
+    pwd_msg = ""
+    if pwd:
+        sp = doh_mod.set_pihole_password(pwd)
+        if sp.get("ok"):
+            pwd_msg = " Пароль Pi-hole применён к контейнеру."
+        else:
+            flash(request, f"DoH сохранены, но пароль Pi-hole не применён: {sp.get('error')}", "error")
+            return go("/doh")
     # Re-apply nginx so /doh/ location + reserved path update
     xr = _apply_xray(_load_store())
-    flash(request, *_ok_msg("DoH настройки сохранены", xr))
+    flash(request, *_ok_msg(f"DoH настройки сохранены.{pwd_msg}".rstrip(), xr))
     return go("/doh")
 
 
