@@ -221,6 +221,18 @@ GEO_SOURCES = {
     "geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
 }
 
+# Optional packs — use in routes as ext:filename.dat:tag
+GEO_PACKS = {
+    "russia": {
+        "title": "Russia rules (runetfreedom)",
+        "hint": "ext:geoip_RU.dat:ru · ext:geosite_RU.dat:ru / category-ads-all",
+        "files": [
+            {"name": "geoip_RU.dat", "url": "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"},
+            {"name": "geosite_RU.dat", "url": "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"},
+        ],
+    },
+}
+
 
 def update_geo(custom: list[dict] | None = None) -> dict:
     GEO_DIR.mkdir(parents=True, exist_ok=True)
@@ -243,7 +255,12 @@ def update_geo(custom: list[dict] | None = None) -> dict:
         except Exception as exc:
             ok = False
             log.append(f"{name}: ERROR {exc}")
-    _run(["systemctl", "restart", "xray"], 30)
+    xr = _run(["systemctl", "restart", "xray"], 30)
+    if not xr.get("ok"):
+        ok = False
+        log.append(f"xray restart: {xr.get('stderr') or xr.get('stdout') or 'fail'}")
+    else:
+        log.append("xray: restarted")
     return {"ok": ok, "log": "\n".join(log)}
 
 
@@ -254,6 +271,16 @@ def geo_files() -> list[dict]:
         {"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)}
         for p in sorted(GEO_DIR.glob("*.dat"))
     ]
+
+
+def geo_missing_core() -> list[str]:
+    """Return core geoip/geosite names that are missing or empty."""
+    missing = []
+    for name in GEO_SOURCES:
+        p = GEO_DIR / name
+        if not p.is_file() or p.stat().st_size < 1024:
+            missing.append(name)
+    return missing
 
 
 # ---------------------------------------------------------------- logs

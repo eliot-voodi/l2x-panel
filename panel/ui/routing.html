@@ -49,6 +49,51 @@
 {% endblock %}
 {% block content %}
 <div class="card">
+  <div class="card-head">
+    <h3>GeoIP / GeoSite</h3>
+    <form method="post" action="{{ bp }}/xray/geo/update?next=/routing">
+      <button class="btn sm">{{ ic.icon('download') }}Обновить geo</button>
+    </form>
+  </div>
+  {% if geo_missing %}
+  <div class="badge err" style="margin-bottom:.6rem">Нет файлов: {{ geo_missing|join(', ') }} — маршруты geosite:/geoip: не работают, нажмите «Обновить geo»</div>
+  {% endif %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Файл</th><th>Размер</th><th>Обновлён</th></tr></thead>
+      <tbody>
+      {% for g in geo %}
+        <tr><td class="mono">{{ g.name }}</td><td class="small">{{ format_traffic(g.size) }}</td><td class="small dim">{{ fmt_ts(g.mtime) }}</td></tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">Файлов нет — скачайте Loyalsoldier geoip/geosite</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="hint mt">
+    Основные: <code>geoip.dat</code> / <code>geosite.dat</code> (Loyalsoldier).
+    В правилах: <code>geoip:ru</code>, <code>geosite:google</code>, <code>geosite:category-ads-all</code>,
+    <code>ext:geosite_RU.dat:ru</code>.
+    {% if geo_state.last_at %} Последнее обновление: {{ fmt_dt(geo_state.last_at) }}{% if geo_state.last_ok is defined %} · {% if geo_state.last_ok %}ok{% else %}ошибка{% endif %}{% endif %}.{% endif %}
+    Подробнее: <a href="{{ bp }}/xray?tab=geo">Xray → Geo</a>.
+  </div>
+  <form method="post" action="{{ bp }}/xray/geo/settings?next=/routing" class="row mt" style="align-items:end;max-width:520px">
+    <div style="flex:0 0 auto">{{ m.check('auto', geo_cfg.get('auto', True), 'Авто-обновление') }}</div>
+    <div style="max-width:140px"><label class="f">Интервал, ч</label><input name="interval_hours" type="number" min="6" max="720" value="{{ geo_cfg.get('interval_hours', 168) }}"></div>
+    <div><button class="btn ghost sm">Сохранить</button></div>
+  </form>
+  <div class="actions mt rt-presets">
+    {% for key, pack in geo_packs.items() %}
+    <form method="post" action="{{ bp }}/xray/geo/pack/{{ key }}?next=/routing"
+          onsubmit="return confirm('Добавить пакет «{{ pack.title }}» и скачать сейчас?')">
+      <button class="btn ghost sm" title="{{ pack.hint }}">+ {{ pack.title }}</button>
+    </form>
+    {% endfor %}
+  </div>
+</div>
+{% include "_jobs.html" %}
+
+<div class="card">
   <div class="card-head"><h3>Готовые шаблоны</h3></div>
   <div class="actions rt-presets">
     {% for key, p in presets.items() %}
@@ -57,7 +102,7 @@
         {{ '⛔' if p.outbound == 'block' else '🏠' }} {{ p.name }}</button></form>
     {% endfor %}
   </div>
-  <div class="hint">geosite/geoip берутся из geo-файлов (Xray → Geo). Для direct-ru используется Loyalsoldier geosite.</div>
+  <div class="hint">Шаблоны используют теги из geo-файлов выше. Без актуальных <code>geosite.dat</code>/<code>geoip.dat</code> правила вроде direct-ru / block-ads не сработают.</div>
 </div>
 
 <div class="card" style="padding:0">
@@ -146,8 +191,10 @@
         <select name="outbound">{% for tag in outbounds %}<option value="{{ tag }}">{{ outbound_label(store, tag) }}</option>{% endfor %}</select></div>
     </div>
     <div class="row">
-      <div><label class="f">Домены (по строке)</label><textarea name="domain" class="mono" placeholder="geosite:google&#10;domain:example.com&#10;full:a.b.com&#10;regexp:.*\.ru$"></textarea></div>
-      <div><label class="f">IP / CIDR</label><textarea name="ip" class="mono" placeholder="geoip:ru&#10;8.8.8.8/32"></textarea></div>
+      <div><label class="f">Домены (по строке)</label><textarea name="domain" class="mono" placeholder="geosite:google&#10;geosite:category-ads-all&#10;geosite:category-ru&#10;ext:geosite_RU.dat:ru&#10;domain:example.com&#10;regexp:.*\.ru$"></textarea>
+        <div class="hint">geosite:tag из geosite.dat · ext:file.dat:tag из доп. пакетов</div></div>
+      <div><label class="f">IP / CIDR</label><textarea name="ip" class="mono" placeholder="geoip:ru&#10;geoip:cn&#10;geoip:private&#10;ext:geoip_RU.dat:ru&#10;8.8.8.8/32"></textarea>
+        <div class="hint">geoip:cc из geoip.dat · CIDR напрямую</div></div>
     </div>
     <div class="row">
       <div><label class="f">Пользователи (email)</label><textarea name="user" class="mono" style="min-height:3.5rem"></textarea></div>

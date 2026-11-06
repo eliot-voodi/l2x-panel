@@ -85,22 +85,48 @@
 {% elif tab == 'geo' %}
 <div class="grid g2">
   <div class="card">
-    <div class="card-head"><h3>Geo-файлы</h3>
-      <form method="post" action="{{ bp }}/xray/geo/update"><button class="btn sm">{{ ic.icon('download') }}{{ t('Обновить') }}</button></form></div>
+    <div class="card-head"><h3>GeoIP / GeoSite</h3>
+      <form method="post" action="{{ bp }}/xray/geo/update?next=/xray?tab=geo"><button class="btn sm">{{ ic.icon('download') }}{{ t('Обновить') }}</button></form></div>
+    {% if geo_missing %}<div class="badge err" style="margin-bottom:.6rem">Отсутствуют: {{ geo_missing|join(', ') }}</div>{% endif %}
     <table><tbody>
       {% for g in geo %}<tr><td class="mono">{{ g.name }}</td><td class="small">{{ format_traffic(g.size) }}</td><td class="small dim">{{ fmt_ts(g.mtime) }}</td></tr>
-      {% else %}<tr><td class="empty">Файлов нет</td></tr>{% endfor %}
+      {% else %}<tr><td class="empty">Файлов нет — нажмите Обновить</td></tr>{% endfor %}
     </tbody></table>
-    <div class="hint">geoip.dat / geosite.dat — Loyalsoldier (v2ray-rules-dat), плюс свои файлы ниже. Использование: <code>ext:file.dat:tag</code>.</div>
+    <div class="hint">
+      Базовые <code>geoip.dat</code> / <code>geosite.dat</code> — Loyalsoldier (v2ray-rules-dat).
+      В маршрутах: <code>geoip:ru</code>, <code>geosite:google</code>, доп. пакеты — <code>ext:file.dat:tag</code>.
+      {% if geo_state.last_at %}Обновлено: {{ fmt_dt(geo_state.last_at) }}{% if not geo_state.last_ok %} · <span style="color:var(--danger)">ошибка</span>{% endif %}.{% endif %}
+    </div>
+    <form method="post" action="{{ bp }}/xray/geo/settings?next=/xray?tab=geo" class="mt">
+      {{ m.check('auto', geo_cfg.get('auto', True), 'Автоматически обновлять geo-файлы') }}
+      <div style="max-width:180px"><label class="f">Интервал, ч</label><input name="interval_hours" type="number" min="6" max="720" value="{{ geo_cfg.get('interval_hours', 168) }}"></div>
+      <div class="actions mt"><button class="btn ghost sm">{{ t('Сохранить') }}</button></div>
+    </form>
+    {% if geo_state.last_log %}<details class="mt"><summary class="small" style="cursor:pointer">Лог последнего обновления</summary><pre style="max-height:200px">{{ geo_state.last_log }}</pre></details>{% endif %}
   </div>
+  <div>
   <form class="card" method="post" action="{{ bp }}/xray/settings">
     <input type="hidden" name="section" value="geo_custom">
     <h3>Свои geo-файлы</h3>
     <textarea name="geo_custom" class="mono" rows="6" placeholder="geoip_RU.dat | https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat">{% for g in store.settings.geo_custom %}{{ g.name }} | {{ g.url }}
 {% endfor %}</textarea>
-    <div class="hint">name | url — по строке. Скачиваются вместе с основными.</div>
+    <div class="hint">name | url — по строке. Скачиваются вместе с основными при «Обновить».</div>
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
   </form>
+  <div class="card">
+    <h3>Готовые пакеты</h3>
+    <div class="actions" style="flex-wrap:wrap">
+      {% for key, pack in geo_packs.items() %}
+      <form method="post" action="{{ bp }}/xray/geo/pack/{{ key }}?next=/xray?tab=geo"
+            onsubmit="return confirm('Добавить «{{ pack.title }}» и скачать?')">
+        <button class="btn ghost sm" title="{{ pack.hint }}">+ {{ pack.title }}</button>
+      </form>
+      {% endfor %}
+    </div>
+    <div class="hint">После скачивания в правилах: <code>ext:geosite_RU.dat:ru</code>, <code>ext:geoip_RU.dat:ru</code>.</div>
+    <div class="hint mt"><a href="{{ bp }}/routing">← К маршрутизации</a></div>
+  </div>
+  </div>
 </div>
 {% include "_jobs.html" %}
 

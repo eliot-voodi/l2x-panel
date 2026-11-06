@@ -149,6 +149,7 @@ def default_settings() -> dict:
         "security": {"totp_enabled": False, "totp_secret": ""},
         "api_tokens": [],
         "geo_custom": [],
+        "geo_update": {"auto": True, "interval_hours": 168},
         "doh": {
             "enabled": False, "path_prefix": "doh", "upstream": "127.0.0.1", "upstream_port": 53,
             "pihole_web": "127.0.0.1:8089", "pihole_password": "", "timeout_sec": 4,
@@ -1162,6 +1163,45 @@ def _xray_update_loop() -> None:
             return
 
 
+def _run_geo_update(*, reason: str = "manual") -> dict:
+    """Download geoip/geosite (+ custom) and record state."""
+    custom = (_settings().get("geo_custom") or [])
+    res = ops.update_geo(custom)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with mutate() as store:
+        st = store.setdefault("geo_update_state", {})
+        st.update({
+            "last_at": now,
+            "last_ok": bool(res.get("ok")),
+            "last_log": (res.get("log") or "")[:2000],
+            "last_reason": reason,
+            "missing": ops.geo_missing_core(),
+        })
+    return res
+
+
+def _geo_update_loop() -> None:
+    """Periodically refresh Loyalsoldier geoip/geosite (+ custom packs)."""
+    if _stop.wait(120):
+        return
+    # First boot: if core files missing, fetch once
+    try:
+        if ops.geo_missing_core():
+            _run_geo_update(reason="startup-missing")
+    except Exception:
+        pass
+    while True:
+        cfg = (_settings().get("geo_update") or {})
+        hours = max(6, _int(cfg.get("interval_hours"), 168))
+        if cfg.get("auto", True):
+            try:
+                _run_geo_update(reason="auto")
+            except Exception:
+                pass
+        if _stop.wait(hours * 3600):
+            return
+
+
 # ================================================================ Panel self-update
 
 PANEL_UPDATE_JOB: dict[str, str] = {}
@@ -1495,7 +1535,7 @@ def _startup():
     _ensure_agent_sticky()
     _refresh_settings_cache()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
-                   _l2tp_auto_loop, _nodes_sync_loop, _pia_loop):
+                   _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -3404,7 +3444,12 @@ def routing_page(request: Request):
     store = _load_store()
     return page(request, "routing.html", active="routing", routes=store["routes"], store=store,
                 outbounds=xray.all_outbound_tags(store), presets=xray.ROUTE_PRESETS,
-                inbound_tags=[i["tag"] for i in store["inbounds"]])
+                inbound_tags=[i["tag"] for i in store["inbounds"]],
+                geo=ops.geo_files(), geo_missing=ops.geo_missing_core(),
+                geo_cfg=store["settings"].get("geo_update") or {},
+                geo_state=store.get("geo_update_state") or {},
+                geo_packs=ops.GEO_PACKS,
+                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5])
 
 
 @app.post("/routing")
@@ -3490,6 +3535,10 @@ def xray_page(request: Request):
         ctx["final"] = json.dumps(xray.build_config(store), ensure_ascii=False, indent=2)
     if tab == "geo":
         ctx["geo"] = ops.geo_files()
+        ctx["geo_missing"] = ops.geo_missing_core()
+        ctx["geo_cfg"] = store["settings"].get("geo_update") or {}
+        ctx["geo_state"] = store.get("geo_update_state") or {}
+        ctx["geo_packs"] = ops.GEO_PACKS
     return page(request, "xray.html", active="xray", tab=tab, store=store, xs=xray.xray_status(),
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5], **ctx)
 
@@ -3692,9 +3741,54 @@ async def xray_update_settings(request: Request):
 def xray_geo_update(request: Request):
     if redir := _require(request):
         return redir
-    ops.start_job("geo-update", ops.update_geo, _settings().get("geo_custom") or [])
-    flash(request, "Обновление geo-файлов запущено", "info")
-    return go("/xray?tab=geo")
+    nxt = _next(request, "/xray?tab=geo")
+
+    def job():
+        return _run_geo_update(reason="manual")
+
+    ops.start_job("geo-update", job)
+    flash(request, "Обновление geoip/geosite запущено (фоновая задача)", "info")
+    return go(nxt)
+
+
+@app.post("/xray/geo/settings")
+async def xray_geo_settings(request: Request):
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    with mutate() as store:
+        store["settings"]["geo_update"] = {
+            "auto": form.get("auto") == "1",
+            "interval_hours": max(6, min(720, _int(form.get("interval_hours"), 168))),
+        }
+    _refresh_settings_cache()
+    flash(request, "Расписание обновления geo сохранено", "info")
+    return go(_next(request, "/xray?tab=geo"))
+
+
+@app.post("/xray/geo/pack/{key}")
+def xray_geo_pack(key: str, request: Request):
+    """Add a known geo pack (e.g. Russia rules) to custom sources and download now."""
+    if redir := _require(request):
+        return redir
+    pack = ops.GEO_PACKS.get(key)
+    if not pack:
+        flash(request, "Неизвестный geo-пакет", "error")
+        return go(_next(request, "/routing"))
+    with mutate() as store:
+        custom = store["settings"].setdefault("geo_custom", [])
+        by_name = {str(x.get("name") or ""): x for x in custom if isinstance(x, dict)}
+        for f in pack["files"]:
+            by_name[f["name"]] = {"name": f["name"], "url": f["url"]}
+        store["settings"]["geo_custom"] = list(by_name.values())
+    _refresh_settings_cache()
+
+    def job():
+        return _run_geo_update(reason=f"pack-{key}")
+
+    ops.start_job(f"geo-pack-{key}", job)
+    flash(request, f"Пакет «{pack['title']}» добавлен, скачивание запущено", "info")
+    return go(_next(request, "/routing"))
 
 
 # ================================================================ logs
