@@ -184,6 +184,10 @@ install_code() {
   chmod 700 "$DATA_DIR" "$ETC_DIR"
   rm -rf "$APP_DIR/ui" "$APP_DIR"/*.py
   cp -a "$SRC/panel/." "$APP_DIR/"
+  # Prefer repo-root VERSION (release source of truth) over a stale panel/VERSION copy.
+  if [ -f "$SRC/VERSION" ]; then
+    install -m 644 "$SRC/VERSION" "$APP_DIR/VERSION"
+  fi
   find "$APP_DIR" -name '__pycache__' -prune -exec rm -rf {} +
   if [ ! -x "$APP_DIR/.venv/bin/uvicorn" ]; then
     python3 -m venv "$APP_DIR/.venv"
@@ -191,7 +195,9 @@ install_code() {
   fi
   "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
   install -m 755 "$SRC/scripts/l2x.sh" /usr/local/bin/l2x
-  ok "Код в $APP_DIR, данные в $DATA_DIR"
+  local ver
+  ver=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
+  ok "Код в $APP_DIR (v$ver), данные в $DATA_DIR"
 }
 
 backup_unmanaged() {

@@ -5078,17 +5078,26 @@ async def nodes_action(node_id: str, action: str, request: Request):
 
         def job():
             import time as _time
+            before = str(node_copy.get("panel_version") or "")
             if ssh_password:
                 res = nodes_mod.update_via_ssh(node_copy, ssh_password=ssh_password)
             else:
                 res = nodes_mod.trigger_update(node_copy)
+                # trigger_update returns pre-update "current"; wait until health version changes
+                # (or settle after enough time if already newest).
                 if res.get("ok") and (res.get("started") or res.get("already")):
-                    _time.sleep(20)
-                    for _ in range(6):
+                    before = str(res.get("current") or before or "")
+                    last_ver = before
+                    for i in range(24):  # up to ~2 min
+                        _time.sleep(5 if i else 15)
                         probe = nodes_mod.probe_health(node_copy, timeout=8)
-                        if probe.get("ok") and probe.get("version"):
+                        if not probe.get("ok"):
+                            continue
+                        last_ver = str(probe.get("version") or last_ver)
+                        if last_ver and last_ver != before:
                             break
-                        _time.sleep(5)
+                    if last_ver:
+                        node_copy["panel_version"] = last_ver
             with mutate() as st:
                 for n in nodes_mod.ensure_list(st):
                     if n.get("id") != node_id_local:
@@ -5105,6 +5114,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     break
             log = res.get("log") or ""
             ver = node_copy.get("panel_version") or res.get("version") or ""
+            if before:
+                log = (log + f"\nbefore: {before}").strip()
             if ver:
                 log = (log + f"\nversion: {ver}").strip()
             return {
