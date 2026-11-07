@@ -195,7 +195,7 @@ POST-запросы должны иметь `Content-Type: application/json`. Е
 
 Публичный персональный endpoint (через nginx :443):
 
-`https://<domain>/doh/<token>/dns-query` — RFC 8484 (GET `?dns=` / POST `application/dns-message`).
+`https://<domain>/doh/<token>` — RFC 8484 (GET `?dns=` / POST `application/dns-message`).
 
 В карточке клиента: `doh_enabled`, `doh_in_tunnel` (DNS в подписке через proxy). Управление: UI **DoH / Pi-hole**.
 

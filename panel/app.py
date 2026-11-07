@@ -439,6 +439,20 @@ class BasePathMiddleware:
         )
         return path == f"/{prefix}" or path.startswith(f"/{prefix}/")
 
+    def _rewrite_doh(self, path: str) -> str | None:
+        """Map /{prefix}/{token}[/dns-query] → /doh/{token} for the FastAPI handler."""
+        prefix = doh_mod.normalize_prefix(
+            str((SETTINGS_CACHE.get("doh") or {}).get("path_prefix") or "doh")
+        )
+        root = f"/{prefix}/"
+        if not path.startswith(root):
+            return None
+        rest = path[len(root):]
+        token = rest.split("/", 1)[0]
+        if not doh_mod.TOKEN_RE.match(token):
+            return None
+        return f"/doh/{token}"
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             bp = base_path()
@@ -447,10 +461,15 @@ class BasePathMiddleware:
                 if path == bp or path.startswith(bp + "/"):
                     scope = dict(scope)
                     scope["path"] = path[len(bp):] or "/"
+                    path = scope["path"]
                 elif not self._public(path):
                     resp = PlainTextResponse("404 page not found", status_code=404)
                     await resp(scope, receive, send)
                     return
+            rewritten = self._rewrite_doh(path)
+            if rewritten and rewritten != path:
+                scope = dict(scope)
+                scope["path"] = rewritten
         await self.inner(scope, receive, send)
 
 
@@ -4310,9 +4329,10 @@ def logs_page(request: Request):
 
 # ================================================================ DoH (Pi-hole via nginx)
 
-@app.api_route("/doh/{token}/dns-query", methods=["GET", "POST"])
+@app.api_route("/doh/{token}", methods=["GET", "POST"])
+@app.api_route("/doh/{token}/dns-query", methods=["GET", "POST"])  # legacy alias, never shown in UI
 async def doh_dns_query(token: str, request: Request):
-    """RFC 8484 DoH endpoint — reached only via nginx :443 /doh/<token>/dns-query."""
+    """RFC 8484 DoH — public URL is /{prefix}/{token} (no /dns-query in links)."""
     store = _load_store()
     cfg = store["settings"].get("doh") or {}
     if not cfg.get("enabled"):

@@ -1,7 +1,7 @@
 """DoH (DNS-over-HTTPS) in front of Pi-hole, exposed via nginx :443.
 
-Public URLs:
-  https://<domain>/doh/<token>/dns-query
+Public URLs (no /dns-query suffix — never shown to users):
+  https://<domain>/doh/<token>
 
 Client apps with ``doh_in_tunnel`` use this URL with detour=proxy (queries inside VPN).
 Standalone device DoH uses the same URL without a tunnel.
@@ -92,7 +92,7 @@ def client_by_token(store: dict, token: str) -> dict | None:
 
 
 def public_url(store: dict, client: dict, *, host: str = "") -> str:
-    """https://domain/doh/<token>/dns-query"""
+    """https://domain/doh/<token> — never append /dns-query in any UI or subscription."""
     cfg = ((store.get("settings") or {}).get("doh") or {})
     if not cfg.get("enabled"):
         return ""
@@ -108,7 +108,7 @@ def public_url(store: dict, client: dict, *, host: str = "") -> str:
             domain = ""
     if not domain:
         return ""
-    return f"https://{domain}/{prefix}/{client['doh_token']}/dns-query"
+    return f"https://{domain}/{prefix}/{client['doh_token']}"
 
 
 def b64url_decode(value: str) -> bytes:

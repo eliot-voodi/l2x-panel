@@ -107,7 +107,7 @@
     </div>
     <label class="f">Пароль Pi-hole admin (пусто = не менять)</label>
     <input name="pihole_password" type="password" autocomplete="new-password" placeholder="при сохранении — пересоздаёт контейнер с новым паролем">
-    <div class="hint">Публичный URL клиента: <code>https://{{ public_host or 'домен' }}/{{ doh.path_prefix or 'doh' }}/&lt;token&gt;/dns-query</code> — только через nginx :443.</div>
+    <div class="hint">Публичный URL клиента: <code>https://{{ public_host or 'домен' }}/{{ doh.path_prefix or 'doh' }}/&lt;token&gt;</code> — только через nginx :443.</div>
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
   </form>
 
