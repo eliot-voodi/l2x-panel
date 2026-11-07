@@ -74,19 +74,22 @@
     </div>
     <div>
       <h3 class="mb0" style="margin-bottom:.55rem">Топ‑10 клиентов</h3>
+      <div class="hint" style="margin-bottom:.4rem">Внешний IP; если DoH пришёл через VLESS-туннель — имя клиента панели</div>
       <div class="table-wrap"><table>
         <thead><tr><th>#</th><th>Клиент</th><th class="right">Запросы</th></tr></thead>
         <tbody id="pd-top-clients">
         {% for row in (pihole_dash.top_clients if pihole_dash else []) %}
-          <tr><td class="dim">{{ loop.index }}</td><td class="mono small">{{ row.name }}</td><td class="right">{{ row.count }}</td></tr>
+          <tr><td class="dim">{{ loop.index }}</td>
+            <td class="mono small">{{ row.name }}{% if row.via_tunnel or row.kind == 'name' %} <span class="badge accent">туннель</span>{% endif %}</td>
+            <td class="right">{{ row.count }}</td></tr>
         {% else %}
-          <tr><td colspan="3" class="dim">нет данных</td></tr>
+          <tr><td colspan="3" class="dim">нет данных — появятся после DoH-запросов</td></tr>
         {% endfor %}
         </tbody>
       </table></div>
     </div>
   </div>
-  <div class="hint mt">Обновление каждые 30 с с <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/api/…</code> — без локального учёта DNS на панели.</div>
+  <div class="hint mt">Запросы/блоки/домены — из Pi-hole API. Клиенты — атрибуция DoH на панели (Pi-hole видит только docker/localhost).</div>
 </div>
 
 <div class="grid g2">
@@ -187,10 +190,13 @@
       return;
     }
     tb.innerHTML = rows.slice(0, 10).map(function (r, i) {
+      var name = String(r.name || '—').replace(/[<>&]/g, function (c) {
+        return ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]);
+      });
+      var badge = (r.via_tunnel || r.kind === 'name')
+        ? ' <span class="badge accent">туннель</span>' : '';
       return '<tr><td class="dim">' + (i + 1) + '</td><td class="mono small">' +
-        String(r.name || '—').replace(/[<>&]/g, function (c) {
-          return ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]);
-        }) + '</td><td class="right">' + fmt(r.count) + '</td></tr>';
+        name + badge + '</td><td class="right">' + fmt(r.count) + '</td></tr>';
     }).join('');
   }
   function apply(d) {

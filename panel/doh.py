@@ -24,9 +24,14 @@ import urllib.request
 from pathlib import Path
 
 COMPOSE_DIR = Path(os.environ.get("L2XPANEL_DOH_DIR", "/opt/l2xpanel/doh"))
+_DATA_DIR = Path(os.environ.get("L2XPANEL_DATA", "/var/lib/l2xpanel"))
 TICKETS_FILE = Path(os.environ.get(
     "L2XPANEL_PIHOLE_TICKETS",
-    str(Path(os.environ.get("L2XPANEL_DATA", "/var/lib/l2xpanel")) / "pihole_tickets.json"),
+    str(_DATA_DIR / "pihole_tickets.json"),
+))
+DOH_CLIENT_STATS_FILE = Path(os.environ.get(
+    "L2XPANEL_DOH_CLIENT_STATS",
+    str(_DATA_DIR / "doh_client_stats.json"),
 ))
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 PATH_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
@@ -122,6 +127,197 @@ def resolve_wire(query: bytes, *, upstream: str = "127.0.0.1", port: int = 53, t
         return data
     finally:
         sock.close()
+
+
+# ---------------------------------------------------------------- DoH client attribution (top clients)
+
+_PRIV_NETS = (
+    ("127.",),
+    ("10.",),
+    ("192.168.",),
+    ("169.254.",),
+    ("0.",),
+    ("::1",),
+    ("fc",), ("fd",), ("fe80",),
+)
+_STATS_LOCK = threading.Lock()
+_STATS: dict = {"day": "", "clients": {}, "writes": 0}
+_SELF_IPS: set[str] = set()
+_SELF_IPS_AT = 0.0
+
+
+def _ip_in_priv_172(ip: str) -> bool:
+    """172.16.0.0/12 (incl. Docker bridge 172.17–172.31)."""
+    if not ip.startswith("172."):
+        return False
+    try:
+        second = int(ip.split(".")[1])
+    except (IndexError, ValueError):
+        return False
+    return 16 <= second <= 31
+
+
+def is_private_or_local_ip(ip: str) -> bool:
+    ip = (ip or "").strip().lower().split("%")[0]
+    if not ip or ip in ("unknown", "null", "-"):
+        return True
+    if _ip_in_priv_172(ip):
+        return True
+    for p in _PRIV_NETS:
+        if ip.startswith(p[0]):
+            return True
+    return False
+
+
+def refresh_self_ips(*, force: bool = False) -> set[str]:
+    """Local / public addresses of this host — DoH via VLESS often loops back as these."""
+    global _SELF_IPS, _SELF_IPS_AT
+    now = time.time()
+    if not force and _SELF_IPS and now - _SELF_IPS_AT < 300:
+        return _SELF_IPS
+    found: set[str] = {"127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            addr = info[4][0]
+            if addr:
+                found.add(addr)
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("1.1.1.1", 80))
+            found.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    # Optional: hostname from env / common docker gateway
+    found.add("172.17.0.1")
+    found.add("172.18.0.1")
+    _SELF_IPS = {a for a in found if a}
+    _SELF_IPS_AT = now
+    return _SELF_IPS
+
+
+def request_client_ip(headers: dict | None = None, *, fallback: str = "") -> str:
+    """Best-effort external IP from nginx X-Real-IP / X-Forwarded-For."""
+    h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    xff = (h.get("x-forwarded-for") or "").split(",")[0].strip()
+    xri = (h.get("x-real-ip") or "").strip()
+    cf = (h.get("cf-connecting-ip") or "").strip()
+    for cand in (cf, xri, xff, fallback):
+        ip = (cand or "").strip().strip("[]")
+        if ip and ip.lower() not in ("unknown", "null", "-"):
+            return ip
+    return (fallback or "").strip()
+
+
+def doh_client_label(client: dict, request_ip: str, *, self_ips: set[str] | None = None) -> dict:
+    """Label for Top clients: external IP, or panel client name when request came via VLESS/local.
+
+    DoH is proxied by the panel → Pi-hole always sees localhost/docker. Attribution happens here.
+    """
+    email = str(client.get("email") or "").strip() or "client"
+    ip = (request_ip or "").strip()
+    self_ips = self_ips if self_ips is not None else refresh_self_ips()
+    # VLESS/tunneled DoH hits nginx from loopback, docker bridge, or this host's own IP
+    via_tunnel = is_private_or_local_ip(ip) or ip in self_ips
+    if via_tunnel:
+        return {
+            "name": email,
+            "kind": "name",
+            "email": email,
+            "ip": ip,
+            "via_tunnel": True,
+        }
+    # Direct DoH from the internet → external IP
+    return {
+        "name": ip,
+        "kind": "ip",
+        "email": email,
+        "ip": ip,
+        "via_tunnel": False,
+    }
+
+
+def _load_client_stats() -> dict:
+    try:
+        if DOH_CLIENT_STATS_FILE.is_file():
+            data = json.loads(DOH_CLIENT_STATS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("clients"), dict):
+                return {
+                    "day": str(data.get("day") or ""),
+                    "clients": data["clients"],
+                    "writes": 0,
+                }
+    except Exception:
+        pass
+    return {"day": "", "clients": {}, "writes": 0}
+
+
+def _save_client_stats(data: dict) -> None:
+    try:
+        DOH_CLIENT_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DOH_CLIENT_STATS_FILE.with_suffix(".tmp")
+        payload = {"day": data.get("day") or "", "clients": data.get("clients") or {}}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(DOH_CLIENT_STATS_FILE)
+    except OSError:
+        pass
+
+
+def record_doh_client(label: dict) -> None:
+    """Increment today's counter for a DoH client label (name or external IP)."""
+    name = str((label or {}).get("name") or "").strip()
+    if not name:
+        return
+    day = time.strftime("%Y-%m-%d")
+    with _STATS_LOCK:
+        global _STATS
+        if not _STATS.get("clients") and not _STATS.get("day"):
+            _STATS = _load_client_stats()
+        if _STATS.get("day") != day:
+            _STATS = {"day": day, "clients": {}, "writes": 0}
+        entry = _STATS["clients"].get(name) or {
+            "count": 0, "kind": "ip", "email": "", "ip": "", "via_tunnel": False,
+        }
+        entry["count"] = int(entry.get("count") or 0) + 1
+        entry["kind"] = label.get("kind") or entry.get("kind") or "ip"
+        entry["email"] = str(label.get("email") or entry.get("email") or "")
+        entry["ip"] = str(label.get("ip") or entry.get("ip") or "")
+        entry["via_tunnel"] = bool(label.get("via_tunnel"))
+        _STATS["clients"][name] = entry
+        _STATS["writes"] = int(_STATS.get("writes") or 0) + 1
+        # Flush every 25 queries (and always keep memory hot)
+        if _STATS["writes"] >= 25:
+            _STATS["writes"] = 0
+            _save_client_stats(_STATS)
+
+
+def top_doh_clients(limit: int = 10) -> list[dict]:
+    """Today's DoH clients for the dashboard (external IP or client name)."""
+    day = time.strftime("%Y-%m-%d")
+    with _STATS_LOCK:
+        global _STATS
+        if not _STATS.get("clients") and not _STATS.get("day"):
+            _STATS = _load_client_stats()
+        if _STATS.get("day") != day:
+            return []
+        rows = [
+            {
+                "name": str(name),
+                "count": int((meta or {}).get("count") or 0),
+                "kind": (meta or {}).get("kind") or "ip",
+                "email": (meta or {}).get("email") or "",
+                "ip": (meta or {}).get("ip") or "",
+                "via_tunnel": bool((meta or {}).get("via_tunnel")),
+            }
+            for name, meta in (_STATS.get("clients") or {}).items()
+        ]
+    rows.sort(key=lambda r: r["count"], reverse=True)
+    return rows[: max(1, min(50, int(limit or 10)))]
 
 
 def status(cfg: dict | None = None) -> dict:
@@ -739,8 +935,20 @@ def _dashboard_from_v5(cfg: dict) -> dict | None:
     }
 
 
+def _with_doh_top_clients(dash: dict) -> dict:
+    """Replace Pi-hole localhost/docker top_clients with DoH-attributed names/IPs."""
+    if not isinstance(dash, dict):
+        return dash
+    ours = top_doh_clients(10)
+    if ours:
+        dash = {**dash, "top_clients": ours, "top_clients_source": "doh"}
+    else:
+        dash = {**dash, "top_clients_source": dash.get("top_clients_source") or "pihole"}
+    return dash
+
+
 def pihole_dashboard(cfg: dict | None = None) -> dict:
-    """Pull summary + top lists from local Pi-hole API (no local DNS accounting)."""
+    """Pull summary + top lists from local Pi-hole API; clients attributed from DoH."""
     cfg = {**default_settings(), **(cfg or {})}
     empty = {
         "ok": False,
@@ -752,16 +960,22 @@ def pihole_dashboard(cfg: dict | None = None) -> dict:
         "top_domains": [],
         "top_blocked": [],
         "top_clients": [],
+        "top_clients_source": "doh",
         "fetched_at": "",
     }
 
     dash = _dashboard_from_v6(cfg)
     if dash and dash.get("ok"):
-        return dash
+        return _with_doh_top_clients(dash)
 
     dash5 = _dashboard_from_v5(cfg)
     if dash5 and dash5.get("ok"):
-        return dash5
+        return _with_doh_top_clients(dash5)
+
+    # Even if Pi-hole API is down, still show DoH client attribution
+    ours = top_doh_clients(10)
+    if ours:
+        empty = {**empty, "ok": True, "source": "doh-clients", "top_clients": ours, "error": ""}
 
     probe = _pihole_get("/api/stats/summary", cfg)
     err = probe.get("error") or ""
@@ -771,4 +985,7 @@ def pihole_dashboard(cfg: dict | None = None) -> dict:
     if not err:
         ready = pihole_ready()
         err = ready.get("reason") if not ready.get("ok") else "не удалось получить статистику Pi-hole"
+    if ours and empty.get("ok"):
+        empty["error"] = err  # soft: show clients even if summary failed
+        return empty
     return {**empty, "error": err, "source": "pihole"}

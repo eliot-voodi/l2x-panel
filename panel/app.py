@@ -3981,6 +3981,18 @@ async def doh_dns_query(token: str, request: Request):
         )
     except Exception as exc:  # noqa: BLE001
         return Response(str(exc), status_code=502)
+    # Attribute client for dashboard (Pi-hole only sees docker/localhost)
+    try:
+        peer = ""
+        try:
+            if request.client:
+                peer = str(request.client.host or "")
+        except Exception:
+            peer = ""
+        rip = doh_mod.request_client_ip(dict(request.headers), fallback=peer)
+        doh_mod.record_doh_client(doh_mod.doh_client_label(client, rip))
+    except Exception:
+        pass
     return Response(answer, media_type="application/dns-message",
                     headers={"cache-control": "no-store", "access-control-allow-origin": "*"})
 
