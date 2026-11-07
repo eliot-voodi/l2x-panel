@@ -1,6 +1,7 @@
 """Telegram bot: admin notifications, reports, backups and lookup commands (long polling)."""
 from __future__ import annotations
 
+import contextvars
 import html
 import json
 import logging
@@ -14,6 +15,33 @@ from typing import Callable
 
 API = "https://api.telegram.org/bot{token}/{method}"
 log = logging.getLogger("l2x.tgbot")
+
+# Who triggered a panel change (login + IP). Copied into background jobs via ops.start_job.
+_actor_line: contextvars.ContextVar[str] = contextvars.ContextVar("l2x_tg_actor", default="")
+
+
+def bind_actor(username: str, ip: str) -> None:
+    """Remember panel operator for subsequent admin notifications in this request/job."""
+    user = escape(username or "?")
+    addr = escape(ip or "?")
+    _actor_line.set(f"\n👤 <b>{user}</b> · <code>{addr}</code>")
+
+
+def clear_actor() -> None:
+    _actor_line.set("")
+
+
+def get_actor() -> str:
+    return _actor_line.get() or ""
+
+
+def set_actor(line: str):
+    """Set raw actor suffix (used when hopping into a worker thread)."""
+    return _actor_line.set(line or "")
+
+
+def reset_actor(token) -> None:
+    _actor_line.reset(token)
 
 
 def default_settings() -> dict:

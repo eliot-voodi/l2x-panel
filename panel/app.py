@@ -576,13 +576,26 @@ def _user(request: Request):
     return request.session.get("user")
 
 
+def _client_ip(request: Request) -> str:
+    xf = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xf:
+        return xf
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return "?"
+
+
 def _require(request: Request):
     if not _user(request):
+        tgbot.clear_actor()
         return go("/login")
     exp = request.session.get("exp", 0)
     if exp and time.time() > exp:
         request.session.clear()
+        tgbot.clear_actor()
         return go("/login")
+    # Always attribute subsequent TG change/node notices to this panel session
+    tgbot.bind_actor(str(_user(request) or "?"), _client_ip(request))
     return None
 
 
@@ -978,15 +991,33 @@ BOT = tgbot.Bot(_bot_settings, {
 TG_LOW_GB = 5.0
 
 
-def _tg_admin(text: str, *, flag: str = "notify_changes") -> None:
-    """Send HTML message to Telegram admins if the given notify flag is on."""
+def _tg_admin(text: str, *, flag: str = "notify_changes", actor: str | None = None) -> None:
+    """Send HTML message to Telegram admins if the given notify flag is on.
+
+    For notify_changes / notify_nodes always append who (login) and from which IP
+    when the action came from a panel session (or an inherited background job).
+    """
     try:
         s = _bot_settings()
         if not s.get("enabled") or not s.get(flag, True):
             return
+        if flag in ("notify_changes", "notify_nodes"):
+            suffix = tgbot.get_actor() if actor is None else (actor or "")
+            if suffix:
+                text = f"{text}{suffix}"
         BOT.send(text)
     except Exception:
         pass
+
+
+def _tg_change(summary: str, *details: str) -> None:
+    """notify_changes with a clear «what changed» body + actor footer via _tg_admin."""
+    lines = [summary]
+    for d in details:
+        d = str(d or "").strip()
+        if d:
+            lines.append(d)
+    _tg_admin("\n".join(lines), flag="notify_changes")
 
 
 def _tg_node_events(events: list[dict]) -> None:
@@ -1934,7 +1965,7 @@ def login_page(request: Request):
 
 @app.post("/login")
 def login(request: Request, username: str = Form(...), password: str = Form(...), code: str = Form("")):
-    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "?")
+    ip = _client_ip(request)
     fails = [t_ for t_ in _login_fail.get(ip, []) if time.time() - t_ < 900]
     sec = _settings()["security"]
     if len(fails) >= 8:
@@ -2403,9 +2434,14 @@ async def inbound_save(request: Request):
             for c in store["clients"]:
                 c["inbounds"] = [ib["tag"] if x == old_tag else x for x in c.get("inbounds") or []]
     result = _apply_xray(_load_store())
-    _tg_admin(
-        f"📥 Inbound <b>{tgbot.escape(ib['tag'])}</b> {'создан' if not ib_id else 'обновлён'}",
-        flag="notify_changes",
+    st = ib.get("stream") or {}
+    act = "создан" if not ib_id else "обновлён"
+    _tg_change(
+        f"📥 Inbound <b>{tgbot.escape(ib['tag'])}</b> {act}",
+        f"<code>{tgbot.escape(ib.get('protocol') or '')}</code> · "
+        f"port <code>{tgbot.escape(str(ib.get('port') or ''))}</code> · "
+        f"{tgbot.escape(st.get('network') or '')}/{tgbot.escape(st.get('security') or '')} · "
+        f"fp=<code>{tgbot.escape(st.get('fingerprint') or '')}</code>",
     )
     flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён", result))
     return go("/inbounds")
@@ -2415,15 +2451,20 @@ async def inbound_save(request: Request):
 def inbound_action(ib_id: int, action: str, request: Request):
     if redir := _require(request):
         return redir
+    what = ""
+    tag = ""
     with mutate() as store:
         ib = xray.inbound_by_id(store, ib_id)
         if not ib:
             flash(request, "Inbound не найден", "error")
             return go("/inbounds")
+        tag = ib["tag"]
         if action == "toggle":
             ib["enabled"] = not ib.get("enabled", True)
+            what = "включён" if ib["enabled"] else "выключен"
         elif action == "reset":
             ib["traffic"].update({"up": 0, "down": 0})
+            what = "сброс трафика"
         elif action == "delete":
             if len(store["inbounds"]) == 1:
                 flash(request, "Нельзя удалить последний inbound", "error")
@@ -2431,6 +2472,7 @@ def inbound_action(ib_id: int, action: str, request: Request):
             store["inbounds"] = [i for i in store["inbounds"] if i is not ib]
             for c in store["clients"]:
                 c["inbounds"] = [x for x in c.get("inbounds") or [] if x != ib["tag"]]
+            what = "удалён"
         elif action == "clone":
             clone = json.loads(json.dumps(ib))
             used = {i["port"] for i in store["inbounds"]}
@@ -2443,11 +2485,13 @@ def inbound_action(ib_id: int, action: str, request: Request):
                 clone["stream"]["reality"]["private_key"] = clone["stream"]["reality"]["public_key"] = ""
             xray.ensure_inbound_keys(clone)
             store["inbounds"].append(clone)
+            what = f"клонирован → <b>{tgbot.escape(clone['tag'])}</b> port <code>{clone['port']}</code>"
         else:
             flash(request, "Неизвестное действие", "error")
             return go("/inbounds")
     result = _apply_xray(_load_store())
-    flash(request, *_ok_msg(f"Inbound {ib['tag']}: {action}", result))
+    _tg_change(f"📥 Inbound <b>{tgbot.escape(tag)}</b>: {what}")
+    flash(request, *_ok_msg(f"Inbound {tag}: {action}", result))
     return go("/inbounds")
 
 
@@ -2632,7 +2676,20 @@ async def client_save(request: Request):
         xray.ensure_wg_peer(store, c)
     result = _apply_xray(_load_store())
     act = "создан" if not original else "обновлён"
-    _tg_admin(f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}", flag="notify_changes")
+    bits = []
+    if c.get("limit_gb"):
+        bits.append(f"лимит {c['limit_gb']} GB")
+    if c.get("expire_at"):
+        bits.append(f"до {str(c['expire_at'])[:10]}")
+    if c.get("outbound"):
+        bits.append(f"out=<code>{tgbot.escape(str(c['outbound']))}</code>")
+    ibs = c.get("inbounds") or []
+    if ibs:
+        bits.append("inbounds: " + ", ".join(f"<code>{tgbot.escape(str(x))}</code>" for x in ibs[:8]))
+    _tg_change(
+        f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}",
+        " · ".join(bits),
+    )
     flash(request, *_ok_msg(f"Клиент {c['email']} сохранён", result))
     return go(f"/clients/{c['email']}/edit")
 
@@ -2695,6 +2752,7 @@ async def clients_bulk(request: Request):
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
     result = _apply_xray(_load_store())
+    _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
 
@@ -2703,6 +2761,7 @@ async def clients_bulk(request: Request):
 def client_action(email: str, action: str, request: Request):
     if redir := _require(request):
         return redir
+    what = ""
     with mutate() as store:
         c = next((x for x in store["clients"] if x["email"] == email), None)
         if not c:
@@ -2710,32 +2769,35 @@ def client_action(email: str, action: str, request: Request):
             return go("/clients")
         if action == "toggle":
             c["enabled"] = not c.get("enabled", True)
+            what = "включён" if c["enabled"] else "выключен"
         elif action == "reset":
             xray.reset_client_traffic(c)
+            what = "сброс трафика"
         elif action == "regen_sub":
             c["sub_token"] = secrets.token_urlsafe(18)
+            what = "новый sub-token"
         elif action == "regen_uuid":
             c["uuid"] = str(uuid.uuid4())
             c["password"] = secrets.token_hex(12)
+            what = "новый UUID/пароль"
         elif action == "delete":
             store["clients"].remove(c)
             for r in store.get("routes") or []:
                 if isinstance(r.get("user"), list):
                     r["user"] = [u for u in r["user"] if u != email]
             webhooks.fire(store["settings"], "client.deleted", {"email": email})
+            what = "удалён"
         elif action == "clear_ips":
             c["ips"] = {}
+            what = "очищены IP"
         elif action == "clear_hwids":
             hwid.clear(c)
+            what = "очищены HWID"
         else:
             flash(request, "Неизвестное действие", "error")
             return go("/clients")
     result = _apply_xray(_load_store()) if action not in ("regen_sub", "clear_ips", "clear_hwids") else {"ok": True}
-    if action in ("delete", "toggle", "reset", "regen_uuid"):
-        _tg_admin(
-            f"👤 Клиент <b>{tgbot.escape(email)}</b>: {tgbot.escape(action)}",
-            flag="notify_changes",
-        )
+    _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
         return go("/clients")
@@ -3447,7 +3509,7 @@ async def outbound_add(request: Request):
         flash(request, f"Outbound {tag} не сохранён — Xray отклонил конфиг: {xr.get('error')}", "error")
         return go("/outbounds")
     act = "обновлён" if edit_tag else "добавлен"
-    _tg_admin(f"📤 Outbound <b>{tgbot.escape(tag)}</b> {act}", flag="notify_changes")
+    _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b> {act}")
     flash(request, f"Outbound {tag} {act}", "info")
     return go("/outbounds")
 
@@ -3579,8 +3641,12 @@ def outbound_action(tag: str, action: str, request: Request):
                     return go("/outbounds")
                 store["outbounds_custom"].remove(o)
     xr = _apply_xray(_load_store()) if action != "reset" else {"ok": True}
-    if action in ("delete", "toggle", "sub"):
-        _tg_admin(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: {tgbot.escape(action)}", flag="notify_changes")
+    labels = {
+        "delete": "удалён", "toggle": "вкл/выкл", "sub": "в подписке вкл/выкл",
+        "reset": "сброс трафика",
+    }
+    if action in labels:
+        _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: {labels[action]}")
     flash(request, *_ok_msg(f"{tag}: {action}", xr))
     return go("/outbounds")
 
@@ -3620,6 +3686,11 @@ async def balancers_save(key: str, request: Request):
             b["max_rtt"] = str(form.get("max_rtt") or "1s")
             b["tolerance"] = _float(form.get("tolerance"), 0.15)
     xr = _apply_xray(_load_store())
+    with_state = "вкл" if form.get("enabled") == "1" else "выкл"
+    _tg_change(
+        f"⚖ Balancer <b>{tgbot.escape(key)}</b> сохранён ({with_state})",
+        f"fallback=<code>{tgbot.escape(str(form.get('fallback') or 'direct'))}</code>",
+    )
     flash(request, *_ok_msg(f"{key} сохранён", xr))
     return go("/balancers")
 
@@ -3664,6 +3735,10 @@ async def routing_add(request: Request):
             return go("/routing")
         store["routes"].append(rule)
     xr = _apply_xray(_load_store())
+    _tg_change(
+        f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> добавлено",
+        f"→ <code>{tgbot.escape(str(form.get('outbound') or 'direct'))}</code>",
+    )
     flash(request, *_ok_msg(f"Правило {name} добавлено", xr))
     return go("/routing")
 
@@ -3681,6 +3756,7 @@ def routing_preset(key: str, request: Request):
             return go("/routing")
         store["routes"].insert(0, {"enabled": True, **json.loads(json.dumps(preset))})
     xr = _apply_xray(_load_store())
+    _tg_change(f"🗺 Routing: preset <b>{tgbot.escape(preset['name'])}</b> добавлен")
     flash(request, *_ok_msg(f"Добавлено {preset['name']}", xr))
     return go("/routing")
 
@@ -3689,6 +3765,7 @@ def routing_preset(key: str, request: Request):
 def routing_action(name: str, action: str, request: Request):
     if redir := _require(request):
         return redir
+    what = action
     with mutate() as store:
         routes = store["routes"]
         idx = next((i for i, r in enumerate(routes) if r.get("name") == name), None)
@@ -3696,13 +3773,18 @@ def routing_action(name: str, action: str, request: Request):
             return go("/routing")
         if action == "delete":
             routes.pop(idx)
+            what = "удалено"
         elif action == "toggle":
             routes[idx]["enabled"] = not routes[idx].get("enabled", True)
+            what = "включено" if routes[idx]["enabled"] else "выключено"
         elif action == "up" and idx > 0:
             routes[idx - 1], routes[idx] = routes[idx], routes[idx - 1]
+            what = "выше"
         elif action == "down" and idx < len(routes) - 1:
             routes[idx + 1], routes[idx] = routes[idx], routes[idx + 1]
+            what = "ниже"
     xr = _apply_xray(_load_store())
+    _tg_change(f"🗺 Routing: <b>{tgbot.escape(name)}</b> — {tgbot.escape(what)}")
     flash(request, *_ok_msg(f"{name}: {action}", xr))
     return go("/routing")
 
@@ -4118,6 +4200,12 @@ async def doh_save(request: Request):
             return go("/doh")
     # Re-apply nginx so /doh/ location + reserved path update
     xr = _apply_xray(_load_store())
+    on = "вкл" if form.get("enabled") == "1" else "выкл"
+    _tg_change(
+        f"🛡 DoH настройки сохранены ({on})",
+        f"prefix=<code>{tgbot.escape(str(form.get('path_prefix') or 'doh'))}</code>"
+        + (" · пароль Pi-hole обновлён" if pwd else ""),
+    )
     # Soft front path remarks (e.g. grpc path occupied) are unrelated to DoH — don't flash them
     if not xr.get("ok"):
         flash(request, f"DoH сохранены.{pwd_msg} Ошибка front/Xray: {xr.get('error')}".strip(), "error")
@@ -4141,10 +4229,10 @@ def doh_install(request: Request):
             st["settings"]["doh"]["upstream_port"] = 53
         _apply_xray(_load_store())
         extra = " Docker установлен автоматически." if res.get("docker_installed") else ""
-        _tg_admin(f"🛡 Pi-hole установлен на этой панели. DoH включён.{extra}", flag="notify_changes")
+        _tg_change(f"🛡 Pi-hole установлен на этой панели. DoH включён.{extra}")
         flash(request, f"Pi-hole установлен (docker). DoH включён.{extra}", "info")
     else:
-        _tg_admin(f"❌ Pi-hole install: {tgbot.escape(res.get('error') or 'fail')}", flag="notify_changes")
+        _tg_change(f"❌ Pi-hole install: {tgbot.escape(res.get('error') or 'fail')}")
         flash(request, f"Pi-hole install: {res.get('error')}", "error")
     return go("/doh")
 
@@ -4154,6 +4242,8 @@ def doh_stop(request: Request):
     if redir := _require(request):
         return redir
     res = doh_mod.stop_pihole()
+    if res.get("ok"):
+        _tg_change("🛡 Pi-hole остановлен")
     flash(request, "Pi-hole остановлен" if res.get("ok") else f"stop: {res.get('error')}",
           "info" if res.get("ok") else "error")
     return go("/doh")
@@ -4490,6 +4580,7 @@ async def settings_save(request: Request):
     if section == "tg":
         # Force restart so token/enabled/admin_ids take effect immediately
         BOT.restart()
+    _tg_change(f"⚙️ Настройки: секция <b>{tgbot.escape(section)}</b> сохранена")
     if section == "panel":
         flash(request, *_ok_msg("Настройки сохранены, HTTPS :443 обновлён", _apply_xray(_load_store())))
     else:
@@ -4505,15 +4596,25 @@ def settings_account(request: Request, username: str = Form(...), current: str =
     if not _check_credentials(admin["username"], current):
         flash(request, "Текущий пароль неверный", "error")
         return go("/settings?tab=security")
+    old_user = admin["username"]
     username = username.strip() or admin["username"]
     admin["username"] = username
+    pwd_changed = False
     if new_password:
         if len(new_password) < 8:
             flash(request, "Пароль минимум 8 символов", "error")
             return go("/settings?tab=security")
         admin["password_hash"] = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+        pwd_changed = True
     _save_admin(admin)
     request.session["user"] = username
+    tgbot.bind_actor(username, _client_ip(request))
+    bits = []
+    if username != old_user:
+        bits.append(f"логин {tgbot.escape(old_user)} → <b>{tgbot.escape(username)}</b>")
+    if pwd_changed:
+        bits.append("пароль изменён")
+    _tg_change("🔑 Учётные данные панели обновлены", " · ".join(bits) or "без смены логина/пароля")
     flash(request, "Учётные данные обновлены", "info")
     return go("/settings?tab=security")
 

@@ -47,8 +47,21 @@ def _http(url: str, timeout: int = 30, data: bytes | None = None, headers: dict 
 def start_job(name: str, fn, *args) -> str:
     job_id = f"{name}-{int(time.time())}"
     JOBS[job_id] = {"name": name, "status": "running", "log": "", "started": time.time()}
+    # Preserve panel operator (login+IP) across the worker thread for TG notifications
+    actor = ""
+    try:
+        import tgbot as _tg
+        actor = _tg.get_actor()
+    except Exception:
+        actor = ""
 
     def runner():
+        tok = None
+        try:
+            import tgbot as _tg
+            tok = _tg.set_actor(actor)
+        except Exception:
+            tok = None
         try:
             res = fn(*args)
             JOBS[job_id]["status"] = "done" if res.get("ok") else "failed"
@@ -56,6 +69,13 @@ def start_job(name: str, fn, *args) -> str:
         except Exception as exc:  # noqa: BLE001
             JOBS[job_id]["status"] = "failed"
             JOBS[job_id]["log"] = str(exc)
+        finally:
+            if tok is not None:
+                try:
+                    import tgbot as _tg
+                    _tg.reset_actor(tok)
+                except Exception:
+                    pass
 
     threading.Thread(target=runner, daemon=True).start()
     return job_id
