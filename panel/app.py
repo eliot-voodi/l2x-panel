@@ -36,11 +36,13 @@ import nodes as nodes_mod
 import ops
 import protocols as P
 import doh as doh_mod
+import settings_history as shist
 import sysmon
 import tgbot
 import totp
 import webhooks
 import xray_runtime as xray
+from copy import deepcopy
 
 try:
     import segno
@@ -220,10 +222,20 @@ def _save_store(data: dict) -> None:
 
 
 @contextmanager
-def mutate():
+def mutate(*, history_section: str = "", history_note: str = ""):
+    """Yield store for edits. Auto-records settings version history when settings change."""
     with STORE_LOCK:
         store = _load_store()
+        before_settings = deepcopy(store.get("settings") or {})
         yield store
+        after_settings = store.get("settings") or {}
+        if after_settings != before_settings:
+            meta = tgbot.get_actor_meta()
+            shist.record(
+                before_settings, after_settings,
+                user=meta.get("user") or "", ip=meta.get("ip") or "",
+                section=history_section, note=history_note,
+            )
         _save_store(store)
 
 
@@ -4698,13 +4710,50 @@ def settings_page(request: Request):
                 panel_tls_error=PANEL_TLS.error, **ctx)
 
 
+@app.get("/settings/versions", response_class=HTMLResponse)
+def settings_versions_page(request: Request):
+    if redir := _require(request):
+        return redir
+    return page(request, "settings_versions.html", active="settings", tab="versions",
+                versions=shist.list_versions(60), detail=None, vid="")
+
+
+@app.get("/settings/versions/{vid}", response_class=HTMLResponse)
+def settings_version_detail(vid: str, request: Request):
+    if redir := _require(request):
+        return redir
+    current = _load_store().get("settings") or {}
+    detail = shist.version_detail(vid, current)
+    if not detail:
+        flash(request, "Версия не найдена", "error")
+        return go("/settings/versions")
+    return page(request, "settings_versions.html", active="settings", tab="versions",
+                versions=shist.list_versions(60), detail=detail, vid=vid)
+
+
+@app.post("/settings/versions/{vid}/restore")
+def settings_version_restore(vid: str, request: Request):
+    if redir := _require(request):
+        return redir
+    try:
+        with mutate(history_section="rollback", history_note=f"restore {vid}") as store:
+            shist.apply_snapshot(store, vid)
+        result = _apply_xray(_load_store())
+        _refresh_settings_cache()
+        _tg_change(f"⏪ Настройки откачены к версии <code>{tgbot.escape(vid)}</code>")
+        flash(request, *_ok_msg(f"Откат к {vid}", result))
+    except Exception as exc:  # noqa: BLE001
+        flash(request, f"Откат: {exc}", "error")
+    return go(f"/settings/versions/{vid}")
+
+
 @app.post("/settings/save")
 async def settings_save(request: Request):
     if redir := _require(request):
         return redir
     form = await request.form()
     section = str(form.get("section") or "")
-    with mutate() as store:
+    with mutate(history_section=section or "settings", history_note="settings/save") as store:
         s = store["settings"]
         if section == "panel":
             p = s["panel"]

@@ -18,21 +18,31 @@ log = logging.getLogger("l2x.tgbot")
 
 # Who triggered a panel change (login + IP). Copied into background jobs via ops.start_job.
 _actor_line: contextvars.ContextVar[str] = contextvars.ContextVar("l2x_tg_actor", default="")
+_actor_user: contextvars.ContextVar[str] = contextvars.ContextVar("l2x_tg_actor_user", default="")
+_actor_ip: contextvars.ContextVar[str] = contextvars.ContextVar("l2x_tg_actor_ip", default="")
 
 
 def bind_actor(username: str, ip: str) -> None:
     """Remember panel operator for subsequent admin notifications in this request/job."""
-    user = escape(username or "?")
-    addr = escape(ip or "?")
-    _actor_line.set(f"\n👤 <b>{user}</b> · <code>{addr}</code>")
+    raw_user = str(username or "?").strip() or "?"
+    raw_ip = str(ip or "?").strip() or "?"
+    _actor_user.set(raw_user)
+    _actor_ip.set(raw_ip)
+    _actor_line.set(f"\n👤 <b>{escape(raw_user)}</b> · <code>{escape(raw_ip)}</code>")
 
 
 def clear_actor() -> None:
     _actor_line.set("")
+    _actor_user.set("")
+    _actor_ip.set("")
 
 
 def get_actor() -> str:
     return _actor_line.get() or ""
+
+
+def get_actor_meta() -> dict:
+    return {"user": _actor_user.get() or "", "ip": _actor_ip.get() or ""}
 
 
 def set_actor(line: str):

@@ -13,6 +13,7 @@
   {% for k, l in [('panel', t('Панель')), ('sub', t('Подписки')), ('tg', 'Telegram'), ('webhooks', 'Webhooks'), ('nodes', 'Nodes agent'), ('security', t('Безопасность')), ('api', 'API'), ('certs', t('Сертификаты')), ('backup', t('Бэкап')), ('system', t('Система')), ('iplimit', 'IP limit')] %}
   <a href="?tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
   {% endfor %}
+  <a href="{{ bp }}/settings/versions" class="{% if tab == 'versions' %}active{% endif %}">Версии</a>
 </div>
 
 {% if tab == 'panel' %}{% set p = s.panel %}
