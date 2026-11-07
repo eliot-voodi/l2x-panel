@@ -5,6 +5,90 @@
 {% block page_title %}DoH / Pi-hole{% endblock %}
 {% block page_sub %}DNS-over-HTTPS через nginx :443 → панель → Pi-hole. Персональные URL для клиентов.{% endblock %}
 {% block content %}
+{% set q = (pihole_dash.queries if pihole_dash else {}) or {} %}
+{% set cl = (pihole_dash.clients if pihole_dash else {}) or {} %}
+{% set gr = (pihole_dash.gravity if pihole_dash else {}) or {} %}
+<div class="card" id="pihole-dash" data-url="{{ bp }}/doh/stats">
+  <div class="card-head">
+    <h3>Дашборд Pi-hole</h3>
+    <div class="actions">
+      <span class="badge {% if pihole_dash and pihole_dash.ok %}ok{% else %}warn{% endif %}" id="pd-badge">
+        {% if pihole_dash and pihole_dash.ok %}API {{ pihole_dash.source }}{% else %}нет данных{% endif %}
+      </span>
+      <button type="button" class="btn ghost sm" id="pd-refresh">Обновить</button>
+    </div>
+  </div>
+  <div class="hint" id="pd-error" {% if not pihole_dash or pihole_dash.ok or not pihole_dash.error %}hidden{% endif %}>
+    {{ (pihole_dash.error if pihole_dash else '') or '' }} — укажите пароль Pi-hole выше и сохраните, либо откройте admin.
+  </div>
+  <div class="grid g4">
+    <div class="stat">
+      <div class="label">Запросы DNS</div>
+      <div class="value" id="pd-total">{{ q.total or 0 }}</div>
+      <div class="hint">всего · forwarded <span id="pd-forwarded">{{ q.forwarded or 0 }}</span> · cache <span id="pd-cached">{{ q.cached or 0 }}</span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Заблокировано рекламы</div>
+      <div class="value" id="pd-blocked">{{ q.blocked or 0 }}</div>
+      <div class="hint"><span id="pd-pct">{{ '%.1f'|format(q.percent_blocked or 0) }}</span>% · в gravity <span id="pd-gravity">{{ gr.domains or 0 }}</span> доменов</div>
+      <div class="bar"><span id="pd-pct-bar" style="width:{{ q.percent_blocked or 0 }}%"></span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Клиенты</div>
+      <div class="value" id="pd-clients">{{ cl.active or 0 }}</div>
+      <div class="hint">активных · уникальных <span id="pd-clients-total">{{ cl.total or 0 }}</span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Частота</div>
+      <div class="value" id="pd-freq">{% if q.frequency %}{{ '%.1f'|format(q.frequency) }}{% else %}—{% endif %}</div>
+      <div class="hint">запросов/сек · данные только из Pi-hole API</div>
+    </div>
+  </div>
+
+  <div class="grid g3 mt">
+    <div>
+      <h3 class="mb0" style="margin-bottom:.55rem">Топ‑10 сайтов</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>#</th><th>Домен</th><th class="right">Запросы</th></tr></thead>
+        <tbody id="pd-top-domains">
+        {% for row in (pihole_dash.top_domains if pihole_dash else []) %}
+          <tr><td class="dim">{{ loop.index }}</td><td class="mono small">{{ row.name }}</td><td class="right">{{ row.count }}</td></tr>
+        {% else %}
+          <tr><td colspan="3" class="dim">нет данных</td></tr>
+        {% endfor %}
+        </tbody>
+      </table></div>
+    </div>
+    <div>
+      <h3 class="mb0" style="margin-bottom:.55rem">Топ‑10 заблокированных</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>#</th><th>Домен</th><th class="right">Блоков</th></tr></thead>
+        <tbody id="pd-top-blocked">
+        {% for row in (pihole_dash.top_blocked if pihole_dash else []) %}
+          <tr><td class="dim">{{ loop.index }}</td><td class="mono small">{{ row.name }}</td><td class="right">{{ row.count }}</td></tr>
+        {% else %}
+          <tr><td colspan="3" class="dim">нет данных</td></tr>
+        {% endfor %}
+        </tbody>
+      </table></div>
+    </div>
+    <div>
+      <h3 class="mb0" style="margin-bottom:.55rem">Топ‑10 клиентов</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>#</th><th>Клиент</th><th class="right">Запросы</th></tr></thead>
+        <tbody id="pd-top-clients">
+        {% for row in (pihole_dash.top_clients if pihole_dash else []) %}
+          <tr><td class="dim">{{ loop.index }}</td><td class="mono small">{{ row.name }}</td><td class="right">{{ row.count }}</td></tr>
+        {% else %}
+          <tr><td colspan="3" class="dim">нет данных</td></tr>
+        {% endfor %}
+        </tbody>
+      </table></div>
+    </div>
+  </div>
+  <div class="hint mt">Обновление каждые 30 с с <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/api/…</code> — без локального учёта DNS на панели.</div>
+</div>
+
 <div class="grid g2">
   <form class="card" method="post" action="{{ bp }}/doh/save">
     <h3>Сервис</h3>
@@ -84,4 +168,68 @@
   <div class="hint">Пока ни у кого не включён DoH — откройте клиента и включите опции.</div>
   {% endif %}
 </div>
+<script>
+(function () {
+  var root = document.getElementById('pihole-dash');
+  if (!root) return;
+  var url = root.getAttribute('data-url');
+
+  function fmt(n) {
+    n = Number(n) || 0;
+    return n.toLocaleString('ru-RU');
+  }
+  function fillTop(tbodyId, rows) {
+    var tb = document.getElementById(tbodyId);
+    if (!tb) return;
+    rows = rows || [];
+    if (!rows.length) {
+      tb.innerHTML = '<tr><td colspan="3" class="dim">нет данных</td></tr>';
+      return;
+    }
+    tb.innerHTML = rows.slice(0, 10).map(function (r, i) {
+      return '<tr><td class="dim">' + (i + 1) + '</td><td class="mono small">' +
+        String(r.name || '—').replace(/[<>&]/g, function (c) {
+          return ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]);
+        }) + '</td><td class="right">' + fmt(r.count) + '</td></tr>';
+    }).join('');
+  }
+  function apply(d) {
+    if (!d) return;
+    var badge = document.getElementById('pd-badge');
+    var err = document.getElementById('pd-error');
+    if (badge) {
+      badge.textContent = d.ok ? ('API ' + (d.source || 'pihole')) : 'нет данных';
+      badge.className = 'badge ' + (d.ok ? 'ok' : 'warn');
+    }
+    if (err) {
+      if (d.ok || !d.error) { err.hidden = true; err.textContent = ''; }
+      else { err.hidden = false; err.textContent = d.error + ' — укажите пароль Pi-hole выше и сохраните, либо откройте admin.'; }
+    }
+    var q = d.queries || {}, cl = d.clients || {}, gr = d.gravity || {};
+    var el = function (id) { return document.getElementById(id); };
+    if (el('pd-total')) el('pd-total').textContent = fmt(q.total);
+    if (el('pd-forwarded')) el('pd-forwarded').textContent = fmt(q.forwarded);
+    if (el('pd-cached')) el('pd-cached').textContent = fmt(q.cached);
+    if (el('pd-blocked')) el('pd-blocked').textContent = fmt(q.blocked);
+    if (el('pd-pct')) el('pd-pct').textContent = (Number(q.percent_blocked) || 0).toFixed(1);
+    if (el('pd-pct-bar')) el('pd-pct-bar').style.width = Math.min(100, Number(q.percent_blocked) || 0) + '%';
+    if (el('pd-gravity')) el('pd-gravity').textContent = fmt(gr.domains);
+    if (el('pd-clients')) el('pd-clients').textContent = fmt(cl.active);
+    if (el('pd-clients-total')) el('pd-clients-total').textContent = fmt(cl.total);
+    if (el('pd-freq')) el('pd-freq').textContent = q.frequency ? Number(q.frequency).toFixed(1) : '—';
+    fillTop('pd-top-domains', d.top_domains);
+    fillTop('pd-top-blocked', d.top_blocked);
+    fillTop('pd-top-clients', d.top_clients);
+  }
+  function refresh() {
+    fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(apply)
+      .catch(function () {});
+  }
+  var btn = document.getElementById('pd-refresh');
+  if (btn) btn.addEventListener('click', refresh);
+  setInterval(refresh, 30000);
+})();
+</script>
 {% endblock %}

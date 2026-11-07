@@ -16,7 +16,11 @@ import secrets
 import shutil
 import socket
 import subprocess
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 COMPOSE_DIR = Path(os.environ.get("L2XPANEL_DOH_DIR", "/opt/l2xpanel/doh"))
@@ -456,3 +460,315 @@ def redeem_pihole_ticket(token: str) -> dict:
     if found.get("used") or float(found.get("exp") or 0) <= now:
         return {"ok": False, "error": "ссылка уже использована или истекла"}
     return {"ok": True, "session_ttl": PIHOLE_SESSION_TTL_SEC}
+
+
+# ---------------------------------------------------------------- Pi-hole stats dashboard (API only)
+
+_SID_LOCK = threading.Lock()
+_SID_CACHE: dict[str, dict] = {}  # host:port → {sid, exp, csrf}
+
+
+def _pihole_base_url(cfg: dict | None = None) -> str:
+    host, port = pihole_upstream(cfg)
+    return f"http://{host}:{port}"
+
+
+def _pihole_http(
+    method: str,
+    path: str,
+    *,
+    cfg: dict | None = None,
+    sid: str = "",
+    body: dict | None = None,
+    timeout: float = 4,
+) -> dict:
+    """Low-level JSON call to local Pi-hole web API. Returns {ok, status, data, error}."""
+    url = _pihole_base_url(cfg).rstrip("/") + path
+    data = None
+    headers = {"Accept": "application/json", "User-Agent": "L2XPanel-DoH/1.0"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if sid:
+        headers["X-FTL-SID"] = sid
+        headers["sid"] = sid
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                return {"ok": False, "status": resp.status, "data": {}, "error": "не JSON от Pi-hole"}
+            return {"ok": True, "status": resp.status, "data": payload if isinstance(payload, dict) else {"value": payload}, "error": ""}
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+        err = ""
+        if isinstance(payload, dict):
+            e = payload.get("error") or {}
+            if isinstance(e, dict):
+                err = str(e.get("message") or e.get("key") or "")
+        return {
+            "ok": False,
+            "status": int(exc.code or 0),
+            "data": payload if isinstance(payload, dict) else {},
+            "error": err or f"HTTP {exc.code}",
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"ok": False, "status": 0, "data": {}, "error": str(exc) or "Pi-hole недоступен"}
+
+
+def _pihole_auth(cfg: dict | None = None, *, force: bool = False) -> dict:
+    """Obtain / reuse Pi-hole v6 SID. Returns {ok, sid, error}."""
+    cfg = {**default_settings(), **(cfg or {})}
+    host, port = pihole_upstream(cfg)
+    key = f"{host}:{port}"
+    now = time.time()
+    with _SID_LOCK:
+        cached = _SID_CACHE.get(key) or {}
+        if not force and cached.get("sid") and float(cached.get("exp") or 0) > now + 15:
+            return {"ok": True, "sid": cached["sid"], "error": ""}
+    pwd = str(cfg.get("pihole_password") or "")
+    # Empty password is valid when Pi-hole has no password set
+    r = _pihole_http("POST", "/api/auth", cfg=cfg, body={"password": pwd}, timeout=5)
+    if not r["ok"]:
+        # v5 fallback probe — no SID needed for summaryRaw with auth token later
+        return {"ok": False, "sid": "", "error": r.get("error") or "auth failed", "status": r.get("status")}
+    sess = (r.get("data") or {}).get("session") or {}
+    sid = str(sess.get("sid") or "")
+    if not sid and sess.get("valid"):
+        # No password configured — API allows unauthenticated reads
+        sid = ""
+    validity = float(sess.get("validity") or 280)
+    with _SID_LOCK:
+        _SID_CACHE[key] = {
+            "sid": sid,
+            "csrf": str(sess.get("csrf") or ""),
+            "exp": now + max(60.0, validity - 30),
+        }
+    return {"ok": True, "sid": sid, "error": ""}
+
+
+def invalidate_pihole_session(cfg: dict | None = None) -> None:
+    host, port = pihole_upstream(cfg)
+    with _SID_LOCK:
+        _SID_CACHE.pop(f"{host}:{port}", None)
+
+
+def _pihole_get(path: str, cfg: dict | None = None, *, retry: bool = True) -> dict:
+    auth = _pihole_auth(cfg)
+    if not auth.get("ok"):
+        # Open (no-password) installs may still answer without SID
+        r = _pihole_http("GET", path, cfg=cfg, sid="", timeout=5)
+        if r.get("ok"):
+            return r
+        return {
+            "ok": False,
+            "data": {},
+            "error": auth.get("error") or r.get("error") or "auth failed",
+            "status": auth.get("status") or r.get("status"),
+        }
+    r = _pihole_http("GET", path, cfg=cfg, sid=auth.get("sid") or "", timeout=5)
+    if r["ok"]:
+        return r
+    if retry and int(r.get("status") or 0) == 401:
+        auth = _pihole_auth(cfg, force=True)
+        if not auth.get("ok"):
+            return {"ok": False, "data": {}, "error": auth.get("error") or "re-auth failed", "status": 401}
+        return _pihole_http("GET", path, cfg=cfg, sid=auth.get("sid") or "", timeout=5)
+    return r
+
+
+def _num(value, default: float | int = 0):
+    try:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        s = str(value).replace(",", "").strip()
+        if "." in s:
+            return float(s)
+        return int(s)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_top_list(items, *, name_keys: tuple[str, ...] = ("domain", "name", "client", "ip")) -> list[dict]:
+    out: list[dict] = []
+    if isinstance(items, dict):
+        # v5 style {domain: count}
+        for k, v in items.items():
+            out.append({"name": str(k), "count": int(_num(v, 0))})
+    elif isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = ""
+            for key in name_keys:
+                if it.get(key):
+                    name = str(it.get(key))
+                    break
+            if not name and it.get("client"):
+                c = it["client"]
+                if isinstance(c, dict):
+                    name = str(c.get("name") or c.get("ip") or "")
+                else:
+                    name = str(c)
+            count = _num(it.get("count", it.get("hits", it.get("queries"))), 0)
+            out.append({"name": name or "—", "count": int(count)})
+    out.sort(key=lambda x: x["count"], reverse=True)
+    return out[:10]
+
+
+def _dashboard_from_v6(cfg: dict) -> dict | None:
+    summary = _pihole_get("/api/stats/summary", cfg)
+    if not summary.get("ok"):
+        return None
+    data = summary.get("data") or {}
+    queries = data.get("queries") or {}
+    clients = data.get("clients") or {}
+    gravity = data.get("gravity") or {}
+
+    top_all = _pihole_get("/api/stats/top_domains?count=10", cfg)
+    top_blocked = _pihole_get("/api/stats/top_domains?blocked=true&count=10", cfg)
+    top_clients = _pihole_get("/api/stats/top_clients?count=10", cfg)
+
+    domains_payload = (top_all.get("data") or {}) if top_all.get("ok") else {}
+    blocked_payload = (top_blocked.get("data") or {}) if top_blocked.get("ok") else {}
+    clients_payload = (top_clients.get("data") or {}) if top_clients.get("ok") else {}
+
+    total = int(_num(queries.get("total"), 0))
+    blocked = int(_num(queries.get("blocked"), 0))
+    pct = _num(queries.get("percent_blocked"), 0)
+    if not pct and total:
+        pct = round(100.0 * blocked / total, 2)
+
+    return {
+        "ok": True,
+        "source": "pihole-v6",
+        "error": "",
+        "queries": {
+            "total": total,
+            "blocked": blocked,
+            "forwarded": int(_num(queries.get("forwarded"), 0)),
+            "cached": int(_num(queries.get("cached"), 0)),
+            "percent_blocked": round(float(pct), 2),
+            "frequency": _num(queries.get("frequency"), 0),
+            "types": queries.get("types") if isinstance(queries.get("types"), dict) else {},
+        },
+        "clients": {
+            "active": int(_num(clients.get("active"), _num(clients.get("total"), 0))),
+            "total": int(_num(clients.get("total"), _num(clients.get("active"), 0))),
+        },
+        "gravity": {
+            "domains": int(_num(
+                gravity.get("domains_being_blocked"),
+                _num(gravity.get("domains"), 0),
+            )),
+            "last_update": gravity.get("last_update") or gravity.get("updated") or "",
+        },
+        "top_domains": _normalize_top_list(
+            domains_payload.get("domains") or domains_payload.get("top_domains") or domains_payload
+        ),
+        "top_blocked": _normalize_top_list(
+            blocked_payload.get("domains") or blocked_payload.get("top_domains") or blocked_payload
+        ),
+        "top_clients": _normalize_top_list(
+            clients_payload.get("clients") or clients_payload.get("top_clients") or clients_payload,
+            name_keys=("name", "ip", "client"),
+        ),
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def _dashboard_from_v5(cfg: dict) -> dict | None:
+    """Legacy admin/api.php — only if v6 is unavailable."""
+    host, port = pihole_upstream(cfg)
+    pwd = str(cfg.get("pihole_password") or "")
+    q = urllib.parse.urlencode({"summaryRaw": "", "topItems": "10", "getQuerySources": "", "auth": pwd})
+    url = f"http://{host}:{port}/admin/api.php?{q}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "L2XPanel-DoH/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or data.get("status") == "error":
+        return None
+    total = int(_num(data.get("dns_queries_today"), 0))
+    blocked = int(_num(data.get("ads_blocked_today"), 0))
+    pct = _num(data.get("ads_percentage_today"), 0)
+    top_q = data.get("top_queries") or {}
+    top_ads = data.get("top_ads") or {}
+    sources = data.get("top_sources") or data.get("top_sources_blocked") or {}
+    return {
+        "ok": True,
+        "source": "pihole-v5",
+        "error": "",
+        "queries": {
+            "total": total,
+            "blocked": blocked,
+            "forwarded": int(_num(data.get("queries_forwarded"), 0)),
+            "cached": int(_num(data.get("queries_cached"), 0)),
+            "percent_blocked": round(float(pct), 2),
+            "frequency": 0,
+            "types": {},
+        },
+        "clients": {
+            "active": int(_num(data.get("unique_clients"), 0)),
+            "total": int(_num(data.get("unique_clients"), 0)),
+        },
+        "gravity": {
+            "domains": int(_num(data.get("domains_being_blocked"), 0)),
+            "last_update": "",
+        },
+        "top_domains": _normalize_top_list(top_q),
+        "top_blocked": _normalize_top_list(top_ads),
+        "top_clients": _normalize_top_list(sources),
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def pihole_dashboard(cfg: dict | None = None) -> dict:
+    """Pull summary + top lists from local Pi-hole API (no local DNS accounting)."""
+    cfg = {**default_settings(), **(cfg or {})}
+    empty = {
+        "ok": False,
+        "source": "",
+        "error": "",
+        "queries": {"total": 0, "blocked": 0, "forwarded": 0, "cached": 0, "percent_blocked": 0, "frequency": 0, "types": {}},
+        "clients": {"active": 0, "total": 0},
+        "gravity": {"domains": 0, "last_update": ""},
+        "top_domains": [],
+        "top_blocked": [],
+        "top_clients": [],
+        "fetched_at": "",
+    }
+
+    dash = _dashboard_from_v6(cfg)
+    if dash and dash.get("ok"):
+        return dash
+
+    dash5 = _dashboard_from_v5(cfg)
+    if dash5 and dash5.get("ok"):
+        return dash5
+
+    probe = _pihole_get("/api/stats/summary", cfg)
+    err = probe.get("error") or ""
+    status = int(probe.get("status") or 0)
+    if status in (401, 403) or "unauthor" in err.lower():
+        err = "неверный или пустой пароль Pi-hole — сохраните его в настройках DoH"
+    if not err:
+        ready = pihole_ready()
+        err = ready.get("reason") if not ready.get("ok") else "не удалось получить статистику Pi-hole"
+    return {**empty, "error": err, "source": "pihole"}

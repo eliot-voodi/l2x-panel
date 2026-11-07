@@ -3933,6 +3933,7 @@ def doh_page(request: Request):
     store = _load_store()
     cfg = {**doh_mod.default_settings(), **(store["settings"].get("doh") or {})}
     st = doh_mod.status(cfg)
+    dash = doh_mod.pihole_dashboard(cfg)
     clients = []
     for c in store.get("clients") or []:
         if not c.get("doh_enabled"):
@@ -3954,7 +3955,17 @@ def doh_page(request: Request):
     }
     return page(request, "doh.html", active="doh", doh=cfg, status=st, doh_clients=clients,
                 public_host=public_host(), pihole_link=link, pihole_session=pihole_session,
-                pihole_open=f"{base_path()}/pihole/admin/")
+                pihole_open=f"{base_path()}/pihole/admin/", pihole_dash=dash)
+
+
+@app.get("/doh/stats")
+def doh_stats(request: Request):
+    """JSON dashboard from Pi-hole API — used by the DoH tab auto-refresh."""
+    if not _user(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    store = _load_store()
+    cfg = {**doh_mod.default_settings(), **(store["settings"].get("doh") or {})}
+    return JSONResponse(doh_mod.pihole_dashboard(cfg))
 
 
 @app.post("/doh/save")
@@ -3977,6 +3988,7 @@ async def doh_save(request: Request):
             d["pihole_password"] = pwd
     pwd_msg = ""
     if pwd:
+        doh_mod.invalidate_pihole_session(_load_store()["settings"].get("doh") or {})
         sp = doh_mod.set_pihole_password(pwd)
         if sp.get("ok"):
             pwd_msg = " Пароль Pi-hole применён к контейнеру."
