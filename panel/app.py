@@ -1217,25 +1217,31 @@ def check_xray_update(force: bool = False) -> dict:
     latest = ops.xray_latest(bool(cfg.get("include_prerelease")))
     current = xray.xray_status().get("version") or ""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    notify_tag = ""
     with mutate() as store:
         st = store.setdefault("xray_update_state", {})
-        prev_latest = st.get("latest")
         st.update({"checked_at": now, "current": current, "error": "" if latest.get("ok") else latest.get("error", "")})
         if latest.get("ok"):
             st.update({"latest": latest["tag"], "url": latest["url"], "published": latest["published"],
                        "prerelease": latest["prerelease"], "notes": latest["notes"]})
         available = bool(st.get("latest")) and ops.version_tuple(st["latest"]) > ops.version_tuple(current)
         st["available"] = available
-        is_new = available and st.get("latest") != prev_latest
-        if is_new:
+        tag = str(st.get("latest") or "")
+        if available and tag and st.get("tg_notified") != tag:
             st["dismissed"] = ""
+            st["tg_notified"] = tag
+            notify_tag = tag
         result = dict(st)
-    if is_new and _bot_settings().get("enabled"):
-        try:
-            BOT.send(f"⬆️ Доступна новая версия Xray {result['latest']} (установлена {current}). "
-                     f"Установка — в панели, вкладка Xray → Ядро.")
-        except Exception:
-            pass
+    if notify_tag:
+        pre = " (pre-release)" if result.get("prerelease") else ""
+        url = result.get("url") or ""
+        link = f"\n{tgbot.escape(url)}" if url else ""
+        _tg_admin(
+            f"⬆️ <b>Xray</b>: доступна {tgbot.escape(notify_tag)}{pre}\n"
+            f"Сейчас: <code>{tgbot.escape(current or '?')}</code>\n"
+            f"Установка — Xray → Ядро.{link}",
+            flag="notify_updates",
+        )
     return result
 
 
@@ -1309,17 +1315,37 @@ def check_panel_update(force: bool = False) -> dict:
     latest = ops.panel_latest(False)
     current = panel_version()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    notify_tag = ""
     with mutate() as store:
         st = store.setdefault("panel_update_state", {})
-        prev = st.get("latest")
         st.update({"checked_at": now, "current": current, "error": "" if latest.get("ok") else latest.get("error", "")})
         if latest.get("ok"):
             st.update({"latest": latest["tag"], "url": latest.get("url") or "", "notes": latest.get("notes") or ""})
         available = bool(st.get("latest")) and ops.version_tuple(st["latest"]) > ops.version_tuple(current)
         st["available"] = available
-        if available and st.get("latest") != prev:
+        tag = str(st.get("latest") or "")
+        if available and tag and st.get("tg_notified") != tag:
             st["dismissed"] = ""
-        return dict(st)
+            st["tg_notified"] = tag
+            notify_tag = tag
+        result = dict(st)
+    if notify_tag:
+        url = result.get("url") or ""
+        link = f"\n{tgbot.escape(url)}" if url else ""
+        notes = str(result.get("notes") or "").strip()
+        # First line / short blurb from release notes
+        blurb = ""
+        if notes:
+            line = notes.splitlines()[0].strip()[:180]
+            if line:
+                blurb = f"\n<i>{tgbot.escape(line)}</i>"
+        _tg_admin(
+            f"🧩 <b>Панель</b>: доступна {tgbot.escape(notify_tag)}\n"
+            f"Сейчас: <code>{tgbot.escape(current or '?')}</code>\n"
+            f"Обновление — Система / баннер на дашборде.{blurb}{link}",
+            flag="notify_updates",
+        )
+    return result
 
 
 def panel_update_banner() -> dict | None:
@@ -4390,6 +4416,7 @@ async def settings_save(request: Request):
                 "notify_iplimit": form.get("notify_iplimit") == "1", "notify_tunnel": form.get("notify_tunnel") == "1",
                 "notify_nodes": form.get("notify_nodes") == "1",
                 "notify_changes": form.get("notify_changes") == "1",
+                "notify_updates": form.get("notify_updates") == "1",
                 "notify_expire_days": _float(form.get("notify_expire_days"), 3),
                 "cpu_threshold": _float(form.get("cpu_threshold"), 85), "report_hours": _float(form.get("report_hours"), 24),
                 "backup_hours": _float(form.get("backup_hours"), 24),

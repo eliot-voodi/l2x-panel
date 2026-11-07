@@ -30,6 +30,7 @@ def default_settings() -> dict:
         "notify_tunnel": True,
         "notify_nodes": True,      # online/offline, sync, update, provision, promote, changes
         "notify_changes": True,    # clients, inbounds, outbounds, DoH, settings
+        "notify_updates": True,    # new Xray core / panel releases on GitHub
         "cpu_threshold": 85,
         "report_hours": 24,
         "backup_hours": 24,
