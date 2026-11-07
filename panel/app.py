@@ -4380,54 +4380,8 @@ def logs_page(request: Request):
 
 
 # ================================================================ DoH (Pi-hole via nginx)
-
-@app.api_route("/doh/{token}", methods=["GET", "POST"])
-@app.api_route("/doh/{token}/dns-query", methods=["GET", "POST"])  # legacy alias, never shown in UI
-async def doh_dns_query(token: str, request: Request):
-    """RFC 8484 DoH — public URL is /{prefix}/{token} (no /dns-query in links)."""
-    store = _load_store()
-    cfg = store["settings"].get("doh") or {}
-    if not cfg.get("enabled"):
-        return Response(status_code=404)
-    client = doh_mod.client_by_token(store, token)
-    if not client:
-        return Response(status_code=403)
-    try:
-        if request.method == "GET":
-            raw = str(request.query_params.get("dns") or "").strip()
-            if not raw:
-                return Response("missing dns=", status_code=400)
-            query = doh_mod.b64url_decode(raw)
-        else:
-            ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
-            body = await request.body()
-            if ctype in ("application/dns-message", "application/dns-message; charset=utf-8", ""):
-                query = body
-            else:
-                return Response("unsupported content-type", status_code=415)
-        answer = doh_mod.resolve_wire(
-            query,
-            upstream=str(cfg.get("upstream") or "127.0.0.1"),
-            port=int(cfg.get("upstream_port") or 53),
-            timeout=float(cfg.get("timeout_sec") or 4),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return Response(str(exc), status_code=502)
-    # Attribute client for dashboard (Pi-hole only sees docker/localhost)
-    try:
-        peer = ""
-        try:
-            if request.client:
-                peer = str(request.client.host or "")
-        except Exception:
-            peer = ""
-        rip = doh_mod.request_client_ip(dict(request.headers), fallback=peer)
-        doh_mod.record_doh_client(doh_mod.doh_client_label(client, rip))
-    except Exception:
-        pass
-    return Response(answer, media_type="application/dns-message",
-                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"})
-
+# Admin routes (/doh/install, /doh/save, …) MUST be registered before /doh/{token},
+# otherwise Starlette matches «install» as a token and returns 403.
 
 @app.get("/doh", response_class=HTMLResponse)
 def doh_page(request: Request):
@@ -4572,6 +4526,55 @@ def doh_pihole_session_end(request: Request):
     request.session.pop("pihole_until", None)
     flash(request, "Сессия доступа к Pi-hole закрыта", "info")
     return go("/doh")
+
+
+@app.api_route("/doh/{token}", methods=["GET", "POST"])
+@app.api_route("/doh/{token}/dns-query", methods=["GET", "POST"])  # legacy alias, never shown in UI
+async def doh_dns_query(token: str, request: Request):
+    """RFC 8484 DoH — public URL is /{prefix}/{token} (no /dns-query in links)."""
+    if not doh_mod.TOKEN_RE.match(token or ""):
+        return Response(status_code=404)
+    store = _load_store()
+    cfg = store["settings"].get("doh") or {}
+    if not cfg.get("enabled"):
+        return Response(status_code=404)
+    client = doh_mod.client_by_token(store, token)
+    if not client:
+        return Response(status_code=403)
+    try:
+        if request.method == "GET":
+            raw = str(request.query_params.get("dns") or "").strip()
+            if not raw:
+                return Response("missing dns=", status_code=400)
+            query = doh_mod.b64url_decode(raw)
+        else:
+            ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+            body = await request.body()
+            if ctype in ("application/dns-message", "application/dns-message; charset=utf-8", ""):
+                query = body
+            else:
+                return Response("unsupported content-type", status_code=415)
+        answer = doh_mod.resolve_wire(
+            query,
+            upstream=str(cfg.get("upstream") or "127.0.0.1"),
+            port=int(cfg.get("upstream_port") or 53),
+            timeout=float(cfg.get("timeout_sec") or 4),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return Response(str(exc), status_code=502)
+    try:
+        peer = ""
+        try:
+            if request.client:
+                peer = str(request.client.host or "")
+        except Exception:
+            peer = ""
+        rip = doh_mod.request_client_ip(dict(request.headers), fallback=peer)
+        doh_mod.record_doh_client(doh_mod.doh_client_label(client, rip))
+    except Exception:
+        pass
+    return Response(answer, media_type="application/dns-message",
+                    headers={"cache-control": "no-store", "access-control-allow-origin": "*"})
 
 
 def _pihole_session_ok(request: Request) -> bool:
