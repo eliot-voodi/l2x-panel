@@ -312,15 +312,81 @@ def connected_l2tp_tags(store: dict) -> list[str]:
     return [_l2tp_tag(t) for t in store.get("l2tp") or [] if t.get("status") == "connected"]
 
 
-def balancer_member_tags(store: dict, balancer: dict) -> list[str]:
+def sub_health_settings(store: dict) -> dict:
+    """Subscription health gate: hide disconnected / high-loss outbounds from client links."""
+    sub = ((store.get("settings") or {}).get("sub") or {})
+    try:
+        max_loss = float(sub.get("max_loss_pct") if sub.get("max_loss_pct") not in (None, "") else 20)
+    except (TypeError, ValueError):
+        max_loss = 20.0
+    return {
+        "hide_unhealthy": bool(sub.get("hide_unhealthy", True)),
+        "max_loss_pct": max(0.0, min(100.0, max_loss)),
+    }
+
+
+def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None) -> bool:
+    """Whether an outbound/balancer tag may appear in a client subscription."""
+    tag = str(tag or "").strip()
+    if not tag or tag in ("direct", "block", "blackhole"):
+        return True
+    cfg = sub_health_settings(store)
+    if not cfg["hide_unhealthy"]:
+        return True
+    seen = _seen if _seen is not None else set()
+    if tag in seen:
+        return False
+    seen.add(tag)
+    max_loss = cfg["max_loss_pct"]
+
+    for t in store.get("l2tp") or []:
+        if _l2tp_tag(t) != tag:
+            continue
+        if t.get("status") != "connected":
+            return False
+        metrics = t.get("metrics") or {}
+        loss = metrics.get("loss_pct")
+        try:
+            if loss is not None and float(loss) > max_loss:
+                return False
+        except (TypeError, ValueError):
+            pass
+        return True
+
+    for o in store.get("outbounds_custom") or []:
+        if o.get("tag") != tag:
+            continue
+        if not o.get("enabled", True) or not o.get("in_sub", True):
+            return False
+        lt = o.get("last_test")
+        if isinstance(lt, dict) and lt.get("ok") is False:
+            return False
+        return True
+
+    for b in ensure_balancers(store).values():
+        if b.get("tag") != tag:
+            continue
+        if not b.get("enabled", True):
+            return False
+        members = balancer_member_tags(store, b, healthy_only=True)
+        return bool(members)
+
+    return True
+
+
+def balancer_member_tags(store: dict, balancer: dict, *, healthy_only: bool = False) -> list[str]:
     """explicit members ∩ (connected L2TP ∪ enabled custom outbounds); empty → all connected L2TP."""
     connected = connected_l2tp_tags(store)
     members = balancer.get("members") or []
     if not members:
-        return connected
-    custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True)}
-    pool = set(connected) | custom
-    return [t for t in members if t in pool]
+        pool_list = connected
+    else:
+        custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True)}
+        pool = set(connected) | custom
+        pool_list = [t for t in members if t in pool]
+    if not healthy_only or not sub_health_settings(store)["hide_unhealthy"]:
+        return pool_list
+    return [t for t in pool_list if outbound_ok_for_sub(store, t)]
 
 
 # ---------------------------------------------------------------- outbounds
@@ -685,7 +751,11 @@ def selectable_outbound_tags(store: dict) -> list[dict]:
 
 
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
-    """One identity per balancer / connected country / enabled custom outbound."""
+    """One identity per balancer / connected country / enabled custom outbound.
+
+    Unhealthy outbounds (disconnected L2TP, high packet loss, failed custom probe)
+    are omitted so clients do not keep dead nodes until the next refresh.
+    """
     if not client.get("uuid") or not client.get("sub_enabled", True):
         return []
     if not ignore_quota and not client_access_ok(client):
@@ -696,6 +766,8 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
     entries = []
     for tag in tags:
         if not ignore_quota and not tag_allowed_for_client(client, tag):
+            continue
+        if not outbound_ok_for_sub(store, tag):
             continue
         ident_uuid = P.identity_uuid(client["uuid"], tag)
         entries.append({
@@ -748,6 +820,8 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
             if ident["main"]:
                 ob = client.get("outbound") or "direct"
                 if ob != "direct" and not tag_allowed_for_client(client, ob):
+                    continue
+                if ob != "direct" and not outbound_ok_for_sub(store, ob):
                     continue
                 remark = f"{prefix}{client['email']} · {outbound_label(store, ob)}{tag_quota_suffix(client, ob)}"
             else:
@@ -983,7 +1057,7 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
     observatory = burst = None
     ping_b = bals.get("least_ping") or {}
     if ping_b.get("enabled", True):
-        members = balancer_member_tags(store, ping_b)
+        members = balancer_member_tags(store, ping_b, healthy_only=True)
         if members:
             entry = {"tag": ping_b["tag"], "selector": members, "strategy": {"type": "leastPing"}}
             fb = balancer_fallback_tag(ping_b)
@@ -998,7 +1072,7 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
             }
     load_b = bals.get("least_load") or {}
     if load_b.get("enabled", True):
-        members = balancer_member_tags(store, load_b)
+        members = balancer_member_tags(store, load_b, healthy_only=True)
         if members:
             entry = {
                 "tag": load_b["tag"], "selector": members,

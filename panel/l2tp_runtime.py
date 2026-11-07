@@ -470,19 +470,57 @@ def probe_public_ip(iface: str, timeout: int = 8) -> str:
     return ""
 
 
-def ping_host_ms(host: str, timeout: int = 4) -> float | None:
-    """ICMP RTT to LNS host in ms (rough pre-filter before connecting)."""
+def ping_stats(
+    host: str,
+    *,
+    iface: str | None = None,
+    count: int = 4,
+    timeout: int = 2,
+) -> dict:
+    """ICMP stats: {ok, ms, loss_pct, sent, recv, error}."""
     host = (host or "").strip()
+    out: dict = {"ok": False, "ms": None, "loss_pct": None, "sent": 0, "recv": 0, "error": ""}
     if not host:
-        return None
-    r = _run(["ping", "-4", "-c", "2", "-W", str(timeout), host], timeout=timeout * 3 + 2)
+        out["error"] = "no host"
+        return out
+    count = max(1, min(20, int(count or 4)))
+    timeout = max(1, min(10, int(timeout or 2)))
+    cmd = ["ping", "-4", "-c", str(count), "-W", str(timeout)]
+    if iface:
+        cmd += ["-I", iface]
+    cmd.append(host)
+    r = _run(cmd, timeout=timeout * count + 4)
     text = (r.get("stdout") or "") + "\n" + (r.get("stderr") or "")
-    # rtt min/avg/max/mdev = 12.3/14.1/...
+    m = re.search(
+        r"(\d+)\s+packets?\s+transmitted,\s+(\d+)\s+(?:packets?\s+)?received(?:,\s+(\d+(?:\.\d+)?)% packet loss)?",
+        text,
+        re.I,
+    )
+    if m:
+        out["sent"] = int(m.group(1))
+        out["recv"] = int(m.group(2))
+        if m.group(3) is not None:
+            out["loss_pct"] = round(float(m.group(3)), 1)
+        elif out["sent"] > 0:
+            out["loss_pct"] = round(100.0 * (1 - out["recv"] / out["sent"]), 1)
     m = re.search(r"=\s*([\d.]+)/([\d.]+)/", text)
     if m:
-        return round(float(m.group(2)), 1)
-    m = re.search(r"time[=<]([\d.]+)\s*ms", text)
-    return round(float(m.group(1)), 1) if m else None
+        out["ms"] = round(float(m.group(2)), 1)
+    else:
+        m = re.search(r"time[=<]([\d.]+)\s*ms", text)
+        if m:
+            out["ms"] = round(float(m.group(1)), 1)
+    out["ok"] = out["recv"] > 0
+    if not out["ok"]:
+        out["error"] = (r.get("stderr") or "ping failed")[:160]
+        if out["loss_pct"] is None and out["sent"]:
+            out["loss_pct"] = 100.0
+    return out
+
+
+def ping_host_ms(host: str, timeout: int = 4) -> float | None:
+    """ICMP RTT to LNS host in ms (rough pre-filter before connecting)."""
+    return ping_stats(host, count=2, timeout=timeout).get("ms")
 
 
 def measure_iface(iface: str, *, dl_bytes: int = 8_000_000, ul_bytes: int = 2_000_000) -> dict:

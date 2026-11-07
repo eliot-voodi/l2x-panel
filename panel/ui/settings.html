@@ -52,6 +52,16 @@
   <label class="f">Объявление (announce)</label><input name="announce" value="{{ sb.announce }}">
   <div class="hint">Ссылки подписки: <code>https://{{ public_host or 'домен' }}/{{ sb.path or 'sub' }}/&lt;token&gt;</code> — только порт 443, отдельный listener не используется. Форматы: base64, <code>?format=plain|json|clash|singbox|html</code>.</div>
 
+  <h3 class="mt">Здоровье outbound в подписке</h3>
+  {{ m.check('hide_unhealthy', sb.hide_unhealthy if sb.hide_unhealthy is defined else true, 'Скрывать disconnected / high-loss outbound из подписки') }}
+  <div class="row">
+    <div style="max-width:220px">
+      <label class="f">Макс. потери пакетов, %</label>
+      <input name="max_loss_pct" type="number" min="0" max="100" value="{{ sb.max_loss_pct if sb.max_loss_pct is defined else 20 }}">
+    </div>
+  </div>
+  <div class="hint">L2TP не в <code>connected</code>, custom с проваленным тестом, или loss выше порога — не попадают в подписку (и в balancer), пока не восстановятся. Клиент увидит изменения после обновления подписки.</div>
+
   <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
   <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. Пусто = не трогать.</div>
   <label class="f">Fragment JSON</label>

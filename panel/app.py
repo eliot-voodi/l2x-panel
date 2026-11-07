@@ -133,6 +133,8 @@ def default_settings() -> dict:
             "support_url": "", "announce": "", "show_page": True,
             "json_fragment": "", "json_noise": "", "json_mux": "",
             "hwid_required": False, "hwid_fallback": "device", "migrate_url": False, "happ_provider_id": "",
+            # Hide disconnected / high-loss outbounds from subscription until healthy again
+            "hide_unhealthy": True, "max_loss_pct": 20,
         },
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
@@ -692,12 +694,24 @@ def _probe_tunnel_alive(item: dict) -> tuple[bool, str]:
             item["local_ip"] = local
         if peer:
             item["peer_ip"] = peer
-    r = l2tp._run(["ping", "-I", iface, "-c", "2", "-W", "2", peer or "1.1.1.1"], timeout=8)
-    if r.get("exit_code") == 0:
+    target = peer or "1.1.1.1"
+    stats = l2tp.ping_stats(target, iface=iface, count=5, timeout=2)
+    metrics = dict(item.get("metrics") or {})
+    if stats.get("ms") is not None:
+        metrics["ping_ms"] = stats["ms"]
+    if stats.get("loss_pct") is not None:
+        metrics["loss_pct"] = stats["loss_pct"]
+    metrics["probed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    item["metrics"] = metrics
+    if stats.get("ok"):
         return True, "ok"
     pub = l2tp.probe_public_ip(iface, timeout=5)
     if pub:
         item["public_ip"] = pub
+        # Tunnel still has egress; keep up but leave loss_pct=100 for sub filter if ping failed
+        if metrics.get("loss_pct") is None:
+            metrics["loss_pct"] = 100.0
+            item["metrics"] = metrics
         return True, "ok"
     return False, "ping/egress failed"
 
@@ -1071,21 +1085,42 @@ def _expiry_warnings(store: dict) -> None:
         BOT.send(text, chat)
 
 
+def _tunnel_sub_health_key(item: dict, max_loss: float) -> tuple:
+    """Stable key for subscription/balancer eligibility of an L2TP tunnel."""
+    status = item.get("status") or ""
+    loss = (item.get("metrics") or {}).get("loss_pct")
+    try:
+        loss_f = float(loss) if loss is not None else None
+    except (TypeError, ValueError):
+        loss_f = None
+    unhealthy = status != "connected" or (loss_f is not None and loss_f > max_loss)
+    return (item.get("name"), status, unhealthy, loss_f)
+
+
 def _watchdog_cycle() -> None:
     global ONLINE
     # 1) L2TP health (slow; no lock)
     snapshot = _load_store()
+    sub_cfg = xray.sub_health_settings(snapshot)
+    max_loss = float(sub_cfg["max_loss_pct"])
     bad: dict[str, str] = {}
+    probed_metrics: dict[str, dict] = {}
     for item in snapshot.get("l2tp") or []:
         if item.get("status") == "connected":
             ok, reason = _probe_tunnel_alive(item)
+            if item.get("metrics"):
+                probed_metrics[item["name"]] = dict(item["metrics"])
             if not ok:
                 bad[item["name"]] = reason
     need_apply = False
     with STORE_LOCK:
         store = _load_store()
         events: list[dict] = []
+        health_before = {_tunnel_sub_health_key(t, max_loss) for t in store.get("l2tp") or []}
         for item in store["l2tp"]:
+            m = probed_metrics.get(item["name"])
+            if m:
+                item["metrics"] = m
             if item["name"] in bad:
                 item["status"] = "error"
                 item["last_error"] = f"watchdog: {bad[item['name']]}"
@@ -1102,6 +1137,10 @@ def _watchdog_cycle() -> None:
             if item.get("status") == "connected" and not l2tp.is_connected(item["name"]):
                 item["status"] = "disconnected"
         if before != [(t["name"], t.get("status")) for t in store["l2tp"]]:
+            need_apply = True
+        health_after = {_tunnel_sub_health_key(t, max_loss) for t in store.get("l2tp") or []}
+        if health_before != health_after:
+            # Loss crossed threshold or status flipped — rebuild balancers / sub view
             need_apply = True
         # 2) traffic + quotas
         try:
@@ -4259,6 +4298,8 @@ async def settings_save(request: Request):
                 "hwid_required": form.get("hwid_required") == "1", "migrate_url": form.get("migrate_url") == "1",
                 "hwid_fallback": form.get("hwid_fallback") if form.get("hwid_fallback") in hwid.FALLBACK_MODES else "device",
                 "happ_provider_id": str(form.get("happ_provider_id") or "").strip(),
+                "hide_unhealthy": form.get("hide_unhealthy") == "1",
+                "max_loss_pct": max(0, min(100, _int(form.get("max_loss_pct"), 20))),
             })
         elif section == "webhooks":
             wh = webhooks.ensure(s)
