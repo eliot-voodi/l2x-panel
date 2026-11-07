@@ -267,12 +267,13 @@ def apply(
                     c["comment"] = u.comment
                 if u.tg_id:
                     c["tg_id"] = str(u.tg_id)
-                t = c.setdefault("traffic", {})
-                t["up"] = int(u.up or 0)
-                t["down"] = int(u.down or 0)
                 if tags:
                     c["inbounds"] = list(tags)
                 xray.ensure_client(c)
+                t = c.setdefault("traffic", {})
+                t["up"] = int(u.up or 0)
+                t["down"] = int(u.down or 0)
+                t.setdefault("by_email", {})
                 xray.ensure_wg_peer(store, c)
                 updated += 1
             else:
@@ -285,7 +286,6 @@ def apply(
                     "comment": u.comment or "",
                     "tg_id": str(u.tg_id or ""),
                     "sub_enabled": True,
-                    "traffic": {"up": int(u.up or 0), "down": int(u.down or 0), "by_email": {}},
                 }
                 if u.sub_token:
                     payload["sub_token"] = u.sub_token
@@ -294,6 +294,11 @@ def apply(
                 if u.password:
                     payload["password"] = u.password
                 c = xray.ensure_client(payload)
+                # Force counters after ensure_client (setdefault must not keep zeros from a partial dict)
+                t = c.setdefault("traffic", {})
+                t["up"] = int(u.up or 0)
+                t["down"] = int(u.down or 0)
+                t.setdefault("by_email", {})
                 if not c.get("sub_token"):
                     import secrets
                     c["sub_token"] = secrets.token_urlsafe(18)
@@ -316,25 +321,49 @@ def apply(
 
 # ---------------------------------------------------------------- 3x-ui
 
+def _row_dict(row: sqlite3.Row | dict) -> dict[str, Any]:
+    """SQLite row → dict with lowercase keys (GORM may use email/up/down or mixed)."""
+    if isinstance(row, dict):
+        return {str(k).lower(): row[k] for k in row}
+    return {str(k).lower(): row[k] for k in row.keys()}
+
+
+def _x3_pick_uuid(c: dict) -> str:
+    for key in ("uuid", "id"):
+        raw = str(c.get(key) or "").strip()
+        if not raw:
+            continue
+        # clients.id is often an autoincrement int — skip those
+        if raw.isdigit():
+            continue
+        return raw
+    return ""
+
+
 def _x3_client_from_dict(c: dict, traffic: dict | None = None, *, source: str = "3xui") -> NormalizedUser | None:
     email = _norm_email(c.get("email") or c.get("Email") or "")
     if not email:
         return None
     tr = traffic or {}
-    up = _safe_int(tr.get("up") if "up" in tr else c.get("up"), 0)
-    down = _safe_int(tr.get("down") if "down" in tr else c.get("down"), 0)
-    total = _safe_int(c.get("totalGB") if "totalGB" in c else c.get("total"), 0)
-    # totalGB in modern 3x-ui is already GB; total in client_traffics is bytes
-    if "totalGB" in c:
-        limit_gb = _safe_float(c.get("totalGB"), 0)
+    # Prefer client_traffics counters; fall back to fields on the client object
+    up = _safe_int(tr.get("up", tr.get("upload", c.get("up", c.get("upload")))), 0)
+    down = _safe_int(tr.get("down", tr.get("download", c.get("down", c.get("download")))), 0)
+    # Limit: totalGB (GB) on client, else total bytes from traffic/client
+    if c.get("totalGB") not in (None, "") or c.get("total_gb") not in (None, ""):
+        limit_gb = _safe_float(c.get("totalGB", c.get("total_gb")), 0)
     else:
-        limit_gb = bytes_to_limit_gb(total) if total > 1000 else _safe_float(total, 0)
-    exp = expire_from_ms(c.get("expiryTime") or tr.get("expiryTime"))
+        total = _safe_int(tr.get("total", c.get("total")), 0)
+        limit_gb = bytes_to_limit_gb(total) if total > 1024 else _safe_float(total, 0)
+    exp = expire_from_ms(
+        c.get("expiryTime") or c.get("expiry_time") or tr.get("expirytime") or tr.get("expiry_time")
+    )
     enabled = c.get("enable", True)
     if isinstance(enabled, str):
         enabled = enabled.lower() not in ("0", "false", "no")
-    sub = str(c.get("subId") or c.get("sub_id") or "").strip()
-    uid = str(c.get("id") or c.get("uuid") or "").strip()
+    elif "enable" in tr and c.get("enable") is None:
+        enabled = bool(tr.get("enable"))
+    sub = str(c.get("subId") or c.get("sub_id") or tr.get("subid") or "").strip()
+    uid = _x3_pick_uuid(c)
     password = str(c.get("password") or c.get("passwd") or "").strip()
     return NormalizedUser(
         email=email,
@@ -344,8 +373,8 @@ def _x3_client_from_dict(c: dict, traffic: dict | None = None, *, source: str = 
         limit_gb=limit_gb,
         expire_at=exp,
         enabled=bool(enabled),
-        comment=str(c.get("comment") or c.get("tgId") and f"tg:{c.get('tgId')}" or ""),
-        tg_id=str(c.get("tgId") or c.get("telegramId") or ""),
+        comment=str(c.get("comment") or "") or (f"tg:{c.get('tgId')}" if c.get("tgId") else ""),
+        tg_id=str(c.get("tgId") or c.get("tg_id") or c.get("telegramId") or ""),
         up=up,
         down=down,
         source=source,
@@ -427,79 +456,121 @@ def read_3xui_sub_meta(path: Path | str) -> dict[str, Any]:
     return meta
 
 
+def _load_3xui_traffics(conn: sqlite3.Connection) -> dict[str, dict]:
+    """email(lower) → {up, down, total, enable, expiryTime} from client_traffics."""
+    traffics: dict[str, dict] = {}
+    try:
+        rows = conn.execute("SELECT * FROM client_traffics")
+    except sqlite3.Error:
+        return traffics
+    for row in rows:
+        d = _row_dict(row)
+        email = _norm_email(d.get("email") or "")
+        if not email:
+            continue
+        key = email.lower()
+        up = _safe_int(d.get("up"), 0)
+        down = _safe_int(d.get("down"), 0)
+        prev = traffics.get(key)
+        if prev:
+            # Same email on multiple rows (shouldn't happen) — sum usage
+            up += _safe_int(prev.get("up"), 0)
+            down += _safe_int(prev.get("down"), 0)
+        traffics[key] = {
+            "up": up,
+            "down": down,
+            "total": _safe_int(d.get("total"), 0),
+            "enable": d.get("enable", True),
+            "expiryTime": d.get("expiry_time", d.get("expirytime")),
+            "subId": d.get("sub_id") or d.get("subid") or "",
+            "_email": email,
+        }
+    return traffics
+
+
 def parse_3xui_sqlite(path: Path | str) -> list[NormalizedUser]:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     try:
-        traffics: dict[str, dict] = {}
-        try:
-            for row in conn.execute("SELECT email, up, down, total, enable, expiry_time FROM client_traffics"):
-                traffics[str(row["email"])] = {
-                    "up": row["up"], "down": row["down"], "total": row["total"],
-                    "enable": row["enable"], "expiryTime": row["expiry_time"],
-                }
-        except sqlite3.Error:
-            try:
-                for row in conn.execute("SELECT email, up, down, total, enable, expiryTime FROM client_traffics"):
-                    traffics[str(row["email"])] = dict(row)
-            except sqlite3.Error:
-                pass
+        traffics = _load_3xui_traffics(conn)
 
-        # Modern separate clients table
-        clients: list[dict] = []
-        try:
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(clients)")]
-            if cols:
-                for row in conn.execute("SELECT * FROM clients"):
-                    clients.append({k: row[k] for k in row.keys()})
-        except sqlite3.Error:
-            clients = []
+        # Collect client defs from modern `clients` table AND classic inbounds.settings
+        by_email: dict[str, dict] = {}
 
-        if clients:
-            out: list[NormalizedUser] = []
-            for c in clients:
-                # Map snake/camel
-                mapped = {
-                    "email": c.get("email"),
-                    "id": c.get("id") or c.get("uuid"),
-                    "password": c.get("password"),
-                    "subId": c.get("sub_id") or c.get("subId"),
-                    "totalGB": c.get("total_gb") if "total_gb" in c else c.get("totalGB"),
-                    "expiryTime": c.get("expiry_time") if "expiry_time" in c else c.get("expiryTime"),
-                    "enable": c.get("enable", True),
-                    "comment": c.get("comment") or "",
-                    "tgId": c.get("tg_id") or c.get("tgId") or "",
-                }
-                email = _norm_email(mapped["email"])
-                tr = traffics.get(email) or {}
-                if mapped.get("totalGB") in (None, "") and tr.get("total"):
-                    mapped["total"] = tr["total"]
-                u = _x3_client_from_dict(mapped, tr)
-                if u:
-                    out.append(u)
-            return out
-
-        # Legacy: clients embedded in inbounds.settings JSON
-        out = []
-        seen: set[str] = set()
         try:
-            rows = conn.execute("SELECT settings FROM inbounds")
-        except sqlite3.Error:
-            return []
-        for row in rows:
-            try:
-                settings = json.loads(row["settings"] or "{}")
-            except ValueError:
-                continue
-            for c in settings.get("clients") or []:
-                if not isinstance(c, dict):
+            for row in conn.execute("SELECT * FROM clients"):
+                d = _row_dict(row)
+                email = _norm_email(d.get("email") or "")
+                if not email:
                     continue
-                email = _norm_email(c.get("email"))
-                tr = traffics.get(email) or {}
-                u = _x3_client_from_dict(c, tr)
-                if u and u.email not in seen:
-                    seen.add(u.email)
-                    out.append(u)
+                mapped = {
+                    "email": email,
+                    "uuid": d.get("uuid") or "",
+                    "id": d.get("uuid") or d.get("id") or "",
+                    "password": d.get("password") or "",
+                    "subId": d.get("sub_id") or d.get("subid") or "",
+                    "totalGB": d.get("total_gb") if d.get("total_gb") not in (None, "") else d.get("totalgb"),
+                    "expiryTime": d.get("expiry_time") or d.get("expirytime"),
+                    "enable": d.get("enable", True),
+                    "comment": d.get("comment") or "",
+                    "tgId": d.get("tg_id") or d.get("tgid") or "",
+                }
+                by_email[email.lower()] = mapped
+        except sqlite3.Error:
+            pass
+
+        try:
+            for row in conn.execute("SELECT settings FROM inbounds"):
+                try:
+                    settings = json.loads(row["settings"] or "{}")
+                except (ValueError, TypeError, KeyError):
+                    continue
+                for c in settings.get("clients") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    email = _norm_email(c.get("email") or "")
+                    if not email:
+                        continue
+                    key = email.lower()
+                    # Inbound JSON is the classic source of uuid/subId; don't wipe modern row
+                    if key not in by_email:
+                        by_email[key] = dict(c)
+                    else:
+                        cur = by_email[key]
+                        if not cur.get("uuid") and not _x3_pick_uuid(cur):
+                            if c.get("id") or c.get("uuid"):
+                                cur["id"] = c.get("id") or c.get("uuid")
+                                cur["uuid"] = c.get("uuid") or c.get("id") or cur.get("uuid")
+                        if not cur.get("subId") and (c.get("subId") or c.get("sub_id")):
+                            cur["subId"] = c.get("subId") or c.get("sub_id")
+                        if cur.get("totalGB") in (None, "", 0) and c.get("totalGB") not in (None, ""):
+                            cur["totalGB"] = c.get("totalGB")
+                        if not cur.get("password") and c.get("password"):
+                            cur["password"] = c.get("password")
+        except sqlite3.Error:
+            pass
+
+        # Traffic-only rows still become users (email from client_traffics)
+        for key, tr in traffics.items():
+            if key not in by_email:
+                by_email[key] = {"email": tr.get("_email") or key, "enable": tr.get("enable", True)}
+
+        out: list[NormalizedUser] = []
+        for key, c in by_email.items():
+            tr = traffics.get(key) or {}
+            u = _x3_client_from_dict(c, tr)
+            if u:
+                out.append(u)
+
+        global LAST_SOURCE_META
+        used = sum(int(u.up) + int(u.down) for u in out)
+        LAST_SOURCE_META = {
+            **(LAST_SOURCE_META or {}),
+            "source": "3xui",
+            "traffic_rows": len(traffics),
+            "clients": len(out),
+            "traffic_bytes": used,
+        }
         return out
     finally:
         conn.close()
@@ -556,9 +627,8 @@ def fetch_3xui_api(
                 try:
                     users = parse_3xui_sqlite(tmp_path)
                     meta = read_3xui_sub_meta(tmp_path)
-                    # stash on first user.extra for caller; also return via module last_meta
                     global LAST_SOURCE_META
-                    LAST_SOURCE_META = {"source": "3xui", **meta}
+                    LAST_SOURCE_META = {**(LAST_SOURCE_META or {}), "source": "3xui", **meta}
                     return users
                 finally:
                     tmp_path.unlink(missing_ok=True)
@@ -1035,24 +1105,50 @@ def fetch_remnawave_api(
 
 # ---------------------------------------------------------------- dispatch
 
+def _extract_3xui_db_bytes(raw: bytes, filename: str = "") -> bytes | None:
+    """Return SQLite db bytes from raw upload or from zip/tar that contains a .db."""
+    if raw[:15] == b"SQLite format 3":
+        return raw
+    name = (filename or "").lower()
+    if name.endswith(".db") and raw[:15] == b"SQLite format 3":
+        return raw
+    # zip / tar backup wrapping x-ui.db
+    try:
+        for member_name, content in _extract_archive_members(raw):
+            low = member_name.lower()
+            if content[:15] == b"SQLite format 3" or low.endswith(".db"):
+                if content[:15] == b"SQLite format 3":
+                    return content
+    except Exception:
+        pass
+    return None
+
+
 def parse_backup(source: str, raw: bytes, filename: str = "") -> list[NormalizedUser]:
     global LAST_SOURCE_META
     LAST_SOURCE_META = {}
     src = (source or "").lower().strip()
     name = (filename or "").lower()
     if src == "3xui":
-        if raw[:15] == b"SQLite format 3" or name.endswith(".db"):
+        db_bytes = _extract_3xui_db_bytes(raw, filename)
+        if db_bytes:
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-                tmp.write(raw)
+                tmp.write(db_bytes)
                 path = Path(tmp.name)
             try:
                 users = parse_3xui_sqlite(path)
                 meta = read_3xui_sub_meta(path)
-                LAST_SOURCE_META = {"source": "3xui", **meta}
+                LAST_SOURCE_META = {**(LAST_SOURCE_META or {}), "source": "3xui", **meta}
                 return users
             finally:
                 path.unlink(missing_ok=True)
-        return parse_3xui_json(raw)
+        users = parse_3xui_json(raw)
+        used = sum(int(u.up) + int(u.down) for u in users)
+        LAST_SOURCE_META = {
+            "source": "3xui", "clients": len(users), "traffic_bytes": used,
+            "note": "JSON export — traffic only if present in file; prefer x-ui.db backup",
+        }
+        return users
     if src == "pasarguard":
         if name.endswith(".json") or (raw[:1] in (b"{", b"[") and b"username" in raw[:2000]):
             try:

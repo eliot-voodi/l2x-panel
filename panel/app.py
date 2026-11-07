@@ -2804,6 +2804,12 @@ async def clients_migrate_run(request: Request):
         hint = ""
         if legacy_path or legacy_port:
             hint = f" · старый path/port: /{legacy_path or '?'} :{legacy_port or '?'}"
+        meta = migrate_mod.LAST_SOURCE_META or {}
+        tb = int(meta.get("traffic_bytes") or 0)
+        if tb > 0:
+            hint += f" · трафик в файле: {xray.format_traffic(tb)}"
+        elif source == "3xui":
+            hint += " · трафик в файле: 0 (нужен полный x-ui.db с таблицей client_traffics, не JSON export)"
         flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         return _migrate_page(request, preview=prev, **form_kw)
 
