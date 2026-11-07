@@ -223,16 +223,16 @@ def _save_store(data: dict) -> None:
 
 @contextmanager
 def mutate(*, history_section: str = "", history_note: str = ""):
-    """Yield store for edits. Auto-records settings version history when settings change."""
+    """Yield store for edits. Auto-records version history for clients/inbounds/settings/…"""
     with STORE_LOCK:
         store = _load_store()
-        before_settings = deepcopy(store.get("settings") or {})
+        before_state = shist.canonical_state(store)
         yield store
-        after_settings = store.get("settings") or {}
-        if after_settings != before_settings:
+        after_state = shist.canonical_state(store)
+        if after_state != before_state:
             meta = tgbot.get_actor_meta()
             shist.record(
-                before_settings, after_settings,
+                before_state, after_state,
                 user=meta.get("user") or "", ip=meta.get("ip") or "",
                 section=history_section, note=history_note,
             )
@@ -4712,8 +4712,7 @@ def settings_versions_page(request: Request):
 def settings_version_detail(vid: str, request: Request):
     if redir := _require(request):
         return redir
-    current = _load_store().get("settings") or {}
-    detail = shist.version_detail(vid, current)
+    detail = shist.version_detail(vid, _load_store())
     if not detail:
         flash(request, "Версия не найдена", "error")
         return go("/settings/versions")
@@ -4730,7 +4729,7 @@ def settings_version_restore(vid: str, request: Request):
             shist.apply_snapshot(store, vid)
         result = _apply_xray(_load_store())
         _refresh_settings_cache()
-        _tg_change(f"⏪ Настройки откачены к версии <code>{tgbot.escape(vid)}</code>")
+        _tg_change(f"⏪ Откат к версии <code>{tgbot.escape(vid)}</code>")
         flash(request, *_ok_msg(f"Откат к {vid}", result))
     except Exception as exc:  # noqa: BLE001
         flash(request, f"Откат: {exc}", "error")

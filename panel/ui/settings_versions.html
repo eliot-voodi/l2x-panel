@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
 {% import "_icons.html" as ic %}
-{% block title %}Версии настроек · {{ app_name }}{% endblock %}
-{% block page_title %}Версии настроек{% endblock %}
-{% block page_sub %}История изменений · откат{% endblock %}
+{% block title %}История изменений · {{ app_name }}{% endblock %}
+{% block page_title %}История изменений{% endblock %}
+{% block page_sub %}Клиенты · inbound · настройки · откат{% endblock %}
 {% block top_actions %}
 <div class="actions">
   <a class="btn ghost" href="{{ bp }}/settings">{{ ic.icon('gear') }}Настройки</a>
@@ -11,19 +11,25 @@
 {% endblock %}
 {% block head %}
 <style>
-  .diff-wrap { overflow: auto; max-height: 420px }
-  .diff-table td, .diff-table th { font-size: .82rem; vertical-align: top }
-  .diff-table .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all }
-  .diff-table .val { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-width: 280px }
-  .diff-add { background: color-mix(in srgb, var(--ok) 12%, transparent) }
-  .diff-remove { background: color-mix(in srgb, var(--err) 12%, transparent) }
-  .diff-change { background: color-mix(in srgb, var(--warn, #c9a227) 12%, transparent) }
+  .diff-wrap { overflow: auto; max-height: 480px }
+  .evt { border: 1px solid var(--line, #333); border-radius: 8px; padding: .55rem .7rem; margin: 0 0 .5rem }
+  .evt.add { border-left: 3px solid var(--ok, #3a9) }
+  .evt.remove { border-left: 3px solid var(--err, #c55) }
+  .evt.change { border-left: 3px solid var(--warn, #c9a227) }
+  .evt .evt-title { font-weight: 600; font-size: .9rem }
+  .evt .evt-text { color: var(--dim); font-size: .82rem; margin-top: .2rem; white-space: pre-wrap; word-break: break-word }
+  .evt details { margin-top: .35rem }
+  .evt details summary { cursor: pointer; color: var(--dim); font-size: .75rem }
+  .evt .fld { display: grid; grid-template-columns: minmax(90px, 1.1fr) 1fr 1fr; gap: .25rem .5rem; font-size: .78rem; margin-top: .25rem }
+  .evt .fld .k { color: var(--dim); word-break: break-word }
+  .evt .fld .v { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word }
   .ver-cols { display: grid; grid-template-columns: 1fr; gap: 1rem }
   @media (min-width: 1100px) {
     .ver-cols { grid-template-columns: 1fr 1fr 1fr }
   }
   .ver-card h4 { margin: 0 0 .4rem; font-size: .95rem }
   .ver-card .meta { color: var(--dim); font-size: .8rem; margin-bottom: .6rem }
+  .hist-sum { font-size: .78rem; line-height: 1.35; color: var(--fg); word-break: break-word }
 </style>
 {% endblock %}
 {% block content %}
@@ -35,35 +41,69 @@
 </div>
 
 <div class="hint" style="margin-bottom:1rem">
-  При каждом изменении <code>settings</code> сохраняется снимок. В карточке версии: разница
-  <b>предыдущая → эта</b> (что сделали тогда), <b>эта → нынешняя</b> (что изменилось с тех пор),
-  и сводка <b>предыдущая → нынешняя</b>. Секреты (токены/пароли) в diff скрыты.
+  При каждом сохранении (клиенты, inbound, L2TP, маршруты, настройки и т.д.) пишется снимок.
+  Трафик и online-статус в историю не попадают. Секреты в diff скрыты.
 </div>
 
+{% macro events_block(rows) -%}
+  {% if not rows %}
+  <div class="hint">нет отличий</div>
+  {% else %}
+  <div class="diff-wrap">
+    {% for e in rows %}
+    <div class="evt {{ e.op }}">
+      <div class="evt-title">
+        {% if e.op == 'add' %}+{% elif e.op == 'remove' %}−{% else %}~{% endif %}
+        {{ e.title }}
+        {% if e.op in ('add', 'remove') %}<span class="dim"> — {{ e.text }}</span>{% endif %}
+      </div>
+      {% if e.op == 'change' and e.text %}
+      <div class="evt-text">{{ e.text }}</div>
+      {% endif %}
+      {% if e.fields %}
+      <details>
+        <summary>поля ({{ e.fields|length }})</summary>
+        <div class="fld" style="margin-top:.4rem;font-weight:600;color:var(--dim)">
+          <div>Поле</div><div>Было</div><div>Стало</div>
+        </div>
+        {% for f in e.fields %}
+        <div class="fld">
+          <div class="k">{{ f.label }}</div>
+          <div class="v">{% if f.op == 'add' %}<span class="dim">—</span>{% else %}{{ f.before_fmt }}{% endif %}</div>
+          <div class="v">{% if f.op == 'remove' %}<span class="dim">—</span>{% else %}{{ f.after_fmt }}{% endif %}</div>
+        </div>
+        {% endfor %}
+      </details>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+{%- endmacro %}
+
 <div class="row" style="align-items:flex-start;gap:1rem">
-  <div class="card" style="flex:0 0 320px;max-width:100%">
+  <div class="card" style="flex:0 0 360px;max-width:100%">
     <h3>История</h3>
     {% if versions %}
     <div style="overflow:auto;max-height:70vh">
       <table class="table">
-        <thead><tr><th>Когда</th><th>Кто</th><th></th></tr></thead>
+        <thead><tr><th>Когда</th><th>Кто</th></tr></thead>
         <tbody>
         {% for v in versions %}
           <tr class="{% if v.id == vid %}active{% endif %}">
             <td>
               <a href="{{ bp }}/settings/versions/{{ v.id }}"><code>{{ v.id }}</code></a>
               <div class="dim" style="font-size:.75rem">{{ v.at }}{% if v.section %} · {{ v.section }}{% endif %}</div>
-              <div class="dim" style="font-size:.75rem">{{ v.summary }}</div>
+              <div class="hist-sum">{{ v.summary }}</div>
             </td>
             <td class="small">{{ v.user or '—' }}<div class="dim">{{ v.ip }}</div></td>
-            <td><a class="btn ghost sm" href="{{ bp }}/settings/versions/{{ v.id }}">diff</a></td>
           </tr>
         {% endfor %}
         </tbody>
       </table>
     </div>
     {% else %}
-    <div class="hint">Пока нет версий — сохраните любые настройки панели.</div>
+    <div class="hint">Пока нет версий — создайте клиента, измените inbound или сохраните настройки.</div>
     {% endif %}
   </div>
 
@@ -75,13 +115,14 @@
         <div>
           <h3 style="margin:0">Версия <code>{{ meta.id }}</code></h3>
           <div class="hint">{{ meta.at }} · {{ meta.user or '?' }} · {{ meta.ip or '?' }}
-            {% if meta.section %} · секция <b>{{ meta.section }}</b>{% endif %}
+            {% if meta.section %} · <b>{{ meta.section }}</b>{% endif %}
             {% if meta.note %} · {{ meta.note }}{% endif %}
-            · изменений: {{ meta.changes }}
+            · событий: {{ meta.changes }}
           </div>
+          <div class="hist-sum" style="margin-top:.35rem">{{ meta.summary }}</div>
         </div>
         <form method="post" action="{{ bp }}/settings/versions/{{ meta.id }}/restore"
-              onsubmit="return confirm('Откатить текущие настройки к этой версии? Будет создана новая запись в истории.')">
+              onsubmit="return confirm('Откатить панель к этой версии? Клиенты, inbound и настройки будут восстановлены. Будет создана новая запись в истории.')">
           <button class="btn">Откатить к этой версии</button>
         </form>
       </div>
@@ -93,76 +134,25 @@
         <div class="meta">Что изменили в этом сохранении
           {% if detail.prev_meta %}(от <code>{{ detail.prev_meta.id }}</code>){% else %}(первая версия){% endif %}
         </div>
-        {% set rows = detail.diff_prev_after %}
-        {% if not rows %}<div class="hint">нет отличий</div>
-        {% else %}
-        <div class="diff-wrap">
-          <table class="table diff-table">
-            <thead><tr><th>Путь</th><th>Было</th><th>Стало</th></tr></thead>
-            <tbody>
-            {% for r in rows %}
-              <tr class="diff-{{ r.op }}">
-                <td class="path">{{ r.path }}</td>
-                <td class="val">{% if r.op == 'add' %}<span class="dim">—</span>{% else %}{{ r.before | tojson }}{% endif %}</td>
-                <td class="val">{% if r.op == 'remove' %}<span class="dim">—</span>{% else %}{{ r.after | tojson }}{% endif %}</td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% endif %}
+        {{ events_block(detail.events_prev_after) }}
       </div>
 
       <div class="card ver-card">
         <h4>2. Эта → нынешняя</h4>
-        <div class="meta">Что изменилось с тех пор до текущего состояния панели</div>
-        {% set rows = detail.diff_after_current %}
-        {% if not rows %}<div class="hint">совпадает с нынешней</div>
-        {% else %}
-        <div class="diff-wrap">
-          <table class="table diff-table">
-            <thead><tr><th>Путь</th><th>Эта версия</th><th>Сейчас</th></tr></thead>
-            <tbody>
-            {% for r in rows %}
-              <tr class="diff-{{ r.op }}">
-                <td class="path">{{ r.path }}</td>
-                <td class="val">{% if r.op == 'add' %}<span class="dim">—</span>{% else %}{{ r.before | tojson }}{% endif %}</td>
-                <td class="val">{% if r.op == 'remove' %}<span class="dim">—</span>{% else %}{{ r.after | tojson }}{% endif %}</td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% endif %}
+        <div class="meta">Что изменилось с тех пор до текущего состояния</div>
+        {{ events_block(detail.events_after_current) }}
       </div>
 
       <div class="card ver-card">
         <h4>3. Предыдущая → нынешняя</h4>
         <div class="meta">Полный разрыв от состояния до этого изменения до сейчас</div>
-        {% set rows = detail.diff_prev_current %}
-        {% if not rows %}<div class="hint">нет отличий</div>
-        {% else %}
-        <div class="diff-wrap">
-          <table class="table diff-table">
-            <thead><tr><th>Путь</th><th>До изменения</th><th>Сейчас</th></tr></thead>
-            <tbody>
-            {% for r in rows %}
-              <tr class="diff-{{ r.op }}">
-                <td class="path">{{ r.path }}</td>
-                <td class="val">{% if r.op == 'add' %}<span class="dim">—</span>{% else %}{{ r.before | tojson }}{% endif %}</td>
-                <td class="val">{% if r.op == 'remove' %}<span class="dim">—</span>{% else %}{{ r.after | tojson }}{% endif %}</td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% endif %}
+        {{ events_block(detail.events_prev_current) }}
       </div>
     </div>
     {% else %}
     <div class="card">
       <h3>Выберите версию</h3>
-      <div class="hint">Откройте запись слева, чтобы увидеть три сравнения и откатить настройки.</div>
+      <div class="hint">Откройте запись слева — увидите создание/изменение клиентов, inbound и прочего в читаемом виде.</div>
     </div>
     {% endif %}
   </div>
