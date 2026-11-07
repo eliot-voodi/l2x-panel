@@ -245,6 +245,19 @@ def domains_without_cert(store: dict) -> list[str]:
 CAMOUFLAGE_URL = "https://ya.ru/"
 
 
+def _sub_location(path_seg: str, proxy: str) -> str:
+    """Proxy subscription path; non-/sub/ aliases are rewritten to /sub/… so panel routes stay unique."""
+    sp = _clean_sub_segment(path_seg) or "sub"
+    if sp == "sub":
+        return f"    location ^~ /sub/ {{\n{proxy}    }}"
+    # Old 3x-ui style /{subPath}/{token} → panel /sub/{token} (avoids FastAPI /{path}/{token} catching /clients/…)
+    return (
+        f"    location ^~ /{sp}/ {{\n"
+        f"        rewrite ^/{sp}/(.*)$ /sub/$1 break;\n"
+        f"{proxy}    }}"
+    )
+
+
 def _panel_locations(store: dict | None = None) -> list[str]:
     """Public HTTPS site: correct links work; bare / goes to ya.ru, unknown paths are 404."""
     common = (
@@ -280,7 +293,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         "        default_type text/plain;\n"
         "        try_files $uri =404;\n"
         "    }",
-        *[f"    location ^~ /{sp}/ {{\n{proxy}    }}" for sp in sub_uri_paths(store)],
+        *[_sub_location(sp, proxy) for sp in sub_uri_paths(store)],
         f"    location ^~ /api/sub/ {{\n{proxy}    }}",
         doh_loc,
         f"    location ^~ /panel/api/ {{\n{proxy}    }}",
@@ -365,9 +378,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
             "        client_max_body_size 16m;\n"
         )
         proxy = f"        proxy_pass http://{PANEL_UPSTREAM};\n{common}"
-        sub_locs = "\n".join(
-            f"    location ^~ /{sp}/ {{\n{proxy}    }}" for sp in sub_uri_paths(store)
-        )
+        sub_locs = "\n".join(_sub_location(sp, proxy) for sp in sub_uri_paths(store))
         sub_locs += f"\n    location ^~ /api/sub/ {{\n{proxy}    }}"
         for port in leg_ports:
             listen_lines = f"    listen {port};\n"

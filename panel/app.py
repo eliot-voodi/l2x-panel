@@ -1895,16 +1895,6 @@ def sub_remnawave_alias(token: str, request: Request, client_type: str = ""):
     return _sub_response(request, token)
 
 
-@app.get("/{path}/{token}")
-def sub_path_alias(path: str, token: str, request: Request):
-    """Serve subscriptions under primary path and configured aliases (old 3x-ui subPath)."""
-    allowed = set(front.sub_uri_paths({"settings": SETTINGS_CACHE} if SETTINGS_CACHE else None))
-    # Never steal reserved first segments
-    if path in BASE_PATH_RESERVED or path not in allowed:
-        return PlainTextResponse("not found", status_code=404)
-    return _sub_response(request, token)
-
-
 @app.post("/sub/{token}/tg/link")
 def sub_tg_link(token: str, request: Request):
     """Start Telegram bind: create one-time token and redirect to t.me/bot?start=bind_…"""
