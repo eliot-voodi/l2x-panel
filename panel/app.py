@@ -31,6 +31,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import front
 import hwid
 import l2tp_runtime as l2tp
+import migrate as migrate_mod
 import nodes as nodes_mod
 import ops
 import protocols as P
@@ -313,7 +314,7 @@ def base_path() -> str:
 # Public site root and these prefixes belong to nginx / subscriptions, never to the panel
 BASE_PATH_RESERVED = {
     "sub", "panel", "health", "static", "login", "logout", "well-known",
-    "pihole", "pihole-gate", "doh",
+    "pihole", "pihole-gate", "doh", "api",
 }
 
 
@@ -404,7 +405,7 @@ app = FastAPI(title=APP_NAME_DEFAULT, docs_url=None, redoc_url=None, openapi_url
 class BasePathMiddleware:
     """Serve the panel under a secret prefix; public sub/API paths stay reachable."""
 
-    PUBLIC = ("/sub/", "/health", "/panel/api/", "/static/")
+    PUBLIC = ("/sub/", "/api/sub/", "/health", "/panel/api/", "/static/")
 
     def __init__(self, inner):
         self.inner = inner
@@ -1867,6 +1868,13 @@ def sub_main(token: str, request: Request):
     return _sub_response(request, token)
 
 
+@app.get("/api/sub/{token}")
+@app.get("/api/sub/{token}/{client_type}")
+def sub_remnawave_alias(token: str, request: Request, client_type: str = ""):
+    """Remnawave-compatible subscription path so migrated shortUuid links keep working."""
+    return _sub_response(request, token)
+
+
 @app.post("/sub/{token}/tg/link")
 def sub_tg_link(token: str, request: Request):
     """Start Telegram bind: create one-time token and redirect to t.me/bot?start=bind_…"""
@@ -2625,6 +2633,155 @@ def client_new(request: Request):
                 tags=xray.selectable_outbound_tags(store), inbounds=xray.client_capable_inbounds(store),
                 hwids=[], bans=[], links=[], wg_confs=[], doh_url="",
                 doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
+
+
+MIGRATE_CACHE = DATA / "migrate_preview.json"
+
+
+def _migrate_cache_save(users: list) -> None:
+    payload = [u.to_dict() if hasattr(u, "to_dict") else u for u in users]
+    MIGRATE_CACHE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(MIGRATE_CACHE, 0o600)
+    except OSError:
+        pass
+
+
+def _migrate_cache_load() -> list:
+    if not MIGRATE_CACHE.exists():
+        return []
+    try:
+        raw = json.loads(MIGRATE_CACHE.read_text(encoding="utf-8"))
+    except ValueError:
+        return []
+    out = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        out.append(migrate_mod.NormalizedUser(
+            email=str(item.get("email") or ""),
+            uuid=str(item.get("uuid") or ""),
+            password=str(item.get("password") or ""),
+            sub_token=str(item.get("sub_token") or ""),
+            limit_gb=float(item.get("limit_gb") or 0),
+            expire_at=str(item.get("expire_at") or ""),
+            enabled=bool(item.get("enabled", True)),
+            comment=str(item.get("comment") or ""),
+            tg_id=str(item.get("tg_id") or ""),
+            up=int(item.get("up") or 0),
+            down=int(item.get("down") or 0),
+            source=str(item.get("source") or ""),
+        ))
+    return out
+
+
+def _migrate_page(request: Request, *, preview=None, report=None, **form_kw):
+    store = _load_store()
+    inbounds = xray.client_capable_inbounds(store)
+    return page(
+        request, "migrate.html", active="migrate",
+        sources=list(migrate_mod.SOURCE_LABELS.items()),
+        inbounds=inbounds,
+        preview=preview, report=report,
+        source=form_kw.get("source") or "3xui",
+        mode=form_kw.get("mode") or "api",
+        url=form_kw.get("url") or "",
+        username=form_kw.get("username") or "",
+        web_base=form_kw.get("web_base") or "",
+        insecure=bool(form_kw.get("insecure")),
+        update_existing=bool(form_kw.get("update_existing")),
+        selected_inbounds=form_kw.get("selected_inbounds"),
+    )
+
+
+@app.get("/clients/migrate", response_class=HTMLResponse)
+def clients_migrate_page(request: Request):
+    if redir := _require(request):
+        return redir
+    return _migrate_page(request)
+
+
+@app.post("/clients/migrate")
+async def clients_migrate_run(request: Request):
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    source = str(form.get("source") or "3xui").strip().lower()
+    mode = str(form.get("mode") or "api").strip().lower()
+    action = str(form.get("action") or "preview").strip().lower()
+    url = str(form.get("url") or "").strip()
+    username = str(form.get("username") or "").strip()
+    password = str(form.get("password") or "")
+    api_token = str(form.get("api_token") or "").strip()
+    web_base = str(form.get("web_base") or "").strip()
+    insecure = form.get("insecure") == "1"
+    update_existing = form.get("update_existing") == "1"
+    selected = [str(x) for x in form.getlist("inbounds")]
+    form_kw = {
+        "source": source, "mode": mode, "url": url, "username": username,
+        "web_base": web_base, "insecure": insecure, "update_existing": update_existing,
+        "selected_inbounds": selected,
+    }
+
+    users: list = []
+    err = ""
+    try:
+        if mode == "file":
+            up = form.get("file")
+            raw = b""
+            filename = ""
+            if up is not None and hasattr(up, "read"):
+                raw = await up.read()
+                filename = getattr(up, "filename", "") or ""
+            if not raw and action == "import":
+                users = _migrate_cache_load()
+                if not users:
+                    err = "Нет кэша preview — сначала нажмите «Проверить» с файлом"
+            elif not raw:
+                err = "Выберите файл бэкапа / экспорта"
+            else:
+                users = migrate_mod.parse_backup(source, raw, filename)
+                _migrate_cache_save(users)
+        else:
+            if action == "import" and not (url or password or api_token or username):
+                users = _migrate_cache_load()
+            if not users:
+                users = migrate_mod.fetch_api(
+                    source, url,
+                    username=username, password=password, api_token=api_token,
+                    insecure=insecure, web_base=web_base,
+                )
+                _migrate_cache_save(users)
+    except Exception as exc:  # noqa: BLE001
+        err = str(exc)
+
+    if err:
+        flash(request, err, "error")
+        return _migrate_page(request, **form_kw)
+
+    if not users:
+        flash(request, "Пользователи не найдены", "error")
+        return _migrate_page(request, **form_kw)
+
+    store = _load_store()
+    if action != "import":
+        prev = migrate_mod.preview(store, users)
+        flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}", "info")
+        return _migrate_page(request, preview=prev, **form_kw)
+
+    with mutate() as st:
+        report = migrate_mod.apply(st, users, selected, update_existing=update_existing)
+    result = _apply_xray(_load_store())
+    _tg_change(
+        f"📦 Миграция <b>{migrate_mod.SOURCE_LABELS.get(source, source)}</b>: "
+        f"создано {report.get('created', 0)}, обновлено {report.get('updated', 0)}, "
+        f"пропуск {report.get('skipped', 0)}",
+    )
+    flash(request, *_ok_msg(
+        f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}",
+        result,
+    ))
+    return _migrate_page(request, report=report, **form_kw)
 
 
 @app.get("/clients/{email}/edit", response_class=HTMLResponse)

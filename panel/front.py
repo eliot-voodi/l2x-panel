@@ -107,7 +107,7 @@ def plan(store: dict) -> dict:
         r"[^A-Za-z0-9_-]", "",
         str((((store.get("settings") or {}).get("doh") or {}).get("path_prefix") or "doh")),
     ).strip("_-") or "doh"
-    reserved_paths = {"/sub/", "/panel/", "/health", "/.well-known/", f"/{doh_prefix}/"}
+    reserved_paths = {"/sub/", "/api/sub/", "/panel/", "/health", "/.well-known/", f"/{doh_prefix}/"}
     if base:
         reserved_paths.add(f"/{base}/")
 
@@ -248,6 +248,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         "        try_files $uri =404;\n"
         "    }",
         f"    location ^~ /sub/ {{\n{proxy}    }}",
+        f"    location ^~ /api/sub/ {{\n{proxy}    }}",
         doh_loc,
         f"    location ^~ /panel/api/ {{\n{proxy}    }}",
         f"    location = /health {{\n{proxy}    }}",

@@ -6,6 +6,7 @@
 {% block page_sub %}{{ items|length }} из {{ total }}{% endblock %}
 {% block top_actions %}
 <div class="actions">
+  <a class="btn ghost" href="{{ bp }}/clients/migrate">{{ ic.icon('inbox') }}Миграция</a>
   <button class="btn ghost" type="button" onclick="openDlg('dlg-bulk')">{{ ic.icon('users') }}Массово</button>
   <a class="btn" href="{{ bp }}/clients/new">{{ ic.icon('plus') }}{{ t('Новый клиент') }}</a>
 </div>

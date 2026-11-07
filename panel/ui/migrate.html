@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Миграция · {{ app_name }}{% endblock %}
+{% block page_title %}Миграция клиентов{% endblock %}
+{% block page_sub %}3x-ui · PasarGuard · Remnawave{% endblock %}
+{% block top_actions %}
+<div class="actions">
+  <a class="btn ghost" href="{{ bp }}/clients">{{ ic.icon('users') }}К клиентам</a>
+</div>
+{% endblock %}
+{% block content %}
+<div class="card" style="margin-bottom:1rem">
+  <h3>Что переносится</h3>
+  <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит, срок, уже потраченный трафик.
+  Inbounds/ноды чужих панелей не импортируются — клиенты вешаются на выбранные L2X inbounds.</div>
+  <div class="hint" style="margin-top:.5rem">Чтобы старые ссылки продолжили работать: направьте DNS старого sub-домена на этот сервер.
+  Remnawave: также доступен путь <code>/api/sub/&lt;token&gt;</code>.</div>
+</div>
+
+<form method="post" action="{{ bp }}/clients/migrate" enctype="multipart/form-data" class="card">
+  <h3>Источник</h3>
+  <div class="row">
+    <div>
+      <label class="f">Панель</label>
+      <select name="source" id="source">
+        {% for key, label in sources %}
+        <option value="{{ key }}" {% if key == source %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="f">Режим</label>
+      <select name="mode" id="mode">
+        <option value="api" {% if mode != 'file' %}selected{% endif %}>API (логин / токен)</option>
+        <option value="file" {% if mode == 'file' %}selected{% endif %}>Файл бэкапа / экспорта</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="box-api" style="margin-top:1rem">
+    <div class="row">
+      <div style="flex:1.4"><label class="f">URL панели</label>
+        <input name="url" value="{{ url or '' }}" placeholder="https://panel.example.com" autocomplete="off">
+      </div>
+      <div><label class="f">Логин</label><input name="username" value="{{ username or '' }}" autocomplete="username"></div>
+      <div><label class="f">Пароль</label><input name="password" type="password" value="" autocomplete="current-password" placeholder="••••••••"></div>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <div style="flex:1.2"><label class="f">API token / key</label>
+        <input name="api_token" value="" placeholder="Remnawave Bearer / PasarGuard X-Api-Key (вместо пароля)">
+        <div class="hint">Если заполнено — пароль не обязателен (PasarGuard, Remnawave).</div>
+      </div>
+      <div><label class="f">3x-ui web path</label>
+        <input name="web_base" value="{{ web_base or '' }}" placeholder="пусто или panel">
+        <div class="hint">Кастомный webBasePath, если не корень.</div>
+      </div>
+    </div>
+    {{ m.check('insecure', insecure, 'Не проверять TLS-сертификат') }}
+  </div>
+
+  <div id="box-file" style="margin-top:1rem;display:none">
+    <label class="f">Файл</label>
+    <input type="file" name="file" accept=".db,.json,.sql,.zip,.tar,.gz,.tgz,application/octet-stream">
+    <div class="hint">
+      <b>3x-ui:</b> SQLite <code>.db</code> (getDb) или JSON export клиентов.<br>
+      <b>PasarGuard:</b> backup <code>.tar.gz</code>/<code>.zip</code>, SQL dump или JSON users.<br>
+      <b>Remnawave:</b> JSON массив/ответ API с users.
+    </div>
+  </div>
+
+  <h3 style="margin-top:1.4rem">Куда повесить</h3>
+  <div class="hint">Выберите L2X inbounds для импортированных клиентов (по умолчанию — все).</div>
+  <div class="row" style="flex-wrap:wrap;gap:.4rem 1rem;margin-top:.5rem">
+    {% for ib in inbounds %}
+    <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}"
+      {% if not selected_inbounds or ib.tag in selected_inbounds %}checked{% endif %}> {{ ib.tag }}
+      <span class="dim">({{ ib.protocol }})</span></label>
+    {% else %}
+    <div class="hint">Нет подходящих inbounds — создайте inbound перед импортом.</div>
+    {% endfor %}
+  </div>
+  <div style="margin-top:.8rem">
+    {{ m.check('update_existing', update_existing, 'Обновить существующих (трафик / sub_token / лимиты) — иначе пропуск') }}
+  </div>
+
+  <div class="actions" style="margin-top:1.2rem">
+    <button class="btn ghost" type="submit" name="action" value="preview">Проверить</button>
+    <button class="btn" type="submit" name="action" value="import" onclick="return confirm('Импортировать клиентов в панель?')">Импорт</button>
+  </div>
+</form>
+
+{% if preview %}
+<div class="card" style="margin-top:1rem">
+  <h3>Результат проверки</h3>
+  <div class="row">
+    <div><span class="dim">Найдено</span><div><b>{{ preview.total }}</b></div></div>
+    <div><span class="dim">Новых</span><div><b class="ok">{{ preview.create }}</b></div></div>
+    <div><span class="dim">Уже есть (пропуск)</span><div><b>{{ preview.skip }}</b></div></div>
+  </div>
+  {% if preview.conflicts %}
+  <div class="hint" style="margin-top:.6rem">Конфликты: {{ preview.conflicts|join(', ') }}{% if preview.skip > preview.conflicts|length %}…{% endif %}</div>
+  {% endif %}
+  {% if preview.sample %}
+  <div style="overflow:auto;margin-top:.8rem">
+    <table class="table">
+      <thead><tr><th>email</th><th>sub</th><th>лимит GB</th><th>трафик</th><th>срок</th></tr></thead>
+      <tbody>
+      {% for u in preview.sample %}
+        <tr>
+          <td>{{ u.email }}</td>
+          <td class="mono">{{ u.sub_token[:16] }}{% if u.sub_token|length > 16 %}…{% endif %}</td>
+          <td>{{ u.limit_gb or '∞' }}</td>
+          <td>{{ format_traffic((u.up or 0) + (u.down or 0)) }}</td>
+          <td>{{ u.expire_at[:10] if u.expire_at else '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  <div class="hint" style="margin-top:.6rem">Нажмите <b>Импорт</b> с теми же параметрами (файл — снова выберите при режиме «файл»).</div>
+</div>
+{% endif %}
+
+{% if report %}
+<div class="card" style="margin-top:1rem">
+  <h3>Импорт завершён</h3>
+  <div class="row">
+    <div><span class="dim">Создано</span><div><b class="ok">{{ report.created }}</b></div></div>
+    <div><span class="dim">Обновлено</span><div><b>{{ report.updated }}</b></div></div>
+    <div><span class="dim">Пропущено</span><div><b>{{ report.skipped }}</b></div></div>
+  </div>
+  {% if report.errors %}
+  <div class="hint" style="color:var(--err);margin-top:.6rem">
+    {% for e in report.errors %}{{ e }}<br>{% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<script>
+(function () {
+  var mode = document.getElementById('mode');
+  var api = document.getElementById('box-api');
+  var file = document.getElementById('box-file');
+  function sync() {
+    var f = mode.value === 'file';
+    api.style.display = f ? 'none' : 'block';
+    file.style.display = f ? 'block' : 'none';
+  }
+  mode.addEventListener('change', sync);
+  sync();
+})();
+</script>
+{% endblock %}
