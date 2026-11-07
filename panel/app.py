@@ -2169,33 +2169,66 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         st["security"] = "none" if proto not in ("vmess",) else "tls"
     if st["network"] not in P.NETWORKS:
         st["network"] = "raw"
-    # ws/grpc/httpupgrade/xhttp share the public HTTPS domain via nginx Path — TLS ends at nginx
-    if st["network"] in P.FRONT_HTTP_NETWORKS:
+    # Path transports behind nginx TLS use security=none; Reality/TLS → SNI passthrough (3x-ui)
+    if st["network"] in P.FRONT_HTTP_NETWORKS and st["security"] not in ("reality", "tls"):
         st["security"] = "none"
+    if st["security"] == "reality" and proto not in ("vless", "trojan"):
+        st["security"] = "tls" if proto == "vmess" else "none"
+    if st["security"] == "reality" and st["network"] not in ("raw", "grpc", "xhttp"):
+        # Reality only on tcp/grpc/xhttp like 3x-ui
+        st["network"] = "raw"
     st["accept_proxy_protocol"] = form.get("accept_proxy") == "1"
     st["raw"].update({
         "header": str(form.get("raw_header") or "none"),
         "http_host": str(form.get("raw_host") or ""),
         "http_path": str(form.get("raw_path") or "/"),
+        "http_method": str(form.get("raw_method") or "GET"),
+        "http_headers": str(form.get("raw_headers") or "").strip(),
         "accept_proxy_protocol": form.get("accept_proxy") == "1",
     })
     st["ws"].update({
         "path": str(form.get("ws_path") or "/"), "host": str(form.get("ws_host") or ""),
+        "headers": str(form.get("ws_headers") or "").strip(),
+        "heartbeat": max(0, _int(form.get("ws_heartbeat"), 0)),
         "accept_proxy_protocol": form.get("accept_proxy") == "1",
     })
     st["grpc"].update({
         "service_name": str(form.get("grpc_service") or "grpc"),
         "multi_mode": form.get("grpc_multi") == "1",
         "authority": str(form.get("grpc_authority") or ""),
+        "idle_timeout": max(0, _int(form.get("grpc_idle"), 0)),
+        "health_check_timeout": max(0, _int(form.get("grpc_health"), 0)),
+        "permit_without_stream": form.get("grpc_permit") == "1",
+        "initial_windows_size": max(0, _int(form.get("grpc_window"), 0)),
     })
     st["httpupgrade"].update({
         "path": str(form.get("hu_path") or "/"), "host": str(form.get("hu_host") or ""),
+        "headers": str(form.get("hu_headers") or "").strip(),
         "accept_proxy_protocol": form.get("accept_proxy") == "1",
     })
+    xmux = {
+        "enabled": form.get("xh_xmux") == "1",
+        "max_concurrency": str(form.get("xh_xmux_conc") or "16-32").strip() or "16-32",
+        "max_connections": max(0, _int(form.get("xh_xmux_conn"), 0)),
+        "c_max_reuse_times": str(form.get("xh_xmux_reuse") or "0").strip() or "0",
+        "c_max_lifetime_ms": str(form.get("xh_xmux_life") or "0").strip() or "0",
+        "h_max_request_times": str(form.get("xh_xmux_req") or "0").strip() or "0",
+        "h_max_reusable_secs": str(form.get("xh_xmux_secs") or "0").strip() or "0",
+    }
     st["xhttp"].update({
         "path": str(form.get("xh_path") or "/"), "host": str(form.get("xh_host") or ""),
-        "mode": str(form.get("xh_mode") or "auto"),
+        "mode": str(form.get("xh_mode") or "auto") if str(form.get("xh_mode") or "auto") in P.XH_MODES else "auto",
         "extra": str(form.get("xh_extra") or "").strip(),
+        "headers": str(form.get("xh_headers") or "").strip(),
+        "x_padding_bytes": str(form.get("xh_padding") or "100-1000").strip() or "100-1000",
+        "sc_max_buffered_posts": max(0, _int(form.get("xh_buf_posts"), 30)),
+        "sc_max_each_post_bytes": str(form.get("xh_max_post") or "1000000").strip() or "1000000",
+        "sc_min_each_post_bytes": str(form.get("xh_min_post") or "1").strip() or "1",
+        "sc_stream_up_server_secs": str(form.get("xh_stream_secs") or "20-80").strip() or "20-80",
+        "sc_min_posts_interval_ms": max(0, _int(form.get("xh_post_interval"), 30)),
+        "no_sse_header": form.get("xh_no_sse") == "1",
+        "no_grpc_header": form.get("xh_no_grpc") == "1",
+        "xmux": xmux,
     })
     st["kcp"].update({
         "mtu": _int(form.get("kcp_mtu"), 1350), "tti": _int(form.get("kcp_tti"), 20),
@@ -2203,13 +2236,19 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         "congestion": form.get("kcp_congestion") == "1",
         "header": str(form.get("kcp_header") or "none"),
         "seed": str(form.get("kcp_seed") or ""),
+        "read_buffer": max(0, _int(form.get("kcp_rbuf"), 2)),
+        "write_buffer": max(0, _int(form.get("kcp_wbuf"), 2)),
     })
     st["tls"].update({
         "server_name": str(form.get("tls_sni") or ""), "cert_file": str(form.get("tls_cert") or ""),
         "key_file": str(form.get("tls_key") or ""), "alpn": _split_lines(str(form.get("tls_alpn") or "h2,http/1.1")),
-        "fingerprint": str(form.get("tls_fp") or "chrome"), "min_version": str(form.get("tls_min") or "1.2"),
+        "fingerprint": str(form.get("tls_fp") or "chrome"),
+        "min_version": str(form.get("tls_min") or "1.2"),
+        "max_version": str(form.get("tls_max") or "1.3"),
+        "cipher_suites": str(form.get("tls_ciphers") or "").strip(),
         "allow_insecure": form.get("tls_insecure") == "1",
         "reject_unknown_sni": form.get("tls_reject_sni") == "1",
+        "disable_system_root": form.get("tls_no_system") == "1",
         "ech_server_keys": str(form.get("tls_ech") or "").strip(),
     })
     r = st["reality"]
@@ -2246,19 +2285,25 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         "tcp_keep_alive_interval": _int(form.get("so_kai"), 0),
         "tcp_keep_alive_idle": _int(form.get("so_kaidle"), 0),
         "tcp_user_timeout": _int(form.get("so_uto"), 0),
+        "tcp_congestion": str(form.get("so_cong") or ""),
+        "tcp_window_clamp": max(0, _int(form.get("so_clamp"), 0)),
+        "tcp_max_seg": max(0, _int(form.get("so_mss"), 0)),
         "mark": _int(form.get("so_mark"), 0),
         "tproxy": str(form.get("so_tproxy") or ""),
         "domain_strategy": str(form.get("so_ds") or "AsIs"),
         "dialer_proxy": str(form.get("so_dialer") or "").strip(),
+        "interface": str(form.get("so_iface") or "").strip(),
         "penetrate": form.get("so_penetrate") == "1",
         "tcp_mptcp": form.get("so_mptcp") == "1",
         "tcp_no_delay": form.get("so_nodelay") == "1",
+        "v6only": form.get("so_v6only") == "1",
     })
     ib["sniffing"] = {
         "enabled": form.get("sniff") == "1",
         "dest": [d for d in ("http", "tls", "quic", "fakedns") if form.get(f"sniff_{d}") == "1"] or ["http", "tls", "quic"],
         "route_only": form.get("sniff_route_only") == "1",
         "metadata_only": form.get("sniff_meta") == "1",
+        "excluded_domains": _split_lines(str(form.get("sniff_excl") or "")),
     }
     fbs = []
     for line in str(form.get("fallbacks") or "").splitlines():

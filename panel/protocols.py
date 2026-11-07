@@ -33,9 +33,12 @@ SS_METHODS = (
 )
 FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized")
 KCP_HEADERS = ("none", "srtp", "utp", "wechat-video", "dtls", "wireguard")
-TRAFFIC_RESETS = ("never", "daily", "weekly", "monthly")
-SOCKOPT_DOMAIN = ("AsIs", "UseIP", "UseIPv4", "UseIPv6")
-TPROXY_MODES = ("", "redirect", "tproxy", "off")
+TRAFFIC_RESETS = ("never", "hourly", "daily", "weekly", "monthly")
+SOCKOPT_DOMAIN = ("AsIs", "UseIP", "UseIPv4", "UseIPv6", "ForceIP", "ForceIPv4", "ForceIPv6", "ForceIPv4v6", "ForceIPv6v4")
+TPROXY_MODES = ("", "off", "redirect", "tproxy")
+TCP_CONGESTION = ("", "bbr", "cubic", "reno")
+XH_MODES = ("auto", "packet-up", "stream-up", "stream-one")
+TLS_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
 
 # Inbounds are published only through the nginx front on :443; Xray itself never binds a public address.
 FRONT_PORT = 443
@@ -61,8 +64,11 @@ def default_stream(security: str = "reality") -> dict:
             "alpn": ["h2", "http/1.1"],
             "fingerprint": "chrome",
             "min_version": "1.2",
+            "max_version": "1.3",
+            "cipher_suites": "",
             "allow_insecure": False,
             "reject_unknown_sni": False,
+            "disable_system_root": False,
             "ech_server_keys": "",
         },
         "reality": {
@@ -81,14 +87,49 @@ def default_stream(security: str = "reality") -> dict:
             "mldsa65_seed": "",
             "mldsa65_verify": "",
         },
-        "raw": {"header": "none", "http_host": "", "http_path": "/", "accept_proxy_protocol": False},
-        "ws": {"path": "/ws", "host": "", "accept_proxy_protocol": False},
-        "grpc": {"service_name": "grpc", "multi_mode": False, "authority": ""},
-        "httpupgrade": {"path": "/up", "host": "", "accept_proxy_protocol": False},
-        "xhttp": {"path": "/xh", "host": "", "mode": "auto", "extra": ""},
+        "raw": {
+            "header": "none", "http_host": "", "http_path": "/",
+            "http_method": "GET", "http_headers": "",
+            "accept_proxy_protocol": False,
+        },
+        "ws": {
+            "path": "/ws", "host": "", "headers": "", "heartbeat": 0,
+            "accept_proxy_protocol": False,
+        },
+        "grpc": {
+            "service_name": "grpc", "multi_mode": False, "authority": "",
+            "idle_timeout": 0, "health_check_timeout": 0,
+            "permit_without_stream": False, "initial_windows_size": 0,
+        },
+        "httpupgrade": {
+            "path": "/up", "host": "", "headers": "",
+            "accept_proxy_protocol": False,
+        },
+        "xhttp": {
+            "path": "/xh", "host": "", "mode": "auto", "extra": "",
+            "x_padding_bytes": "100-1000",
+            "sc_max_buffered_posts": 30,
+            "sc_max_each_post_bytes": "1000000",
+            "sc_min_each_post_bytes": "1",
+            "sc_stream_up_server_secs": "20-80",
+            "sc_min_posts_interval_ms": 30,
+            "no_sse_header": False,
+            "no_grpc_header": False,
+            "headers": "",
+            "xmux": {
+                "enabled": False,
+                "max_concurrency": "16-32",
+                "max_connections": 0,
+                "c_max_reuse_times": "0",
+                "c_max_lifetime_ms": "0",
+                "h_max_request_times": "0",
+                "h_max_reusable_secs": "0",
+            },
+        },
         "kcp": {
             "mtu": 1350, "tti": 20, "uplink": 5, "downlink": 20, "congestion": False,
             "header": "none", "seed": "",
+            "read_buffer": 2, "write_buffer": 2,
         },
         "sockopt": {
             "enabled": False,
@@ -96,13 +137,18 @@ def default_stream(security: str = "reality") -> dict:
             "tcp_keep_alive_interval": 0,
             "tcp_keep_alive_idle": 0,
             "tcp_user_timeout": 0,
+            "tcp_congestion": "",
+            "tcp_window_clamp": 0,
+            "tcp_max_seg": 0,
             "mark": 0,
             "tproxy": "",
             "domain_strategy": "AsIs",
             "dialer_proxy": "",
+            "interface": "",
             "penetrate": False,
             "tcp_mptcp": False,
             "tcp_no_delay": False,
+            "v6only": False,
         },
     }
 
@@ -141,7 +187,10 @@ def default_inbound(protocol: str = "vless", port: int = 10443, tag: str = "vles
         "protocol": protocol,
         "settings": default_settings(protocol),
         "stream": default_stream(sec),
-        "sniffing": {"enabled": True, "dest": ["http", "tls", "quic"], "route_only": False, "metadata_only": False},
+        "sniffing": {
+            "enabled": True, "dest": ["http", "tls", "quic"],
+            "route_only": False, "metadata_only": False, "excluded_domains": [],
+        },
         "fallbacks": [],
         "outbound": "direct",
         "share_host": "",
@@ -165,7 +214,12 @@ def ensure_inbound_shape(ib: dict) -> dict:
         if isinstance(v, dict):
             cur = st.setdefault(k, {})
             for kk, vv in v.items():
-                cur.setdefault(kk, vv)
+                if isinstance(vv, dict):
+                    sub = cur.setdefault(kk, {})
+                    for k3, v3 in vv.items():
+                        sub.setdefault(k3, v3)
+                else:
+                    cur.setdefault(kk, vv)
         else:
             st.setdefault(k, v)
     if st.get("network") == "tcp":
@@ -207,6 +261,50 @@ def identity_uuid(client_uuid: str, tag: str) -> str:
 
 # ---------------------------------------------------------------- server side builders
 
+def parse_header_lines(raw: str) -> dict[str, list[str]]:
+    """Parse `Key: Value` lines (or JSON object) into Xray header map."""
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            out: dict[str, list[str]] = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    out[str(k)] = [str(x) for x in v]
+                elif v is not None and str(v) != "":
+                    out[str(k)] = [str(v)]
+            return out
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if not key:
+            continue
+        out.setdefault(key, []).append(val)
+    return out
+
+
+def _maybe_range(value) -> Any:
+    """Keep dash-ranges as strings; coerce plain ints."""
+    s = str(value if value is not None else "").strip()
+    if not s:
+        return None
+    if "-" in s:
+        return s
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
 def build_stream_settings(stream: dict) -> dict:
     net = stream.get("network") or "raw"
     sec = stream.get("security") or "none"
@@ -215,11 +313,17 @@ def build_stream_settings(stream: dict) -> dict:
         raw = stream.get("raw") or {}
         raw_settings: dict[str, Any] = {}
         if raw.get("header") == "http":
+            headers = parse_header_lines(raw.get("http_headers") or "")
+            hosts = [h.strip() for h in (raw.get("http_host") or "").split(",") if h.strip()]
+            if hosts:
+                headers["Host"] = hosts
             raw_settings["header"] = {
                 "type": "http",
                 "request": {
+                    "version": "1.1",
+                    "method": raw.get("http_method") or "GET",
                     "path": [raw.get("http_path") or "/"],
-                    "headers": {"Host": [h.strip() for h in (raw.get("http_host") or "").split(",") if h.strip()]},
+                    **({"headers": headers} if headers else {}),
                 },
             }
         if raw.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
@@ -229,6 +333,12 @@ def build_stream_settings(stream: dict) -> dict:
     elif net == "ws":
         ws = stream.get("ws") or {}
         ws_settings: dict[str, Any] = {"path": ws.get("path") or "/", **({"host": ws["host"]} if ws.get("host") else {})}
+        headers = parse_header_lines(ws.get("headers") or "")
+        if headers:
+            # ws headers are flat string map in Xray
+            ws_settings["headers"] = {k: (v[0] if isinstance(v, list) and v else str(v)) for k, v in headers.items()}
+        if int(ws.get("heartbeat") or 0) > 0:
+            ws_settings["heartbeatPeriod"] = int(ws["heartbeat"])
         if ws.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
             ws_settings["acceptProxyProtocol"] = True
         out["wsSettings"] = ws_settings
@@ -237,10 +347,21 @@ def build_stream_settings(stream: dict) -> dict:
         grpc: dict[str, Any] = {"serviceName": g.get("service_name") or "grpc", "multiMode": bool(g.get("multi_mode"))}
         if g.get("authority"):
             grpc["authority"] = g["authority"]
+        if int(g.get("idle_timeout") or 0) > 0:
+            grpc["idle_timeout"] = int(g["idle_timeout"])
+        if int(g.get("health_check_timeout") or 0) > 0:
+            grpc["health_check_timeout"] = int(g["health_check_timeout"])
+        if g.get("permit_without_stream"):
+            grpc["permit_without_stream"] = True
+        if int(g.get("initial_windows_size") or 0) > 0:
+            grpc["initial_windows_size"] = int(g["initial_windows_size"])
         out["grpcSettings"] = grpc
     elif net == "httpupgrade":
         h = stream.get("httpupgrade") or {}
         hu: dict[str, Any] = {"path": h.get("path") or "/", **({"host": h["host"]} if h.get("host") else {})}
+        headers = parse_header_lines(h.get("headers") or "")
+        if headers:
+            hu["headers"] = {k: (v[0] if isinstance(v, list) and v else str(v)) for k, v in headers.items()}
         if h.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
             hu["acceptProxyProtocol"] = True
         out["httpupgradeSettings"] = hu
@@ -251,10 +372,66 @@ def build_stream_settings(stream: dict) -> dict:
             "mode": x.get("mode") or "auto",
             **({"host": x["host"]} if x.get("host") else {}),
         }
+        headers = parse_header_lines(x.get("headers") or "")
+        if headers:
+            xh["headers"] = {k: (v[0] if isinstance(v, list) and v else str(v)) for k, v in headers.items()}
+        pad = _maybe_range(x.get("x_padding_bytes"))
+        if pad is not None:
+            xh["xPaddingBytes"] = pad
+        for src, dst in (
+            ("sc_max_buffered_posts", "scMaxBufferedPosts"),
+            ("sc_min_posts_interval_ms", "scMinPostsIntervalMs"),
+        ):
+            val = int(x.get(src) or 0)
+            if val > 0:
+                xh[dst] = val
+        for src, dst in (
+            ("sc_max_each_post_bytes", "scMaxEachPostBytes"),
+            ("sc_min_each_post_bytes", "scMinEachPostBytes"),
+            ("sc_stream_up_server_secs", "scStreamUpServerSecs"),
+        ):
+            val = _maybe_range(x.get(src))
+            if val is not None:
+                xh[dst] = val
+        if x.get("no_sse_header"):
+            xh["noSSEHeader"] = True
+        if x.get("no_grpc_header"):
+            xh["noGRPCHeader"] = True
+        xm = x.get("xmux") or {}
+        if xm.get("enabled"):
+            xmux: dict[str, Any] = {}
+            for src, dst in (
+                ("max_concurrency", "maxConcurrency"),
+                ("c_max_reuse_times", "cMaxReuseTimes"),
+                ("c_max_lifetime_ms", "cMaxLifetimeMs"),
+                ("h_max_request_times", "hMaxRequestTimes"),
+                ("h_max_reusable_secs", "hMaxReusableSecs"),
+            ):
+                val = _maybe_range(xm.get(src))
+                if val is not None and val != 0 and val != "0":
+                    xmux[dst] = val
+            max_conn = int(xm.get("max_connections") or 0)
+            if max_conn > 0:
+                xmux["maxConnections"] = max_conn
+            if xmux:
+                xh["xmux"] = xmux
+        # Advanced JSON overlay (wins on conflicts)
         extra = str(x.get("extra") or "").strip()
         if extra:
             try:
-                xh["extra"] = json.loads(extra)
+                parsed = json.loads(extra)
+                if isinstance(parsed, dict):
+                    # Prefer nesting under extra for splitHTTP extras, else merge
+                    if any(k in parsed for k in ("xmux", "headers", "xPaddingBytes", "mode", "path")):
+                        for k, v in parsed.items():
+                            if k == "xmux" and isinstance(v, dict) and isinstance(xh.get("xmux"), dict):
+                                xh["xmux"] = {**xh["xmux"], **v}
+                            else:
+                                xh[k] = v
+                    else:
+                        xh["extra"] = parsed
+                else:
+                    xh["extra"] = parsed
             except ValueError:
                 xh["extra"] = extra
         out["xhttpSettings"] = xh
@@ -267,6 +444,8 @@ def build_stream_settings(stream: dict) -> dict:
             "downlinkCapacity": int(k.get("downlink") or 20),
             "congestion": bool(k.get("congestion")),
             "header": {"type": k.get("header") or "none"},
+            "readBufferSize": int(k.get("read_buffer") or 2),
+            "writeBufferSize": int(k.get("write_buffer") or 2),
         }
         if k.get("seed"):
             kcp["seed"] = k["seed"]
@@ -279,6 +458,12 @@ def build_stream_settings(stream: dict) -> dict:
             "minVersion": t.get("min_version") or "1.2",
             "rejectUnknownSni": bool(t.get("reject_unknown_sni")),
         }
+        if t.get("max_version"):
+            tls["maxVersion"] = t["max_version"]
+        if t.get("cipher_suites"):
+            tls["cipherSuites"] = str(t["cipher_suites"]).strip()
+        if t.get("disable_system_root"):
+            tls["disableSystemRoot"] = True
         if t.get("cert_file") and t.get("key_file"):
             tls["certificates"] = [{"certificateFile": t["cert_file"], "keyFile": t["key_file"]}]
         if t.get("ech_server_keys"):
@@ -314,20 +499,30 @@ def build_stream_settings(stream: dict) -> dict:
             sock["tcpKeepAliveIdle"] = int(so["tcp_keep_alive_idle"])
         if so.get("tcp_user_timeout"):
             sock["tcpUserTimeout"] = int(so["tcp_user_timeout"])
+        if so.get("tcp_congestion"):
+            sock["tcpcongestion"] = so["tcp_congestion"]
+        if int(so.get("tcp_window_clamp") or 0) > 0:
+            sock["tcpWindowClamp"] = int(so["tcp_window_clamp"])
+        if int(so.get("tcp_max_seg") or 0) > 0:
+            sock["tcpMaxSeg"] = int(so["tcp_max_seg"])
         if so.get("mark"):
             sock["mark"] = int(so["mark"])
-        if so.get("tproxy"):
+        if so.get("tproxy") and so["tproxy"] != "off":
             sock["tproxy"] = so["tproxy"]
         if so.get("domain_strategy") and so["domain_strategy"] != "AsIs":
             sock["domainStrategy"] = so["domain_strategy"]
         if so.get("dialer_proxy"):
             sock["dialerProxy"] = so["dialer_proxy"]
+        if so.get("interface"):
+            sock["interface"] = so["interface"]
         if so.get("penetrate"):
             sock["penetrate"] = True
         if so.get("tcp_mptcp"):
             sock["tcpMptcp"] = True
         if so.get("tcp_no_delay"):
             sock["tcpNoDelay"] = True
+        if so.get("v6only"):
+            sock["V6Only"] = True
         if sock:
             out["sockopt"] = sock
     return out
@@ -362,12 +557,12 @@ def front_mode(ib: dict) -> str | None:
         return None
     st = ib.get("stream") or {}
     net = st.get("network") or "raw"
-    # Path transports always share the HTTPS site (like the reference nginx setup).
-    if net in FRONT_HTTP_NETWORKS:
-        return "http"
     sec = st.get("security") or "none"
+    # Reality/TLS on path transports (esp. XHTTP/gRPC) use SNI passthrough like 3x-ui
     if sec in ("reality", "tls"):
         return "sni"
+    if net in FRONT_HTTP_NETWORKS:
+        return "http"
     return None
 
 
@@ -396,9 +591,25 @@ def front_http_path(ib: dict) -> str:
     return ((st.get(net) or {}).get("path") or "/").split("?", 1)[0]
 
 
+def _vless_enc_on(settings: dict | None) -> bool:
+    s = settings or {}
+    for key in ("encryption", "decryption"):
+        val = str(s.get(key) or "").strip().lower()
+        if val and val != "none":
+            return True
+    return False
+
+
 def supports_flow(ib: dict) -> bool:
+    """XTLS-Vision: classic raw+tls/reality, or any transport when VLESS encryption is on (3x-ui)."""
+    if ib.get("protocol") != "vless":
+        return False
     st = ib.get("stream") or {}
-    return ib.get("protocol") == "vless" and (st.get("network") or "raw") == "raw" and st.get("security") in ("tls", "reality")
+    net = st.get("network") or "raw"
+    sec = st.get("security") or "none"
+    if net == "raw" and sec in ("tls", "reality"):
+        return True
+    return _vless_enc_on(ib.get("settings"))
 
 
 def build_inbound(ib: dict, identities: list[dict]) -> dict:
@@ -489,12 +700,16 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
             out["streamSettings"].setdefault("sockopt", {})["trustedXForwardedFor"] = ["X-Forwarded-For", "X-Real-IP"]
     sn = ib.get("sniffing") or {}
     if sn.get("enabled"):
-        out["sniffing"] = {
+        sniff: dict[str, Any] = {
             "enabled": True,
             "destOverride": sn.get("dest") or ["http", "tls", "quic"],
             "routeOnly": bool(sn.get("route_only")),
             "metadataOnly": bool(sn.get("metadata_only")),
         }
+        excl = [d for d in (sn.get("excluded_domains") or []) if str(d).strip()]
+        if excl:
+            sniff["domainsExcluded"] = excl
+        out["sniffing"] = sniff
     return out
 
 

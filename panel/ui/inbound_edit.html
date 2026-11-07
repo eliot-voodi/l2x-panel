@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
 {% import "_icons.html" as ic %}
-{% set st = ib.stream %}{% set s = ib.settings %}{% set so = st.sockopt or {} %}{% set r = st.reality or {} %}{% set tls = st.tls or {} %}
+{% set st = ib.stream %}{% set s = ib.settings %}{% set so = st.sockopt or {} %}{% set r = st.reality or {} %}{% set tls = st.tls or {} %}{% set xh = st.xhttp or {} %}{% set xm = xh.xmux or {} %}{% set sniff = ib.sniffing or {} %}
 {% block title %}Inbound {{ ib.tag }} · {{ app_name }}{% endblock %}
 {% block page_title %}{% if is_new %}{{ t('Новый inbound') }}{% else %}Inbound · {{ ib.remark or ib.tag }}{% endif %}{% endblock %}
 {% block page_sub %}<a href="{{ bp }}/inbounds">← все inbounds</a>{% endblock %}
@@ -57,7 +57,7 @@
       <label class="f">Flow</label>
       <select name="flow">
         <option value="" {% if not s.flow %}selected{% endif %}>нет</option>
-        <option value="xtls-rprx-vision" {% if s.flow == 'xtls-rprx-vision' %}selected{% endif %}>xtls-rprx-vision (только raw + tls/reality)</option>
+        <option value="xtls-rprx-vision" {% if s.flow == 'xtls-rprx-vision' %}selected{% endif %}>xtls-rprx-vision (raw+tls/reality или VLESS encryption)</option>
       </select>
       <div id="vless-enc" class="mt">
         <label class="f">Authentication (encryption)</label>
@@ -129,9 +129,11 @@
     </div>
 
     <h3 class="mt">Sniffing</h3>
-    {{ m.check('sniff', ib.sniffing.enabled, 'Включить') }}
-    <div>{% for d in ('http', 'tls', 'quic', 'fakedns') %}{{ m.check('sniff_' ~ d, d in ib.sniffing.dest, d) }}{% endfor %}</div>
-    <div>{{ m.check('sniff_route_only', ib.sniffing.route_only, 'routeOnly') }}{{ m.check('sniff_meta', ib.sniffing.metadata_only, 'metadataOnly') }}</div>
+    {{ m.check('sniff', sniff.enabled, 'Включить') }}
+    <div>{% for d in ('http', 'tls', 'quic', 'fakedns') %}{{ m.check('sniff_' ~ d, d in (sniff.dest or []), d) }}{% endfor %}</div>
+    <div>{{ m.check('sniff_route_only', sniff.route_only, 'routeOnly') }}{{ m.check('sniff_meta', sniff.metadata_only, 'metadataOnly') }}</div>
+    <label class="f">Excluded domains</label>
+    <textarea name="sniff_excl" class="mono" rows="2" placeholder="по одному на строку / через запятую">{{ (sniff.excluded_domains or [])|join('\n') }}</textarea>
   </div>
 </div>
 
@@ -146,32 +148,80 @@
     </div>
   </div>
   {{ m.check('accept_proxy', st.accept_proxy_protocol or (st.raw and st.raw.accept_proxy_protocol), 'acceptProxyProtocol') }}
-  <div data-net="raw" class="row">
-    <div><label class="f">Header</label><select name="raw_header"><option value="none">none</option><option value="http" {% if st.raw.header == 'http' %}selected{% endif %}>http (obfs)</option></select></div>
-    <div><label class="f">HTTP Host</label><input name="raw_host" value="{{ st.raw.http_host }}"></div>
-    <div><label class="f">HTTP Path</label><input name="raw_path" value="{{ st.raw.http_path }}"></div>
+  <div data-net="raw">
+    <div class="row">
+      <div><label class="f">Header</label><select name="raw_header"><option value="none">none</option><option value="http" {% if st.raw.header == 'http' %}selected{% endif %}>http (obfs)</option></select></div>
+      <div><label class="f">HTTP Method</label><input name="raw_method" value="{{ st.raw.http_method or 'GET' }}"></div>
+      <div><label class="f">HTTP Host</label><input name="raw_host" value="{{ st.raw.http_host }}"></div>
+      <div><label class="f">HTTP Path</label><input name="raw_path" value="{{ st.raw.http_path }}"></div>
+    </div>
+    <label class="f">HTTP headers (Key: Value)</label>
+    <textarea name="raw_headers" class="mono" rows="2" placeholder="User-Agent: …">{{ st.raw.http_headers or '' }}</textarea>
   </div>
-  <div data-net="ws" class="row">
-    <div><label class="f">Path</label><input name="ws_path" value="{{ st.ws.path }}"></div>
-    <div><label class="f">Host</label><input name="ws_host" value="{{ st.ws.host }}"></div>
+  <div data-net="ws">
+    <div class="row">
+      <div><label class="f">Path</label><input name="ws_path" value="{{ st.ws.path }}"></div>
+      <div><label class="f">Host</label><input name="ws_host" value="{{ st.ws.host }}"></div>
+      <div><label class="f">Heartbeat, с</label><input name="ws_heartbeat" type="number" min="0" value="{{ st.ws.heartbeat or 0 }}"></div>
+    </div>
+    <label class="f">Headers (Key: Value)</label>
+    <textarea name="ws_headers" class="mono" rows="2">{{ st.ws.headers or '' }}</textarea>
   </div>
-  <div data-net="grpc" class="row">
-    <div><label class="f">serviceName</label><input name="grpc_service" value="{{ st.grpc.service_name }}"></div>
-    <div><label class="f">Authority</label><input name="grpc_authority" value="{{ st.grpc.authority or '' }}"></div>
-    <div>{{ m.check('grpc_multi', st.grpc.multi_mode, 'multiMode') }}</div>
+  <div data-net="grpc">
+    <div class="row">
+      <div><label class="f">serviceName</label><input name="grpc_service" value="{{ st.grpc.service_name }}"></div>
+      <div><label class="f">Authority</label><input name="grpc_authority" value="{{ st.grpc.authority or '' }}"></div>
+      <div>{{ m.check('grpc_multi', st.grpc.multi_mode, 'multiMode') }}</div>
+    </div>
+    <div class="row">
+      <div><label class="f">idle_timeout</label><input name="grpc_idle" type="number" min="0" value="{{ st.grpc.idle_timeout or 0 }}"></div>
+      <div><label class="f">health_check_timeout</label><input name="grpc_health" type="number" min="0" value="{{ st.grpc.health_check_timeout or 0 }}"></div>
+      <div><label class="f">initial_windows_size</label><input name="grpc_window" type="number" min="0" value="{{ st.grpc.initial_windows_size or 0 }}"></div>
+      <div>{{ m.check('grpc_permit', st.grpc.permit_without_stream, 'permitWithoutStream') }}</div>
+    </div>
   </div>
-  <div data-net="httpupgrade" class="row">
-    <div><label class="f">Path</label><input name="hu_path" value="{{ st.httpupgrade.path }}"></div>
-    <div><label class="f">Host</label><input name="hu_host" value="{{ st.httpupgrade.host }}"></div>
+  <div data-net="httpupgrade">
+    <div class="row">
+      <div><label class="f">Path</label><input name="hu_path" value="{{ st.httpupgrade.path }}"></div>
+      <div><label class="f">Host</label><input name="hu_host" value="{{ st.httpupgrade.host }}"></div>
+    </div>
+    <label class="f">Headers (Key: Value)</label>
+    <textarea name="hu_headers" class="mono" rows="2">{{ st.httpupgrade.headers or '' }}</textarea>
   </div>
   <div data-net="xhttp">
     <div class="row">
-      <div><label class="f">Path</label><input name="xh_path" value="{{ st.xhttp.path }}"></div>
-      <div><label class="f">Host</label><input name="xh_host" value="{{ st.xhttp.host }}"></div>
-      <div><label class="f">Mode</label><select name="xh_mode">{% for x in ('auto', 'packet-up', 'stream-up', 'stream-one') %}<option {% if x == st.xhttp.mode %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div>
+      <div><label class="f">Path</label><input name="xh_path" value="{{ xh.path }}"></div>
+      <div><label class="f">Host</label><input name="xh_host" value="{{ xh.host }}"></div>
+      <div><label class="f">Mode</label><select name="xh_mode">{% for x in P.XH_MODES %}<option {% if x == (xh.mode or 'auto') %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div>
     </div>
-    <label class="f">Extra (JSON)</label>
-    <textarea name="xh_extra" class="mono" rows="3" placeholder='{"headers":{}}'>{{ st.xhttp.extra or '' }}</textarea>
+    <div class="row">
+      <div><label class="f">xPaddingBytes</label><input name="xh_padding" value="{{ xh.x_padding_bytes or '100-1000' }}" class="mono"></div>
+      <div><label class="f">scMaxBufferedPosts</label><input name="xh_buf_posts" type="number" min="0" value="{{ xh.sc_max_buffered_posts if xh.sc_max_buffered_posts is defined else 30 }}"></div>
+      <div><label class="f">scMinPostsIntervalMs</label><input name="xh_post_interval" type="number" min="0" value="{{ xh.sc_min_posts_interval_ms if xh.sc_min_posts_interval_ms is defined else 30 }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">scMaxEachPostBytes</label><input name="xh_max_post" value="{{ xh.sc_max_each_post_bytes or '1000000' }}" class="mono"></div>
+      <div><label class="f">scMinEachPostBytes</label><input name="xh_min_post" value="{{ xh.sc_min_each_post_bytes or '1' }}" class="mono"></div>
+      <div><label class="f">scStreamUpServerSecs</label><input name="xh_stream_secs" value="{{ xh.sc_stream_up_server_secs or '20-80' }}" class="mono"></div>
+    </div>
+    <div class="mt">
+      {{ m.check('xh_no_sse', xh.no_sse_header, 'noSSEHeader') }}
+      {{ m.check('xh_no_grpc', xh.no_grpc_header, 'noGRPCHeader') }}
+      {{ m.check('xh_xmux', xm.enabled, 'Xmux (multiplexing)') }}
+    </div>
+    <div class="row" id="xmux_fields">
+      <div><label class="f">maxConcurrency</label><input name="xh_xmux_conc" value="{{ xm.max_concurrency or '16-32' }}" class="mono"></div>
+      <div><label class="f">maxConnections</label><input name="xh_xmux_conn" type="number" min="0" value="{{ xm.max_connections or 0 }}"></div>
+      <div><label class="f">cMaxReuseTimes</label><input name="xh_xmux_reuse" value="{{ xm.c_max_reuse_times or '0' }}" class="mono"></div>
+      <div><label class="f">cMaxLifetimeMs</label><input name="xh_xmux_life" value="{{ xm.c_max_lifetime_ms or '0' }}" class="mono"></div>
+      <div><label class="f">hMaxRequestTimes</label><input name="xh_xmux_req" value="{{ xm.h_max_request_times or '0' }}" class="mono"></div>
+      <div><label class="f">hMaxReusableSecs</label><input name="xh_xmux_secs" value="{{ xm.h_max_reusable_secs or '0' }}" class="mono"></div>
+    </div>
+    <label class="f">Headers (Key: Value)</label>
+    <textarea name="xh_headers" class="mono" rows="2">{{ xh.headers or '' }}</textarea>
+    <label class="f">Extra JSON (overlay)</label>
+    <textarea name="xh_extra" class="mono" rows="2" placeholder='{"sessionIDPlacement":"query"}'>{{ xh.extra or '' }}</textarea>
+    <div class="hint">Reality/TLS + XHTTP — SNI passthrough (как 3x-ui). Без security — path через nginx.</div>
   </div>
   <div data-net="kcp">
     <div class="row">
@@ -185,6 +235,8 @@
         <select name="kcp_header">{% for h in P.KCP_HEADERS %}<option {% if (st.kcp.header or 'none') == h %}selected{% endif %}>{{ h }}</option>{% endfor %}</select>
       </div>
       <div><label class="f">Seed</label><input name="kcp_seed" value="{{ st.kcp.seed or '' }}" class="mono"></div>
+      <div><label class="f">Read buffer</label><input name="kcp_rbuf" type="number" min="0" value="{{ st.kcp.read_buffer if st.kcp.read_buffer is defined else 2 }}"></div>
+      <div><label class="f">Write buffer</label><input name="kcp_wbuf" type="number" min="0" value="{{ st.kcp.write_buffer if st.kcp.write_buffer is defined else 2 }}"></div>
       <div>{{ m.check('kcp_congestion', st.kcp.congestion, 'congestion') }}</div>
     </div>
   </div>
@@ -196,8 +248,11 @@
     <div><label class="f">SNI (serverName)</label><input name="tls_sni" value="{{ tls.server_name }}"></div>
     <div><label class="f">ALPN</label><input name="tls_alpn" value="{{ tls.alpn|join(',') }}"></div>
     <div><label class="f">Fingerprint</label><select name="tls_fp">{% for f in P.FINGERPRINTS %}<option {% if f == tls.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
-    <div><label class="f">Min TLS</label><select name="tls_min">{% for v in ('1.2', '1.3') %}<option {% if v == tls.min_version %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
+    <div><label class="f">Min TLS</label><select name="tls_min">{% for v in P.TLS_VERSIONS %}<option {% if v == (tls.min_version or '1.2') %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
+    <div><label class="f">Max TLS</label><select name="tls_max">{% for v in P.TLS_VERSIONS %}<option {% if v == (tls.max_version or '1.3') %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
   </div>
+  <label class="f">Cipher suites</label>
+  <input name="tls_ciphers" value="{{ tls.cipher_suites or '' }}" class="mono" placeholder="опционально, через :">
   <div class="row">
     <div><label class="f">Сертификат (fullchain)</label><input name="tls_cert" id="tls_cert" value="{{ tls.cert_file }}" placeholder="/etc/l2xpanel/certs/domain.crt"></div>
     <div><label class="f">Ключ</label><input name="tls_key" id="tls_key" value="{{ tls.key_file }}"></div>
@@ -212,6 +267,7 @@
   <div class="mt">
     {{ m.check('tls_insecure', tls.allow_insecure, 'allowInsecure в ссылках') }}
     {{ m.check('tls_reject_sni', tls.reject_unknown_sni, 'rejectUnknownSni') }}
+    {{ m.check('tls_no_system', tls.disable_system_root, 'disableSystemRoot') }}
   </div>
 </div>
 
@@ -272,13 +328,22 @@
       <div><label class="f">Domain strategy</label>
         <select name="so_ds">{% for x in P.SOCKOPT_DOMAIN %}<option {% if (so.domain_strategy or 'AsIs') == x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select>
       </div>
+      <div><label class="f">TCP congestion</label>
+        <select name="so_cong">{% for x in P.TCP_CONGESTION %}<option value="{{ x }}" {% if (so.tcp_congestion or '') == x %}selected{% endif %}>{{ x or '—' }}</option>{% endfor %}</select>
+      </div>
       <div><label class="f">Dialer proxy (tag)</label><input name="so_dialer" value="{{ so.dialer_proxy or '' }}" class="mono"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Interface</label><input name="so_iface" value="{{ so.interface or '' }}" class="mono" placeholder="eth0"></div>
+      <div><label class="f">tcpWindowClamp</label><input name="so_clamp" type="number" min="0" value="{{ so.tcp_window_clamp or 0 }}"></div>
+      <div><label class="f">tcpMaxSeg</label><input name="so_mss" type="number" min="0" value="{{ so.tcp_max_seg or 0 }}"></div>
     </div>
     <div class="mt">
       {{ m.check('so_tfo', so.tcp_fast_open, 'tcpFastOpen') }}
       {{ m.check('so_penetrate', so.penetrate, 'penetrate') }}
       {{ m.check('so_mptcp', so.tcp_mptcp, 'tcpMptcp') }}
       {{ m.check('so_nodelay', so.tcp_no_delay, 'tcpNoDelay') }}
+      {{ m.check('so_v6only', so.v6only, 'V6Only') }}
     </div>
   </div>
 </div>
@@ -338,21 +403,21 @@
     var hint = document.getElementById('front_hint');
     var front = FRONT_PROTOS.indexOf(p) >= 0;
     var http = front && HTTP_NETS.indexOf(n) >= 0;
-    if (http && sec !== 'none') {
+    // Path + none → nginx TLS; Reality/TLS on xhttp/grpc/raw → SNI passthrough (3x-ui)
+    if (http && sec !== 'none' && sec !== 'reality' && sec !== 'tls') {
       secEl.value = 'none';
       sec = 'none';
-      document.querySelectorAll('[data-sec]').forEach(function (el) {
-        if (el.dataset.proto && el.dataset.proto.split(' ').indexOf(p) < 0) return;
-        el.hidden = true;
-      });
+    }
+    if (sec === 'reality' && n !== 'raw' && n !== 'grpc' && n !== 'xhttp') {
+      hint.textContent = 'Reality доступен для raw / grpc / xhttp (как в 3x-ui).';
     }
     share.required = false;
     if (!front) {
       hint.textContent = 'Этот протокол не публикуется через nginx :443 — доступен только локально.';
+    } else if ((sec === 'reality' || sec === 'tls')) {
+      hint.textContent = 'SNI passthrough на :443. SNI Reality/TLS не должен совпадать с доменом панели. Для XHTTP+Reality security остаётся reality.';
     } else if (http) {
-      hint.innerHTML = 'Как на reference: один публичный домен, несколько inbound через <b>Path</b> (location в nginx). TLS снимает nginx, в Xray security=none. Пустое URL share → домен из Настроек. Клиенты только на <code>:443</code>.';
-    } else if (sec === 'reality' || sec === 'tls') {
-      hint.textContent = 'Клиенты на :443. SNI Reality/TLS не должен совпадать с публичным доменом панели (тот домен — для панели и Path-inbound). Reality SNI = камуфляж (ya.ru…). TLS на IP — без SNI.';
+      hint.innerHTML = 'Path через nginx: TLS снимает nginx, в Xray security=none. Несколько inbound на одном домене по Path.';
     } else {
       hint.textContent = 'raw без TLS не публикуется через nginx — выберите ws/grpc/httpupgrade/xhttp, TLS или Reality.';
     }

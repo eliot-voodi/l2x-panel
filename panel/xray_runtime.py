@@ -1395,6 +1395,8 @@ def reset_client_traffic(client: dict) -> None:
 
 
 def _period_delta(period: str, base: datetime) -> datetime:
+    if period == "hourly":
+        return base + timedelta(hours=1)
     if period == "monthly":
         month = base.month + 1
         year = base.year + (month - 1) // 12
