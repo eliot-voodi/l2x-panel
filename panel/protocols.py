@@ -74,6 +74,8 @@ def default_stream(security: str = "reality") -> dict:
     return {
         "network": "raw",
         "security": security,
+        # Client uTLS fingerprint for share links (all inbounds that emit TLS/Reality/CDN links)
+        "fingerprint": "chrome",
         "accept_proxy_protocol": False,
         "tls": {
             "server_name": "",
@@ -855,6 +857,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
             "net": "hysteria",
             "security": "tls",
             "sni": t.get("server_name") or (ib.get("share_host") or host),
+            "fp": st.get("fingerprint") or t.get("fingerprint") or "chrome",
             "allow_insecure": bool(t.get("allow_insecure")),
             "brutal_up": s.get("brutal_up") or "100mbps",
             "brutal_down": s.get("brutal_down") or "300mbps",
@@ -876,21 +879,30 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         g = st.get("grpc") or {}
         ep["service_name"] = g.get("service_name") or "grpc"
         ep["mode"] = "multi" if g.get("multi_mode") else "gun"
+    # Canonical client fingerprint (stream-level); tls/reality copies kept in sync for legacy
+    fp = (
+        st.get("fingerprint")
+        or (st.get("tls") or {}).get("fingerprint")
+        or (st.get("reality") or {}).get("fingerprint")
+        or "chrome"
+    )
     if sec == "tls":
         t = st.get("tls") or {}
         ep["sni"] = t.get("server_name") or ""
-        ep["fp"] = t.get("fingerprint") or "chrome"
+        ep["fp"] = fp
         ep["alpn"] = ",".join(t.get("alpn") or [])
         ep["allow_insecure"] = bool(t.get("allow_insecure"))
     elif sec == "reality":
         r = st.get("reality") or {}
         names = r.get("server_names") or []
         ep["sni"] = names[0] if names else str(r.get("dest") or "").split(":")[0]
-        ep["fp"] = r.get("fingerprint") or "chrome"
+        ep["fp"] = fp
         ep["pbk"] = r.get("public_key") or ""
         sids = r.get("short_ids") or []
         ep["sid"] = sids[0] if sids else ""
         ep["spx"] = r.get("spider_x") or "/"
+    else:
+        ep["fp"] = fp
     mode = front_mode(ib)
     if mode:
         ep["port"] = FRONT_PORT
@@ -903,7 +915,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
             "security": "tls",
             "sni": domain,
             "host": domain,
-            "fp": "chrome",
+            "fp": fp,
             "alpn": "h2,http/1.1" if net in ("grpc", "xhttp") else "http/1.1",
             "allow_insecure": False,
         })
