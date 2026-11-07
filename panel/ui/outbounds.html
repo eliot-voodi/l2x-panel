@@ -283,8 +283,8 @@
         <div class="row">
           <div><label class="f">Security</label><select id="sec"><option>none</option><option>tls</option><option>reality</option></select></div>
           <div data-show="sec:tls,reality"><label class="f">SNI</label><input id="sni"></div>
-          <div data-show="sec:tls,reality"><label class="f">Fingerprint</label>
-            <select id="fp"><option value="">нет</option>{% for f in fingerprints %}<option>{{ f }}</option>{% endfor %}</select></div>
+          <div data-show="sec:tls,reality"><label class="f">Отпечаток браузера (uTLS)</label>
+            <select id="fp"><option value="">нет</option>{% for f in fingerprints %}<option value="{{ f }}">{{ f }}</option>{% endfor %}</select></div>
         </div>
         <div class="row" data-show="sec:tls">
           <div><label class="f">ALPN</label><input id="alpn" placeholder="h2,http/1.1"></div>

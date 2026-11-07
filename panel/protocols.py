@@ -31,7 +31,25 @@ SS_METHODS = (
     "aes-128-gcm",
     "chacha20-poly1305",
 )
-FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized")
+# uTLS client fingerprints for share links / Reality+TLS (aligned with 3x-ui / Xray)
+FINGERPRINTS = (
+    "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+    "random", "randomized", "randomizednoalpn", "unsafe",
+)
+FINGERPRINT_LABELS = {
+    "chrome": "Chrome",
+    "firefox": "Firefox",
+    "safari": "Safari",
+    "ios": "iOS",
+    "android": "Android",
+    "edge": "Edge",
+    "360": "360 Browser",
+    "qq": "QQ Browser",
+    "random": "Random",
+    "randomized": "Randomized",
+    "randomizednoalpn": "Randomized (no ALPN)",
+    "unsafe": "unsafe (без uTLS)",
+}
 KCP_HEADERS = ("none", "srtp", "utp", "wechat-video", "dtls", "wireguard")
 TRAFFIC_RESETS = ("never", "hourly", "daily", "weekly", "monthly")
 SOCKOPT_DOMAIN = ("AsIs", "UseIP", "UseIPv4", "UseIPv6", "ForceIP", "ForceIPv4", "ForceIPv6", "ForceIPv4v6", "ForceIPv6v4")

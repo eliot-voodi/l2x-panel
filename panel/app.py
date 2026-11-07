@@ -2242,7 +2242,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     st["tls"].update({
         "server_name": str(form.get("tls_sni") or ""), "cert_file": str(form.get("tls_cert") or ""),
         "key_file": str(form.get("tls_key") or ""), "alpn": _split_lines(str(form.get("tls_alpn") or "h2,http/1.1")),
-        "fingerprint": str(form.get("tls_fp") or "chrome"),
+        "fingerprint": str(form.get("tls_fp") or "chrome") if str(form.get("tls_fp") or "chrome") in P.FINGERPRINTS else "chrome",
         "min_version": str(form.get("tls_min") or "1.2"),
         "max_version": str(form.get("tls_max") or "1.3"),
         "cipher_suites": str(form.get("tls_ciphers") or "").strip(),
@@ -2263,7 +2263,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         "dest": str(form.get("r_dest") or "www.cloudflare.com:443"),
         "xver": _int(form.get("r_xver"), 0),
         "server_names": _split_lines(str(form.get("r_names") or "")) or ["www.cloudflare.com"],
-        "fingerprint": str(form.get("r_fp") or "chrome"),
+        "fingerprint": str(form.get("r_fp") or "chrome") if str(form.get("r_fp") or "chrome") in P.FINGERPRINTS else "chrome",
         "spider_x": str(form.get("r_spx") or "/"),
         "short_ids": short_ids,
         "private_key": str(form.get("r_priv") or "").strip(),

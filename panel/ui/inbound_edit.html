@@ -247,7 +247,14 @@
   <div class="row">
     <div><label class="f">SNI (serverName)</label><input name="tls_sni" value="{{ tls.server_name }}"></div>
     <div><label class="f">ALPN</label><input name="tls_alpn" value="{{ tls.alpn|join(',') }}"></div>
-    <div><label class="f">Fingerprint</label><select name="tls_fp">{% for f in P.FINGERPRINTS %}<option {% if f == tls.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
+    <div><label class="f">Отпечаток браузера (uTLS)</label>
+      <select name="tls_fp">
+        {% for f in P.FINGERPRINTS %}
+        <option value="{{ f }}" {% if f == (tls.fingerprint or 'chrome') %}selected{% endif %}>{{ P.FINGERPRINT_LABELS.get(f, f) }}</option>
+        {% endfor %}
+      </select>
+      <div class="hint">Попадает в ссылки как <code>fp=</code></div>
+    </div>
     <div><label class="f">Min TLS</label><select name="tls_min">{% for v in P.TLS_VERSIONS %}<option {% if v == (tls.min_version or '1.2') %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
     <div><label class="f">Max TLS</label><select name="tls_max">{% for v in P.TLS_VERSIONS %}<option {% if v == (tls.max_version or '1.3') %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
   </div>
@@ -276,9 +283,17 @@
   <div class="row">
     <div><label class="f">Dest (target)</label><input name="r_dest" id="r_dest" value="{{ r.dest }}"></div>
     <div><label class="f">Server names</label><input name="r_names" id="r_names" value="{{ r.server_names|join(',') }}"></div>
-    <div><label class="f">Fingerprint (uTLS)</label><select name="r_fp">{% for f in P.FINGERPRINTS %}<option {% if f == r.fingerprint %}selected{% endif %}>{{ f }}</option>{% endfor %}</select></div>
   </div>
   <div class="row">
+    <div style="flex:1.2">
+      <label class="f">Отпечаток браузера (uTLS)</label>
+      <select name="r_fp">
+        {% for f in P.FINGERPRINTS %}
+        <option value="{{ f }}" {% if f == (r.fingerprint or 'chrome') %}selected{% endif %}>{{ P.FINGERPRINT_LABELS.get(f, f) }}</option>
+        {% endfor %}
+      </select>
+      <div class="hint">Для Reality обычно <b>Chrome</b>. Пишется в ссылку как <code>fp=</code></div>
+    </div>
     <div><label class="f">Xver</label><input name="r_xver" type="number" min="0" max="2" value="{{ r.xver or 0 }}"></div>
     <div><label class="f">Max Time Diff (ms)</label><input name="r_max_diff" type="number" min="0" value="{{ r.max_time_diff or 0 }}"></div>
     <div>{{ m.check('r_show', r.show, 'Show (отладка)') }}</div>
