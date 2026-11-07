@@ -1269,6 +1269,49 @@ def _watchdog_cycle() -> None:
     _notify_events(events)
 
 
+OUTBOUND_PROBE_INTERVAL = int(os.environ.get("L2XPANEL_OB_PROBE_SEC", "300"))
+
+
+def _outbounds_probe_cycle() -> None:
+    """Ping enabled custom/node outbounds; status + subscription gate use last_test."""
+    store = _load_store()
+    tags = [o["tag"] for o in (store.get("outbounds_custom") or []) if o.get("enabled", True) and o.get("tag")]
+    if not tags:
+        return
+    results: dict[str, dict] = {}
+    for tag in tags:
+        try:
+            results[tag] = xray.test_outbound(store, tag)
+        except Exception as exc:  # noqa: BLE001
+            results[tag] = {"ok": False, "error": str(exc), "ms": 0}
+    now = xray.now_utc().isoformat()
+    with mutate() as st:
+        for o in st.get("outbounds_custom") or []:
+            tag = o.get("tag")
+            if tag not in results:
+                continue
+            r = results[tag]
+            o["last_test"] = {
+                "ok": bool(r.get("ok")),
+                "ms": int(r.get("ms") or 0),
+                "at": now,
+                "error": str(r.get("error") or "")[:300],
+            }
+
+
+def _outbounds_probe_loop() -> None:
+    # First pass after a short delay so startup apply finishes
+    if _stop.wait(90):
+        return
+    while True:
+        try:
+            _outbounds_probe_cycle()
+        except Exception:
+            pass
+        if _stop.wait(max(60, OUTBOUND_PROBE_INTERVAL)):
+            return
+
+
 def _watchdog_loop() -> None:
     while not _stop.wait(WATCHDOG_INTERVAL):
         try:
@@ -1730,7 +1773,7 @@ def _startup():
     _ensure_agent_sticky()
     _refresh_settings_cache()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
-                   _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop):
+                   _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -3590,11 +3633,20 @@ def outbounds_page(request: Request):
         tag = t_.get("outbound") or f"l2tp_{t_['name']}"
         rows.append({"tag": tag, "kind": "l2tp", "label": xray.outbound_label(store, tag), "enabled": True,
                      "status": t_.get("status"), "info": t_.get("public_ip") or t_.get("server_host")})
+    hide_unhealthy = xray.sub_health_settings(store)["hide_unhealthy"]
     for o in store["outbounds_custom"]:
-        rows.append({"tag": o["tag"], "kind": o.get("kind") or "custom", "label": xray.outbound_label(store, o["tag"]),
-                     "enabled": o.get("enabled", True), "status": "active" if o.get("enabled", True) else "disabled",
-                     "info": o.get("info") or (o.get("config") or {}).get("protocol"), "in_sub": o.get("in_sub", True),
-                     "custom": True, "last_test": o.get("last_test")})
+        status = xray.custom_outbound_status(o)
+        in_sub = bool(o.get("in_sub", True))
+        live = status == "connected" or not hide_unhealthy
+        rows.append({
+            "tag": o["tag"], "kind": o.get("kind") or "custom",
+            "label": xray.outbound_label(store, o["tag"]),
+            "enabled": o.get("enabled", True), "status": status,
+            "info": o.get("info") or (o.get("config") or {}).get("protocol"),
+            "in_sub": in_sub,
+            "sub_live": in_sub and live,
+            "custom": True, "last_test": o.get("last_test"),
+        })
     for r in rows:
         tr = ot.get(r["tag"]) or {}
         r["up"], r["down"] = int(tr.get("up") or 0), int(tr.get("down") or 0)

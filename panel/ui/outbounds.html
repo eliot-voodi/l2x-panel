@@ -64,7 +64,7 @@
     {% for o in items %}
       <tr>
         <td><b>{{ o.label }}</b><div class="dim small mono">{{ o.tag }}</div></td>
-        <td><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.in_sub %} <span class="badge" title="показывается в подписках">в подписке</span>{% endif %}</td>
+        <td><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.sub_live %} <span class="badge ok" title="доступен в подписках">в подписке</span>{% elif o.custom and o.in_sub %}<span class="badge" title="вкл. в подписку, но disconnected — скрыт">скрыт</span>{% endif %}</td>
         <td>{{ m.status_badge(o.status if o.status else 'active') }}</td>
         <td class="small mono">{{ o.info or '' }}</td>
         <td class="small nowrap">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</td>
@@ -106,7 +106,7 @@
         </button>
         <div class="ob-detail" hidden>
           <div class="kv">
-            <div><span class="lbl">Тип</span><span class="val"><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.in_sub %} · в подписке{% endif %}</span></div>
+            <div><span class="lbl">Тип</span><span class="val"><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.sub_live %} · в подписке{% elif o.custom and o.in_sub %} · скрыт (нет пинга){% endif %}</span></div>
             {% if o.info %}<div><span class="lbl">Инфо</span><span class="val mono">{{ o.info }}</span></div>{% endif %}
             <div><span class="lbl">Трафик</span><span class="val">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</span></div>
             <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
@@ -133,7 +133,7 @@
     {% endif %}
   </div>
 </div>
-<div class="hint">Свои outbounds можно выбрать у клиента, в правилах маршрутизации и в балансировщиках. Тест поднимает временный Xray и замеряет запрос к generate_204.</div>
+<div class="hint">Статус custom/node: <b>connected</b> только если outbound включён и последний пинг успешен; иначе <b>disconnected</b> — в подписку не попадает (если включено «скрывать unhealthy»). Тест поднимает временный Xray → generate_204; периодический probe обновляет статус сам.</div>
 
 <dialog id="dlg-add">
   <div class="card-head"><h3 id="ob-title">Новый outbound</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>

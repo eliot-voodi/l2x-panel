@@ -325,6 +325,20 @@ def sub_health_settings(store: dict) -> dict:
     }
 
 
+def custom_outbound_status(o: dict) -> str:
+    """Live status for a custom/node outbound: enabled + successful probe → connected."""
+    if not o.get("enabled", True):
+        return "disabled"
+    lt = o.get("last_test")
+    if isinstance(lt, dict) and lt.get("ok") is True:
+        return "connected"
+    return "disconnected"
+
+
+def custom_outbound_healthy(o: dict) -> bool:
+    return custom_outbound_status(o) == "connected"
+
+
 def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None) -> bool:
     """Whether an outbound/balancer tag may appear in a client subscription."""
     tag = str(tag or "").strip()
@@ -358,10 +372,8 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
             continue
         if not o.get("enabled", True) or not o.get("in_sub", True):
             return False
-        lt = o.get("last_test")
-        if isinstance(lt, dict) and lt.get("ok") is False:
-            return False
-        return True
+        # Must have a successful probe (enabled alone is not enough)
+        return custom_outbound_healthy(o)
 
     for b in ensure_balancers(store).values():
         if b.get("tag") != tag:
@@ -746,7 +758,7 @@ def selectable_outbound_tags(store: dict) -> list[dict]:
         out.append({"tag": tag, "label": outbound_label(store, tag), "kind": "l2tp", "status": t.get("status") or ""})
     for o in store.get("outbounds_custom") or []:
         out.append({"tag": o["tag"], "label": outbound_label(store, o["tag"]), "kind": "custom",
-                    "status": "enabled" if o.get("enabled", True) else "disabled"})
+                    "status": custom_outbound_status(o)})
     return out
 
 
@@ -767,6 +779,7 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
     for tag in tags:
         if not ignore_quota and not tag_allowed_for_client(client, tag):
             continue
+        # hide_unhealthy: requires enabled + successful ping (see outbound_ok_for_sub)
         if not outbound_ok_for_sub(store, tag):
             continue
         ident_uuid = P.identity_uuid(client["uuid"], tag)
