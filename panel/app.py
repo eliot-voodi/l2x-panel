@@ -989,6 +989,39 @@ def _tg_admin(text: str, *, flag: str = "notify_changes") -> None:
         pass
 
 
+def _tg_node_events(events: list[dict]) -> None:
+    """Notify admins about node online/offline/version (and similar) events."""
+    for e in events or []:
+        typ = e.get("type")
+        name = tgbot.escape(e.get("name") or "node")
+        domain = tgbot.escape(e.get("domain") or "")
+        suffix = f"\n<code>{domain}</code>" if domain else ""
+        if typ == "offline":
+            reason = tgbot.escape(e.get("reason") or "unreachable")
+            _tg_admin(
+                f"🔴 Нода <b>{name}</b> отключилась{suffix}\n{reason}",
+                flag="notify_nodes",
+            )
+        elif typ == "online":
+            ver = tgbot.escape(e.get("version") or "")
+            extra = f"\nv{ver}" if ver else ""
+            _tg_admin(
+                f"🟢 Нода <b>{name}</b> снова онлайн{suffix}{extra}",
+                flag="notify_nodes",
+            )
+        elif typ == "version":
+            _tg_admin(
+                f"📦 Нода <b>{name}</b>: версия {tgbot.escape(e.get('from') or '?')} → "
+                f"<b>{tgbot.escape(e.get('to') or '?')}</b>{suffix}",
+                flag="notify_nodes",
+            )
+        elif typ == "change":
+            _tg_admin(
+                f"🖥 Нода <b>{name}</b>: {tgbot.escape(e.get('detail') or 'изменение')}{suffix}",
+                flag="notify_nodes",
+            )
+
+
 def _notify_events(events: list[dict]) -> None:
     s = _bot_settings()
     for e in events:
@@ -4665,11 +4698,40 @@ NODES_JOB: dict[str, str] = {}
 NODES_SCHED_LOCK = threading.Lock()
 
 
+def _nodes_health_cycle() -> None:
+    """Probe all enabled nodes; persist reachability; Telegram on connect/disconnect/version."""
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        return
+    # Probe outside the lock (network I/O)
+    snapshot = [dict(n) for n in nodes_mod.ensure_list(store) if n.get("enabled", True)]
+    if not snapshot:
+        return
+    events = nodes_mod.probe_all_health(snapshot, timeout=5)
+    by_id = {n.get("id"): n for n in snapshot if n.get("id")}
+    with mutate() as st:
+        for n in nodes_mod.ensure_list(st):
+            src = by_id.get(n.get("id"))
+            if not src:
+                continue
+            for key in (
+                "online", "fail_streak", "last_seen", "last_probe",
+                "last_probe_error", "panel_version",
+            ):
+                if key in src:
+                    n[key] = src[key]
+    _tg_node_events(events)
+
+
 def _nodes_sync_loop() -> None:
-    """Periodic per-node sync according to each node's sync_interval_min."""
-    if _stop.wait(75):
+    """Periodic health probes + per-node sync according to sync_interval_min."""
+    if _stop.wait(45):
         return
     while True:
+        try:
+            _nodes_health_cycle()
+        except Exception:
+            pass
         try:
             store = _load_store()
             if nodes_mod.is_master(store):
@@ -4829,8 +4891,19 @@ async def settings_node_action(node_id: str, request: Request):
                         n["url"] = f"https://{new_host}"
                     break
         flash(request, msg if msg != f"{action}: ok" else f"Нода {node.get('name')}: {action} — ok", "info")
+        detail = msg if msg != f"{action}: ok" else action
+        _tg_admin(
+            f"🖥 Нода <b>{tgbot.escape(node.get('name') or node_id)}</b>: "
+            f"{tgbot.escape(detail)}",
+            flag="notify_nodes",
+        )
     else:
         flash(request, f"{node.get('name')}: {res.get('error') or 'ошибка'}", "error")
+        _tg_admin(
+            f"❌ Нода <b>{tgbot.escape(node.get('name') or node_id)}</b> / "
+            f"{tgbot.escape(action or '?')}: {tgbot.escape(res.get('error') or 'ошибка')}",
+            flag="notify_nodes",
+        )
     return go(f"/settings-node?id={node_id}&tab={tab}")
 
 
@@ -4873,6 +4946,10 @@ async def nodes_add(request: Request):
             nodes_mod.ensure_bridge(node)
         nodes_mod.ensure_list(store).append(node)
         nodes_mod.upsert_node_outbound(store, node)
+    _tg_admin(
+        f"➕ Нода <b>{tgbot.escape(name)}</b> добавлена\n<code>{tgbot.escape(host or url)}</code>",
+        flag="notify_nodes",
+    )
     flash(request, f"Нода {name} добавлена", "info")
     return go("/nodes")
 
@@ -4959,6 +5036,7 @@ def _node_push_job(node_id: str, label: str, host: str):
         payload = nodes_mod.build_payload(store, node, xray.build_config)
         node_snap = dict(node)
         name = node.get("name") or node_id
+        prev_ok = bool(node.get("last_ok"))
         doh_on = bool((store.get("settings") or {}).get("doh", {}).get("enabled"))
         is_mirror = bool(node.get("mirror"))
     # Network I/O must not hold mutate()/STORE_LOCK
@@ -4972,6 +5050,12 @@ def _node_push_job(node_id: str, label: str, host: str):
         )
         if not node_snap.get("last_warning"):
             node_snap["last_warning"] = "; ".join(warns)[:600]
+    # Reachability from successful sync
+    reach_events: list[dict] = []
+    if res.get("ok"):
+        reach_events = nodes_mod.apply_health_probe(node_snap, {
+            "ok": True, "version": node_snap.get("panel_version") or "",
+        })
     with mutate() as store:
         for n in nodes_mod.ensure_list(store):
             if n.get("id") != node_id:
@@ -4982,6 +5066,9 @@ def _node_push_job(node_id: str, label: str, host: str):
             n["last_warning"] = node_snap.get("last_warning") or ("; ".join(warns)[:600] if warns else "")
             if node_snap.get("panel_version"):
                 n["panel_version"] = node_snap["panel_version"]
+            for key in ("online", "fail_streak", "last_seen", "last_probe", "last_probe_error"):
+                if key in node_snap:
+                    n[key] = node_snap[key]
             break
         webhooks.fire(store["settings"], "node.sync", {
             "node": name, "ok": res.get("ok"), "error": res.get("error"),
@@ -4993,8 +5080,9 @@ def _node_push_job(node_id: str, label: str, host: str):
         log += "\n⚠ " + " | ".join(warns)
     if not xr.get("ok"):
         log += f"\nxray: {xr.get('error') or 'fail'}"
-    # Telegram: always report failures/warnings; successes only for manual sync (not schedule)
+    # Telegram: failures/warnings always; success when manual OR recovered after fail
     is_sched = "schedule" in (label or "").lower()
+    recovered = bool(res.get("ok")) and not prev_ok
     if not res.get("ok"):
         _tg_admin(
             f"❌ Sync <b>{tgbot.escape(name)}</b>: {tgbot.escape(res.get('error') or 'fail')}\n"
@@ -5007,11 +5095,13 @@ def _node_push_job(node_id: str, label: str, host: str):
             + "\n".join(f"• {tgbot.escape(w)}" for w in warns),
             flag="notify_nodes",
         )
-    elif not is_sched:
+    elif not is_sched or recovered:
+        mark = "восстановлен · " if recovered and is_sched else ""
         _tg_admin(
-            f"✅ Sync <b>{tgbot.escape(name)}</b>: OK ({tgbot.escape(label)})",
+            f"✅ Sync <b>{tgbot.escape(name)}</b>: {mark}OK ({tgbot.escape(label)})",
             flag="notify_nodes",
         )
+    _tg_node_events(reach_events)
     return {
         "ok": bool(res.get("ok")), "log": log,
         "error": "" if res.get("ok") else (res.get("error") or "push failed"),
@@ -5054,6 +5144,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 mins = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
                 node["sync_interval_min"] = mins
                 label = nodes_mod.sync_interval_label(mins)
+                _tg_admin(
+                    f"⏱ Нода <b>{tgbot.escape(node['name'])}</b>: расписание sync — {tgbot.escape(label)}",
+                    flag="notify_nodes",
+                )
                 flash(request, f"{node['name']}: расписание sync — {label}", "info")
             else:
                 new_tok = str(form.get("token") or "").strip()
@@ -5061,6 +5155,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     flash(request, "Token слишком короткий", "error")
                     return go("/nodes")
                 node["token"] = new_tok
+                _tg_admin(
+                    f"🔑 Нода <b>{tgbot.escape(node['name'])}</b>: token обновлён",
+                    flag="notify_nodes",
+                )
                 flash(request, f"{node['name']}: token обновлён — нажмите Sync", "info")
         if action == "delete":
             _apply_xray(_load_store())
@@ -5099,6 +5197,11 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 label = "sync"
             nodes_mod.upsert_node_outbound(store, node)
             name = node["name"]
+            if action in ("outbound", "mirror"):
+                _tg_admin(
+                    f"🖥 Нода <b>{tgbot.escape(name)}</b>: {tgbot.escape(label)}",
+                    flag="notify_nodes",
+                )
             running = NODES_JOB.get("id")
             if running and ops.JOBS.get(running, {}).get("status") == "running":
                 flash(request, "Уже идёт операция с нодами — флаг сохранён, Sync позже", "info")
@@ -5171,6 +5274,19 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 log = (log + f"\nbefore: {before}").strip()
             if ver:
                 log = (log + f"\nversion: {ver}").strip()
+            if res.get("ok"):
+                ver_s = f" → v{tgbot.escape(ver)}" if ver else ""
+                before_s = f" (было v{tgbot.escape(before)})" if before and before != ver else ""
+                _tg_admin(
+                    f"⬆️ Нода <b>{tgbot.escape(name)}</b>: обновление OK{ver_s}{before_s}",
+                    flag="notify_nodes",
+                )
+            else:
+                _tg_admin(
+                    f"❌ Нода <b>{tgbot.escape(name)}</b>: обновление — "
+                    f"{tgbot.escape(res.get('error') or 'fail')}",
+                    flag="notify_nodes",
+                )
             return {
                 "ok": bool(res.get("ok")),
                 "log": log or ("" if res.get("ok") else res.get("error") or "update failed"),
@@ -5179,6 +5295,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
 
         NODES_JOB["id"] = ops.start_job(f"node-update-{name}", job)
         via = "SSH" if ssh_password else "agent API"
+        _tg_admin(
+            f"⬆️ Обновление ноды <b>{tgbot.escape(name)}</b> запущено ({via})",
+            flag="notify_nodes",
+        )
         flash(request, f"Обновление ноды {name} запущено ({via}). Смотрите фоновые задачи.", "info")
         return go("/nodes")
 
@@ -5357,10 +5477,19 @@ def nodes_sync_all(request: Request):
                 webhooks.fire(store["settings"], "node.sync", {"node": name, "ok": res.get("ok")})
         with mutate() as store:
             _apply_xray(store)
-        return {"ok": fail == 0, "log": f"OK {ok}, ошибок {fail}\n" + "\n".join(logs),
+        summary = f"OK {ok}, ошибок {fail}"
+        if fail:
+            _tg_admin(
+                f"❌ Sync all: {summary}\n" + "\n".join(tgbot.escape(x) for x in logs[:12]),
+                flag="notify_nodes",
+            )
+        else:
+            _tg_admin(f"✅ Sync all: {summary}", flag="notify_nodes")
+        return {"ok": fail == 0, "log": f"{summary}\n" + "\n".join(logs),
                 "error": "" if fail == 0 else f"{fail} failed"}
 
     NODES_JOB["id"] = ops.start_job("nodes-sync-all", job)
+    _tg_admin("🔄 Sync all нод запущен", flag="notify_nodes")
     flash(request, "Синхронизация всех нод запущена в фоне", "info")
     return go("/nodes")
 

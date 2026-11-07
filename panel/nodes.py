@@ -50,6 +50,12 @@ def ensure_list(store: dict) -> list[dict]:
         # Auto-sync interval in minutes; 0 = disabled
         n.setdefault("sync_interval_min", 0)
         n.setdefault("role", "agent")  # on master registry entries are always agents
+        # Reachability (master health probes) — online is None until first probe baseline
+        n.setdefault("online", None)
+        n.setdefault("fail_streak", 0)
+        n.setdefault("last_seen", "")
+        n.setdefault("last_probe", "")
+        n.setdefault("last_probe_error", "")
     return nodes
 
 
@@ -501,7 +507,7 @@ def health_url(node: dict) -> str:
 
 
 def probe_health(node: dict, timeout: int = 8) -> dict:
-    """Fetch node /health and store panel_version on the registry entry."""
+    """Fetch node /health (does not mutate reachability fields — use apply_health_probe)."""
     url = health_url(node)
     if not url:
         return {"ok": False, "error": "no url"}
@@ -516,6 +522,80 @@ def probe_health(node: dict, timeout: int = 8) -> dict:
             return {"ok": True, "version": ver, "raw": data}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+OFFLINE_FAIL_STREAK = 2  # consecutive probe fails before marking offline
+
+
+def apply_health_probe(node: dict, probe: dict) -> list[dict]:
+    """Update online/last_seen from a probe result.
+
+    Returns Telegram-worthy events:
+      {type: online|offline|version, name, ...}
+    First successful/failed baseline (online is None) is silent — no spam on master restart.
+    """
+    events: list[dict] = []
+    name = str(node.get("name") or node.get("domain") or node.get("id") or "node")
+    ok = bool(probe.get("ok"))
+    prev = node.get("online")  # True / False / None
+    old_ver = str(node.get("panel_version") or "")
+    new_ver = str(probe.get("version") or "").strip()
+    node["last_probe"] = now_iso()
+
+    if ok:
+        node["fail_streak"] = 0
+        node["last_seen"] = node["last_probe"]
+        node["last_probe_error"] = ""
+        if new_ver:
+            if old_ver and new_ver != old_ver and prev is not None:
+                events.append({
+                    "type": "version", "name": name, "from": old_ver, "to": new_ver,
+                    "domain": node.get("domain") or "",
+                })
+            node["panel_version"] = new_ver
+        if prev is False:
+            node["online"] = True
+            events.append({
+                "type": "online", "name": name,
+                "version": node.get("panel_version") or "",
+                "domain": node.get("domain") or "",
+            })
+        else:
+            node["online"] = True
+        return events
+
+    err = str(probe.get("error") or "unreachable")[:300]
+    node["fail_streak"] = int(node.get("fail_streak") or 0) + 1
+    node["last_probe_error"] = err
+    if int(node["fail_streak"]) >= OFFLINE_FAIL_STREAK:
+        if prev is True:
+            node["online"] = False
+            events.append({
+                "type": "offline", "name": name, "reason": err,
+                "domain": node.get("domain") or "",
+            })
+        elif prev is None:
+            # Baseline: known offline, no notify
+            node["online"] = False
+        else:
+            node["online"] = False
+    return events
+
+
+def probe_all_health(nodes: list[dict], *, timeout: int = 5) -> list[dict]:
+    """Probe enabled nodes; mutate each in place; return combined events."""
+    events: list[dict] = []
+    for n in nodes or []:
+        if not n.get("enabled", True):
+            continue
+        if not (n.get("url") or n.get("domain")):
+            continue
+        try:
+            probe = probe_health(n, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            probe = {"ok": False, "error": str(exc)}
+        events.extend(apply_health_probe(n, probe))
+    return events
 
 
 def trigger_update(node: dict, timeout: int = 45) -> dict:

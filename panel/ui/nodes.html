@@ -89,7 +89,15 @@
         <td class="small mono">{% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn" title="мастер {{ master_version }}"{% endif %}>{{ n.panel_version }}</span>{% else %}<span class="dim">?</span>{% endif %}{% if n.last_update %}<div class="dim">{{ fmt_dt(n.last_update) }}</div>{% endif %}</td>
         <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
         <td>{% if n.mirror %}<span class="badge ok" title="Полная копия мастера для быстрого failover">standby</span>{% else %}<span class="dim">—</span>{% endif %}</td>
-        <td>{% if not n.enabled %}<span class="badge">выкл</span>{% elif n.last_ok and n.last_warning %}<span class="badge warn" title="{{ n.last_warning }}">warn</span>{% elif n.last_ok %}<span class="badge ok">ok</span>{% elif n.last_error %}<span class="badge err" title="{{ n.last_error }}">ошибка</span>{% else %}<span class="badge">—</span>{% endif %}</td>
+        <td>
+          {% if not n.enabled %}<span class="badge">выкл</span>
+          {% elif n.online == true %}<span class="badge ok" title="{{ n.last_seen or '' }}">online</span>
+          {% elif n.online == false %}<span class="badge err" title="{{ n.last_probe_error or '' }}">offline</span>
+          {% else %}<span class="badge">?</span>{% endif %}
+          {% if n.enabled and n.last_ok and n.last_warning %}<div class="badge warn" title="{{ n.last_warning }}">warn</div>
+          {% elif n.enabled and n.last_ok %}<div class="badge ok">sync ok</div>
+          {% elif n.enabled and n.last_error %}<div class="badge err" title="{{ n.last_error }}">sync err</div>{% endif %}
+        </td>
         <td class="small">
           <div class="dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}</div>
           {% if n.last_error %}<div class="badge err" title="{{ n.last_error }}">{{ n.last_error[:80] }}</div>{% endif %}
@@ -151,10 +159,11 @@
             <span class="dim small mono">{{ n.domain or n.url }}</span>
           </span>
           {% if not n.enabled %}<span class="badge">выкл</span>
-          {% elif n.last_ok and n.last_warning %}<span class="badge warn">warn</span>
+          {% elif n.online == true %}<span class="badge ok">online</span>
+          {% elif n.online == false %}<span class="badge err">offline</span>
           {% elif n.last_ok %}<span class="badge ok">ok</span>
           {% elif n.last_error %}<span class="badge err">ошибка</span>
-          {% else %}<span class="badge">—</span>{% endif %}
+          {% else %}<span class="badge">?</span>{% endif %}
           <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
         </button>
         <div class="nd-detail" hidden>
