@@ -32,6 +32,9 @@ SOURCE_LABELS = {
     "remnawave": "Remnawave",
 }
 
+# Filled by fetch/parse when source exposes sub path/port (3x-ui settings).
+LAST_SOURCE_META: dict[str, Any] = {}
+
 
 @dataclass
 class NormalizedUser:
@@ -374,6 +377,56 @@ def parse_3xui_json(raw: bytes | str) -> list[NormalizedUser]:
     return out
 
 
+def read_3xui_sub_meta(path: Path | str) -> dict[str, Any]:
+    """Read subPath / subPort from a 3x-ui SQLite backup (settings table)."""
+    meta: dict[str, Any] = {"path": "", "port": 0}
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            rows = conn.execute("SELECT key, value FROM settings")
+        except sqlite3.Error:
+            try:
+                rows = conn.execute('SELECT "key", value FROM settings')
+            except sqlite3.Error:
+                return meta
+        kv = {}
+        for row in rows:
+            try:
+                kv[str(row["key"])] = row["value"]
+            except (KeyError, IndexError):
+                keys = list(row.keys())
+                if len(keys) >= 2:
+                    kv[str(row[keys[0]])] = row[keys[1]]
+        for k in ("subPath", "sub_path"):
+            if kv.get(k):
+                raw = str(kv[k]).strip().strip("/")
+                meta["path"] = re.sub(r"[^A-Za-z0-9_-]", "", raw.split("/")[0])
+                if meta["path"]:
+                    break
+        if not meta["path"]:
+            for k in ("subURI", "subUri", "sub_uri"):
+                if not kv.get(k):
+                    continue
+                raw = str(kv[k]).strip()
+                parts = [p for p in urlsplit(raw).path.split("/") if p] if "://" in raw else [p for p in raw.split("/") if p]
+                if parts:
+                    meta["path"] = re.sub(r"[^A-Za-z0-9_-]", "", parts[0])
+                if meta["path"]:
+                    break
+        for k in ("subPort", "sub_port"):
+            if kv.get(k) not in (None, ""):
+                try:
+                    meta["port"] = int(kv[k])
+                except (TypeError, ValueError):
+                    pass
+                if meta["port"]:
+                    break
+    finally:
+        conn.close()
+    return meta
+
+
 def parse_3xui_sqlite(path: Path | str) -> list[NormalizedUser]:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -501,7 +554,12 @@ def fetch_3xui_api(
                     tmp.write(raw)
                     tmp_path = Path(tmp.name)
                 try:
-                    return parse_3xui_sqlite(tmp_path)
+                    users = parse_3xui_sqlite(tmp_path)
+                    meta = read_3xui_sub_meta(tmp_path)
+                    # stash on first user.extra for caller; also return via module last_meta
+                    global LAST_SOURCE_META
+                    LAST_SOURCE_META = {"source": "3xui", **meta}
+                    return users
                 finally:
                     tmp_path.unlink(missing_ok=True)
             # Sometimes wrapped — ignore
@@ -978,6 +1036,8 @@ def fetch_remnawave_api(
 # ---------------------------------------------------------------- dispatch
 
 def parse_backup(source: str, raw: bytes, filename: str = "") -> list[NormalizedUser]:
+    global LAST_SOURCE_META
+    LAST_SOURCE_META = {}
     src = (source or "").lower().strip()
     name = (filename or "").lower()
     if src == "3xui":
@@ -986,7 +1046,10 @@ def parse_backup(source: str, raw: bytes, filename: str = "") -> list[Normalized
                 tmp.write(raw)
                 path = Path(tmp.name)
             try:
-                return parse_3xui_sqlite(path)
+                users = parse_3xui_sqlite(path)
+                meta = read_3xui_sub_meta(path)
+                LAST_SOURCE_META = {"source": "3xui", **meta}
+                return users
             finally:
                 path.unlink(missing_ok=True)
         return parse_3xui_json(raw)
@@ -1012,6 +1075,8 @@ def fetch_api(
     insecure: bool = False,
     web_base: str = "",
 ) -> list[NormalizedUser]:
+    global LAST_SOURCE_META
+    LAST_SOURCE_META = {}
     src = (source or "").lower().strip()
     if src == "3xui":
         if not username or not password:

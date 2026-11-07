@@ -50,7 +50,20 @@
     <div style="max-width:160px"><label class="f">Путь</label><input name="path" value="{{ sb.path }}" placeholder="sub"></div>
   </div>
   <label class="f">Объявление (announce)</label><input name="announce" value="{{ sb.announce }}">
-  <div class="hint">Ссылки подписки: <code>https://{{ public_host or 'домен' }}/{{ sb.path or 'sub' }}/&lt;token&gt;</code> — только порт 443, отдельный listener не используется. Форматы: base64, <code>?format=plain|json|clash|singbox|html</code>.</div>
+  <div class="hint">Канонические ссылки: <code>https://{{ public_host or 'домен' }}/{{ sb.path or 'sub' }}/&lt;token&gt;</code> (:443). Форматы: base64, <code>?format=plain|json|clash|singbox|html</code>.</div>
+
+  <h3 class="mt">Совместимость старых ссылок (3x-ui и др.)</h3>
+  <div class="hint">Токен клиента при миграции сохраняется. Если в старой панели путь был не <code>/sub/</code> (например <code>/zdgdjmy3kho5i6qg/</code>) и/или порт <code>2096</code> — укажите их здесь, чтобы старые URL продолжили открываться без смены у пользователей.</div>
+  <label class="f">Доп. пути подписки (по одному в строке)</label>
+  <textarea name="path_aliases" class="mono" rows="2" placeholder="zdgdjmy3kho5i6qg">{% for a in (sb.path_aliases or []) %}{{ a }}
+{% endfor %}</textarea>
+  <div class="row">
+    <div style="max-width:280px">
+      <label class="f">Доп. HTTP-порты (через запятую)</label>
+      <input name="legacy_ports" value="{{ (sb.legacy_ports or [])|join(', ') }}" placeholder="2096">
+    </div>
+  </div>
+  <div class="hint">nginx слушает эти порты <b>без TLS</b> (как 3x-ui sub) и отдаёт те же подписки. iptables не блокирует их. Нельзя завернуть 2096→443 через REDIRECT: на 443 — TLS stream.</div>
 
   <h3 class="mt">Здоровье outbound в подписке</h3>
   {{ m.check('hide_unhealthy', sb.hide_unhealthy if sb.hide_unhealthy is defined else true, 'Скрывать disconnected / high-loss outbound из подписки') }}

@@ -130,6 +130,10 @@ def default_settings() -> dict:
         },
         "sub": {
             "enabled": True, "server_enabled": False, "listen": "0.0.0.0", "port": 2096, "path": "sub",
+            # Extra URI prefixes that also serve subscriptions (e.g. old 3x-ui subPath)
+            "path_aliases": [],
+            # Extra HTTP ports nginx listens on for old clients (e.g. 2096); not TLS :443
+            "legacy_ports": [],
             "domain": "", "cert_file": "", "key_file": "", "update_hours": 1, "title": "",
             "support_url": "", "announce": "", "show_page": True,
             "json_fragment": "", "json_noise": "", "json_mux": "",
@@ -413,6 +417,10 @@ class BasePathMiddleware:
     def _public(self, path: str) -> bool:
         if path.startswith(self.PUBLIC):
             return True
+        # Subscription path aliases (old 3x-ui subPath etc.)
+        for sp in front.sub_uri_paths({"settings": SETTINGS_CACHE} if SETTINGS_CACHE else None):
+            if path == f"/{sp}" or path.startswith(f"/{sp}/"):
+                return True
         # DoH is always outside the secret base path (nginx → panel)
         prefix = doh_mod.normalize_prefix(
             str((SETTINGS_CACHE.get("doh") or {}).get("path_prefix") or "doh")
@@ -1875,6 +1883,16 @@ def sub_remnawave_alias(token: str, request: Request, client_type: str = ""):
     return _sub_response(request, token)
 
 
+@app.get("/{path}/{token}")
+def sub_path_alias(path: str, token: str, request: Request):
+    """Serve subscriptions under primary path and configured aliases (old 3x-ui subPath)."""
+    allowed = set(front.sub_uri_paths({"settings": SETTINGS_CACHE} if SETTINGS_CACHE else None))
+    # Never steal reserved first segments
+    if path in BASE_PATH_RESERVED or path not in allowed:
+        return PlainTextResponse("not found", status_code=404)
+    return _sub_response(request, token)
+
+
 @app.post("/sub/{token}/tg/link")
 def sub_tg_link(token: str, request: Request):
     """Start Telegram bind: create one-time token and redirect to t.me/bot?start=bind_…"""
@@ -2691,6 +2709,9 @@ def _migrate_page(request: Request, *, preview=None, report=None, **form_kw):
         insecure=bool(form_kw.get("insecure")),
         update_existing=bool(form_kw.get("update_existing")),
         selected_inbounds=form_kw.get("selected_inbounds"),
+        legacy_path=form_kw.get("legacy_path") or "",
+        legacy_port=form_kw.get("legacy_port") or "",
+        apply_legacy=bool(form_kw.get("apply_legacy")),
     )
 
 
@@ -2717,10 +2738,15 @@ async def clients_migrate_run(request: Request):
     insecure = form.get("insecure") == "1"
     update_existing = form.get("update_existing") == "1"
     selected = [str(x) for x in form.getlist("inbounds")]
+    legacy_path = re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("legacy_path") or ""))
+    legacy_port = _int(form.get("legacy_port"), 0)
+    apply_legacy = form.get("apply_legacy") == "1"
     form_kw = {
         "source": source, "mode": mode, "url": url, "username": username,
         "web_base": web_base, "insecure": insecure, "update_existing": update_existing,
         "selected_inbounds": selected,
+        "legacy_path": legacy_path, "legacy_port": legacy_port or "",
+        "apply_legacy": apply_legacy,
     }
 
     users: list = []
@@ -2755,6 +2781,15 @@ async def clients_migrate_run(request: Request):
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
 
+    # Auto-fill path/port from 3x-ui backup settings when empty
+    meta = migrate_mod.LAST_SOURCE_META or {}
+    if not legacy_path and meta.get("path"):
+        legacy_path = re.sub(r"[^A-Za-z0-9_-]", "", str(meta["path"]))
+        form_kw["legacy_path"] = legacy_path
+    if not legacy_port and meta.get("port"):
+        legacy_port = int(meta["port"])
+        form_kw["legacy_port"] = legacy_port
+
     if err:
         flash(request, err, "error")
         return _migrate_page(request, **form_kw)
@@ -2766,19 +2801,39 @@ async def clients_migrate_run(request: Request):
     store = _load_store()
     if action != "import":
         prev = migrate_mod.preview(store, users)
-        flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}", "info")
+        hint = ""
+        if legacy_path or legacy_port:
+            hint = f" · старый path/port: /{legacy_path or '?'} :{legacy_port or '?'}"
+        flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         return _migrate_page(request, preview=prev, **form_kw)
 
     with mutate() as st:
         report = migrate_mod.apply(st, users, selected, update_existing=update_existing)
+        if apply_legacy and (legacy_path or legacy_port):
+            sub = st["settings"].setdefault("sub", {})
+            if legacy_path:
+                aliases = list(sub.get("path_aliases") or [])
+                primary = (sub.get("path") or "sub").strip()
+                if legacy_path != primary and legacy_path not in aliases:
+                    aliases.append(legacy_path)
+                sub["path_aliases"] = aliases
+            if legacy_port and 1 <= legacy_port <= 65535 and legacy_port not in (80, 443):
+                ports = list(sub.get("legacy_ports") or [])
+                if legacy_port not in ports:
+                    ports.append(legacy_port)
+                sub["legacy_ports"] = ports
+            report["legacy"] = {"path": legacy_path, "port": legacy_port}
     result = _apply_xray(_load_store())
     _tg_change(
         f"📦 Миграция <b>{migrate_mod.SOURCE_LABELS.get(source, source)}</b>: "
         f"создано {report.get('created', 0)}, обновлено {report.get('updated', 0)}, "
         f"пропуск {report.get('skipped', 0)}",
     )
+    extra = ""
+    if report.get("legacy"):
+        extra = f" · legacy /{report['legacy'].get('path')}:{report['legacy'].get('port')}"
     flash(request, *_ok_msg(
-        f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}",
+        f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}{extra}",
         result,
     ))
     return _migrate_page(request, report=report, **form_kw)
@@ -4664,10 +4719,25 @@ async def settings_save(request: Request):
             s["sub"]["server_enabled"] = False
         elif section == "sub":
             sub = s["sub"]
+            primary = re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("path") or "sub")) or "sub"
+            aliases = []
+            for line in _split_lines(str(form.get("path_aliases") or "")):
+                a = re.sub(r"[^A-Za-z0-9_-]", "", line)
+                if a and a != primary and a not in aliases and a.lower() not in BASE_PATH_RESERVED:
+                    aliases.append(a)
+            leg_ports: list[int] = []
+            for part in re.split(r"[\s,;]+", str(form.get("legacy_ports") or "")):
+                if not part.strip():
+                    continue
+                pnum = _int(part, 0)
+                if 1 <= pnum <= 65535 and pnum not in (80, 443) and pnum not in leg_ports:
+                    leg_ports.append(pnum)
             sub.update({
                 "enabled": form.get("enabled") == "1", "server_enabled": False,
                 "listen": "127.0.0.1", "port": 2096,
-                "path": re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("path") or "sub")) or "sub",
+                "path": primary,
+                "path_aliases": aliases,
+                "legacy_ports": leg_ports,
                 "domain": front.public_domain({"settings": s}) or front.normalize_host(str(form.get("domain") or "")),
                 "cert_file": "", "key_file": "", "update_hours": _int(form.get("update_hours"), 1),
                 "title": str(form.get("title") or ""), "support_url": str(form.get("support_url") or ""),
@@ -4738,8 +4808,11 @@ async def settings_save(request: Request):
         # Force restart so token/enabled/admin_ids take effect immediately
         BOT.restart()
     _tg_change(f"⚙️ Настройки: секция <b>{tgbot.escape(section)}</b> сохранена")
-    if section == "panel":
-        flash(request, *_ok_msg("Настройки сохранены, HTTPS :443 обновлён", _apply_xray(_load_store())))
+    if section in ("panel", "sub"):
+        flash(request, *_ok_msg(
+            "Настройки сохранены, nginx/front обновлён" if section == "sub" else "Настройки сохранены, HTTPS :443 обновлён",
+            _apply_xray(_load_store()),
+        ))
     else:
         flash(request, "Настройки сохранены", "info")
     return go(f"/settings?tab={section}")

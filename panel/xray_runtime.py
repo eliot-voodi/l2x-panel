@@ -1226,9 +1226,16 @@ PORTBAN_CHAIN = "L2X_PORTBAN"
 
 
 def ban_inbound_ports(store: dict) -> None:
-    """Drop incoming non-loopback traffic to every inbound port: clients reach Xray only via nginx :443."""
-    # 2096/2053 — legacy dedicated listeners; never expose them (subs/panel live on :443)
-    ports = sorted(({int(ib["port"]) for ib in ensure_inbounds(store)} | {2096, 2053}) - P.RESERVED_PORTS)
+    """Drop incoming non-loopback traffic to every inbound port: clients reach Xray only via nginx :443.
+
+    Ports listed in settings.sub.legacy_ports (e.g. 2096 for old 3x-ui subscription links)
+    stay open so nginx can serve plain-HTTP subscription aliases there.
+    """
+    import front as front_mod
+    keep = set(front_mod.legacy_sub_ports(store))
+    # 2053 always banned; 2096 banned only when not declared as a legacy sub port
+    forced = {2053} | ({2096} - keep)
+    ports = sorted(({int(ib["port"]) for ib in ensure_inbounds(store)} | forced) - P.RESERVED_PORTS - keep)
     for tool in ("iptables", "ip6tables"):
         if not shutil.which(tool):
             continue
@@ -1245,6 +1252,10 @@ def ban_inbound_ports(store: dict) -> None:
         while _run([tool, "-D", "INPUT", "-j", PORTBAN_CHAIN])["exit_code"] == 0:
             pass
         _run([tool, "-I", "INPUT", "1", "-j", PORTBAN_CHAIN])
+        # Explicitly allow legacy subscription ports (nginx HTTP listeners)
+        for port in sorted(keep):
+            if _run([tool, "-C", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"])["exit_code"] != 0:
+                _run([tool, "-I", "INPUT", "1", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"])
 
 
 def xray_status() -> dict:

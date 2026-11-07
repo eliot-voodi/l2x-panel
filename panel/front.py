@@ -38,6 +38,37 @@ HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-
 PATH_RE = re.compile(r"^/[A-Za-z0-9/_.~-]*$")
 
 
+def _clean_sub_segment(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(value or "")).strip("_-")
+
+
+def sub_uri_paths(store: dict | None = None) -> list[str]:
+    """Primary subscription path + aliases (e.g. old 3x-ui subPath)."""
+    sub = (((store or {}).get("settings") or {}).get("sub") or {})
+    out: list[str] = []
+    for raw in [sub.get("path") or "sub", *(sub.get("path_aliases") or [])]:
+        p = _clean_sub_segment(raw)
+        if p and p not in out and p.lower() not in ("api", "panel", "health", "static", "login"):
+            out.append(p)
+    if "sub" not in out:
+        out.append("sub")
+    return out
+
+
+def legacy_sub_ports(store: dict | None = None) -> list[int]:
+    """Extra HTTP ports nginx should listen on for old panel subscription URLs (e.g. 2096)."""
+    sub = (((store or {}).get("settings") or {}).get("sub") or {})
+    ports: list[int] = []
+    for raw in sub.get("legacy_ports") or []:
+        try:
+            p = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= p <= 65535 and p not in (80, 443, P.FRONT_PORT, P.FRONT_INTERNAL_PORT) and p not in ports:
+            ports.append(p)
+    return ports
+
+
 def _run(cmd: list[str], timeout: int = 60) -> dict:
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -108,6 +139,8 @@ def plan(store: dict) -> dict:
         str((((store.get("settings") or {}).get("doh") or {}).get("path_prefix") or "doh")),
     ).strip("_-") or "doh"
     reserved_paths = {"/sub/", "/api/sub/", "/panel/", "/health", "/.well-known/", f"/{doh_prefix}/"}
+    for sp in sub_uri_paths(store):
+        reserved_paths.add(f"/{sp}/")
     if base:
         reserved_paths.add(f"/{base}/")
 
@@ -247,7 +280,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         "        default_type text/plain;\n"
         "        try_files $uri =404;\n"
         "    }",
-        f"    location ^~ /sub/ {{\n{proxy}    }}",
+        *[f"    location ^~ /{sp}/ {{\n{proxy}    }}" for sp in sub_uri_paths(store)],
         f"    location ^~ /api/sub/ {{\n{proxy}    }}",
         doh_loc,
         f"    location ^~ /panel/api/ {{\n{proxy}    }}",
@@ -318,6 +351,37 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         else:
             body.append("    location / {\n        return 404;\n    }")
         blocks.append("server {\n" + "\n".join(body) + "\n}")
+    # Legacy subscription ports (HTTP): 3x-ui style http://host:2096/<path>/<token>
+    # Cannot iptables-REDIRECT to :443 (TLS stream) — dedicated plain-HTTP listeners.
+    leg_ports = legacy_sub_ports(store)
+    if leg_ports and pub:
+        common = (
+            "        proxy_http_version 1.1;\n"
+            "        proxy_set_header Host $host;\n"
+            "        proxy_set_header X-Real-IP $remote_addr;\n"
+            "        proxy_set_header X-Forwarded-For $remote_addr;\n"
+            "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+            "        proxy_read_timeout 300s;\n"
+            "        client_max_body_size 16m;\n"
+        )
+        proxy = f"        proxy_pass http://{PANEL_UPSTREAM};\n{common}"
+        sub_locs = "\n".join(
+            f"    location ^~ /{sp}/ {{\n{proxy}    }}" for sp in sub_uri_paths(store)
+        )
+        sub_locs += f"\n    location ^~ /api/sub/ {{\n{proxy}    }}"
+        for port in leg_ports:
+            listen_lines = f"    listen {port};\n"
+            if _ipv6():
+                listen_lines += f"    listen [::]:{port};\n"
+            blocks.append(
+                "server {\n"
+                f"{listen_lines}"
+                f"    server_name {pub} _;\n"
+                "    server_tokens off;\n"
+                f"{sub_locs}\n"
+                "    location / { return 404; }\n"
+                "}"
+            )
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
 
 

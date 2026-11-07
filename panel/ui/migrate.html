@@ -14,8 +14,12 @@
   <h3>Что переносится</h3>
   <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит, срок, уже потраченный трафик.
   Inbounds/ноды чужих панелей не импортируются — клиенты вешаются на выбранные L2X inbounds.</div>
-  <div class="hint" style="margin-top:.5rem">Чтобы старые ссылки продолжили работать: направьте DNS старого sub-домена на этот сервер.
-  Remnawave: также доступен путь <code>/api/sub/&lt;token&gt;</code>.</div>
+  <div class="hint" style="margin-top:.5rem">
+    Токен клиента (последний сегмент URL) сохраняется. Если в 3x-ui ссылка была вида
+    <code>http://host:2096/&lt;path&gt;/&lt;token&gt;</code>, а здесь стало
+    <code>https://host/sub/&lt;token&gt;</code> — это не другой ключ: отличаются <b>путь</b> и <b>порт</b>.
+    Ниже можно включить совместимость (alias пути + nginx на :2096). Remnawave: <code>/api/sub/&lt;token&gt;</code>.
+  </div>
 </div>
 
 <form method="post" action="{{ bp }}/clients/migrate" enctype="multipart/form-data" class="card">
@@ -83,6 +87,19 @@
   <div style="margin-top:.8rem">
     {{ m.check('update_existing', update_existing, 'Обновить существующих (трафик / sub_token / лимиты) — иначе пропуск') }}
   </div>
+
+  <h3 style="margin-top:1.4rem">Старые ссылки (путь / порт)</h3>
+  <div class="hint">Для 3x-ui: из ссылки <code>http://…:2096/zdgdjmy3kho5i6qg/oyyse3e3oy3tu9bf</code> путь =
+    <code>zdgdjmy3kho5i6qg</code>, порт = <code>2096</code>, токен = <code>oyyse3e3oy3tu9bf</code> (уже в клиенте).</div>
+  <div class="row">
+    <div><label class="f">Старый sub path</label>
+      <input name="legacy_path" value="{{ legacy_path or '' }}" placeholder="zdgdjmy3kho5i6qg" pattern="[A-Za-z0-9_-]*">
+    </div>
+    <div style="max-width:160px"><label class="f">Старый порт</label>
+      <input name="legacy_port" type="number" min="1" max="65535" value="{{ legacy_port or '' }}" placeholder="2096">
+    </div>
+  </div>
+  {{ m.check('apply_legacy', apply_legacy, 'Включить совместимость: alias пути + nginx HTTP на этом порту (и открыть в iptables)') }}
 
   <div class="actions" style="margin-top:1.2rem">
     <button class="btn ghost" type="submit" name="action" value="preview">Проверить</button>
