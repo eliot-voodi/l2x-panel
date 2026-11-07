@@ -2840,8 +2840,16 @@ async def clients_migrate_run(request: Request):
     extra = ""
     if report.get("legacy"):
         extra = f" · legacy /{report['legacy'].get('path')}:{report['legacy'].get('port')}"
+    tb = int(report.get("traffic_bytes") or 0)
+    tf = int(report.get("traffic_fixed") or 0)
+    traffic_hint = ""
+    if tb > 0:
+        traffic_hint = f" · трафик {xray.format_traffic(tb)}"
+    if tf:
+        traffic_hint += f" (восстановлен у {tf})"
     flash(request, *_ok_msg(
-        f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}{extra}",
+        f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}"
+        f"{traffic_hint}{extra}",
         result,
     ))
     return _migrate_page(request, report=report, **form_kw)

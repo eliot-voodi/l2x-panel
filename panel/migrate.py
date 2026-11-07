@@ -226,6 +226,27 @@ def preview(store: dict, users: list[NormalizedUser]) -> dict[str, Any]:
     }
 
 
+def _set_imported_traffic(client: dict, up: int, down: int) -> None:
+    """Write migrated counters into both top-level traffic and by_email.
+
+    harvest_traffic rebuilds traffic.up/down from by_email sums. An empty
+    by_email would wipe imported usage on the next watchdog cycle.
+    """
+    up_i = max(0, int(up or 0))
+    down_i = max(0, int(down or 0))
+    t = client.setdefault("traffic", {})
+    t["up"] = up_i
+    t["down"] = down_i
+    by = t.setdefault("by_email", {})
+    email = str(client.get("email") or "").strip()
+    if not email:
+        return
+    row = by.setdefault(email, {"up": 0, "down": 0, "last_up": 0, "last_down": 0})
+    row["up"] = up_i
+    row["down"] = down_i
+    # last_* stay 0 so live Xray deltas accumulate on top of imported totals
+
+
 def apply(
     store: dict,
     users: list[NormalizedUser],
@@ -237,7 +258,8 @@ def apply(
     capable = {i["tag"] for i in xray.client_capable_inbounds(store)}
     tags = [t for t in inbound_tags if t in capable] if inbound_tags else list(capable)
     by_email = {str(c.get("email") or ""): c for c in store.get("clients") or []}
-    created = updated = skipped = 0
+    created = updated = skipped = traffic_fixed = 0
+    traffic_bytes = 0
     errors: list[str] = []
 
     for u in users:
@@ -246,8 +268,19 @@ def apply(
             skipped += 1
             continue
         existing = by_email.get(email)
+        up_i, down_i = int(u.up or 0), int(u.down or 0)
         if existing and not update_existing:
-            skipped += 1
+            # Re-run after a buggy import: fill traffic if panel still shows 0
+            if (up_i or down_i) and xray.client_used_bytes(existing) <= 0:
+                try:
+                    xray.ensure_client(existing)
+                    _set_imported_traffic(existing, up_i, down_i)
+                    traffic_fixed += 1
+                    traffic_bytes += up_i + down_i
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{email}: {exc}")
+            else:
+                skipped += 1
             continue
         try:
             if existing and update_existing:
@@ -270,10 +303,8 @@ def apply(
                 if tags:
                     c["inbounds"] = list(tags)
                 xray.ensure_client(c)
-                t = c.setdefault("traffic", {})
-                t["up"] = int(u.up or 0)
-                t["down"] = int(u.down or 0)
-                t.setdefault("by_email", {})
+                _set_imported_traffic(c, up_i, down_i)
+                traffic_bytes += up_i + down_i
                 xray.ensure_wg_peer(store, c)
                 updated += 1
             else:
@@ -294,11 +325,8 @@ def apply(
                 if u.password:
                     payload["password"] = u.password
                 c = xray.ensure_client(payload)
-                # Force counters after ensure_client (setdefault must not keep zeros from a partial dict)
-                t = c.setdefault("traffic", {})
-                t["up"] = int(u.up or 0)
-                t["down"] = int(u.down or 0)
-                t.setdefault("by_email", {})
+                _set_imported_traffic(c, up_i, down_i)
+                traffic_bytes += up_i + down_i
                 if not c.get("sub_token"):
                     import secrets
                     c["sub_token"] = secrets.token_urlsafe(18)
@@ -314,6 +342,8 @@ def apply(
         "created": created,
         "updated": updated,
         "skipped": skipped,
+        "traffic_fixed": traffic_fixed,
+        "traffic_bytes": traffic_bytes,
         "errors": errors[:30],
         "inbounds": tags,
     }
@@ -471,6 +501,10 @@ def _load_3xui_traffics(conn: sqlite3.Connection) -> dict[str, dict]:
         key = email.lower()
         up = _safe_int(d.get("up"), 0)
         down = _safe_int(d.get("down"), 0)
+        # After a traffic reset 3x-ui keeps lifetime in allTime / all_time
+        all_time = _safe_int(d.get("all_time", d.get("alltime")), 0)
+        if up + down <= 0 and all_time > 0:
+            down = all_time
         prev = traffics.get(key)
         if prev:
             # Same email on multiple rows (shouldn't happen) — sum usage

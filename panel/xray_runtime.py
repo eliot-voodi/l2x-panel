@@ -1358,6 +1358,15 @@ def harvest_traffic(store: dict) -> bool:
     for client in store.get("clients") or []:
         ensure_client(client)
         by = client["traffic"]["by_email"]
+        # Keep imported top-level counters if by_email was never seeded (legacy migrate bug)
+        if not by:
+            tu = int(client["traffic"].get("up") or 0)
+            td = int(client["traffic"].get("down") or 0)
+            if tu or td:
+                email0 = str(client.get("email") or "")
+                if email0:
+                    by[email0] = {"up": tu, "down": td, "last_up": 0, "last_down": 0}
+                    changed = True
         emails = {client["email"]} | {e["email"] for e in subscription_entries(store, client, ignore_quota=True)}
         active = False
         for email in emails:
@@ -1370,11 +1379,12 @@ def harvest_traffic(store: dict) -> bool:
                 changed = True
             if int(row.get("up") or 0) + int(row.get("down") or 0) > before:
                 active = True
-        up = sum(int(r.get("up") or 0) for r in by.values())
-        down = sum(int(r.get("down") or 0) for r in by.values())
-        if client["traffic"].get("up") != up or client["traffic"].get("down") != down:
-            client["traffic"]["up"], client["traffic"]["down"] = up, down
-            changed = True
+        if by:
+            up = sum(int(r.get("up") or 0) for r in by.values())
+            down = sum(int(r.get("down") or 0) for r in by.values())
+            if client["traffic"].get("up") != up or client["traffic"].get("down") != down:
+                client["traffic"]["up"], client["traffic"]["down"] = up, down
+                changed = True
         if active:
             client["last_online"] = now_iso
             changed = True
