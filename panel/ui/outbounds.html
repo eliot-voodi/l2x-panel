@@ -436,7 +436,7 @@
       if (v('insecure')) tls.allowInsecure = true;
       st.tlsSettings = tls;
     } else if (sec === 'reality') {
-      st.realitySettings = { serverName: v('sni'), fingerprint: v('fp') || 'chrome', publicKey: v('pbk'), shortId: v('sid'), spiderX: v('spx') || '/' };
+      st.realitySettings = { serverName: v('sni'), fingerprint: v('fp') || 'firefox', publicKey: v('pbk'), shortId: v('sid'), spiderX: v('spx') || '/' };
     }
     return st;
   }

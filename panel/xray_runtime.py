@@ -496,7 +496,7 @@ def ensure_inbounds(store: dict) -> list[dict]:
             r["private_key"] = legacy.get("private_key") or ""
             r["public_key"] = legacy.get("public_key") or ""
             r["short_ids"] = legacy.get("short_ids") or r["short_ids"]
-            r["fingerprint"] = legacy.get("fingerprint") or "chrome"
+            r["fingerprint"] = legacy.get("fingerprint") or "firefox"
             r["spider_x"] = legacy.get("spider_x") or "/"
             inbounds.append(ib)
         store["inbounds"] = inbounds

@@ -2178,9 +2178,9 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         # Reality only on tcp/grpc/xhttp like 3x-ui
         st["network"] = "raw"
     # Browser fingerprint for all inbounds (share links / client uTLS)
-    fp = str(form.get("client_fp") or form.get("tls_fp") or form.get("r_fp") or "chrome").strip()
+    fp = str(form.get("client_fp") or form.get("tls_fp") or form.get("r_fp") or "firefox").strip()
     if fp not in P.FINGERPRINTS:
-        fp = "chrome"
+        fp = "firefox"
     st["fingerprint"] = fp
     st["accept_proxy_protocol"] = form.get("accept_proxy") == "1"
     st["raw"].update({

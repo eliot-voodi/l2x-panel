@@ -75,14 +75,14 @@ def default_stream(security: str = "reality") -> dict:
         "network": "raw",
         "security": security,
         # Client uTLS fingerprint for share links (all inbounds that emit TLS/Reality/CDN links)
-        "fingerprint": "chrome",
+        "fingerprint": "firefox",
         "accept_proxy_protocol": False,
         "tls": {
             "server_name": "",
             "cert_file": "",
             "key_file": "",
             "alpn": ["h2", "http/1.1"],
-            "fingerprint": "chrome",
+            "fingerprint": "firefox",
             "min_version": "1.2",
             "max_version": "1.3",
             "cipher_suites": "",
@@ -99,7 +99,7 @@ def default_stream(security: str = "reality") -> dict:
             "private_key": "",
             "public_key": "",
             "short_ids": [secrets.token_hex(4)],
-            "fingerprint": "chrome",
+            "fingerprint": "firefox",
             "spider_x": "/",
             "max_time_diff": 0,
             "min_client_ver": "",
@@ -857,7 +857,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
             "net": "hysteria",
             "security": "tls",
             "sni": t.get("server_name") or (ib.get("share_host") or host),
-            "fp": st.get("fingerprint") or t.get("fingerprint") or "chrome",
+            "fp": st.get("fingerprint") or t.get("fingerprint") or "firefox",
             "allow_insecure": bool(t.get("allow_insecure")),
             "brutal_up": s.get("brutal_up") or "100mbps",
             "brutal_down": s.get("brutal_down") or "300mbps",
@@ -884,7 +884,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         st.get("fingerprint")
         or (st.get("tls") or {}).get("fingerprint")
         or (st.get("reality") or {}).get("fingerprint")
-        or "chrome"
+        or "firefox"
     )
     if sec == "tls":
         t = st.get("tls") or {}
@@ -1009,7 +1009,7 @@ def _stream_params(ep: dict) -> dict:
     if sec in ("tls", "reality"):
         if ep.get("sni"):
             p["sni"] = ep["sni"]
-        p["fp"] = ep.get("fp") or "chrome"
+        p["fp"] = ep.get("fp") or "firefox"
     if sec == "tls":
         if ep.get("alpn"):
             p["alpn"] = ep["alpn"]
@@ -1198,7 +1198,7 @@ def _client_stream(ep: dict) -> dict:
     elif net == "xhttp":
         st["xhttpSettings"] = {"path": ep.get("path") or "/", "mode": ep.get("mode") or "auto", **({"host": ep["host"]} if ep.get("host") else {})}
     if sec == "tls":
-        tls: dict[str, Any] = {"serverName": ep.get("sni") or ep["address"], "fingerprint": ep.get("fp") or "chrome"}
+        tls: dict[str, Any] = {"serverName": ep.get("sni") or ep["address"], "fingerprint": ep.get("fp") or "firefox"}
         if ep.get("alpn"):
             tls["alpn"] = [a for a in ep["alpn"].split(",") if a]
         if ep.get("allow_insecure"):
@@ -1207,7 +1207,7 @@ def _client_stream(ep: dict) -> dict:
     elif sec == "reality":
         st["realitySettings"] = {
             "serverName": ep.get("sni") or "",
-            "fingerprint": ep.get("fp") or "chrome",
+            "fingerprint": ep.get("fp") or "firefox",
             "publicKey": ep.get("pbk") or "",
             "shortId": ep.get("sid") or "",
             "spiderX": ep.get("spx") or "/",
@@ -1356,7 +1356,7 @@ def endpoint_to_clash(ep: dict) -> dict | None:
         p["tls"] = True
         if ep.get("sni"):
             p["servername" if proto != "trojan" else "sni"] = ep["sni"]
-        p["client-fingerprint"] = ep.get("fp") or "chrome"
+        p["client-fingerprint"] = ep.get("fp") or "firefox"
         if ep.get("alpn"):
             p["alpn"] = ep["alpn"].split(",")
         if ep.get("allow_insecure"):
@@ -1442,7 +1442,7 @@ def endpoint_to_singbox(ep: dict) -> dict | None:
     sec = ep.get("security")
     if sec in ("tls", "reality"):
         tls: dict[str, Any] = {"enabled": True, "server_name": ep.get("sni") or ep["address"],
-                               "utls": {"enabled": True, "fingerprint": ep.get("fp") or "chrome"}}
+                               "utls": {"enabled": True, "fingerprint": ep.get("fp") or "firefox"}}
         if ep.get("alpn"):
             tls["alpn"] = ep["alpn"].split(",")
         if ep.get("allow_insecure"):
