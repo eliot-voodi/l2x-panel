@@ -6669,7 +6669,8 @@ def _agent_pull_cycle() -> None:
         if cfg_path.is_file():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             tags = {o.get("tag") for o in (cfg.get("outbounds") or [])}
-            has_tags = "rv-up" in tags and "rv-direct" in tags
+            has_up = any(str(t).startswith("rv-up") for t in tags)
+            has_tags = has_up and "rv-direct" in tags
             xray_on = False
             try:
                 import subprocess as _sp

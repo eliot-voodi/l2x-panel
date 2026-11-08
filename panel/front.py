@@ -432,7 +432,8 @@ def _location(loc: dict) -> str:
         return (
             f"    location ^~ {path} {{\n"
             "        client_max_body_size 0;\n"
-            "        client_body_timeout 1h;\n"
+            "        client_body_buffer_size 512k;\n"
+            "        client_body_timeout 52w;\n"
             f"        proxy_pass http://127.0.0.1:{port};\n"
             "        proxy_http_version 1.1;\n"
             "        proxy_set_header Host $host;\n"
@@ -440,8 +441,9 @@ def _location(loc: dict) -> str:
             "        proxy_set_header X-Forwarded-For $remote_addr;\n"
             "        proxy_buffering off;\n"
             "        proxy_request_buffering off;\n"
-            "        proxy_read_timeout 1h;\n"
-            "        proxy_send_timeout 1h;\n"
+            "        proxy_max_temp_file_size 0;\n"
+            "        proxy_read_timeout 52w;\n"
+            "        proxy_send_timeout 52w;\n"
             "    }"
         )
     # ws / httpupgrade

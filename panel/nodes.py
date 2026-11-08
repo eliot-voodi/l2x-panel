@@ -148,12 +148,30 @@ def _ws_like_path() -> str:
     return "/ws-" + "".join(secrets.choice(alphabet) for _ in range(10))
 
 
+def _xh_like_path() -> str:
+    """Same shape as user XHTTP inbounds (/xh-xxxxxxxxxx)."""
+    alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "/xh-" + "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+# Parallel reverse dials from each NAT agent (same UUID / reverse.tag → load pool)
+REVERSE_DIALS_DEFAULT = 4
+REVERSE_DIALS_MAX = 16
+
+
 def ensure_reverse_master(store: dict) -> dict:
-    """Master-wide reverse inbound (one WS path for all NAT nodes, behind nginx :443)."""
+    """Master-wide reverse inbound (XHTTP stream-up behind nginx :443)."""
     ns = store.setdefault("settings", {}).setdefault("nodes", {})
     rv = ns.setdefault("rv", {})
+    # Prefer XHTTP over legacy WS for throughput (multi-conn + no WS overhead)
+    if rv.get("network") != "xhttp":
+        rv["network"] = "xhttp"
+        if not rv.get("path") or str(rv.get("path") or "").startswith("/ws-"):
+            rv["path"] = _xh_like_path()
     if not rv.get("path"):
-        rv["path"] = _ws_like_path()
+        rv["path"] = _xh_like_path()
+    dials = int(rv.get("dials") or REVERSE_DIALS_DEFAULT)
+    rv["dials"] = max(1, min(REVERSE_DIALS_MAX, dials))
     used = {
         int(i.get("port") or 0) for i in store.get("inbounds") or []
         if i.get("tag") != "rv-in"
@@ -582,6 +600,9 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
                 "uuid": node["rv_uuid"],
                 "domain": node["rv_domain"],
                 "fingerprint": "chrome",
+                "network": rv.get("network") or "xhttp",
+                "mode": "stream-up",
+                "dials": int(rv.get("dials") or REVERSE_DIALS_DEFAULT),
             }
 
     return {

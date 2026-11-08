@@ -530,11 +530,17 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     ns = (store.get("settings") or {}).get("nodes") or {}
     rb = ns.get("reverse_bridge") if isinstance(ns.get("reverse_bridge"), dict) else None
     if rb and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
-        up_tag = "rv-up"
         in_tag = "rv-bridge"
         direct_tag = "rv-direct"
+        net = (rb.get("network") or "xhttp").lower()
+        if net not in ("xhttp", "ws"):
+            net = "xhttp"
+        dials = max(1, min(16, int(rb.get("dials") or 4)))
         outs = cfg.setdefault("outbounds", [])
-        outs[:] = [o for o in outs if o.get("tag") not in (up_tag, direct_tag)]
+        outs[:] = [
+            o for o in outs
+            if not (str(o.get("tag") or "").startswith("rv-up") or o.get("tag") == direct_tag)
+        ]
         # Xray ≥26.5: vless-reverse traffic is blackholed unless freedom has finalRules allow.
         outs.append({
             "tag": direct_tag,
@@ -543,33 +549,47 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
                 "finalRules": [{"action": "allow", "network": "tcp,udp"}],
             },
         })
-        outs.append({
-            "tag": up_tag,
-            "protocol": "vless",
-            "settings": {
-                "address": rb["master_host"],
-                "port": int(rb.get("port") or 443),
-                "id": rb["uuid"],
-                "encryption": "none",
-                "flow": "",
-                "reverse": {"tag": in_tag},
-            },
-            "streamSettings": {
-                "network": "ws",
-                "security": "tls",
-                "wsSettings": {
+        tls = {
+            "serverName": rb["master_host"],
+            "allowInsecure": False,
+            "fingerprint": rb.get("fingerprint") or "chrome",
+            "alpn": ["h2", "http/1.1"] if net == "xhttp" else ["http/1.1"],
+        }
+        sockopt = {
+            "tcpFastOpen": True,
+            "tcpCongestion": "bbr",
+            "tcpNoDelay": True,
+        }
+        for i in range(dials):
+            tag = "rv-up" if dials == 1 else f"rv-up-{i}"
+            stream: dict = {"network": net, "security": "tls", "tlsSettings": tls, "sockopt": sockopt}
+            if net == "xhttp":
+                # maxConcurrency=1 → more TCP/H2 under concurrent load (better multi-thread speed)
+                stream["xhttpSettings"] = {
+                    "path": rb["path"],
+                    "host": rb["master_host"],
+                    "mode": rb.get("mode") or "stream-up",
+                    "xmux": {"maxConcurrency": 1},
+                }
+            else:
+                stream["wsSettings"] = {
                     "path": rb["path"],
                     "host": rb["master_host"],
                     "heartbeatPeriod": 10,
+                }
+            outs.append({
+                "tag": tag,
+                "protocol": "vless",
+                "settings": {
+                    "address": rb["master_host"],
+                    "port": int(rb.get("port") or 443),
+                    "id": rb["uuid"],
+                    "encryption": "none",
+                    "flow": "",
+                    "reverse": {"tag": in_tag},
                 },
-                "tlsSettings": {
-                    "serverName": rb["master_host"],
-                    "allowInsecure": False,
-                    "fingerprint": rb.get("fingerprint") or "chrome",
-                    "alpn": ["http/1.1"],
-                },
-            },
-        })
+                "streamSettings": stream,
+            })
         rules = cfg.setdefault("routing", {}).setdefault("rules", [])
         rules[:] = [
             r for r in rules
@@ -581,6 +601,13 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         rules.insert(1 if rules else 0, {
             "type": "field", "inboundTag": [in_tag], "outboundTag": direct_tag,
         })
+        # Larger buffers help high-BDP reverse tunnels
+        try:
+            levels = cfg.setdefault("policy", {}).setdefault("levels", {})
+            lvl = levels.setdefault("0", {})
+            lvl.setdefault("bufferSize", 512)
+        except Exception:
+            pass
         return
 
     # --- Master: shared reverse inbound behind nginx Path ---
@@ -588,8 +615,11 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     if not nat_nodes:
         return
     rv = nodes_mod.ensure_reverse_master(store)
-    path = rv.get("path") or "/ws-rv"
+    path = rv.get("path") or "/xh-rv"
     port = int(rv.get("port") or 19100)
+    net = (rv.get("network") or "xhttp").lower()
+    if net not in ("xhttp", "ws"):
+        net = "xhttp"
     clients = []
     for n in nat_nodes:
         email = f"rv@{nodes_mod.slugify(n.get('name') or 'node')}"
@@ -599,17 +629,25 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
             "reverse": {"tag": tag},
         })
         n["rv_email"] = email
+    if net == "xhttp":
+        stream = {
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": {"path": path, "mode": "stream-up"},
+        }
+    else:
+        stream = {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": path, "heartbeatPeriod": 10},
+        }
     ib = {
         "tag": "rv-in",
         "listen": "127.0.0.1",
         "port": port,
         "protocol": "vless",
         "settings": {"clients": clients, "decryption": "none"},
-        "streamSettings": {
-            "network": "ws",
-            "security": "none",
-            "wsSettings": {"path": path, "heartbeatPeriod": 10},
-        },
+        "streamSettings": stream,
     }
     # Also register a panel-shaped inbound so front.py publishes the path on :443
     panel_ibs = store.setdefault("inbounds", [])
@@ -631,12 +669,36 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         "share_host": share,
         "settings": {"flow": "", "decryption": "none", "encryption": ""},
         "stream": {
-            "network": "ws",
+            "network": net,
             "security": "none",
             "fingerprint": "chrome",
-            "ws": {"path": path, "host": "", "headers": "", "heartbeat": 10, "accept_proxy_protocol": False},
+            "ws": {"path": path if net == "ws" else "/ws", "host": "", "headers": "", "heartbeat": 10, "accept_proxy_protocol": False},
             "tls": {}, "reality": {}, "raw": {"header": "none"}, "grpc": {}, "httpupgrade": {},
-            "xhttp": {"mode": "auto"}, "kcp": {}, "sockopt": {"enabled": False},
+            "xhttp": {
+                "path": path if net == "xhttp" else "/xh",
+                "host": "",
+                "mode": "stream-up",
+                "extra": "",
+                "x_padding_bytes": "100-1000",
+                "sc_max_buffered_posts": 30,
+                "sc_max_each_post_bytes": "1000000",
+                "sc_min_each_post_bytes": "1",
+                "sc_stream_up_server_secs": "20-80",
+                "sc_min_posts_interval_ms": 30,
+                "no_sse_header": False,
+                "no_grpc_header": False,
+                "headers": "",
+                "xmux": {
+                    "enabled": True,
+                    "max_concurrency": "1",
+                    "max_connections": 0,
+                    "c_max_reuse_times": "0",
+                    "c_max_lifetime_ms": "0",
+                    "h_max_request_times": "0",
+                    "h_max_reusable_secs": "0",
+                },
+            },
+            "kcp": {}, "sockopt": {"enabled": False},
         },
         "sniffing": {"enabled": True, "dest": ["http", "tls", "quic"], "route_only": False, "metadata_only": False},
         "fallbacks": [], "outbound": "direct",
@@ -652,6 +714,12 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     inbounds = [i for i in cfg.setdefault("inbounds", []) if i.get("tag") != "rv-in"]
     inbounds.append(ib)
     cfg["inbounds"] = inbounds
+    try:
+        levels = cfg.setdefault("policy", {}).setdefault("levels", {})
+        lvl = levels.setdefault("0", {})
+        lvl.setdefault("bufferSize", 512)
+    except Exception:
+        pass
 
 
 def all_outbound_tags(store: dict) -> list[str]:
