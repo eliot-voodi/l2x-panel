@@ -54,13 +54,13 @@
 <div class="card">
   <h3>Как это работает</h3>
   <div class="hint">
-    <b>Мастер</b> ставит ноду по SSH (domain + login + pass), включает agent token и пушит клиентов/inbounds.
-    Галочка <b>Outbound</b> поднимает на ноде VLESS/WS bridge — мастер получает outbound <code>node_…</code>.
-    <b>Зеркало</b> — полная копия мастера на ноде (клиенты, outbounds, маршруты, реестр нод). В обычном режиме нода остаётся outbound/agent; при сбое → <b>→ Master</b> без потери данных (для зеркала SSH не обязателен).
-    <b>→ Master</b> сначала поднимает новую ноду и проверяет health; старый master сдаёт роль только после подтверждения.
-    На новый master уходят все данные, включая все outbound’ы; outbound на саму эту ноду (<code>node_…</code>) убирается, ссылки клиентов/маршрутов → <code>direct</code>.
-    <b>Обновить</b> ставит свежий релиз на выбранную ноду.
-    <b>Расписание</b> — авто-sync каждой ноды по своему интервалу (5 мин … 24 ч).
+    <b>Мастер</b> ставит ноду по SSH (domain + login + pass, порт любой).
+    <b>Обычная нода</b>: открыт :443, мастер пушит конфиг, Outbound = VLESS/WS bridge на ноде.
+    <b>Нода за NAT</b>: входящих портов нет (SSH достаточно). Нода сама тянет конфиг с мастера и держит
+    зашифрованный VLESS+WS+TLS туннель на домен мастера (выглядит как обычный клиентский WS). На мастере
+    появляется outbound <code>node_…</code> через Xray reverse portal — маршруты, балансеры, подписка.
+    <b>Зеркало</b> — только для обычных нод (полная копия для → Master).
+    <b>Расписание</b> — авто-sync (для NAT — обновление payload, который нода заберёт сама).
   </div>
   {% if not is_master %}
   <div class="badge warn">Эта панель сейчас agent. Управление нодами — на master.</div>
@@ -87,8 +87,8 @@
         <td><b>{{ n.name }}</b><div class="dim small mono">{{ n.id[:8] }}</div></td>
         <td class="small mono">{{ n.domain or n.url }}{% if n.base_path %}<div class="dim">/{{ n.base_path }}/</div>{% endif %}</td>
         <td class="small mono">{% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn" title="мастер {{ master_version }}"{% endif %}>{{ n.panel_version }}</span>{% else %}<span class="dim">?</span>{% endif %}{% if n.last_update %}<div class="dim">{{ fmt_dt(n.last_update) }}</div>{% endif %}</td>
-        <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
-        <td>{% if n.mirror %}<span class="badge ok" title="Полная копия мастера для быстрого failover">standby</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+        <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% if n.nat %} <span class="badge" title="Reverse tunnel: нода → мастер">NAT</span>{% endif %}{% else %}<span class="dim">—</span>{% endif %}</td>
+        <td>{% if n.mirror %}<span class="badge ok" title="Полная копия мастера для быстрого failover">standby</span>{% elif n.nat %}<span class="dim" title="Зеркало недоступно за NAT">—</span>{% else %}<span class="dim">—</span>{% endif %}</td>
         <td>
           {% if not n.enabled %}<span class="badge">выкл</span>
           {% elif n.online == true %}<span class="badge ok" title="{{ n.last_seen or '' }}">online</span>
@@ -171,7 +171,7 @@
             <div><span class="lbl">ID</span><span class="val mono">{{ n.id[:8] }}</span></div>
             <div><span class="lbl">Domain</span><span class="val mono">{{ n.domain or n.url }}{% if n.base_path %}/{{ n.base_path }}/{% endif %}</span></div>
             <div><span class="lbl">Версия</span><span class="val">{% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn"{% endif %}>{{ n.panel_version }}</span>{% else %}?{% endif %}</span></div>
-            <div><span class="lbl">Outbound</span><span class="val">{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% else %}—{% endif %}</span></div>
+            <div><span class="lbl">Outbound</span><span class="val">{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% if n.nat %} <span class="badge">NAT</span>{% endif %}{% else %}—{% endif %}</span></div>
             <div><span class="lbl">Зеркало</span><span class="val">{% if n.mirror %}<span class="badge ok">standby</span>{% else %}—{% endif %}</span></div>
             <div><span class="lbl">Sync</span><span class="val">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}</span></div>
           </div>
@@ -229,8 +229,9 @@
     <div style="max-width:100px"><label class="f">Port</label><input name="ssh_port" type="number" value="22"></div>
   </div>
   <div class="mt">
-    {{ m.check('as_outbound', True, 'Сразу сделать outbound (VLESS bridge на ноде)') }}
-    {{ m.check('mirror', False, 'Зеркало: полная копия мастера (standby для быстрого → Master)') }}
+    {{ m.check('as_outbound', True, 'Сразу сделать outbound') }}
+    {{ m.check('nat', False, 'Нода за NAT (без открытых портов: reverse-туннель к мастеру)') }}
+    {{ m.check('mirror', False, 'Зеркало: полная копия мастера (только обычная нода)') }}
   </div>
   <div class="row mt" style="max-width:280px">
     <div><label class="f">Расписание sync</label>
@@ -241,7 +242,7 @@
       </select>
     </div>
   </div>
-  <div class="hint">Другой сервер (не этот master). A-запись domain → IP ноды. Установщик поставит панель, сертификат, agent. Пароль админа — в логе задачи.</div>
+  <div class="hint">Другой сервер (не этот master). SSH-порт любой. Обычная нода: A-запись domain → IP, открыт :80/:443 (Let's Encrypt). За NAT: домен — произвольная метка, входящие порты не нужны; нода сама подключится к домену мастера по HTTPS.</div>
   <div class="actions mt"><button class="btn" {% if job_running %}disabled{% endif %}>Установить по SSH</button></div>
 </form>
 
@@ -257,6 +258,7 @@
       {{ m.check('sync_clients', True, 'Синхронизировать клиентов') }}
       {{ m.check('sync_inbounds', True, 'Синхронизировать inbounds') }}
       {{ m.check('as_outbound', False, 'Использовать как outbound') }}
+      {{ m.check('nat', False, 'За NAT (reverse → мастер, без :443 на ноде)') }}
       {{ m.check('mirror', False, 'Зеркало (полная копия мастера)') }}
     </div>
     <div class="row mt" style="max-width:280px">
@@ -274,7 +276,7 @@
 {% else %}
 <div class="card">
   <h3>Agent</h3>
-  <div class="hint">В Settings → Nodes agent должен быть включён приём конфига. Outbound-bridge и клиенты приходят с мастера автоматически. Если включено зеркало — на диске лежит полная копия для failover.</div>
+  <div class="hint">В Settings → Nodes agent должен быть включён. Обычная нода принимает push; нода за NAT сама опрашивает мастер (/agent/pull) и держит reverse-туннель.</div>
 </div>
 {% endif %}
 {% endblock %}

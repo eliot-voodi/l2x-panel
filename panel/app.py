@@ -1773,7 +1773,8 @@ def _startup():
     _ensure_agent_sticky()
     _refresh_settings_cache()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
-                   _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop):
+                   _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
+                   _agent_pull_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -5491,13 +5492,22 @@ async def nodes_add(request: Request):
             "id": str(uuid.uuid4()), "name": name, "url": origin, "token": token, "enabled": True,
             "sync_clients": True if mirror else form.get("sync_clients") == "1",
             "sync_inbounds": True if mirror else form.get("sync_inbounds") == "1",
-            "as_outbound": True if mirror else form.get("as_outbound") == "1",
-            "mirror": mirror, "domain": host, "base_path": base_path,
+            "as_outbound": True if mirror or form.get("nat") == "1" else form.get("as_outbound") == "1",
+            "mirror": mirror and form.get("nat") != "1",
+            "nat": form.get("nat") == "1",
+            "domain": host, "base_path": base_path,
             "sync_interval_min": nodes_mod.normalize_sync_interval(form.get("sync_interval_min")),
             "ssh_user": "", "ssh_port": 22,
             "last_sync": "", "last_error": "", "last_ok": False, "role": "agent",
         }
-        if node["as_outbound"]:
+        if node["nat"]:
+            node["as_outbound"] = True
+            node["mirror"] = False
+            node["sync_clients"] = False
+            node["sync_inbounds"] = False
+            nodes_mod.ensure_reverse_master(store)
+            nodes_mod.ensure_reverse(node)
+        elif node["as_outbound"]:
             nodes_mod.ensure_bridge(node)
         nodes_mod.ensure_list(store).append(node)
         nodes_mod.upsert_node_outbound(store, node)
@@ -5525,7 +5535,11 @@ async def nodes_provision(request: Request):
     port = _int(form.get("ssh_port"), 22)
     as_outbound = form.get("as_outbound") == "1"
     mirror = form.get("mirror") == "1"
+    nat = form.get("nat") == "1"
     sync_interval_min = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
+    if nat:
+        as_outbound = True
+        mirror = False
     if mirror:
         as_outbound = True
     if not domain or not password:
@@ -5551,12 +5565,18 @@ async def nodes_provision(request: Request):
         nodes_mod.agent_token(store)
         token = store["settings"]["nodes"]["agent_token"]
     master_url = f"https://{public_host()}" if public_host() else ""
+    # NAT agent dials master under the secret panel path (same as admin UI)
+    master_pull_url = f"{master_url}{base_path()}" if master_url else ""
+    if nat and not master_pull_url:
+        flash(request, "Для ноды за NAT задайте публичный домен мастера (Настройки → Панель)", "error")
+        return go("/nodes")
 
     def job():
         res = nodes_mod.provision_via_ssh(
             domain=domain, ssh_user=login, ssh_password=password, ssh_port=port,
             name=name, master_url=master_url, master_token=token,
             master_host=public_host(), as_outbound=as_outbound, mirror=mirror,
+            nat=nat, master_pull_url=master_pull_url if nat else "",
         )
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}
@@ -5566,13 +5586,20 @@ async def nodes_provision(request: Request):
             nodes = nodes_mod.ensure_list(store)
             # replace same domain if re-provisioning
             nodes[:] = [n for n in nodes if (n.get("domain") or "") != node["domain"] and n.get("url") != node["url"]]
+            if nat:
+                nodes_mod.ensure_reverse_master(store)
+                nodes_mod.ensure_reverse(node)
             nodes.append(node)
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
             push = nodes_mod.push(node, payload, master_host=public_host())
             xr = _apply_xray(store)
         log = (res.get("log") or "") + f"\npanel: {res.get('panel_url')}\nadmin pass: {res.get('admin_password')}\n"
-        log += f"sync: {push.get('ok')} {push.get('error') or ''}\nxray: {xr.get('ok')}"
+        if nat:
+            log += "mode: NAT reverse (нода сама заберёт конфиг с мастера)\n"
+            log += f"queued: {push.get('queued')} xray: {xr.get('ok')}"
+        else:
+            log += f"sync: {push.get('ok')} {push.get('error') or ''}\nxray: {xr.get('ok')}"
         return {"ok": True, "log": log}
 
     NODES_JOB["id"] = ops.start_job("node-provision", job)
@@ -5598,16 +5625,16 @@ def _node_push_job(node_id: str, label: str, host: str):
     res = nodes_mod.push(node_snap, payload, master_host=host, timeout=120)
     warns = list(res.get("warnings") or [])
     # Master-side hint when DoH is on but this was a non-mirror push (settings not sent)
-    if doh_on and not is_mirror and res.get("ok"):
+    if doh_on and not is_mirror and res.get("ok") and not node_snap.get("nat"):
         warns.append(
             "DoH включён на master, но нода без зеркала — настройки DoH/Pi-hole в sync не передаются. "
             "Включите «зеркало» или установите Pi-hole на ноде перед promote."
         )
         if not node_snap.get("last_warning"):
             node_snap["last_warning"] = "; ".join(warns)[:600]
-    # Reachability from successful sync
+    # Reachability from successful sync (skip for NAT — online = recent /agent/pull)
     reach_events: list[dict] = []
-    if res.get("ok"):
+    if res.get("ok") and not res.get("queued") and not node_snap.get("nat"):
         reach_events = nodes_mod.apply_health_probe(node_snap, {
             "ok": True, "version": node_snap.get("panel_version") or "",
         })
@@ -5615,14 +5642,19 @@ def _node_push_job(node_id: str, label: str, host: str):
         for n in nodes_mod.ensure_list(store):
             if n.get("id") != node_id:
                 continue
-            n["last_sync"] = node_snap.get("last_sync") or n.get("last_sync")
-            n["last_ok"] = bool(node_snap.get("last_ok"))
-            n["last_error"] = node_snap.get("last_error") or ""
-            n["last_warning"] = node_snap.get("last_warning") or ("; ".join(warns)[:600] if warns else "")
+            n["last_sync"] = nodes_mod.now_iso() if res.get("queued") else (node_snap.get("last_sync") or n.get("last_sync"))
+            if res.get("queued"):
+                n["last_ok"] = True
+                n["last_error"] = ""
+                n["last_warning"] = "NAT: конфиг в очереди — нода заберёт через /agent/pull"
+            else:
+                n["last_ok"] = bool(node_snap.get("last_ok"))
+                n["last_error"] = node_snap.get("last_error") or ""
+                n["last_warning"] = node_snap.get("last_warning") or ("; ".join(warns)[:600] if warns else "")
             if node_snap.get("panel_version"):
                 n["panel_version"] = node_snap["panel_version"]
             for key in ("online", "fail_streak", "last_seen", "last_probe", "last_probe_error"):
-                if key in node_snap:
+                if key in node_snap and not node_snap.get("nat"):
                     n[key] = node_snap[key]
             break
         webhooks.fire(store["settings"], "node.sync", {
@@ -5731,9 +5763,16 @@ async def nodes_action(node_id: str, action: str, request: Request):
             if action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")
                 if node["as_outbound"]:
-                    nodes_mod.ensure_bridge(node)
+                    if node.get("nat"):
+                        nodes_mod.ensure_reverse_master(store)
+                        nodes_mod.ensure_reverse(node)
+                    else:
+                        nodes_mod.ensure_bridge(node)
                 label = f"outbound {'вкл' if node['as_outbound'] else 'выкл'}"
             elif action == "mirror":
+                if node.get("nat"):
+                    flash(request, "Зеркало недоступно для ноды за NAT", "error")
+                    return go("/nodes")
                 node["mirror"] = not node.get("mirror")
                 if node["mirror"]:
                     node["sync_clients"] = True
@@ -6440,20 +6479,11 @@ async def agent_promote(request: Request):
         return JSONResponse({"ok": False, "error": f"promote exception: {exc}"}, status_code=500)
 
 
-@app.post("/agent/apply")
-async def agent_apply(request: Request):
-    """Remote node agent: accept pushed config from master panel."""
-    store, err = _agent_auth(request)
-    if err:
-        return err
-    try:
-        payload = await request.json()
-    except ValueError:
-        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+def _agent_apply_payload(payload: dict) -> dict:
+    """Apply a master payload on this agent (push or pull). Returns {ok, error, warnings, mirror}."""
     mirror = bool(payload.get("mirror"))
     with mutate() as st:
         if payload.get("clients") is not None:
-            # Mirror keeps master's outbound tags; non-mirror remaps missing ones
             st["clients"] = (
                 list(payload["clients"]) if mirror
                 else nodes_mod._agent_safe_clients(payload["clients"])
@@ -6497,20 +6527,24 @@ async def agent_apply(request: Request):
         if payload.get("xray_settings") is not None:
             st["xray_settings"] = payload["xray_settings"]
         if mirror and payload.get("settings"):
-            # Keep local panel identity; merge DoH/TG/sub/… from master for promote-ready mirror
             nodes_mod.apply_promoted_settings(st, payload.get("settings"))
         if mirror and payload.get("nodes") is not None:
-            # Peer registry for failover — does not include this agent as master yet
             st["nodes"] = list(payload["nodes"] or [])
-        # Keep agent mode sticky — a pushed payload must never demote/disable agent
-        # (unless admin explicitly set agent_manual_off in Settings → Nodes).
         ns = st.setdefault("settings", {}).setdefault("nodes", {})
         if not ns.get("agent_manual_off"):
             ns["agent_enabled"] = True
             ns["role"] = "agent"
         ns["mirror"] = mirror
-        # First successful push from new master may replace preserve mode
         ns["runtime_preserve"] = False
+        rb = payload.get("reverse_bridge")
+        if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
+            ns["reverse_bridge"] = rb
+            ns["nat"] = True
+        elif payload.get("nat") is False or (
+            "reverse_bridge" in payload and not isinstance(rb, dict)
+        ):
+            ns.pop("reverse_bridge", None)
+            ns.pop("nat", None)
     res = _apply_xray(_load_store())
     err = res.get("error") or ""
     try:
@@ -6531,6 +6565,122 @@ async def agent_apply(request: Request):
     except Exception:
         pass
     return {"ok": bool(res.get("ok")), "error": err, "mirror": mirror, "warnings": warnings}
+
+
+@app.post("/agent/apply")
+async def agent_apply(request: Request):
+    """Remote node agent: accept pushed config from master panel."""
+    store, err = _agent_auth(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    return _agent_apply_payload(payload)
+
+
+@app.post("/agent/pull")
+async def agent_pull(request: Request):
+    """NAT agent pulls config from master (Bearer = master agent_token, body.node_id)."""
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        return JSONResponse({"ok": False, "error": "not master"}, status_code=403)
+    auth = request.headers.get("authorization") or ""
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    expected = (store.get("settings") or {}).get("nodes", {}).get("agent_token") or ""
+    if not expected or not token or not secrets.compare_digest(token, expected):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    node_id = str(body.get("node_id") or "").strip()
+    have_ver = str(body.get("have") or "").strip()
+    status = body.get("status") if isinstance(body.get("status"), dict) else {}
+    events: list[dict] = []
+    err_code = 0
+    err_msg = ""
+    payload: dict = {}
+    ver = ""
+    with mutate() as st:
+        node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
+        if not node or not node.get("enabled", True):
+            err_code, err_msg = 404, "unknown node"
+        elif not node.get("nat"):
+            err_code, err_msg = 400, "node is not NAT mode"
+        else:
+            events = nodes_mod.apply_pull_seen(
+                node, version=str(body.get("version") or ""), status=status,
+            )
+            nodes_mod.upsert_node_outbound(st, node)
+            payload = nodes_mod.build_payload(st, node, xray.build_config)
+            ver = nodes_mod.payload_version(payload)
+            node["last_sync"] = nodes_mod.now_iso()
+    if err_code:
+        return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
+    if events:
+        _tg_node_events(events)
+    if have_ver and have_ver == ver:
+        return {"ok": True, "unchanged": True, "version": ver}
+    return {"ok": True, "unchanged": False, "version": ver, "payload": payload}
+
+
+def _agent_pull_cycle() -> None:
+    """On a NAT agent: poll master for config and apply when version changes."""
+    store = _load_store()
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    if (ns.get("role") or "") != "agent":
+        return
+    pull = ns.get("pull") if isinstance(ns.get("pull"), dict) else None
+    if not pull or not pull.get("master_url") or not pull.get("node_id"):
+        return
+    token = ns.get("agent_token") or ""
+    if not token:
+        return
+    have = str(ns.get("pull_version") or "")
+    body = {
+        "node_id": pull["node_id"],
+        "have": have,
+        "version": panel_version(),
+        "status": {
+            "ok": True,
+            "error": str(ns.get("last_apply_error") or ""),
+            "warnings": [],
+        },
+    }
+    res = nodes_mod.pull_request(str(pull["master_url"]), token, body, timeout=45)
+    if not res.get("ok"):
+        return
+    if res.get("unchanged"):
+        with mutate() as st:
+            st.setdefault("settings", {}).setdefault("nodes", {})["pull_version"] = res.get("version") or have
+        return
+    payload = res.get("payload")
+    if not isinstance(payload, dict):
+        return
+    applied = _agent_apply_payload(payload)
+    with mutate() as st:
+        n2 = st.setdefault("settings", {}).setdefault("nodes", {})
+        n2["pull_version"] = res.get("version") or ""
+        n2["last_apply_error"] = "" if applied.get("ok") else str(applied.get("error") or "")[:400]
+        n2["last_pull_at"] = nodes_mod.now_iso()
+
+
+def _agent_pull_loop() -> None:
+    if _stop.wait(25):
+        return
+    while True:
+        try:
+            _agent_pull_cycle()
+        except Exception:
+            pass
+        if _stop.wait(20):
+            return
 
 
 @app.get("/api-docs", response_class=HTMLResponse)

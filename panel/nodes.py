@@ -56,6 +56,9 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("last_seen", "")
         n.setdefault("last_probe", "")
         n.setdefault("last_probe_error", "")
+        # NAT node: no inbound ports; node dials master (reverse tunnel + config pull)
+        n.setdefault("nat", False)
+        n.setdefault("last_pull", "")
     return nodes
 
 
@@ -134,6 +137,101 @@ def ensure_bridge(node: dict) -> dict:
     return node
 
 
+REVERSE_PORT_BASE = 19100
+# NAT node is online while it keeps pulling (agent pulls every ~20s)
+PULL_FRESH_SEC = 120
+
+
+def _ws_like_path() -> str:
+    """Same shape as user WS inbounds (/ws-xxxxxxxxxx) — tunnel path is indistinguishable."""
+    alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "/ws-" + "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def ensure_reverse_master(store: dict) -> dict:
+    """Master-wide reverse inbound (one WS path for all NAT nodes, behind nginx :443)."""
+    ns = store.setdefault("settings", {}).setdefault("nodes", {})
+    rv = ns.setdefault("rv", {})
+    if not rv.get("path"):
+        rv["path"] = _ws_like_path()
+    used = {int(i.get("port") or 0) for i in store.get("inbounds") or []}
+    port = int(rv.get("port") or 0)
+    if not port or port in used:
+        port = REVERSE_PORT_BASE
+        while port in used:
+            port += 1
+        rv["port"] = port
+    return rv
+
+
+def ensure_reverse(node: dict) -> dict:
+    """Per-node reverse credentials (VLESS user on master rv inbound + portal domain)."""
+    if not node.get("rv_uuid"):
+        node["rv_uuid"] = str(uuid.uuid4())
+    if not node.get("rv_domain"):
+        # Only inside the encrypted mux control stream — never seen on the wire
+        node["rv_domain"] = f"{secrets.token_hex(6)}.rv.l2x.internal"
+    node["rv_tag"] = node_outbound_tag(node)
+    return node
+
+
+def pull_fresh(node: dict, now: datetime | None = None) -> bool:
+    last = (node.get("last_pull") or "").strip()
+    if not last:
+        return False
+    try:
+        ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return (now - ts).total_seconds() <= PULL_FRESH_SEC
+    except Exception:
+        return False
+
+
+def payload_version(payload: dict) -> str:
+    import hashlib
+    body = {k: v for k, v in (payload or {}).items() if k != "pushed_at"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
+
+
+def apply_pull_seen(node: dict, *, version: str = "", status: dict | None = None) -> list[dict]:
+    """Master side: NAT node checked in → online + last apply status from the agent."""
+    node["last_pull"] = now_iso()
+    events = apply_health_probe(node, {"ok": True, "version": version})
+    st = status if isinstance(status, dict) else {}
+    if st:
+        node["last_ok"] = bool(st.get("ok"))
+        node["last_error"] = "" if st.get("ok") else str(st.get("error") or "")[:400]
+        warns = st.get("warnings") or []
+        if isinstance(warns, str):
+            warns = [warns]
+        node["last_warning"] = "; ".join(str(w) for w in warns if w)[:600]
+    return events
+
+
+def pull_request(master_url: str, token: str, body: dict, timeout: int = 30) -> dict:
+    """Agent side: POST /agent/pull on master (plain HTTPS, outbound only)."""
+    url = master_url.rstrip("/") + "/agent/pull"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8", "replace") or "{}").get("error") or ""
+        except Exception:
+            detail = ""
+        return {"ok": False, "error": f"HTTP {exc.code} {detail}".strip()}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 def bridge_inbound(node: dict) -> dict:
     """Inbound definition pushed to the remote node for master→node egress."""
     ensure_bridge(node)
@@ -208,6 +306,30 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         if existing:
             customs.remove(existing)
         return
+    if node.get("nat"):
+        # Portal tag on master = outbound; no dial to the node (it has no open ports)
+        ensure_reverse_master(store)
+        ensure_reverse(node)
+        entry = {
+            "tag": tag,
+            "remark": f"Node {node.get('name')} (NAT)",
+            "kind": "node",
+            "reverse": True,
+            "node_id": node.get("id"),
+            "enabled": True,
+            "in_sub": True,
+            "country": (node.get("country") or "")[:2].upper(),
+            "config": {},
+        }
+        if existing:
+            keep = existing.get("last_test")
+            existing.clear()
+            existing.update(entry)
+            if keep:
+                existing["last_test"] = keep
+        else:
+            customs.append(entry)
+        return
     ensure_bridge(node)
     domain = (node.get("domain") or "").strip()
     if not domain:
@@ -226,6 +348,7 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         "config": node_outbound_config(node),
     }
     if existing:
+        existing.pop("reverse", None)
         existing.update(entry)
     else:
         customs.append(entry)
@@ -290,7 +413,7 @@ def _peer_node_export(n: dict) -> dict:
     keys = (
         "id", "name", "url", "token", "enabled", "sync_clients", "sync_inbounds",
         "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
-        "bridge_uuid", "bridge_path", "role", "panel_version",
+        "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "nat",
     )
     return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
 
@@ -352,26 +475,29 @@ def probe_role(node: dict, timeout: int = 10) -> dict:
 def build_payload(store: dict, node: dict, build_config) -> dict:
     """Config push for a remote agent. mirror=True → full master copy for fast failover."""
     mirror = bool(node.get("mirror"))
+    nat = bool(node.get("nat"))
     if mirror:
         node["sync_clients"] = True
         node["sync_inbounds"] = True
-    inbounds = list(store.get("inbounds") or [])
+    # NAT node: no inbound ports → no client inbounds / bridge inbound; only reverse egress
+    bridge_on = bool(node.get("as_outbound")) and not nat
+    inbounds = list(store.get("inbounds") or []) if not nat else []
     # Path/TLS share domains must be the node hostname, not the master
     node_dom = node_public_domain(node)
-    if node_dom and (node.get("sync_inbounds", True) or mirror or node.get("as_outbound")):
+    if inbounds and node_dom and (node.get("sync_inbounds", True) or mirror or bridge_on):
         inbounds = remap_inbounds_for_host(
             inbounds,
             new_host=node_dom,
             old_hosts=master_public_domains(store),
         )
     # Ensure bridge inbound exists on agent when used as outbound
-    if node.get("as_outbound"):
+    if bridge_on:
         ensure_bridge(node)
         inbounds = [i for i in inbounds if i.get("tag") != "node-bridge"]
         inbounds.append(bridge_inbound(node))
     self_tag = node_outbound_tag(node)
     bridge_clients = []
-    if node.get("as_outbound"):
+    if bridge_on:
         bridge_clients = [{
             "email": f"bridge@{slugify(node.get('name') or 'node')}",
             "uuid": node["bridge_uuid"], "enabled": True, "inbounds": ["node-bridge"],
@@ -403,10 +529,34 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         settings_out = json.loads(json.dumps(store.get("settings") or {}))
         settings_out.pop("nodes", None)
 
+    reverse_bridge = None
+    if nat and node.get("as_outbound") and node.get("enabled", True):
+        rv = ensure_reverse_master(store)
+        ensure_reverse(node)
+        master_host = ""
+        try:
+            import front as front_mod
+            master_host = _normalize_domain(front_mod.public_domain(store) or "")
+        except Exception:
+            pass
+        if not master_host:
+            master_host = next(iter(sorted(master_public_domains(store))), "")
+        if master_host:
+            reverse_bridge = {
+                "master_host": master_host,
+                "port": 443,
+                "path": rv["path"],
+                "uuid": node["rv_uuid"],
+                "domain": node["rv_domain"],
+                "fingerprint": "chrome",
+            }
+
     return {
         "mirror": mirror,
-        "clients": (clients if node.get("sync_clients", True) else []) + bridge_clients,
-        "inbounds": inbounds if node.get("sync_inbounds", True) or node.get("as_outbound") else [],
+        "nat": nat,
+        "reverse_bridge": reverse_bridge,
+        "clients": (clients if node.get("sync_clients", True) and not nat else []) + bridge_clients,
+        "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on else [],
         "outbounds_custom": customs,
         "routes": routes,
         "balancers": balancers,
@@ -596,6 +746,14 @@ def probe_all_health(nodes: list[dict], *, timeout: int = 5) -> list[dict]:
     for n in nodes or []:
         if not n.get("enabled", True):
             continue
+        if n.get("nat"):
+            # Unreachable from master by design — online = recent /agent/pull
+            if pull_fresh(n):
+                continue  # apply_pull_seen already marked it online
+            events.extend(apply_health_probe(n, {
+                "ok": False, "error": "нет связи от ноды за NAT (pull не приходит)",
+            }))
+            continue
         if not (n.get("url") or n.get("domain")):
             continue
         try:
@@ -763,6 +921,9 @@ def _push_once(node: dict, payload: dict, timeout: int = 60) -> dict:
 
 
 def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") -> dict:
+    if node.get("nat"):
+        # Node has no open ports — it pulls /agent/pull every ~20s; config is already queued.
+        return {"ok": True, "queued": True, "warnings": [], "error": ""}
     domain = (node.get("domain") or "").strip()
     if not domain:
         from urllib.parse import urlparse
@@ -849,6 +1010,14 @@ def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
         store["dns"] = payload["dns"]
     if payload.get("xray_settings") is not None:
         store["xray_settings"] = payload["xray_settings"]
+    ns = store.setdefault("settings", {}).setdefault("nodes", {})
+    rb = payload.get("reverse_bridge")
+    if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
+        ns["reverse_bridge"] = rb
+        ns["nat"] = True
+    elif payload.get("nat") is False or (payload.get("reverse_bridge") is None and "reverse_bridge" in payload):
+        ns.pop("reverse_bridge", None)
+        ns.pop("nat", None)
     return apply_config(store)
 
 
@@ -936,11 +1105,19 @@ def provision_via_ssh(
     as_outbound: bool = True,
     mirror: bool = False,
     admin_password: str = "",
+    nat: bool = False,
+    master_pull_url: str = "",
 ) -> dict:
-    """Install/configure L2X on a remote host over SSH and return node registry fields."""
+    """Install/configure L2X on a remote host over SSH and return node registry fields.
+
+    nat=True: host has no open inbound ports except SSH. No Let's Encrypt, no inbounds;
+    the agent pulls config from master_pull_url and egress goes through a reverse tunnel.
+    """
     domain = _normalize_domain(domain)
     if not domain or " " in domain:
         return {"ok": False, "error": "некорректный domain"}
+    if nat and not master_pull_url:
+        return {"ok": False, "error": "для ноды за NAT у мастера должен быть публичный домен (Настройки → Панель)"}
     if not master_host and master_url:
         master_host = _normalize_domain(master_url)
     self_err = same_host_as_master(domain, master_host)
@@ -951,17 +1128,22 @@ def provision_via_ssh(
     panel_path = secrets.token_urlsafe(9).replace("_", "").replace("-", "")[:12]
     agent_tok = master_token or secrets.token_urlsafe(32)
     node_id = str(uuid.uuid4())
-    mirror = bool(mirror)
-    if mirror:
+    mirror = bool(mirror) and not nat
+    if mirror or nat:
         as_outbound = True
     node = {
         "id": node_id, "name": name, "domain": domain, "ssh_user": ssh_user, "ssh_port": int(ssh_port or 22),
-        "token": agent_tok, "enabled": True, "sync_clients": True, "sync_inbounds": True,
+        "token": agent_tok, "enabled": True,
+        "sync_clients": not nat, "sync_inbounds": not nat,
         "as_outbound": bool(as_outbound), "mirror": mirror, "base_path": panel_path, "role": "agent",
         "url": f"https://{domain}", "last_sync": "", "last_error": "", "last_ok": False,
+        "nat": bool(nat),
     }
-    ensure_bridge(node)
-    log: list[str] = [f"provision {name} @ {domain}"]
+    if nat:
+        ensure_reverse(node)
+    else:
+        ensure_bridge(node)
+    log: list[str] = [f"provision {name} @ {domain}" + (" [NAT/reverse]" if nat else "")]
 
     try:
         client = _ssh_connect(domain, ssh_user, ssh_password, int(ssh_port or 22))
@@ -995,8 +1177,9 @@ def provision_via_ssh(
             "export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}\"",
             "export DEBIAN_FRONTEND=noninteractive",
             f"export L2X_HOST={json.dumps(domain)[1:-1]}",
-            f"export L2X_DOMAIN={json.dumps(domain)[1:-1]}",
-            "export L2X_SSL=domain",
+            *([] if nat else [f"export L2X_DOMAIN={json.dumps(domain)[1:-1]}"]),
+            # NAT: :80 unreachable → no Let's Encrypt; node never serves public HTTPS
+            "export L2X_SSL=none" if nat else "export L2X_SSL=domain",
             "export L2X_MODE=nginx",
             "export L2X_ADMIN=admin",
             f"export L2X_PASSWORD={json.dumps(admin_password)[1:-1]}",
@@ -1054,6 +1237,9 @@ sys.path.insert(0, "/opt/l2xpanel")
 TOKEN = {agent_tok!r}
 DOMAIN = {domain!r}
 PATH_NEW = {panel_path!r}
+NAT = {bool(nat)!r}
+PULL_URL = {master_pull_url!r}
+NODE_ID = {node_id!r}
 FORCE = os.environ.get("L2X_FORCE_AGENT") == "1"
 store_path = Path("/var/lib/l2xpanel/store.json")
 store = json.loads(store_path.read_text()) if store_path.exists() else {{}}
@@ -1067,6 +1253,12 @@ ns["agent_enabled"] = True
 ns["agent_token"] = TOKEN
 ns["role"] = "agent"
 ns["agent_manual_off"] = False
+if NAT:
+    # Outbound-only control channel: agent polls master (no inbound ports needed)
+    ns["pull"] = {{"master_url": PULL_URL, "node_id": NODE_ID}}
+else:
+    ns.pop("pull", None)
+    ns.pop("reverse_bridge", None)
 panel = s.setdefault("panel", {{}})
 panel["public_host"] = DOMAIN
 # Preserve existing base_path so re-provision does not break the admin URL
