@@ -119,6 +119,39 @@ case "$(uname -m)" in
 esac
 
 # ---------------------------------------------------------------- actions
+_download_repo_tarball() {
+  # GitHub archive endpoints flake with 503; try several URLs with retries.
+  # Never pipe curl|tar — a failed HTML/error body corrupts the extract.
+  local dest=$1 owner repo
+  owner=$(printf '%s' "$REPO_URL" | sed -E 's|https?://github.com/||;s|/+$||' | cut -d/ -f1)
+  repo=$(printf '%s' "$REPO_URL" | sed -E 's|https?://github.com/||;s|/+$||' | cut -d/ -f2)
+  [ -n "$owner" ] && [ -n "$repo" ] || die "Некорректный L2X_REPO: $REPO_URL"
+  local urls=(
+    "https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${BRANCH}"
+    "https://github.com/${owner}/${repo}/archive/refs/heads/${BRANCH}.tar.gz"
+    "https://github.com/${owner}/${repo}/archive/${BRANCH}.tar.gz"
+    "https://codeload.github.com/${owner}/${repo}/tar.gz/${BRANCH}"
+  )
+  local url attempt code
+  for url in "${urls[@]}"; do
+    for attempt in 1 2 3 4 5; do
+      info "Загрузка $url (попытка $attempt/5)"
+      code=$(curl -sS -L --connect-timeout 20 --max-time 180 \
+        -o "$dest" -w '%{http_code}' \
+        -H 'User-Agent: L2XPanel-Installer/1.0' \
+        "$url" || true)
+      if [ "$code" = "200" ] && [ -s "$dest" ] && gzip -t "$dest" 2>/dev/null; then
+        ok "архив скачан ($(wc -c <"$dest") байт)"
+        return 0
+      fi
+      warn "HTTP ${code:-?} / битый архив — повтор через $((attempt * 3))с"
+      rm -f "$dest"
+      sleep $((attempt * 3))
+    done
+  done
+  return 1
+}
+
 fetch_source() {
   SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /nonexistent)
   if [ -f "$SCRIPT_DIR/panel/app.py" ]; then
@@ -127,9 +160,14 @@ fetch_source() {
   fi
   command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null; }
   SRC=$(mktemp -d)
-  trap 'rm -rf "$SRC"' EXIT
+  local tarball
+  tarball=$(mktemp)
+  # shellcheck disable=SC2064
+  trap 'rm -rf "$SRC" "$tarball"' EXIT
   info "Загрузка $REPO_URL ($BRANCH)"
-  curl -fsSL "$REPO_URL/archive/$BRANCH.tar.gz" | tar -xz -C "$SRC" --strip-components=1
+  _download_repo_tarball "$tarball" || die "Не удалось скачать исходники с GitHub (503/сеть). Повторите позже или задайте L2X_REPO на зеркало."
+  tar -xz -C "$SRC" --strip-components=1 -f "$tarball"
+  rm -f "$tarball"
   [ -f "$SRC/panel/app.py" ] || die "В архиве нет panel/app.py"
 }
 
