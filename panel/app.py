@@ -5327,6 +5327,10 @@ def _nodes_health_cycle() -> None:
             ):
                 if key in src:
                     n[key] = src[key]
+            if "rv_conns" in src:
+                n["rv_conns"] = src["rv_conns"]
+            elif not n.get("nat"):
+                n.pop("rv_conns", None)
     _tg_node_events(events)
 
 

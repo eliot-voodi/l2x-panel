@@ -1985,12 +1985,20 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
             except Exception:
                 node = None
             if node and not node.get("nat"):
-                # Reverse mode on a reachable node: health probe reports tunnel connections
-                if node.get("online") and int(node.get("rv_conns") or 0) > 0:
-                    return {"ok": True, "code": "204", "ms": 0, "error": ""}
-                if not node.get("online"):
-                    return {"ok": False, "error": "нода не на связи", "ms": 0}
-                return {"ok": False, "error": "reverse-туннель от ноды не поднят (rv_conns=0)", "ms": 0}
+                # Reverse mode on a reachable node: ask the node live (stored rv_conns may be stale)
+                t0 = time.time()
+                try:
+                    probe = nodes_mod.probe_health(dict(node), timeout=8)
+                except Exception as exc:  # noqa: BLE001
+                    probe = {"ok": False, "error": str(exc)}
+                ms = int((time.time() - t0) * 1000)
+                raw = probe.get("raw") if isinstance(probe.get("raw"), dict) else {}
+                conns = raw.get("rv_conns")
+                if not probe.get("ok"):
+                    return {"ok": False, "error": f"нода не на связи: {probe.get('error') or ''}"[:200], "ms": ms}
+                if isinstance(conns, int) and conns > 0:
+                    return {"ok": True, "code": "204", "ms": ms, "error": "", "rv_conns": conns}
+                return {"ok": False, "error": f"reverse-туннель от ноды не поднят (rv_conns={conns})", "ms": ms}
             if node and nodes_mod.pull_fresh(node) and node.get("online") is not False:
                 return {"ok": True, "code": "204", "ms": 0, "error": ""}
             return {"ok": False, "error": "NAT-нода не на связи (нет reverse pull)", "ms": 0}
