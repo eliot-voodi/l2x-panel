@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 import bcrypt
 import yaml
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
@@ -243,14 +243,38 @@ FRONT_CERT_RETRY = 3600
 _front_cert_tried: dict[str, float] = {}
 
 
-def _apply_xray(store: dict, *, persist: bool = True, defer_front_reload: float = 0) -> dict:
+def _commit_front_safe(staged: dict) -> None:
+    """Background nginx reload after /agent/apply response has been sent."""
+    try:
+        fr = front.commit(staged)
+        if not fr.get("ok"):
+            try:
+                front.rollback(staged)
+                front.commit(staged)
+            except Exception:
+                pass
+    except Exception:
+        try:
+            front.rollback(staged)
+        except Exception:
+            pass
+
+
+def _apply_xray(
+    store: dict,
+    *,
+    persist: bool = True,
+    defer_front_reload: float = 0,
+    hold_front_commit: bool = False,
+) -> dict:
     """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails.
 
     On agent nodes, Xray is built from a runtime view (no local L2TP) while the persisted
     store may still hold a full mirror of the master for fast failover.
 
-    defer_front_reload: seconds to delay nginx reload after a successful stage (used by
-    /agent/apply so the sync HTTP response is not cut by reload of the proxying nginx).
+    hold_front_commit: stage+test nginx but leave reload to the caller (BackgroundTasks on
+    /agent/apply) so the sync HTTP response is not cut by reloading the proxying nginx.
+    defer_front_reload: legacy Timer-based delay inside commit (prefer hold_front_commit).
     """
     ns = (store.get("settings") or {}).get("nodes") or {}
     is_agent = bool(ns.get("agent_enabled") and (ns.get("role") or "") == "agent")
@@ -267,11 +291,16 @@ def _apply_xray(store: dict, *, persist: bool = True, defer_front_reload: float 
             if persist:
                 _save_store(store)
             return result
-        fr = front.commit(staged, defer_reload_sec=defer_front_reload)
-        if not fr["ok"]:
-            result = {**result, "ok": False, "error": fr["error"]}
-        elif staged.get("problems"):
-            result = {**result, "warning": "; ".join(staged["problems"])}
+        if hold_front_commit:
+            result = {**result, "_front_staged": staged}
+            if staged.get("problems"):
+                result["warning"] = "; ".join(staged["problems"])
+        else:
+            fr = front.commit(staged, defer_reload_sec=defer_front_reload)
+            if not fr["ok"]:
+                result = {**result, "ok": False, "error": fr["error"]}
+            elif staged.get("problems"):
+                result = {**result, "warning": "; ".join(staged["problems"])}
         if persist:
             _save_store(store)
     if result.get("ok"):
@@ -284,7 +313,8 @@ def _apply_xray(store: dict, *, persist: bool = True, defer_front_reload: float 
                 ops.ensure_ports_open(direct_ports)
             except Exception:
                 pass
-    _issue_front_certs(store)
+    if not hold_front_commit:
+        _issue_front_certs(store)
     return result
 
 
@@ -6573,8 +6603,12 @@ async def agent_promote(request: Request):
         return JSONResponse({"ok": False, "error": f"promote exception: {exc}"}, status_code=500)
 
 
-def _agent_apply_payload(payload: dict) -> dict:
-    """Apply a master payload on this agent (push or pull). Returns {ok, error, warnings, mirror}."""
+def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> dict:
+    """Apply a master payload on this agent (push or pull). Returns {ok, error, warnings, mirror}.
+
+    hold_front_commit: used by /agent/apply so nginx reload runs in BackgroundTasks
+    after the HTTP response is sent (avoids "Remote end closed without response").
+    """
     mirror = bool(payload.get("mirror"))
     with mutate() as st:
         if payload.get("clients") is not None:
@@ -6633,21 +6667,20 @@ def _agent_apply_payload(payload: dict) -> dict:
         masters = payload.get("masters")
         if isinstance(masters, list) and isinstance(ns.get("pull"), dict):
             ns["pull"]["fallbacks"] = [str(m).rstrip("/") for m in masters if m][:8]
-        rb = payload.get("reverse_bridge")
-        if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
-            ns["reverse_bridge"] = rb
-            if payload.get("nat"):
-                ns["nat"] = True
-            else:
+        # Only touch reverse_bridge when the key is present. Omitting it keeps the
+        # agent's current bridge (avoids wiping reverse when master failed to build one).
+        if "reverse_bridge" in payload:
+            rb = payload.get("reverse_bridge")
+            if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
+                ns["reverse_bridge"] = rb
+                if payload.get("nat"):
+                    ns["nat"] = True
+                else:
+                    ns.pop("nat", None)
+            elif rb is None or payload.get("nat") is False:
+                ns.pop("reverse_bridge", None)
                 ns.pop("nat", None)
-        elif payload.get("nat") is False or (
-            "reverse_bridge" in payload and not isinstance(rb, dict)
-        ):
-            ns.pop("reverse_bridge", None)
-            ns.pop("nat", None)
-    # Defer nginx reload so the master's /agent/apply HTTP response can flush first;
-    # otherwise reload drops the proxied connection → "Remote end closed without response".
-    res = _apply_xray(_load_store(), defer_front_reload=0.6)
+    res = _apply_xray(_load_store(), hold_front_commit=hold_front_commit)
     err = res.get("error") or ""
     try:
         err = xray.clean_xray_error(err) or err
@@ -6666,11 +6699,14 @@ def _agent_apply_payload(payload: dict) -> dict:
                 )
     except Exception:
         pass
-    return {"ok": bool(res.get("ok")), "error": err, "mirror": mirror, "warnings": warnings}
+    out = {"ok": bool(res.get("ok")), "error": err, "mirror": mirror, "warnings": warnings}
+    if hold_front_commit and res.get("_front_staged") is not None:
+        out["_front_staged"] = res["_front_staged"]
+    return out
 
 
 @app.post("/agent/apply")
-async def agent_apply(request: Request):
+async def agent_apply(request: Request, background_tasks: BackgroundTasks):
     """Remote node agent: accept pushed config from master panel."""
     store, err = _agent_auth(request)
     if err:
@@ -6681,7 +6717,22 @@ async def agent_apply(request: Request):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
-    return _agent_apply_payload(payload)
+
+    def _run() -> dict:
+        return _agent_apply_payload(payload, hold_front_commit=True)
+
+    out = await run_in_threadpool(_run)
+    staged = out.pop("_front_staged", None)
+    if staged is not None and out.get("ok"):
+        # Reload nginx only after the response bytes are on the wire.
+        background_tasks.add_task(_commit_front_safe, staged)
+        background_tasks.add_task(lambda: _issue_front_certs(_load_store()))
+    elif staged is not None:
+        try:
+            front.rollback(staged)
+        except Exception:
+            pass
+    return out
 
 
 @app.post("/agent/pull")

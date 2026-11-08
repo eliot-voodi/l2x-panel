@@ -649,10 +649,9 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
                 "dials": int(rv.get("dials") or REVERSE_DIALS_DEFAULT),
             }
 
-    return {
+    out = {
         "mirror": mirror,
         "nat": nat,
-        "reverse_bridge": reverse_bridge,
         "clients": (clients if node.get("sync_clients", True) and not nat else []) + bridge_clients,
         "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on else [],
         "outbounds_custom": customs,
@@ -670,6 +669,14 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             "enabled": bool(node.get("as_outbound")),
         } if node.get("as_outbound") else None,
     }
+    # Include reverse_bridge only when we have a full bridge, or when reverse is off
+    # (explicit null clears it). If rv_on but build failed, omit the key so the agent
+    # keeps its working reverse_bridge instead of wiping it mid-sync.
+    if reverse_bridge:
+        out["reverse_bridge"] = reverse_bridge
+    elif not rv_on:
+        out["reverse_bridge"] = None
+    return out
 
 
 def agent_endpoint(node: dict, path: str) -> str:
@@ -1048,10 +1055,30 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
         "remote end closed", "remotdisconnected", "connection aborted",
         "broken pipe", "connection refused",
     )
+    _drop = (
+        "remote end closed", "remotdisconnected", "connection aborted", "broken pipe",
+    )
     if not result.get("ok") and any(x in err.lower() for x in _transient):
         time.sleep(1.2)
         result = _push_once(node, payload, timeout=max(timeout, 180))
         err = str(result.get("error") or "")
+    # Still dropped with no HTTP status: nginx likely reloaded after apply. If /health
+    # answers, treat as soft-ok so the UI does not stick on a false sync err.
+    if not result.get("ok") and any(x in err.lower() for x in _drop):
+        time.sleep(1.0)
+        probe = probe_health(node, timeout=8)
+        if probe.get("ok"):
+            warn = (
+                f"ответ sync оборван ({err[:100]}), но /health ок — "
+                "конфиг скорее всего уже применён (nginx reload)"
+            )
+            result = {
+                "ok": True,
+                "soft": True,
+                "warnings": list(result.get("warnings") or []) + [warn],
+                "error": "",
+            }
+            err = ""
     # Auto-heal: agent was turned off by update/restart — re-enable via manage API and retry once.
     # Respects remote agent_manual_off (admin unchecked Settings → Nodes).
     if not result.get("ok") and "agent disabled" in err.lower():
@@ -1126,16 +1153,17 @@ def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
     if payload.get("xray_settings") is not None:
         store["xray_settings"] = payload["xray_settings"]
     ns = store.setdefault("settings", {}).setdefault("nodes", {})
-    rb = payload.get("reverse_bridge")
-    if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
-        ns["reverse_bridge"] = rb
-        if payload.get("nat"):
-            ns["nat"] = True
-        else:
+    if "reverse_bridge" in payload:
+        rb = payload.get("reverse_bridge")
+        if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
+            ns["reverse_bridge"] = rb
+            if payload.get("nat"):
+                ns["nat"] = True
+            else:
+                ns.pop("nat", None)
+        elif rb is None or payload.get("nat") is False:
+            ns.pop("reverse_bridge", None)
             ns.pop("nat", None)
-    elif payload.get("nat") is False or (payload.get("reverse_bridge") is None and "reverse_bridge" in payload):
-        ns.pop("reverse_bridge", None)
-        ns.pop("nat", None)
     return apply_config(store)
 
 
