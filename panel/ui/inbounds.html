@@ -68,7 +68,7 @@
         <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit"><b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div></td>
         <td><span class="badge accent">{{ ib.protocol }}</span></td>
         {% set fm = P.front_mode(ib) %}
-        <td class="mono" title="{% if fm %}nginx :443 → 127.0.0.1:{{ ib.port }}{% else %}только 127.0.0.1{% endif %}">{% if fm %}443 → {% endif %}{{ ib.port }}{% if fm == 'http' and ib.share_host %}<div class="hint">{{ ib.share_host }}{{ P.front_http_path(ib) }}</div>{% endif %}</td>
+        <td class="mono" title="{% if P.is_direct(ib) %}напрямую 0.0.0.0:{{ ib.port }} (без nginx){% elif fm %}nginx :443 → 127.0.0.1:{{ ib.port }}{% else %}только 127.0.0.1{% endif %}">{% if fm %}443 → {% endif %}{{ ib.port }}{% if P.is_direct(ib) %} <span class="badge warn">direct</span>{% endif %}{% if fm == 'http' and ib.share_host %}<div class="hint">{{ ib.share_host }}{{ P.front_http_path(ib) }}</div>{% endif %}</td>
         <td>
           {% if ib.protocol in P.USER_PROTOCOLS %}
           <span class="badge">{{ ib.stream.network }}</span>
@@ -117,7 +117,7 @@
         </button>
         <div class="ib-detail" hidden>
           <div class="kv">
-            <div><span class="lbl">Порт</span><span class="val mono">{% if fm %}443 → {% endif %}{{ ib.port }}</span></div>
+            <div><span class="lbl">Порт</span><span class="val mono">{% if fm %}443 → {% endif %}{{ ib.port }}{% if P.is_direct(ib) %} <span class="badge warn">direct</span>{% endif %}</span></div>
             {% if fm == 'http' and ib.share_host %}
             <div><span class="lbl">Path</span><span class="val mono">{{ ib.share_host }}{{ P.front_http_path(ib) }}</span></div>
             {% endif %}

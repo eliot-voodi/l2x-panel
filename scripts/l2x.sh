@@ -134,10 +134,10 @@ firewall() {
   if [ -n "$port" ] && pyrun "$port" <<'EOF'
 import json, os, sys
 s = json.load(open(os.path.join(os.environ["L2XPANEL_DATA"], "store.json"), encoding="utf-8"))
-sys.exit(0 if int(sys.argv[1]) in {int(i.get("port") or 0) for i in s.get("inbounds") or []} else 1)
+sys.exit(0 if int(sys.argv[1]) in {int(i.get("port") or 0) for i in s.get("inbounds") or [] if not i.get("direct")} else 1)
 EOF
   then
-    c_err "Порт $port занят inbound: inbounds доступны только через nginx :443, их порты закрыты снаружи"
+    c_err "Порт $port занят inbound через nginx :443 — включите у него «Напрямую на порт» в панели"
     return
   fi
   if [ -n "$port" ]; then

@@ -321,6 +321,32 @@ def journal(unit: str, lines: int = 300, grep: str = "") -> str:
     return r["stdout"] or r["stderr"]
 
 
+def ensure_ports_open(ports) -> list[str]:
+    """Allow inbound TCP/UDP on direct inbound ports (ufw if active, else iptables). Idempotent."""
+    done: list[str] = []
+    ports = sorted({int(p) for p in ports or [] if 1 <= int(p) <= 65535})
+    if not ports:
+        return done
+    ufw = shutil.which("ufw")
+    ufw_on = bool(ufw) and "Status: active" in (_run([ufw, "status"], 15).get("stdout") or "")
+    ipt = shutil.which("iptables")
+    for port in ports:
+        if ufw_on:
+            _run([ufw, "allow", str(port)], 15)
+            done.append(f"ufw {port}")
+            continue
+        if not ipt:
+            continue
+        for proto in ("tcp", "udp"):
+            rule = ["INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"]
+            if not _run([ipt, "-C", *rule], 10).get("ok"):
+                _run([ipt, "-I", *rule], 10)
+                done.append(f"iptables {proto}/{port}")
+    if done and not ufw_on and shutil.which("netfilter-persistent"):
+        _run(["netfilter-persistent", "save"], 30)
+    return done
+
+
 def xray_debug_capture(seconds: int = 20, grep: str = "", lines: int = 400) -> dict:
     """Run Xray with loglevel=debug for a short window, return its journal, restore config."""
     import time as _time

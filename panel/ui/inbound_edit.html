@@ -21,13 +21,17 @@
       <div><label class="f">Tag</label><input name="tag" value="{{ ib.tag }}" required pattern="[A-Za-z0-9._-]+"></div>
     </div>
     <label class="f">Remark (имя в подписке)</label><input name="remark" value="{{ ib.remark }}">
+    <div class="mt">
+      <label class="check"><input type="checkbox" name="direct" value="1" id="ib_direct" {% if ib.direct %}checked{% endif %}>
+        Напрямую на порт (без nginx :443)</label>
+    </div>
     <div class="row">
-      <div><label class="f">Listen</label><input value="{{ P.INBOUND_LISTEN }}" readonly class="mono" title="Xray слушает только localhost, снаружи — nginx :443"></div>
-      <div><label class="f">Порт (внутренний)</label><input name="port" id="ib_port" type="number" min="1" max="65535" value="{{ ib.port }}" required>
+      <div><label class="f">Listen</label><input id="ib_listen" value="{{ P.inbound_listen(ib) }}" readonly class="mono"></div>
+      <div><label class="f" id="port_lbl">Порт</label><input name="port" id="ib_port" type="number" min="1" max="65535" value="{{ ib.port }}" required>
         <div class="hint" id="port_err" style="display:none;color:var(--bad,#e5484d)">Порты 22, 80, 443 запрещены для inbound</div>
       </div>
     </div>
-    <div class="hint">Снаружи порт inbound закрыт iptables; клиенты подключаются на <b>:443</b> через nginx.</div>
+    <div class="hint" id="direct_hint"></div>
     <div class="row">
       <div><label class="f">Лимит трафика inbound, GB</label><input name="total_gb" type="number" step="0.01" min="0" value="{{ ib.total_gb or '' }}" placeholder="∞"></div>
       <div><label class="f">Срок действия</label><input name="expire_at" type="datetime-local" value="{{ dt_input(ib.expire_at) }}"></div>
@@ -416,7 +420,13 @@
     var sec = secEl.value;
     var share = document.getElementById('share_host');
     var hint = document.getElementById('front_hint');
-    var front = FRONT_PROTOS.indexOf(p) >= 0;
+    var direct = document.getElementById('ib_direct').checked;
+    document.getElementById('ib_listen').value = direct ? '{{ P.DIRECT_LISTEN }}' : '{{ P.INBOUND_LISTEN }}';
+    document.getElementById('port_lbl').textContent = direct ? 'Порт (публичный)' : 'Порт (внутренний)';
+    document.getElementById('direct_hint').innerHTML = direct
+      ? 'Xray слушает <b>0.0.0.0:порт</b>, порт открывается в firewall (ufw/iptables). Клиент подключается на <b>домен:порт</b>; TLS без указанных файлов берёт сертификат домена.'
+      : 'Снаружи порт inbound закрыт; клиенты подключаются на <b>:443</b> через nginx.';
+    var front = !direct && FRONT_PROTOS.indexOf(p) >= 0;
     var http = front && HTTP_NETS.indexOf(n) >= 0;
     // Path + none → nginx TLS; Reality/TLS on xhttp/grpc/raw → SNI passthrough (3x-ui)
     if (http && sec !== 'none' && sec !== 'reality' && sec !== 'tls') {
@@ -427,17 +437,22 @@
       hint.textContent = 'Reality доступен для raw / grpc / xhttp (как в 3x-ui).';
     }
     share.required = false;
-    if (!front) {
-      hint.textContent = 'Этот протокол не публикуется через nginx :443 — доступен только локально.';
+    if (direct) {
+      hint.textContent = 'Напрямую: nginx этот inbound не трогает, security (none/TLS/Reality) обрабатывает Xray.';
+    } else if (!front) {
+      hint.textContent = 'Этот протокол не публикуется через nginx :443 — включите «Напрямую на порт», чтобы он был доступен снаружи.';
     } else if ((sec === 'reality' || sec === 'tls')) {
       hint.textContent = 'SNI passthrough на :443. SNI Reality/TLS не должен совпадать с доменом панели. Для XHTTP+Reality security остаётся reality.';
     } else if (http) {
       hint.innerHTML = 'Path через nginx: TLS снимает nginx, в Xray security=none. Несколько inbound на одном домене по Path.';
     } else {
-      hint.textContent = 'raw без TLS не публикуется через nginx — выберите ws/grpc/httpupgrade/xhttp, TLS или Reality.';
+      hint.textContent = (p === 'vless' || p === 'trojan')
+        ? 'raw на :443: TLS снимает Xray сертификатом публичного домена, остальное уходит в nginx (один такой inbound).'
+        : 'raw без TLS для этого протокола не публикуется через nginx — включите «Напрямую на порт».';
     }
   }
   document.getElementById('share_host').addEventListener('input', syncFront);
+  document.getElementById('ib_direct').addEventListener('change', syncFront);
   var portEl = document.getElementById('ib_port');
   function checkPort() {
     var bad = RESERVED.indexOf(parseInt(portEl.value, 10)) >= 0;

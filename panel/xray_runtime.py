@@ -515,6 +515,32 @@ def reverse_portal_tags(store: dict) -> list[str]:
     return tags
 
 
+def _direct_tls_cert(store: dict, ib: dict, built: dict) -> None:
+    """Direct-port TLS without explicit cert files: reuse the domain certificate nginx/ACME manages."""
+    ss = built.get("streamSettings") or {}
+    if ss.get("security") != "tls":
+        return
+    tls = ss.setdefault("tlsSettings", {})
+    certs = [c for c in tls.get("certificates") or [] if c.get("certificateFile") and c.get("keyFile")]
+    if certs:
+        tls["certificates"] = certs
+        return
+    try:
+        import front as front_mod
+        t = (ib.get("stream") or {}).get("tls") or {}
+        domain = front_mod.normalize_host(t.get("server_name") or ib.get("share_host") or "")
+        if not front_mod.is_domain(domain):
+            domain = front_mod.public_domain(store)
+        if not domain:
+            return
+        crt, key, _ = front_mod.cert_for(domain)
+    except Exception:
+        return
+    tls["certificates"] = [{"certificateFile": crt, "keyFile": key, "ocspStapling": 3600}]
+    if not tls.get("serverName"):
+        tls["serverName"] = domain
+
+
 def _front_raw_tls(store: dict, ib: dict, built: dict) -> None:
     """Plain RAW on :443: Xray terminates TLS (public cert); non-proxy traffic falls back to nginx."""
     try:
@@ -833,7 +859,7 @@ def ensure_inbounds(store: dict) -> list[dict]:
             ib["id"] = next_id
             next_id += 1
         ensure_inbound_keys(ib)
-        ib["listen"] = P.INBOUND_LISTEN
+        ib["listen"] = P.inbound_listen(ib)
         P.normalize_http_inbound(ib)
     # Inbounds from older versions (or pushed by a master node) may sit on a forbidden port
     for ib in inbounds:
@@ -1273,6 +1299,8 @@ def build_config(store: dict) -> dict:
                 dest.append("fakedns")
         if P.front_mode(ib) == "raw":
             _front_raw_tls(store, ib, built)
+        elif P.is_direct(ib):
+            _direct_tls_cert(store, ib, built)
         inbounds.append(built)
 
     inbounds.append({

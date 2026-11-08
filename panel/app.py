@@ -271,6 +271,16 @@ def _apply_xray(store: dict, *, persist: bool = True) -> dict:
             result = {**result, "warning": "; ".join(staged["problems"])}
         if persist:
             _save_store(store)
+    if result.get("ok"):
+        direct_ports = [
+            int(ib.get("port") or 0) for ib in runtime.get("inbounds") or []
+            if ib.get("enabled", True) and P.is_direct(ib)
+        ]
+        if direct_ports:
+            try:
+                ops.ensure_ports_open(direct_ports)
+            except Exception:
+                pass
     _issue_front_certs(store)
     return result
 
@@ -2223,7 +2233,8 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["tag"] = tag
     ib["remark"] = str(form.get("remark") or tag).strip()
     ib["enabled"] = form.get("enabled") == "1"
-    ib["listen"] = P.INBOUND_LISTEN
+    ib["direct"] = form.get("direct") == "1"
+    ib["listen"] = P.inbound_listen(ib)
     ib["port"] = _int(form.get("port"), 0)
     if reason := xray.port_forbidden_reason(ib["port"]):
         return reason
@@ -2448,6 +2459,8 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     share = ib["share_host"] or front.public_domain({"settings": SETTINGS_CACHE}) or public_host()
     if mode == "http" and not front.is_domain(share):
         return f"Для {st['network']} задайте публичный домен в Настройках или URL share"
+    if P.is_direct(ib) and ib["port"] in front.legacy_sub_ports({"settings": SETTINGS_CACHE}):
+        return f"Порт {ib['port']} слушает nginx (старые ссылки подписок) — выберите другой"
     if mode == "raw" and not front.public_domain({"settings": SETTINGS_CACHE}):
         return "RAW на :443 работает через публичный домен — задайте его в Настройки → Панель"
     if mode == "http" and not front.PATH_RE.match(P.front_http_path(ib)):

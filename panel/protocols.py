@@ -582,6 +582,18 @@ def _fallbacks(ib: dict) -> list[dict]:
     return out
 
 
+DIRECT_LISTEN = "0.0.0.0"
+
+
+def is_direct(ib: dict) -> bool:
+    """Inbound listens on its own public port, bypassing the nginx :443 front."""
+    return bool(ib.get("direct"))
+
+
+def inbound_listen(ib: dict) -> str:
+    return DIRECT_LISTEN if is_direct(ib) else INBOUND_LISTEN
+
+
 def front_mode(ib: dict) -> str | None:
     """How the nginx front publishes this inbound on :443.
 
@@ -591,9 +603,9 @@ def front_mode(ib: dict) -> str | None:
              *different* hostname than the public panel domain;
     "raw"  — plain VLESS/Trojan RAW on the public domain: Xray terminates TLS with the
              public certificate and falls back to nginx for everything that is not a proxy client;
-    None   — not reachable from outside.
+    None   — not behind nginx (local only, or direct on its own port).
     """
-    if ib.get("protocol") not in FRONT_PROTOCOLS:
+    if is_direct(ib) or ib.get("protocol") not in FRONT_PROTOCOLS:
         return None
     st = ib.get("stream") or {}
     net = st.get("network") or "raw"
@@ -725,7 +737,7 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
         }
     out: dict[str, Any] = {
         "tag": ib["tag"],
-        "listen": INBOUND_LISTEN,
+        "listen": inbound_listen(ib),
         "port": int(ib["port"]),
         "protocol": proto,
         "settings": settings,
@@ -939,6 +951,8 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
     mode = front_mode(ib)
     if mode:
         ep["port"] = FRONT_PORT
+    elif is_direct(ib) and sec == "tls" and not ep.get("sni"):
+        ep["sni"] = ep["address"]
     if mode == "sni" and sec == "tls" and not ep.get("sni"):
         ep["sni"] = ib.get("share_host") or ""
     elif mode == "raw":
