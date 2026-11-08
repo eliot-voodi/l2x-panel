@@ -66,6 +66,16 @@ RESERVED_PORTS = frozenset({22, 80, 443})
 FRONT_HTTP_NETWORKS = ("ws", "grpc", "httpupgrade", "xhttp")
 FRONT_PROTOCOLS = ("vless", "vmess", "trojan")
 
+# WS without Mux opens a new WebSocket per app connection → nginx/Xray flood.
+# Mux.Cool keeps ~concurrency streams on a few long-lived WS sessions (client-side).
+MUX_NETWORKS = frozenset({"ws", "httpupgrade"})
+DEFAULT_WS_HEARTBEAT = 10  # seconds; Ping frames keep the long WS alive through nginx
+DEFAULT_SUB_MUX = {
+    "concurrency": 8,
+    "xudpConcurrency": 16,
+    "xudpProxyUDP443": "reject",
+}
+
 
 # ---------------------------------------------------------------- defaults
 
@@ -113,7 +123,7 @@ def default_stream(security: str = "reality") -> dict:
             "accept_proxy_protocol": False,
         },
         "ws": {
-            "path": "/ws", "host": "", "headers": "", "heartbeat": 0,
+            "path": "/ws", "host": "", "headers": "", "heartbeat": DEFAULT_WS_HEARTBEAT,
             "accept_proxy_protocol": False,
         },
         "grpc": {
@@ -357,8 +367,12 @@ def build_stream_settings(stream: dict) -> dict:
         if headers:
             # ws headers are flat string map in Xray
             ws_settings["headers"] = {k: (v[0] if isinstance(v, list) and v else str(v)) for k, v in headers.items()}
-        if int(ws.get("heartbeat") or 0) > 0:
-            ws_settings["heartbeatPeriod"] = int(ws["heartbeat"])
+        # Keep long-lived WS alive through nginx idle timeouts (0 / empty → default)
+        try:
+            hb = int(ws.get("heartbeat") or 0)
+        except (TypeError, ValueError):
+            hb = 0
+        ws_settings["heartbeatPeriod"] = hb if hb > 0 else DEFAULT_WS_HEARTBEAT
         if ws.get("accept_proxy_protocol") or stream.get("accept_proxy_protocol"):
             ws_settings["acceptProxyProtocol"] = True
         out["wsSettings"] = ws_settings
@@ -873,6 +887,11 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         cfg = st.get(net) or {}
         ep["path"] = cfg.get("path") or "/"
         ep["host"] = cfg.get("host") or ""
+        if net == "ws":
+            try:
+                ep["heartbeat"] = max(0, int(cfg.get("heartbeat") if cfg.get("heartbeat") not in (None, "") else DEFAULT_WS_HEARTBEAT))
+            except (TypeError, ValueError):
+                ep["heartbeat"] = DEFAULT_WS_HEARTBEAT
         if net == "xhttp":
             ep["mode"] = cfg.get("mode") or "auto"
     elif net == "grpc":
@@ -1190,7 +1209,10 @@ def _client_stream(ep: dict) -> dict:
     if net == "raw" and ep.get("header") == "http":
         st["rawSettings"] = {"header": {"type": "http", "request": {"path": [ep.get("path") or "/"], "headers": {"Host": [ep.get("host") or ""]}}}}
     elif net == "ws":
-        st["wsSettings"] = {"path": ep.get("path") or "/", **({"host": ep["host"]} if ep.get("host") else {})}
+        ws: dict[str, Any] = {"path": ep.get("path") or "/", **({"host": ep["host"]} if ep.get("host") else {})}
+        # Client-side Ping keeps the muxed WS from being dropped by idle timeouts
+        ws["heartbeatPeriod"] = int(ep.get("heartbeat") or DEFAULT_WS_HEARTBEAT) or DEFAULT_WS_HEARTBEAT
+        st["wsSettings"] = ws
     elif net == "grpc":
         st["grpcSettings"] = {"serviceName": ep.get("service_name") or "", "multiMode": ep.get("mode") == "multi"}
     elif net == "httpupgrade":
@@ -1226,14 +1248,28 @@ def _parse_json_blob(value: Any) -> Any:
         return None
 
 
-def apply_sub_json_extras(cfg: dict, extras: dict | None) -> dict:
-    """Inject Fragment / Noise / Mux into a JSON subscription client config."""
-    if not extras:
-        return cfg
+def _mux_compatible(ep: dict | None, proxy: dict | None = None) -> bool:
+    """Mux.Cool is for WS/httpupgrade; Vision flow ignores Mux."""
+    if ep and ep.get("flow"):
+        return False
+    net = (ep or {}).get("net") or ""
+    if not net and proxy:
+        net = ((proxy.get("streamSettings") or {}).get("network") or "")
+    return net in MUX_NETWORKS
+
+
+def apply_sub_json_extras(cfg: dict, extras: dict | None, *, ep: dict | None = None) -> dict:
+    """Inject Fragment / Noise / Mux into a JSON subscription client config.
+
+    Empty Mux setting → auto-enable Mux.Cool for WS/httpupgrade so clients keep
+    one long WebSocket instead of a new handshake per app request.
+    Set json_mux to {"enabled": false} to opt out.
+    """
     outs = cfg.get("outbounds") or []
     proxy = next((o for o in outs if o.get("tag") == "proxy"), outs[0] if outs else None)
     if not proxy:
         return cfg
+    extras = extras or {}
     frag = _parse_json_blob(extras.get("fragment"))
     noise = _parse_json_blob(extras.get("noise"))
     mux = _parse_json_blob(extras.get("mux"))
@@ -1249,8 +1285,11 @@ def apply_sub_json_extras(cfg: dict, extras: dict | None) -> dict:
     if noise and isinstance(noise, (dict, list)):
         st = proxy.setdefault("streamSettings", {})
         st["finalmask"] = {"udp": noise if isinstance(noise, list) else [noise]}
-    if mux and isinstance(mux, dict):
-        proxy["mux"] = {"enabled": True, **mux}
+    if mux is None and _mux_compatible(ep, proxy):
+        mux = dict(DEFAULT_SUB_MUX)
+    if isinstance(mux, dict) and mux.get("enabled", True) is not False:
+        body = {k: v for k, v in mux.items() if k != "enabled"}
+        proxy["mux"] = {"enabled": True, **body}
     cfg["outbounds"] = outs
     return cfg
 
@@ -1307,7 +1346,7 @@ def xray_client_config(ep: dict, extras: dict | None = None, *, doh_url: str = "
             ],
         },
     }
-    return apply_sub_json_extras(cfg, extras)
+    return apply_sub_json_extras(cfg, extras, ep=ep)
 
 
 # ---------------------------------------------------------------- Clash / Mihomo

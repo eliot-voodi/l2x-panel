@@ -178,10 +178,11 @@
     <div class="row">
       <div><label class="f">Path</label><input name="ws_path" value="{{ st.ws.path }}"></div>
       <div><label class="f">Host</label><input name="ws_host" value="{{ st.ws.host }}"></div>
-      <div><label class="f">Heartbeat, с</label><input name="ws_heartbeat" type="number" min="0" value="{{ st.ws.heartbeat or 0 }}"></div>
+      <div><label class="f">Heartbeat, с</label><input name="ws_heartbeat" type="number" min="0" value="{{ st.ws.heartbeat or 10 }}" title="Ping каждые N с — держит одно длинное WS. 0 = 10 с по умолчанию."></div>
     </div>
     <label class="f">Headers (Key: Value)</label>
     <textarea name="ws_headers" class="mono" rows="2">{{ st.ws.headers or '' }}</textarea>
+    <div class="hint">Без Mux каждое соединение приложения = новый WS (сотни рукопожатий). JSON-подписка включает Mux автоматически; в v2rayN/NG/Hiddify для URI-ссылок включите Mux вручную.</div>
   </div>
   <div data-net="grpc">
     <div class="row">
