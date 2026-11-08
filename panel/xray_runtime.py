@@ -502,7 +502,8 @@ def reverse_nat_nodes(store: dict) -> list[dict]:
 
 
 def reverse_portal_tags(store: dict) -> list[str]:
-    tags = [p["tag"] for p in (store.get("reverse") or {}).get("portals") or [] if p.get("tag")]
+    """Outbound tags created by VLESS reverse (inbound clients[].reverse.tag)."""
+    tags: list[str] = []
     for n in reverse_nat_nodes(store):
         tag = n.get("rv_tag") or f"node_{n.get('name') or 'node'}"
         if tag and tag not in tags:
@@ -515,79 +516,59 @@ def reverse_portal_tags(store: dict) -> list[str]:
 
 
 def _inject_reverse(store: dict, cfg: dict) -> None:
-    """Master: reverse portals + shared WS inbound. Agent: reverse bridge + dial to master."""
+    """VLESS Reverse Proxy (Xray ≥ 25.10; legacy bridge/portal is removed from core).
+
+    Master: rv-in inbound whose clients carry reverse.tag = node_… (routable outbound).
+    NAT agent: VLESS outbound with reverse.tag dials master; traffic arriving on that
+    tag goes to direct (node egress).
+    """
     import nodes as nodes_mod
 
-    # --- Agent reverse bridge (this host dials master) ---
+    cfg.pop("reverse", None)
+
+    # --- NAT agent: dial master, expose reverse inbound tag locally ---
     ns = (store.get("settings") or {}).get("nodes") or {}
     rb = ns.get("reverse_bridge") if isinstance(ns.get("reverse_bridge"), dict) else None
-    if rb and rb.get("uuid") and rb.get("path") and rb.get("master_host") and rb.get("domain"):
-        bridge_tag = "rv-bridge"
+    if rb and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
         up_tag = "rv-up"
-        cfg.setdefault("reverse", {}).setdefault("bridges", [])
-        bridges = cfg["reverse"]["bridges"]
-        if not any(b.get("tag") == bridge_tag for b in bridges):
-            bridges.append({"tag": bridge_tag, "domain": rb["domain"]})
+        in_tag = "rv-in"
         outs = cfg.setdefault("outbounds", [])
-        if not any(o.get("tag") == up_tag for o in outs):
-            outs.append({
-                "tag": up_tag,
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [{
-                        "address": rb["master_host"],
-                        "port": int(rb.get("port") or 443),
-                        "users": [{"id": rb["uuid"], "encryption": "none", "flow": ""}],
-                    }],
+        outs[:] = [o for o in outs if o.get("tag") != up_tag]
+        outs.append({
+            "tag": up_tag,
+            "protocol": "vless",
+            "settings": {
+                "address": rb["master_host"],
+                "port": int(rb.get("port") or 443),
+                "id": rb["uuid"],
+                "encryption": "none",
+                "flow": "",
+                "reverse": {"tag": in_tag},
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {
+                    "path": rb["path"],
+                    "host": rb["master_host"],
+                    "heartbeatPeriod": 10,
                 },
-                "streamSettings": {
-                    "network": "ws",
-                    "security": "tls",
-                    "wsSettings": {
-                        "path": rb["path"],
-                        "headers": {},
-                        "heartbeatPeriod": 10,
-                    },
-                    "tlsSettings": {
-                        "serverName": rb["master_host"],
-                        "allowInsecure": False,
-                        "fingerprint": rb.get("fingerprint") or "chrome",
-                        "alpn": ["http/1.1"],
-                    },
+                "tlsSettings": {
+                    "serverName": rb["master_host"],
+                    "allowInsecure": False,
+                    "fingerprint": rb.get("fingerprint") or "chrome",
+                    "alpn": ["http/1.1"],
                 },
-            })
+            },
+        })
         rules = cfg.setdefault("routing", {}).setdefault("rules", [])
-        # Control traffic for this portal domain → master; user traffic → direct (node egress)
-        ctrl = {
-            "type": "field", "inboundTag": [bridge_tag],
-            "domain": [f"full:{rb['domain']}"], "outboundTag": up_tag,
-        }
-        egress = {"type": "field", "inboundTag": [bridge_tag], "outboundTag": "direct"}
-        # Insert before the final catch-all
-        insert_at = max(0, len(rules) - 1)
-        if not any(r.get("inboundTag") == [bridge_tag] and r.get("outboundTag") == up_tag for r in rules):
-            rules.insert(insert_at, ctrl)
-            rules.insert(insert_at + 1, egress)
-        return  # agent host does not also host portals for its own NAT nodes
-
-    # --- Master portals + shared reverse inbound ---
-    nat_nodes = reverse_nat_nodes(store)
-    manual = store.get("reverse") or {}
-    portals = list(manual.get("portals") or [])
-    bridges = list(manual.get("bridges") or [])
-    for n in nat_nodes:
-        tag = n.get("rv_tag") or nodes_mod.node_outbound_tag(n)
-        domain = n.get("rv_domain") or ""
-        if tag and domain and not any(p.get("tag") == tag for p in portals):
-            portals.append({"tag": tag, "domain": domain})
-    if not portals and not bridges:
+        egress = {"type": "field", "inboundTag": [in_tag], "outboundTag": "direct"}
+        if not any(r.get("inboundTag") == [in_tag] for r in rules):
+            rules.insert(1 if rules else 0, egress)
         return
-    cfg["reverse"] = {}
-    if bridges:
-        cfg["reverse"]["bridges"] = [{"tag": b["tag"], "domain": b["domain"]} for b in bridges if b.get("tag")]
-    if portals:
-        cfg["reverse"]["portals"] = [{"tag": p["tag"], "domain": p["domain"]} for p in portals if p.get("tag")]
 
+    # --- Master: shared reverse inbound behind nginx Path ---
+    nat_nodes = reverse_nat_nodes(store)
     if not nat_nodes:
         return
     rv = nodes_mod.ensure_reverse_master(store)
@@ -596,9 +577,12 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     clients = []
     for n in nat_nodes:
         email = f"rv@{nodes_mod.slugify(n.get('name') or 'node')}"
-        clients.append({"id": n["rv_uuid"], "email": email, "level": 0})
+        tag = n.get("rv_tag") or nodes_mod.node_outbound_tag(n)
+        clients.append({
+            "id": n["rv_uuid"], "email": email, "level": 0, "flow": "",
+            "reverse": {"tag": tag},
+        })
         n["rv_email"] = email
-    # Shared reverse inbound — nginx Path publishes it as normal WS on the public domain
     ib = {
         "tag": "rv-in",
         "listen": "127.0.0.1",
@@ -610,7 +594,6 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
             "security": "none",
             "wsSettings": {"path": path, "heartbeatPeriod": 10},
         },
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
     }
     # Also register a panel-shaped inbound so front.py publishes the path on :443
     panel_ibs = store.setdefault("inbounds", [])
@@ -649,31 +632,10 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     else:
         panel_ibs.append(shape)
 
-    # Prefer the fully-built inbound from build_inbound if already present; else inject raw
-    inbounds = cfg.setdefault("inbounds", [])
-    inbounds = [i for i in inbounds if i.get("tag") != "rv-in"]
-    # Rebuild with identities via panel inbound builder when possible
-    try:
-        import protocols as P
-        identities = [{"id": c["id"], "email": c["email"], "flow": ""} for c in clients]
-        built = P.build_inbound(shape, identities)
-        inbounds.append(built)
-    except Exception:
-        inbounds.append(ib)
+    # Raw inbound: build_inbound would drop clients[].reverse
+    inbounds = [i for i in cfg.setdefault("inbounds", []) if i.get("tag") != "rv-in"]
+    inbounds.append(ib)
     cfg["inbounds"] = inbounds
-
-    # Route each reverse user into their portal tag
-    rules = cfg.setdefault("routing", {}).setdefault("rules", [])
-    insert_at = 1  # after api rule
-    for n in nat_nodes:
-        email = n.get("rv_email") or f"rv@{nodes_mod.slugify(n.get('name') or 'node')}"
-        tag = n.get("rv_tag") or nodes_mod.node_outbound_tag(n)
-        rule = {"type": "field", "inboundTag": ["rv-in"], "user": [email], "outboundTag": tag}
-        if not any(
-            r.get("inboundTag") == ["rv-in"] and r.get("user") == [email] for r in rules
-        ):
-            rules.insert(insert_at, rule)
-            insert_at += 1
 
 
 def all_outbound_tags(store: dict) -> list[str]:
@@ -1305,17 +1267,13 @@ def build_config(store: dict) -> dict:
     try:
         _inject_reverse(store, cfg)
     except Exception:
-        # Fall back to manual reverse section if auto-inject fails
-        rev = store.get("reverse") or {}
-        if rev.get("bridges") or rev.get("portals"):
-            cfg["reverse"] = {
-                **({"bridges": [{"tag": b["tag"], "domain": b["domain"]} for b in rev.get("bridges") or []]} if rev.get("bridges") else {}),
-                **({"portals": [{"tag": p["tag"], "domain": p["domain"]} for p in rev.get("portals") or []]} if rev.get("portals") else {}),
-            }
+        cfg.pop("reverse", None)
 
     patch = xs.get("template_patch") or {}
     if patch:
         cfg = deep_merge(cfg, patch)
+    # Legacy reverse{} is rejected by current Xray — never emit it (even via template patch)
+    cfg.pop("reverse", None)
     return cfg
 
 

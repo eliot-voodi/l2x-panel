@@ -57,14 +57,7 @@
 {% elif tab == 'reverse' %}
 <form class="card" method="post" action="{{ bp }}/xray/settings">
   <input type="hidden" name="section" value="reverse">
-  <div class="row">
-    <div><label class="f">Bridges (tag | domain)</label><textarea name="bridges" class="mono" rows="4">{% for b in store.reverse.bridges %}{{ b.tag }} | {{ b.domain }}
-{% endfor %}</textarea></div>
-    <div><label class="f">Portals (tag | domain)</label><textarea name="portals" class="mono" rows="4">{% for b in store.reverse.portals %}{{ b.tag }} | {{ b.domain }}
-{% endfor %}</textarea></div>
-  </div>
-  <div class="hint">Reverse proxy Xray: portal на этом сервере принимает соединения bridge с сервера за NAT. Tag portal'а становится доступен как outbound в маршрутизации.</div>
-  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+  <div class="hint">Legacy reverse (bridges/portals) удалён из Xray и больше не генерируется. Reverse теперь работает через <b>VLESS Reverse Proxy</b>: добавьте сервер за NAT в «Ноды» с типом «NAT» — мастер сам создаст скрытый VLESS-вход, а нода станет outbound <code>node_…</code>.</div>
 </form>
 
 {% elif tab == 'template' %}
