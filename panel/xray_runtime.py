@@ -594,11 +594,16 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
             if not (str(o.get("tag") or "").startswith("rv-up") or o.get("tag") == direct_tag)
         ]
         # Xray ≥26.5: vless-reverse traffic is blackholed unless freedom has finalRules allow.
+        # Match official "home broadband egress" example: allow public internet via reverse.
         outs.append({
             "tag": direct_tag,
             "protocol": "freedom",
             "settings": {
-                "finalRules": [{"action": "allow", "network": "tcp,udp"}],
+                "finalRules": [{
+                    "action": "allow",
+                    "network": "tcp,udp",
+                    "ip": ["!geoip:private"],
+                }],
             },
         })
         tls = {
@@ -682,10 +687,11 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         })
         n["rv_email"] = email
     if net == "xhttp":
+        # Server "auto" accepts stream-up / stream-one / packet-up from agents
         stream = {
             "network": "xhttp",
             "security": "none",
-            "xhttpSettings": {"path": path, "mode": "stream-up"},
+            "xhttpSettings": {"path": path, "mode": "auto"},
         }
     else:
         stream = {
@@ -701,7 +707,39 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         "settings": {"clients": clients, "decryption": "none"},
         "streamSettings": stream,
     }
-    # Also register a panel-shaped inbound so front.py publishes the path on :443
+    # Panel-shaped inbound must exist before front.stage() so nginx publishes the path
+    ensure_reverse_front_inbound(store)
+
+    # Raw inbound: build_inbound would drop clients[].reverse
+    inbounds = [i for i in cfg.setdefault("inbounds", []) if i.get("tag") != "rv-in"]
+    inbounds.append(ib)
+    cfg["inbounds"] = inbounds
+    try:
+        levels = cfg.setdefault("policy", {}).setdefault("levels", {})
+        lvl = levels.setdefault("0", {})
+        lvl.setdefault("bufferSize", 512)
+    except Exception:
+        pass
+
+
+def ensure_reverse_front_inbound(store: dict) -> dict | None:
+    """Register/update the panel-shaped rv-in inbound so nginx publishes its Path on :443.
+
+    Must run BEFORE front.stage() — otherwise the first apply after enabling reverse
+    reloads nginx without the reverse location and agents cannot dial the tunnel.
+    """
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return None
+    if not reverse_nat_nodes(store):
+        return None
+    rv = nodes_mod.ensure_reverse_master(store)
+    path = rv.get("path") or "/xh-rv"
+    port = int(rv.get("port") or 19100)
+    net = (rv.get("network") or "xhttp").lower()
+    if net not in ("xhttp", "ws"):
+        net = "xhttp"
     panel_ibs = store.setdefault("inbounds", [])
     existing = next((i for i in panel_ibs if i.get("tag") == "rv-in"), None)
     share = ""
@@ -729,7 +767,8 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
             "xhttp": {
                 "path": path if net == "xhttp" else "/xh",
                 "host": "",
-                "mode": "stream-up",
+                # auto: accept whatever mode the agent dials (stream-up default on agent)
+                "mode": "auto",
                 "extra": "",
                 "x_padding_bytes": "100-1000",
                 "sc_max_buffered_posts": 30,
@@ -754,24 +793,13 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         },
         "sniffing": {"enabled": True, "dest": ["http", "tls", "quic"], "route_only": False, "metadata_only": False},
         "fallbacks": [], "outbound": "direct",
-        # Hide from client subscriptions — system tunnel only
         "_system": True,
     }
     if existing:
         existing.update(shape)
-    else:
-        panel_ibs.append(shape)
-
-    # Raw inbound: build_inbound would drop clients[].reverse
-    inbounds = [i for i in cfg.setdefault("inbounds", []) if i.get("tag") != "rv-in"]
-    inbounds.append(ib)
-    cfg["inbounds"] = inbounds
-    try:
-        levels = cfg.setdefault("policy", {}).setdefault("levels", {})
-        lvl = levels.setdefault("0", {})
-        lvl.setdefault("bufferSize", 512)
-    except Exception:
-        pass
+        return existing
+    panel_ibs.append(shape)
+    return shape
 
 
 def all_outbound_tags(store: dict) -> list[str]:
@@ -798,7 +826,11 @@ def outbound_label(store: dict, tag: str) -> str:
             cc = o.get("country") or ""
             if o.get("kind") == "node":
                 icon = flag_emoji(cc) if cc else "🖥️"
-                return f"{icon} Node {o.get('remark') or tag}"
+                remark = str(o.get("remark") or tag)
+                # remark already starts with "Node …" from upsert_node_outbound
+                if remark.lower().startswith("node "):
+                    return f"{icon} {remark}"
+                return f"{icon} Node {remark}"
             icon = flag_emoji(cc) if cc else "🔗"
             return f"{icon} {o.get('remark') or tag}"
     if tag.startswith("node_"):

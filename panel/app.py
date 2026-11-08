@@ -281,6 +281,13 @@ def _apply_xray(
     runtime = nodes_mod.agent_runtime_store(store) if is_agent else store
     with STORE_LOCK:
         xray.ensure_inbounds(runtime)
+        # Register rv-in Path in store before nginx stage (otherwise first reverse
+        # enable ships nginx without the location and agents dial into a 404).
+        if not is_agent:
+            try:
+                xray.ensure_reverse_front_inbound(store)
+            except Exception:
+                pass
         # Front/certs use the real store (domains, base_path); Xray uses runtime
         staged = front.stage(store)
         if not staged["ok"]:
@@ -6829,7 +6836,10 @@ AGENT_DIAG: dict = {}
 
 
 def _reverse_conn_count(rb) -> int:
-    """Established TCP connections from this NAT agent to the master reverse endpoint."""
+    """Established TCP connections from this agent to the master reverse endpoint.
+
+    Prefers sockets owned by xray (avoids counting unrelated HTTPS to the same host).
+    """
     if not isinstance(rb, dict) or not rb.get("master_host"):
         return -1
     import socket
@@ -6837,13 +6847,17 @@ def _reverse_conn_count(rb) -> int:
     try:
         ips = {a[4][0] for a in socket.getaddrinfo(rb["master_host"], None)}
         out = _sp.run(
-            ["ss", "-Htn", "state", "established"], capture_output=True, text=True, timeout=10,
+            ["ss", "-Htnip", "state", "established"], capture_output=True, text=True, timeout=10,
         ).stdout
     except Exception:
         return -1
     port = str(int(rb.get("port") or 443))
     n = 0
     for line in out.splitlines():
+        low = line.lower()
+        # When -p is available, prefer xray-owned sockets only
+        if "users:(" in low and "xray" not in low and "\"xray\"" not in low:
+            continue
         parts = line.split()
         if len(parts) < 4:
             continue

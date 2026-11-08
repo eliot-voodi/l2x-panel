@@ -404,7 +404,7 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         ensure_reverse(node)
         entry = {
             "tag": tag,
-            "remark": f"Node {node.get('name')} ({'NAT' if node.get('nat') else 'reverse'})",
+            "remark": f"{node.get('name')} ({'NAT' if node.get('nat') else 'reverse'})",
             "kind": "node",
             "reverse": True,
             "node_id": node.get("id"),
@@ -431,7 +431,7 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         return
     entry = {
         "tag": tag,
-        "remark": f"Node {node.get('name')}",
+        "remark": str(node.get("name") or tag),
         "kind": "node",
         "node_id": node.get("id"),
         "enabled": True,

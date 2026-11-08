@@ -175,8 +175,18 @@ def plan(store: dict) -> dict:
         if tag == "rv-in" and ib.get("_system"):
             rv = ((store.get("settings") or {}).get("nodes") or {}).get("rv") or {}
             port = int(rv.get("port") or port)
+            # Keep panel inbound path in sync with settings.nodes.rv (xhttp or legacy ws)
             if rv.get("path"):
-                ib.setdefault("stream", {}).setdefault("ws", {})["path"] = rv["path"]
+                net = ((ib.get("stream") or {}).get("network") or rv.get("network") or "xhttp").lower()
+                st = ib.setdefault("stream", {})
+                st["network"] = net if net in ("xhttp", "ws") else "xhttp"
+                if st["network"] == "xhttp":
+                    st.setdefault("xhttp", {})["path"] = rv["path"]
+                    st.setdefault("xhttp", {}).setdefault("mode", "auto")
+                else:
+                    st.setdefault("ws", {})["path"] = rv["path"]
+                # front_mode uses security=none path transports
+                st["security"] = "none"
         if mode == "sni":
             names = P.front_snis(ib)
             if not names:
@@ -478,21 +488,19 @@ def _location(loc: dict) -> str:
             "    }"
         )
     if net == "xhttp":
+        # Official XHTTP-behind-nginx setup uses grpc_pass (stream-up/one speak gRPC-framed H2).
+        # plain proxy_pass HTTP/1.1 breaks bidirectional reverse mux while TCP still looks "up".
         return (
             f"    location ^~ {path} {{\n"
             "        client_max_body_size 0;\n"
             "        client_body_buffer_size 512k;\n"
             "        client_body_timeout 52w;\n"
-            f"        proxy_pass http://127.0.0.1:{port};\n"
-            "        proxy_http_version 1.1;\n"
-            "        proxy_set_header Host $host;\n"
-            "        proxy_set_header X-Real-IP $remote_addr;\n"
-            "        proxy_set_header X-Forwarded-For $remote_addr;\n"
-            "        proxy_buffering off;\n"
-            "        proxy_request_buffering off;\n"
-            "        proxy_max_temp_file_size 0;\n"
-            "        proxy_read_timeout 52w;\n"
-            "        proxy_send_timeout 52w;\n"
+            f"        grpc_pass grpc://127.0.0.1:{port};\n"
+            "        grpc_read_timeout 52w;\n"
+            "        grpc_send_timeout 52w;\n"
+            "        grpc_set_header Host $host;\n"
+            "        grpc_set_header X-Real-IP $remote_addr;\n"
+            "        grpc_set_header X-Forwarded-For $remote_addr;\n"
             "    }"
         )
     # ws / httpupgrade
