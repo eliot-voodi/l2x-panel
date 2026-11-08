@@ -5997,6 +5997,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 ns["role"] = "agent"
                 ns["agent_manual_off"] = False
                 ns["runtime_preserve"] = True
+                # NAT agents still poll us — /agent/pull forwards them here
+                ns["master_pull_url"] = nodes_mod.node_pull_base(node_copy)
                 nodes_mod.agent_token(st)
                 st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
             via = "API" if use_api else "SSH"
@@ -6042,6 +6044,7 @@ def nodes_restore_master(request: Request):
         ns["role"] = "master"
         ns["runtime_preserve"] = False
         ns["mirror"] = False
+        ns.pop("master_pull_url", None)
     xr = _apply_xray(_load_store())
     flash(request, *_ok_msg("Роль MASTER восстановлена на этой панели", xr))
     return go("/nodes")
@@ -6322,6 +6325,7 @@ def _manage_action(action: str, payload: dict) -> dict:
             ns["role"] = "master"
             ns["runtime_preserve"] = False
             ns["mirror"] = False
+            ns.pop("master_pull_url", None)
         xr = _apply_xray(_load_store())
         return {"ok": bool(xr.get("ok")), "error": xr.get("error") or "", "role": "master"}
 
@@ -6444,6 +6448,9 @@ async def agent_promote(request: Request):
             ns["role"] = "master"
             ns["mirror"] = False
             ns["runtime_preserve"] = False
+            ns.pop("master_pull_url", None)
+            ns.pop("pull", None)
+            ns.pop("reverse_bridge", None)
         # Re-encrypt L2TP secrets with this host's SECRET_KEY (plaintext over agent TLS + Bearer)
         for tname, sec in (payload.get("l2tp_secrets") or {}).items():
             if not tname or not isinstance(sec, dict):
@@ -6546,6 +6553,9 @@ def _agent_apply_payload(payload: dict) -> dict:
             ns["role"] = "agent"
         ns["mirror"] = mirror
         ns["runtime_preserve"] = False
+        masters = payload.get("masters")
+        if isinstance(masters, list) and isinstance(ns.get("pull"), dict):
+            ns["pull"]["fallbacks"] = [str(m).rstrip("/") for m in masters if m][:8]
         rb = payload.get("reverse_bridge")
         if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
             ns["reverse_bridge"] = rb
@@ -6596,13 +6606,6 @@ async def agent_apply(request: Request):
 async def agent_pull(request: Request):
     """NAT agent pulls config from master (Bearer = master agent_token, body.node_id)."""
     store = _load_store()
-    if not nodes_mod.is_master(store):
-        return JSONResponse({"ok": False, "error": "not master"}, status_code=403)
-    auth = request.headers.get("authorization") or ""
-    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    expected = (store.get("settings") or {}).get("nodes", {}).get("agent_token") or ""
-    if not expected or not token or not secrets.compare_digest(token, expected):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except ValueError:
@@ -6610,6 +6613,25 @@ async def agent_pull(request: Request):
     if not isinstance(body, dict):
         body = {}
     node_id = str(body.get("node_id") or "").strip()
+    auth = request.headers.get("authorization") or ""
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    ns_local = (store.get("settings") or {}).get("nodes") or {}
+    accepted = [ns_local.get("agent_token") or ""]
+    accepted += [
+        n.get("token") or "" for n in (store.get("nodes") or [])
+        if n.get("id") == node_id
+    ]
+    if not token or not any(t and secrets.compare_digest(token, t) for t in accepted):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not nodes_mod.is_master(store):
+        # Demoted master: point the NAT agent at the new master
+        moved_to = str(ns_local.get("master_pull_url") or "").rstrip("/")
+        if moved_to:
+            return JSONResponse(
+                {"ok": False, "error": "not master", "moved": True, "master_url": moved_to},
+                status_code=409,
+            )
+        return JSONResponse({"ok": False, "error": "not master"}, status_code=403)
     have_ver = str(body.get("have") or "").strip()
     status = body.get("status") if isinstance(body.get("status"), dict) else {}
     events: list[dict] = []
@@ -6633,6 +6655,10 @@ async def agent_pull(request: Request):
             want_update = nodes_mod.pull_wants_update(node, agent_ver, master_ver)
             nodes_mod.upsert_node_outbound(st, node)
             payload = nodes_mod.build_payload(st, node, xray.build_config)
+            self_url = f"https://{public_host()}{base_path()}" if public_host() else ""
+            payload["masters"] = nodes_mod.master_candidates(
+                st, self_url=self_url, exclude_id=node_id,
+            )
             ver = nodes_mod.payload_version(payload)
             node["last_sync"] = nodes_mod.now_iso()
     if err_code:
@@ -6697,9 +6723,44 @@ def _agent_pull_cycle() -> None:
             "reverse_ok": reverse_ok,
         },
     }
-    res = nodes_mod.pull_request(str(pull["master_url"]), token, body, timeout=45)
+    current = str(pull["master_url"]).rstrip("/")
+    res = nodes_mod.pull_request(current, token, body, timeout=45)
     if not res.get("ok"):
-        return
+        new_url = ""
+        if res.get("moved") and res.get("master_url"):
+            new_url = str(res["master_url"]).rstrip("/")
+        else:
+            fails = int(ns.get("pull_fail_streak") or 0) + 1
+            with mutate() as st:
+                st.setdefault("settings", {}).setdefault("nodes", {})["pull_fail_streak"] = fails
+            # Master unreachable / demoted without forwarding — try known mirrors
+            if fails >= 3 or res.get("status") == 403:
+                for cand in pull.get("fallbacks") or []:
+                    cand = str(cand or "").rstrip("/")
+                    if not cand or cand == current:
+                        continue
+                    probe = nodes_mod.pull_request(cand, token, body, timeout=20)
+                    if probe.get("ok"):
+                        new_url = cand
+                        break
+                    if probe.get("moved") and probe.get("master_url"):
+                        new_url = str(probe["master_url"]).rstrip("/")
+                        break
+        if new_url and new_url != current:
+            with mutate() as st:
+                n2 = st.setdefault("settings", {}).setdefault("nodes", {})
+                p2 = n2.setdefault("pull", {})
+                p2["master_url"] = new_url
+                n2["pull_version"] = ""
+                n2["pull_fail_streak"] = 0
+            res = nodes_mod.pull_request(new_url, token, {**body, "have": ""}, timeout=45)
+            if not res.get("ok"):
+                return
+        else:
+            return
+    if ns.get("pull_fail_streak"):
+        with mutate() as st:
+            st.setdefault("settings", {}).setdefault("nodes", {})["pull_fail_streak"] = 0
     payload = res.get("payload") if isinstance(res.get("payload"), dict) else {}
     want_update = bool(res.get("update") or payload.get("panel_update"))
     if want_update:

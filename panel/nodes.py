@@ -275,12 +275,43 @@ def pull_request(master_url: str, token: str, body: dict, timeout: int = 30) -> 
             return json.loads(resp.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as exc:
         try:
-            detail = json.loads(exc.read().decode("utf-8", "replace") or "{}").get("error") or ""
+            parsed = json.loads(exc.read().decode("utf-8", "replace") or "{}")
         except Exception:
-            detail = ""
-        return {"ok": False, "error": f"HTTP {exc.code} {detail}".strip()}
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        detail = parsed.get("error") or ""
+        return {**parsed, "ok": False, "status": exc.code, "error": f"HTTP {exc.code} {detail}".strip()}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+def node_pull_base(node: dict) -> str:
+    """https://host/base_path — what a NAT agent uses as master_url when this node is master."""
+    base = (node.get("url") or "").rstrip("/")
+    if not base:
+        dom = _normalize_domain(node.get("domain") or "")
+        base = f"https://{dom}" if dom else ""
+    if not base:
+        return ""
+    bp = (node.get("base_path") or "").strip().strip("/")
+    return f"{base}/{bp}" if bp else base
+
+
+def master_candidates(store: dict, *, self_url: str = "", exclude_id: str = "") -> list[str]:
+    """Pull URLs a NAT agent may fail over to: this master first, then mirror peers."""
+    out: list[str] = []
+    if self_url:
+        out.append(self_url.rstrip("/"))
+    for n in ensure_list(store):
+        if n.get("id") == exclude_id or n.get("nat") or not n.get("enabled", True):
+            continue
+        if not n.get("mirror"):
+            continue
+        u = node_pull_base(n)
+        if u and u not in out:
+            out.append(u)
+    return out
 
 
 def bridge_inbound(node: dict) -> dict:
@@ -464,7 +495,8 @@ def _peer_node_export(n: dict) -> dict:
     keys = (
         "id", "name", "url", "token", "enabled", "sync_clients", "sync_inbounds",
         "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
-        "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "nat",
+        "bridge_uuid", "bridge_path", "role", "panel_version", "nat",
+        "rv_uuid", "rv_domain", "rv_tag",
     )
     return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
 
