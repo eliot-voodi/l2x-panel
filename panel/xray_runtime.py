@@ -409,18 +409,35 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
             continue
         if not b.get("enabled", True):
             return False
-        # Balancer stays in sub while it has any live members for Xray
-        return bool(balancer_member_tags(store, b, healthy_only=True))
+        # Enabled balancers always appear in subscription. Member pool may be empty
+        # (no L2TP / customs down) — Xray then uses fallback; clients still get links.
+        return True
 
     return True
 
 
+def balancer_auto_pool(store: dict) -> list[str]:
+    """Default balancer pool when members is empty: connected L2TP + enabled customs."""
+    connected = connected_l2tp_tags(store)
+    seen = set(connected)
+    out = list(connected)
+    for o in store.get("outbounds_custom") or []:
+        if not o.get("enabled", True):
+            continue
+        tag = o.get("tag")
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        out.append(tag)
+    return out
+
+
 def balancer_member_tags(store: dict, balancer: dict, *, healthy_only: bool = False) -> list[str]:
-    """explicit members ∩ (connected L2TP ∪ enabled custom outbounds); empty → all connected L2TP."""
+    """explicit members ∩ live outbounds; empty members → auto pool (L2TP + enabled customs)."""
     connected = connected_l2tp_tags(store)
     members = balancer.get("members") or []
     if not members:
-        pool_list = connected
+        pool_list = balancer_auto_pool(store)
     else:
         custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True)}
         pool = set(connected) | custom

@@ -3979,7 +3979,15 @@ async def balancers_save(key: str, request: Request):
         b["fallback"] = "none" if raw_fb.lower() in ("none", "-", "off") else (raw_fb or "direct")
         members = [str(x) for x in form.getlist("members")]
         all_l2tp = {t_.get("outbound") or f"l2tp_{t_['name']}" for t_ in store["l2tp"]}
-        b["members"] = [] if members and set(members) == all_l2tp else members
+        all_custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("tag")}
+        all_auto = all_l2tp | all_custom
+        # [] = auto pool (connected L2TP + enabled customs). Explicit all-L2TP-only keeps the list.
+        if not members or set(members) == all_auto:
+            b["members"] = []
+        elif set(members) == all_l2tp and all_custom:
+            b["members"] = sorted(all_l2tp)
+        else:
+            b["members"] = members
         if key == "least_load":
             b["expected"] = max(1, _int(form.get("expected"), 1))
             b["max_rtt"] = str(form.get("max_rtt") or "1s")

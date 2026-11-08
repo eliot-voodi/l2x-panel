@@ -39,14 +39,14 @@
       {% for o in custom %}<option value="{{ o.tag }}" {% if b.fallback == o.tag %}selected{% endif %}>{{ outbound_label(store, o.tag) }}</option>{% endfor %}
     </select>
     <div class="hint">none — в Xray не ставится fallbackTag; при пустом пуле маршрут идёт в blackhole, а не в direct.</div>
-    <label class="f">Участники (ничего не отмечено или отмечены все L2TP = все подключённые L2TP)</label>
+    <label class="f">Участники (пусто / всё = авто: подключённые L2TP + включённые custom/node)</label>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.1rem .5rem">
       {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}
         <label class="check small"><input type="checkbox" name="members" value="{{ ob }}" {% if not b.members or ob in b.members %}checked{% endif %}>
           {{ outbound_label(store, ob) }} {% if l.status != 'connected' %}<span class="dim">({{ l.status }})</span>{% endif %}</label>
       {% endfor %}
       {% for o in custom %}
-        <label class="check small"><input type="checkbox" name="members" value="{{ o.tag }}" {% if o.tag in b.members %}checked{% endif %}>{{ outbound_label(store, o.tag) }}</label>
+        <label class="check small"><input type="checkbox" name="members" value="{{ o.tag }}" {% if not b.members or o.tag in b.members %}checked{% endif %}>{{ outbound_label(store, o.tag) }}</label>
       {% endfor %}
     </div>
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
