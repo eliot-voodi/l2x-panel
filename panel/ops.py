@@ -321,6 +321,36 @@ def journal(unit: str, lines: int = 300, grep: str = "") -> str:
     return r["stdout"] or r["stderr"]
 
 
+def xray_debug_capture(seconds: int = 20, grep: str = "", lines: int = 400) -> dict:
+    """Run Xray with loglevel=debug for a short window, return its journal, restore config."""
+    import time as _time
+
+    seconds = max(5, min(90, int(seconds or 20)))
+    cfg_path = Path("/etc/xray/config.json")
+    if not cfg_path.is_file():
+        return {"ok": False, "error": "нет /etc/xray/config.json", "text": ""}
+    original = cfg_path.read_text(encoding="utf-8")
+    try:
+        cfg = json.loads(original)
+    except ValueError as e:
+        return {"ok": False, "error": f"bad config: {e}", "text": ""}
+    cfg.setdefault("log", {})["loglevel"] = "debug"
+    since = _time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        _run(["systemctl", "restart", "xray"], 30)
+        _time.sleep(seconds)
+    finally:
+        cfg_path.write_text(original, encoding="utf-8")
+        _run(["systemctl", "restart", "xray"], 30)
+    cmd = ["journalctl", "-u", "xray", "--since", since, "--no-pager", "-o", "cat"]
+    if grep:
+        cmd += ["-g", grep]
+    r = _run(cmd, 30)
+    text = "\n".join((r["stdout"] or r["stderr"] or "").splitlines()[-max(50, min(3000, lines)):])
+    return {"ok": True, "error": "", "text": text, "seconds": seconds}
+
+
 def tail(path: str, lines: int = 300) -> str:
     p = Path(path)
     if not p.exists():

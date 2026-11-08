@@ -6350,6 +6350,45 @@ def _manage_action(action: str, payload: dict) -> dict:
             text = ops.journal({"xray": "xray", "panel": "l2xpanel", "l2tp": "xl2tpd"}.get(src, "xray"), lines, grep)
         return {"ok": True, "text": text, "src": src, "n": lines, "q": grep}
 
+    if action == "xray_debug":
+        return ops.xray_debug_capture(
+            _int(payload.get("seconds"), 20), str(payload.get("q") or ""), _int(payload.get("n"), 400),
+        )
+
+    if action == "xray_config":
+        try:
+            cfg = json.loads(Path("/etc/xray/config.json").read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        for ib in cfg.get("inbounds") or []:
+            for c in (ib.get("settings") or {}).get("clients") or []:
+                if c.get("id"):
+                    c["id"] = str(c["id"])[:8] + "…"
+        return {"ok": True, "config": cfg}
+
+    if action == "nodes":
+        rows = []
+        for n in nodes_mod.ensure_list(_load_store()):
+            rows.append({k: n.get(k) for k in (
+                "id", "name", "domain", "nat", "as_outbound", "enabled", "online", "panel_version",
+                "rv_tag", "last_pull", "last_sync", "last_warning", "last_error", "reverse_ok",
+                "agent_diag", "agent_diag_at", "rv_conns",
+            )})
+            rows[-1]["rv_uuid"] = str(n.get("rv_uuid") or "")[:8]
+        return {"ok": True, "nodes": rows}
+
+    if action == "node_diag":
+        node_id = str(payload.get("node_id") or "").strip()
+        with mutate() as st:
+            node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
+            if not node:
+                return {"ok": False, "error": "unknown node"}
+            node["diag_requested"] = {
+                "seconds": max(5, min(90, _int(payload.get("seconds"), 25))),
+                "q": str(payload.get("q") or ""),
+            }
+        return {"ok": True, "error": "", "queued": True}
+
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
@@ -6645,6 +6684,7 @@ async def agent_pull(request: Request):
     payload: dict = {}
     ver = ""
     want_update = False
+    diag_req = None
     agent_ver = str(body.get("version") or "")
     master_ver = panel_version()
     with mutate() as st:
@@ -6658,6 +6698,11 @@ async def agent_pull(request: Request):
                 node, version=agent_ver, status=status, master_version=master_ver,
             )
             want_update = nodes_mod.pull_wants_update(node, agent_ver, master_ver)
+            diag_text = body.get("diag")
+            if isinstance(diag_text, str) and diag_text:
+                node["agent_diag"] = diag_text[-60000:]
+                node["agent_diag_at"] = nodes_mod.now_iso()
+            diag_req = node.pop("diag_requested", None)
             nodes_mod.upsert_node_outbound(st, node)
             payload = nodes_mod.build_payload(st, node, xray.build_config)
             self_url = f"https://{public_host()}{base_path()}" if public_host() else ""
@@ -6671,6 +6716,8 @@ async def agent_pull(request: Request):
     if events:
         _tg_node_events(events)
     extra: dict = {}
+    if isinstance(diag_req, dict):
+        extra["diag"] = diag_req
     if want_update:
         extra["update"] = True
         if isinstance(payload, dict):
@@ -6678,6 +6725,60 @@ async def agent_pull(request: Request):
     if have_ver and have_ver == ver:
         return {"ok": True, "unchanged": True, "version": ver, **extra}
     return {"ok": True, "unchanged": False, "version": ver, "payload": payload, **extra}
+
+
+AGENT_DIAG: dict = {}
+
+
+def _reverse_conn_count(rb) -> int:
+    """Established TCP connections from this NAT agent to the master reverse endpoint."""
+    if not isinstance(rb, dict) or not rb.get("master_host"):
+        return -1
+    import socket
+    import subprocess as _sp
+    try:
+        ips = {a[4][0] for a in socket.getaddrinfo(rb["master_host"], None)}
+        out = _sp.run(
+            ["ss", "-Htn", "state", "established"], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return -1
+    port = str(int(rb.get("port") or 443))
+    n = 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        host, _, p = parts[3].rpartition(":")
+        if p == port and host.strip("[]").removeprefix("::ffff:") in ips:
+            n += 1
+    return n
+
+
+def _start_agent_diag(req: dict) -> None:
+    def job():
+        AGENT_DIAG["running"] = True
+        try:
+            cfg_txt = ""
+            try:
+                cfg = json.loads(Path("/etc/xray/config.json").read_text(encoding="utf-8"))
+                cfg_txt = json.dumps({
+                    "outbounds": [o for o in cfg.get("outbounds") or []
+                                  if str(o.get("tag") or "").startswith("rv-")],
+                    "rules": [r for r in (cfg.get("routing") or {}).get("rules") or []][:6],
+                }, ensure_ascii=False)
+            except Exception as e:
+                cfg_txt = f"config: {e}"
+            r = ops.xray_debug_capture(int(req.get("seconds") or 25), str(req.get("q") or ""), 1500)
+            rb = (_load_store().get("settings") or {}).get("nodes", {}).get("reverse_bridge")
+            AGENT_DIAG["text"] = (
+                f"version={panel_version()} rv_conns_after={_reverse_conn_count(rb)}\n"
+                f"{cfg_txt}\n----- xray debug -----\n{r.get('text') or r.get('error')}"
+            )
+        finally:
+            AGENT_DIAG["running"] = False
+
+    threading.Thread(target=job, daemon=True).start()
 
 
 def _agent_pull_cycle() -> None:
@@ -6717,6 +6818,9 @@ def _agent_pull_cycle() -> None:
                 warnings.append("Xray на ноде не запущен — reverse недоступен")
     except Exception:
         pass
+    rv_conns = _reverse_conn_count(ns.get("reverse_bridge"))
+    if ns.get("reverse_bridge") and rv_conns == 0:
+        warnings.append("нет TCP-соединений reverse к мастеру")
     body = {
         "node_id": pull["node_id"],
         "have": have,
@@ -6726,10 +6830,18 @@ def _agent_pull_cycle() -> None:
             "error": str(ns.get("last_apply_error") or ""),
             "warnings": warnings,
             "reverse_ok": reverse_ok,
+            "rv_conns": rv_conns,
         },
     }
+    diag_ready = AGENT_DIAG.pop("text", None)
+    if diag_ready:
+        body["diag"] = diag_ready
     current = str(pull["master_url"]).rstrip("/")
     res = nodes_mod.pull_request(current, token, body, timeout=45)
+    if diag_ready and not res.get("ok"):
+        AGENT_DIAG.setdefault("text", diag_ready)
+    if isinstance(res.get("diag"), dict) and not AGENT_DIAG.get("running"):
+        _start_agent_diag(res["diag"])
     if res.get("moved") and res.get("master_url"):
         res = {**res, "ok": False}
     if not res.get("ok"):

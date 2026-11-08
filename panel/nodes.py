@@ -247,6 +247,8 @@ def apply_pull_seen(
         warns.append("NAT reverse на ноде не поднят (нет rv-up/rv-direct)")
     elif st.get("reverse_ok") is True:
         node["reverse_ok"] = True
+    if isinstance(st.get("rv_conns"), int):
+        node["rv_conns"] = st["rv_conns"]
     node["last_warning"] = "; ".join(warns)[:600]
     return events
 
