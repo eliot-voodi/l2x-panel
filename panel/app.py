@@ -6669,9 +6669,20 @@ def _agent_pull_cycle() -> None:
         if cfg_path.is_file():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             tags = {o.get("tag") for o in (cfg.get("outbounds") or [])}
-            reverse_ok = "rv-up" in tags and "rv-direct" in tags
-            if ns.get("reverse_bridge") and not reverse_ok:
+            has_tags = "rv-up" in tags and "rv-direct" in tags
+            xray_on = False
+            try:
+                import subprocess as _sp
+                xray_on = _sp.run(
+                    ["systemctl", "is-active", "--quiet", "xray"], check=False,
+                ).returncode == 0
+            except Exception:
+                xray_on = True
+            reverse_ok = bool(has_tags and xray_on)
+            if ns.get("reverse_bridge") and not has_tags:
                 warnings.append("reverse outbound не собран (нет rv-up/rv-direct)")
+            elif ns.get("reverse_bridge") and not xray_on:
+                warnings.append("Xray на ноде не запущен — reverse недоступен")
     except Exception:
         pass
     body = {

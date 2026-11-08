@@ -535,13 +535,11 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         direct_tag = "rv-direct"
         outs = cfg.setdefault("outbounds", [])
         outs[:] = [o for o in outs if o.get("tag") not in (up_tag, direct_tag)]
-        # Xray ≥26.5: traffic from vless-reverse is blocked by default unless freedom
-        # has an explicit finalRules allow (otherwise tunnel connects but egress is blackholed).
-        outs.insert(1 if outs else 0, {
+        # Xray ≥26.5: vless-reverse traffic is blackholed unless freedom has finalRules allow.
+        outs.append({
             "tag": direct_tag,
             "protocol": "freedom",
             "settings": {
-                "domainStrategy": "UseIPv4",
                 "finalRules": [{"action": "allow", "network": "tcp,udp"}],
             },
         })
@@ -554,13 +552,7 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
                 "id": rb["uuid"],
                 "encryption": "none",
                 "flow": "",
-                "reverse": {
-                    "tag": in_tag,
-                    "sniffing": {
-                        "enabled": True,
-                        "destOverride": ["http", "tls", "quic"],
-                    },
-                },
+                "reverse": {"tag": in_tag},
             },
             "streamSettings": {
                 "network": "ws",
@@ -579,11 +571,12 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
             },
         })
         rules = cfg.setdefault("routing", {}).setdefault("rules", [])
-        # Drop stale rules from earlier builds (rv-in → direct)
         rules[:] = [
             r for r in rules
-            if r.get("inboundTag") not in ([in_tag], ["rv-in"])
-            or r.get("outboundTag") not in ("direct", direct_tag)
+            if not (
+                r.get("inboundTag") in ([in_tag], ["rv-in"], ["rv-bridge"])
+                and r.get("outboundTag") in ("direct", direct_tag, "rv-direct")
+            )
         ]
         rules.insert(1 if rules else 0, {
             "type": "field", "inboundTag": [in_tag], "outboundTag": direct_tag,
