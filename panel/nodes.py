@@ -990,9 +990,13 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             node["last_error"] = self_err
             return {"ok": False, "error": self_err}
     result = _push_once(node, payload, timeout=timeout)
+    err = str(result.get("error") or "")
+    # Transient network / busy agent: one retry with a longer timeout
+    if not result.get("ok") and any(x in err.lower() for x in ("timed out", "timeout", "temporarily", "connection reset")):
+        result = _push_once(node, payload, timeout=max(timeout, 180))
+        err = str(result.get("error") or "")
     # Auto-heal: agent was turned off by update/restart — re-enable via manage API and retry once.
     # Respects remote agent_manual_off (admin unchecked Settings → Nodes).
-    err = str(result.get("error") or "")
     if not result.get("ok") and "agent disabled" in err.lower():
         heal = manage_request(node, action="enable_agent", timeout=30)
         if heal.get("ok"):
