@@ -2034,7 +2034,7 @@ def health():
     store = _load_store()
     ns = (store.get("settings") or {}).get("nodes") or {}
     role = "agent" if (ns.get("agent_enabled") and (ns.get("role") or "") == "agent") else "master"
-    return {
+    out = {
         "status": "ok",
         "app": app_title(),
         "version": panel_version(),
@@ -2042,6 +2042,9 @@ def health():
         "agent": role == "agent",
         "time": datetime.now(timezone.utc).isoformat(),
     }
+    if role == "agent" and isinstance(ns.get("reverse_bridge"), dict):
+        out["rv_conns"] = _reverse_conn_count(ns["reverse_bridge"])
+    return out
 
 
 # ================================================================ auth pages
@@ -5752,7 +5755,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
         return go("/nodes")
 
     # --- outbound / mirror / sync: flip flags under lock, push in background ---
-    if action in ("outbound", "mirror", "sync"):
+    if action in ("outbound", "mirror", "sync", "reverse"):
         host = public_host()
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
@@ -5760,10 +5763,27 @@ async def nodes_action(node_id: str, action: str, request: Request):
             if not node:
                 flash(request, "Нода не найдена", "error")
                 return go("/nodes")
-            if action == "outbound":
+            if action == "reverse":
+                if node.get("nat"):
+                    flash(request, "Нода за NAT всегда работает через reverse", "info")
+                    return go("/nodes")
+                if not nodes_mod.is_master(store):
+                    flash(request, "Только мастер может менять режим outbound", "error")
+                    return go("/nodes")
+                node["rv_mode"] = not node.get("rv_mode")
+                node.pop("rv_conns", None)
+                node.pop("reverse_ok", None)
+                if node["rv_mode"]:
+                    node["as_outbound"] = True
+                    nodes_mod.ensure_reverse_master(store)
+                    nodes_mod.ensure_reverse(node)
+                else:
+                    nodes_mod.ensure_bridge(node)
+                label = f"reverse outbound {'вкл' if node['rv_mode'] else 'выкл'}"
+            elif action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")
                 if node["as_outbound"]:
-                    if node.get("nat"):
+                    if nodes_mod.uses_reverse(node):
                         nodes_mod.ensure_reverse_master(store)
                         nodes_mod.ensure_reverse(node)
                     else:
@@ -5791,7 +5811,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 label = "sync"
             nodes_mod.upsert_node_outbound(store, node)
             name = node["name"]
-            if action in ("outbound", "mirror"):
+            if action in ("outbound", "mirror", "reverse"):
                 _tg_admin(
                     f"🖥 Нода <b>{tgbot.escape(name)}</b>: {tgbot.escape(label)}",
                     flag="notify_nodes",
@@ -6598,7 +6618,10 @@ def _agent_apply_payload(payload: dict) -> dict:
         rb = payload.get("reverse_bridge")
         if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
             ns["reverse_bridge"] = rb
-            ns["nat"] = True
+            if payload.get("nat"):
+                ns["nat"] = True
+            else:
+                ns.pop("nat", None)
         elif payload.get("nat") is False or (
             "reverse_bridge" in payload and not isinstance(rb, dict)
         ):

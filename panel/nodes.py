@@ -58,6 +58,8 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("last_probe_error", "")
         # NAT node: no inbound ports; node dials master (reverse tunnel + config pull)
         n.setdefault("nat", False)
+        # Reverse outbound on a reachable node: node dials master instead of master → node
+        n.setdefault("rv_mode", False)
         n.setdefault("last_pull", "")
     return nodes
 
@@ -126,6 +128,11 @@ def is_master(store: dict) -> bool:
     if ns.get("agent_enabled") and ns.get("role") == "agent":
         return False
     return (ns.get("role") or "master") != "agent"
+
+
+def uses_reverse(node: dict) -> bool:
+    """Master egress via this node goes through the VLESS reverse tunnel (node dials master)."""
+    return bool(node.get("nat") or node.get("rv_mode"))
 
 
 def ensure_bridge(node: dict) -> dict:
@@ -243,7 +250,7 @@ def apply_pull_seen(
         ))
     if node.get("update_requested"):
         warns.insert(0, "Обновление поставлено в очередь (agent pull ≤20 с)")
-    if st.get("reverse_ok") is False and node.get("nat") and node.get("as_outbound"):
+    if st.get("reverse_ok") is False and uses_reverse(node) and node.get("as_outbound"):
         warns.append("NAT reverse на ноде не поднят (нет rv-up/rv-direct)")
     elif st.get("reverse_ok") is True:
         node["reverse_ok"] = True
@@ -390,13 +397,13 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         if existing:
             customs.remove(existing)
         return
-    if node.get("nat"):
-        # Portal tag on master = outbound; no dial to the node (it has no open ports)
+    if uses_reverse(node):
+        # Portal tag on master = outbound; master never dials the node
         ensure_reverse_master(store)
         ensure_reverse(node)
         entry = {
             "tag": tag,
-            "remark": f"Node {node.get('name')} (NAT)",
+            "remark": f"Node {node.get('name')} ({'NAT' if node.get('nat') else 'reverse'})",
             "kind": "node",
             "reverse": True,
             "node_id": node.get("id"),
@@ -497,7 +504,7 @@ def _peer_node_export(n: dict) -> dict:
     keys = (
         "id", "name", "url", "token", "enabled", "sync_clients", "sync_inbounds",
         "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
-        "bridge_uuid", "bridge_path", "role", "panel_version", "nat",
+        "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "rv_mode",
         "rv_uuid", "rv_domain", "rv_tag",
     )
     return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
@@ -561,11 +568,13 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     """Config push for a remote agent. mirror=True → full master copy for fast failover."""
     mirror = bool(node.get("mirror"))
     nat = bool(node.get("nat"))
+    rv_on = uses_reverse(node)
     if mirror:
         node["sync_clients"] = True
         node["sync_inbounds"] = True
-    # NAT node: no inbound ports → no client inbounds / bridge inbound; only reverse egress
-    bridge_on = bool(node.get("as_outbound")) and not nat
+    # NAT node: no inbound ports → no client inbounds / bridge inbound; only reverse egress.
+    # Reverse mode: the node dials master, so the bridge inbound is not needed either.
+    bridge_on = bool(node.get("as_outbound")) and not rv_on
     inbounds = list(store.get("inbounds") or []) if not nat else []
     # Path/TLS share domains must be the node hostname, not the master
     node_dom = node_public_domain(node)
@@ -615,7 +624,7 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         settings_out.pop("nodes", None)
 
     reverse_bridge = None
-    if nat and node.get("as_outbound") and node.get("enabled", True):
+    if rv_on and node.get("as_outbound") and node.get("enabled", True):
         rv = ensure_reverse_master(store)
         ensure_reverse(node)
         master_host = ""
@@ -849,6 +858,11 @@ def probe_all_health(nodes: list[dict], *, timeout: int = 5) -> list[dict]:
         except Exception as exc:  # noqa: BLE001
             probe = {"ok": False, "error": str(exc)}
         events.extend(apply_health_probe(n, probe))
+        raw = probe.get("raw") if isinstance(probe.get("raw"), dict) else {}
+        if isinstance(raw.get("rv_conns"), int):
+            n["rv_conns"] = raw["rv_conns"]
+        elif not uses_reverse(n):
+            n.pop("rv_conns", None)
     return events
 
 
@@ -1106,7 +1120,10 @@ def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
     rb = payload.get("reverse_bridge")
     if isinstance(rb, dict) and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
         ns["reverse_bridge"] = rb
-        ns["nat"] = True
+        if payload.get("nat"):
+            ns["nat"] = True
+        else:
+            ns.pop("nat", None)
     elif payload.get("nat") is False or (payload.get("reverse_bridge") is None and "reverse_bridge" in payload):
         ns.pop("reverse_bridge", None)
         ns.pop("nat", None)

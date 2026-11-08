@@ -490,7 +490,7 @@ def reverse_nat_nodes(store: dict) -> list[dict]:
         nodes = store.get("nodes") or []
     out = []
     for n in nodes:
-        if not n.get("enabled", True) or not n.get("as_outbound") or not n.get("nat"):
+        if not n.get("enabled", True) or not n.get("as_outbound") or not (n.get("nat") or n.get("rv_mode")):
             continue
         try:
             import nodes as nodes_mod
@@ -1925,6 +1925,13 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
                 )
             except Exception:
                 node = None
+            if node and not node.get("nat"):
+                # Reverse mode on a reachable node: health probe reports tunnel connections
+                if node.get("online") and int(node.get("rv_conns") or 0) > 0:
+                    return {"ok": True, "code": "204", "ms": 0, "error": ""}
+                if not node.get("online"):
+                    return {"ok": False, "error": "нода не на связи", "ms": 0}
+                return {"ok": False, "error": "reverse-туннель от ноды не поднят (rv_conns=0)", "ms": 0}
             if node and nodes_mod.pull_fresh(node) and node.get("online") is not False:
                 return {"ok": True, "code": "204", "ms": 0, "error": ""}
             return {"ok": False, "error": "NAT-нода не на связи (нет reverse pull)", "ms": 0}
