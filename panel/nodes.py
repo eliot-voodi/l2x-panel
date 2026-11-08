@@ -154,7 +154,10 @@ def ensure_reverse_master(store: dict) -> dict:
     rv = ns.setdefault("rv", {})
     if not rv.get("path"):
         rv["path"] = _ws_like_path()
-    used = {int(i.get("port") or 0) for i in store.get("inbounds") or []}
+    used = {
+        int(i.get("port") or 0) for i in store.get("inbounds") or []
+        if i.get("tag") != "rv-in"
+    }
     port = int(rv.get("port") or 0)
     if not port or port in used:
         port = REVERSE_PORT_BASE
@@ -195,19 +198,48 @@ def payload_version(payload: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
 
 
-def apply_pull_seen(node: dict, *, version: str = "", status: dict | None = None) -> list[dict]:
+def version_tuple(v: str) -> tuple[int, ...]:
+    out = []
+    for part in str(v or "").strip().lstrip("v").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def apply_pull_seen(
+    node: dict, *, version: str = "", status: dict | None = None, master_version: str = "",
+) -> list[dict]:
     """Master side: NAT node checked in → online + last apply status from the agent."""
     node["last_pull"] = now_iso()
     events = apply_health_probe(node, {"ok": True, "version": version})
     st = status if isinstance(status, dict) else {}
+    warns: list[str] = []
     if st:
         node["last_ok"] = bool(st.get("ok"))
         node["last_error"] = "" if st.get("ok") else str(st.get("error") or "")[:400]
-        warns = st.get("warnings") or []
-        if isinstance(warns, str):
-            warns = [warns]
-        node["last_warning"] = "; ".join(str(w) for w in warns if w)[:600]
+        raw = st.get("warnings") or []
+        warns = [raw] if isinstance(raw, str) else [str(w) for w in raw if w]
+    if version and master_version and version_tuple(version) < version_tuple(master_version):
+        warns.insert(0, (
+            f"Нода на v{version}, мастер v{master_version} — NAT-туннель может не работать, "
+            "ноды с v1.9.50 обновляются сами, более старые — «Обновить» с SSH-паролем"
+        ))
+    node["last_warning"] = "; ".join(warns)[:600]
     return events
+
+
+def pull_wants_update(node: dict, agent_version: str, master_version: str) -> bool:
+    """Ask a NAT agent to self-update: manual request, or once per newer master version."""
+    if node.pop("update_requested", None):
+        return True
+    if not agent_version or not master_version:
+        return False
+    if version_tuple(agent_version) >= version_tuple(master_version):
+        return False
+    if node.get("auto_update_for") == master_version:
+        return False
+    node["auto_update_for"] = master_version
+    return True
 
 
 def pull_request(master_url: str, token: str, body: dict, timeout: int = 30) -> dict:

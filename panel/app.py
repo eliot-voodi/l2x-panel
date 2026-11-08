@@ -5818,6 +5818,21 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 flash(request, "Только мастер может обновлять ноды", "error")
                 return go("/nodes")
             ssh_password = str(form.get("password") or "")
+            if node.get("nat") and not ssh_password:
+                node["update_requested"] = True
+                name = node["name"]
+                queued_nat = True
+            else:
+                queued_nat = False
+        if queued_nat:
+            flash(request, f"{name}: обновление в очереди — NAT-нода заберёт его при следующем pull (≤20 с)", "info")
+            return go("/nodes")
+        with mutate() as store:
+            nodes = nodes_mod.ensure_list(store)
+            node = next((n for n in nodes if n["id"] == node_id), None)
+            if not node:
+                flash(request, "Нода не найдена", "error")
+                return go("/nodes")
             running = NODES_JOB.get("id")
             if running and ops.JOBS.get(running, {}).get("status") == "running":
                 flash(request, "Уже идёт операция с нодами", "info")
@@ -6607,6 +6622,9 @@ async def agent_pull(request: Request):
     err_msg = ""
     payload: dict = {}
     ver = ""
+    want_update = False
+    agent_ver = str(body.get("version") or "")
+    master_ver = panel_version()
     with mutate() as st:
         node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
         if not node or not node.get("enabled", True):
@@ -6615,8 +6633,9 @@ async def agent_pull(request: Request):
             err_code, err_msg = 400, "node is not NAT mode"
         else:
             events = nodes_mod.apply_pull_seen(
-                node, version=str(body.get("version") or ""), status=status,
+                node, version=agent_ver, status=status, master_version=master_ver,
             )
+            want_update = nodes_mod.pull_wants_update(node, agent_ver, master_ver)
             nodes_mod.upsert_node_outbound(st, node)
             payload = nodes_mod.build_payload(st, node, xray.build_config)
             ver = nodes_mod.payload_version(payload)
@@ -6625,9 +6644,10 @@ async def agent_pull(request: Request):
         return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
     if events:
         _tg_node_events(events)
+    extra = {"update": True} if want_update else {}
     if have_ver and have_ver == ver:
-        return {"ok": True, "unchanged": True, "version": ver}
-    return {"ok": True, "unchanged": False, "version": ver, "payload": payload}
+        return {"ok": True, "unchanged": True, "version": ver, **extra}
+    return {"ok": True, "unchanged": False, "version": ver, "payload": payload, **extra}
 
 
 def _agent_pull_cycle() -> None:
@@ -6656,6 +6676,10 @@ def _agent_pull_cycle() -> None:
     res = nodes_mod.pull_request(str(pull["master_url"]), token, body, timeout=45)
     if not res.get("ok"):
         return
+    if res.get("update"):
+        running = PANEL_UPDATE_JOB.get("id")
+        if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
+            PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-pull", ops.update_panel)
     if res.get("unchanged"):
         with mutate() as st:
             st.setdefault("settings", {}).setdefault("nodes", {})["pull_version"] = res.get("version") or have
