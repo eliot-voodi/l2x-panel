@@ -326,17 +326,57 @@ def sub_health_settings(store: dict) -> dict:
 
 
 def custom_outbound_status(o: dict) -> str:
-    """Live status for a custom/node outbound: enabled + successful probe → connected."""
+    """UI status: enabled + successful probe → connected; explicit fail → disconnected."""
     if not o.get("enabled", True):
         return "disabled"
     lt = o.get("last_test")
     if isinstance(lt, dict) and lt.get("ok") is True:
         return "connected"
-    return "disconnected"
+    if isinstance(lt, dict) and lt.get("ok") is False:
+        return "disconnected"
+    # Not probed yet — treat as live for UI until first fail
+    return "connected"
 
 
 def custom_outbound_healthy(o: dict) -> bool:
-    return custom_outbound_status(o) == "connected"
+    """Standalone custom may appear in subscription (hide on explicit probe fail)."""
+    if not o.get("enabled", True):
+        return False
+    lt = o.get("last_test")
+    if isinstance(lt, dict) and lt.get("ok") is False:
+        return False
+    return True
+
+
+def outbound_member_ok(store: dict, tag: str) -> bool:
+    """Whether tag can sit in a balancer selector / Xray observatory pool.
+
+    Custom outbounds are included when enabled — Xray observatory does the live
+    probe. Requiring panel last_test here emptied balancers after sync/probe and
+    wiped subscription configs for clients that only use leastPing/leastLoad.
+    """
+    tag = str(tag or "").strip()
+    if not tag or tag in ("direct", "block", "blackhole"):
+        return True
+    max_loss = sub_health_settings(store)["max_loss_pct"]
+    for t in store.get("l2tp") or []:
+        if _l2tp_tag(t) != tag:
+            continue
+        if t.get("status") != "connected":
+            return False
+        metrics = t.get("metrics") or {}
+        loss = metrics.get("loss_pct")
+        try:
+            if loss is not None and float(loss) > max_loss:
+                return False
+        except (TypeError, ValueError):
+            pass
+        return True
+    for o in store.get("outbounds_custom") or []:
+        if o.get("tag") != tag:
+            continue
+        return bool(o.get("enabled", True))
+    return True
 
 
 def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None) -> bool:
@@ -351,28 +391,17 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
     if tag in seen:
         return False
     seen.add(tag)
-    max_loss = cfg["max_loss_pct"]
 
     for t in store.get("l2tp") or []:
         if _l2tp_tag(t) != tag:
             continue
-        if t.get("status") != "connected":
-            return False
-        metrics = t.get("metrics") or {}
-        loss = metrics.get("loss_pct")
-        try:
-            if loss is not None and float(loss) > max_loss:
-                return False
-        except (TypeError, ValueError):
-            pass
-        return True
+        return outbound_member_ok(store, tag)
 
     for o in store.get("outbounds_custom") or []:
         if o.get("tag") != tag:
             continue
-        if not o.get("enabled", True) or not o.get("in_sub", True):
+        if not o.get("in_sub", True):
             return False
-        # Must have a successful probe (enabled alone is not enough)
         return custom_outbound_healthy(o)
 
     for b in ensure_balancers(store).values():
@@ -380,8 +409,8 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
             continue
         if not b.get("enabled", True):
             return False
-        members = balancer_member_tags(store, b, healthy_only=True)
-        return bool(members)
+        # Balancer stays in sub while it has any live members for Xray
+        return bool(balancer_member_tags(store, b, healthy_only=True))
 
     return True
 
@@ -398,7 +427,7 @@ def balancer_member_tags(store: dict, balancer: dict, *, healthy_only: bool = Fa
         pool_list = [t for t in members if t in pool]
     if not healthy_only or not sub_health_settings(store)["hide_unhealthy"]:
         return pool_list
-    return [t for t in pool_list if outbound_ok_for_sub(store, t)]
+    return [t for t in pool_list if outbound_member_ok(store, t)]
 
 
 # ---------------------------------------------------------------- outbounds
@@ -779,7 +808,6 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
     for tag in tags:
         if not ignore_quota and not tag_allowed_for_client(client, tag):
             continue
-        # hide_unhealthy: requires enabled + successful ping (see outbound_ok_for_sub)
         if not outbound_ok_for_sub(store, tag):
             continue
         ident_uuid = P.identity_uuid(client["uuid"], tag)
