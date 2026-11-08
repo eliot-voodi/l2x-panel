@@ -309,6 +309,16 @@ install_system() {
   fi
   ln -sfn "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf
   rm -f /etc/nginx/sites-enabled/default
+  # WS flood → EMFILE without raised FD limits (default worker_connections ~768)
+  mkdir -p /etc/systemd/system/nginx.service.d
+  install -m 644 "$SRC/deploy/nginx-nofile.conf" /etc/systemd/system/nginx.service.d/l2x-nofile.conf
+  if [ -f /etc/nginx/nginx.conf ]; then
+    sed -i 's/worker_connections [0-9]*;/worker_connections 16384;/' /etc/nginx/nginx.conf
+    grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]' /etc/nginx/nginx.conf \
+      || sed -i '/^[[:space:]]*worker_processes/a worker_rlimit_nofile 1048576;' /etc/nginx/nginx.conf
+    sed -i 's/worker_rlimit_nofile [0-9]*;/worker_rlimit_nofile 1048576;/' /etc/nginx/nginx.conf
+  fi
+  systemctl daemon-reload
   nginx -t -q 2>/dev/null || die "Ошибка конфигурации nginx: nginx -t"
   systemctl enable -q nginx
   systemctl restart nginx

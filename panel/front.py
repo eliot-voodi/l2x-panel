@@ -28,11 +28,22 @@ FRONT_DIR = Path("/etc/nginx/l2x")
 STREAM_CONF = FRONT_DIR / "stream.conf"
 HTTP_CONF = FRONT_DIR / "http.conf"
 HTTP_INCLUDE = Path("/etc/nginx/conf.d/l2x-front.conf")
+NGINX_SYSTEMD_DROPIN_DIR = Path("/etc/systemd/system/nginx.service.d")
+NGINX_SYSTEMD_DROPIN = NGINX_SYSTEMD_DROPIN_DIR / "l2x-nofile.conf"
 CERT_DIR = Path(os.environ.get("L2XPANEL_CERT_DIR", "/etc/l2xpanel/certs"))
 SELF_SIGNED_DIR = CERT_DIR / "self-signed"
 PANEL_UPSTREAM = "127.0.0.1:8090"
 MARK = "# managed by l2x-panel — generated, edits are overwritten"
 STREAM_INCLUDE_LINE = f"include {STREAM_CONF};"
+
+# WS without Mux ≈ 2 FDs per app connection; stock worker_connections 768/1024 → EMFILE (errno 24).
+WORKER_CONNECTIONS = 16384
+WORKER_RLIMIT_NOFILE = 1048576
+NGINX_SYSTEMD_DROPIN_BODY = (
+    "# managed by l2x-panel — nginx needs high FD for WS/gRPC (each session ≈ 2 sockets)\n"
+    "[Service]\n"
+    f"LimitNOFILE={WORKER_RLIMIT_NOFILE}\n"
+)
 
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$")
 PATH_RE = re.compile(r"^/[A-Za-z0-9/_.~-]*$")
@@ -448,21 +459,97 @@ def _location(loc: dict) -> str:
 
 # ---------------------------------------------------------------- apply (verify → swap → reload → rollback)
 
-def _ensure_includes() -> dict[Path, str | None]:
-    """Hook generated files into nginx. Returns previous contents of every touched file."""
+def _patch_nginx_fd_limits(main: str) -> tuple[str, bool]:
+    """Raise worker_connections / worker_rlimit_nofile; never lower an already higher value."""
+    changed = False
+    m_conn = re.search(r"worker_connections\s+(\d+)\s*;", main)
+    if m_conn:
+        if int(m_conn.group(1)) < WORKER_CONNECTIONS:
+            main = re.sub(
+                r"worker_connections\s+\d+\s*;",
+                f"worker_connections {WORKER_CONNECTIONS};",
+                main,
+                count=1,
+            )
+            changed = True
+    else:
+        if re.search(r"events\s*\{", main):
+            main = re.sub(
+                r"(events\s*\{)",
+                rf"\1\n    worker_connections {WORKER_CONNECTIONS};",
+                main,
+                count=1,
+            )
+            changed = True
+
+    m_rl = re.search(r"(?m)^\s*worker_rlimit_nofile\s+(\d+)\s*;", main)
+    if m_rl:
+        if int(m_rl.group(1)) < WORKER_RLIMIT_NOFILE:
+            main = re.sub(
+                r"(?m)^\s*worker_rlimit_nofile\s+\d+\s*;",
+                f"worker_rlimit_nofile {WORKER_RLIMIT_NOFILE};",
+                main,
+                count=1,
+            )
+            changed = True
+    else:
+        if re.search(r"(?m)^\s*worker_processes\s+", main):
+            main = re.sub(
+                r"(?m)^(\s*worker_processes\s+[^;]+;)",
+                rf"\1\nworker_rlimit_nofile {WORKER_RLIMIT_NOFILE};",
+                main,
+                count=1,
+            )
+        else:
+            main = f"worker_rlimit_nofile {WORKER_RLIMIT_NOFILE};\n" + main
+        changed = True
+    return main, changed
+
+
+def _ensure_nginx_systemd_nofile() -> tuple[str | None, bool]:
+    """Install LimitNOFILE drop-in. Returns (previous contents or None if new, changed?)."""
+    prev: str | None = None
+    if NGINX_SYSTEMD_DROPIN.is_file():
+        prev = NGINX_SYSTEMD_DROPIN.read_text(encoding="utf-8")
+        if prev.strip() == NGINX_SYSTEMD_DROPIN_BODY.strip():
+            return prev, False
+    NGINX_SYSTEMD_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+    NGINX_SYSTEMD_DROPIN.write_text(NGINX_SYSTEMD_DROPIN_BODY, encoding="utf-8")
+    return prev, True
+
+
+def _ensure_includes() -> tuple[dict[Path, str | None], bool]:
+    """Hook generated files + FD limits into nginx.
+
+    Returns (touched files snapshot, need_systemd_restart).
+    LimitNOFILE only applies after daemon-reload + restart of the nginx master.
+    """
     touched: dict[Path, str | None] = {}
+    need_restart = False
     main = NGINX_CONF.read_text(encoding="utf-8")
+    orig_main = main
     if STREAM_INCLUDE_LINE not in main:
-        touched[NGINX_CONF] = main
-        NGINX_CONF.write_text(main.rstrip("\n") + f"\n\n# l2x-panel: public :443 front\n{STREAM_INCLUDE_LINE}\n",
-                              encoding="utf-8")
+        main = main.rstrip("\n") + f"\n\n# l2x-panel: public :443 front\n{STREAM_INCLUDE_LINE}\n"
+    main, fd_changed = _patch_nginx_fd_limits(main)
+    if main != orig_main:
+        touched[NGINX_CONF] = orig_main
+        NGINX_CONF.write_text(main, encoding="utf-8")
+        if fd_changed:
+            need_restart = True  # workers keep old RLIMIT until master restarts
     want = f"{MARK}\ninclude {HTTP_CONF};\n"
     cur = HTTP_INCLUDE.read_text(encoding="utf-8") if HTTP_INCLUDE.is_file() else None
     if cur != want:
         touched[HTTP_INCLUDE] = cur
         HTTP_INCLUDE.parent.mkdir(parents=True, exist_ok=True)
         HTTP_INCLUDE.write_text(want, encoding="utf-8")
-    return touched
+    try:
+        prev_dropin, dropin_changed = _ensure_nginx_systemd_nofile()
+        if dropin_changed:
+            touched[NGINX_SYSTEMD_DROPIN] = prev_dropin
+            need_restart = True
+    except OSError:
+        pass
+    return touched, need_restart
 
 
 def _restore(snapshot: dict[Path, str | None]) -> None:
@@ -479,26 +566,35 @@ def _restore(snapshot: dict[Path, str | None]) -> None:
 def stage(store: dict) -> dict:
     """Write candidate config and run `nginx -t`. Nginx keeps serving the old config until commit()."""
     if not available():
-        return {"ok": True, "skipped": True, "snapshot": {}, "problems": [], "error": ""}
+        return {"ok": True, "skipped": True, "snapshot": {}, "problems": [], "error": "", "restart": False}
     # Inbounds with routing problems are left out of nginx (and reported); they never block the others.
     stream, http, problems = render(store)
     FRONT_DIR.mkdir(parents=True, exist_ok=True)
     snapshot: dict[Path, str | None] = {}
+    need_restart = False
     for path in (STREAM_CONF, HTTP_CONF):
         snapshot[path] = path.read_text(encoding="utf-8") if path.is_file() else None
     try:
-        snapshot.update({k: v for k, v in _ensure_includes().items() if k not in snapshot})
+        includes, need_restart = _ensure_includes()
+        snapshot.update({k: v for k, v in includes.items() if k not in snapshot})
         STREAM_CONF.write_text(stream, encoding="utf-8")
         HTTP_CONF.write_text(http, encoding="utf-8")
     except OSError as exc:
         _restore(snapshot)
-        return {"ok": False, "snapshot": {}, "problems": [], "error": f"nginx: запись конфига: {exc}"}
+        return {"ok": False, "snapshot": {}, "problems": [], "error": f"nginx: запись конфига: {exc}", "restart": False}
     test = _run(["nginx", "-t"])
     if not test["ok"]:
         _restore(snapshot)
-        return {"ok": False, "snapshot": {}, "problems": [], "error": "nginx -t: " + (test["stderr"] or test["stdout"])[-800:]}
+        return {"ok": False, "snapshot": {}, "problems": [], "error": "nginx -t: " + (test["stderr"] or test["stdout"])[-800:], "restart": False}
     changed = any((path.read_text(encoding="utf-8") if path.is_file() else None) != old for path, old in snapshot.items())
-    return {"ok": True, "snapshot": snapshot, "changed": changed, "problems": problems, "error": ""}
+    return {
+        "ok": True,
+        "snapshot": snapshot,
+        "changed": changed or need_restart,
+        "problems": problems,
+        "error": "",
+        "restart": need_restart,
+    }
 
 
 def rollback(staged: dict) -> None:
@@ -516,8 +612,13 @@ def _listening(port: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def _reload() -> dict:
-    if _run(["systemctl", "is-active", "nginx"])["stdout"].strip() == "active":
+def _reload(*, restart: bool = False) -> dict:
+    active = _run(["systemctl", "is-active", "nginx"])["stdout"].strip() == "active"
+    if restart:
+        _run(["systemctl", "daemon-reload"])
+        _run(["systemctl", "enable", "nginx"])
+        r = _run(["systemctl", "restart", "nginx"])
+    elif active:
         r = _run(["systemctl", "reload", "nginx"])
     else:
         _run(["systemctl", "enable", "nginx"])
@@ -532,11 +633,11 @@ def commit(staged: dict) -> dict:
         return {"ok": True, "skipped": True}
     if not staged.get("changed") and _listening(P.FRONT_PORT, 1) and _listening(P.FRONT_INTERNAL_PORT, 1):
         return {"ok": True}
-    r = _reload()
+    r = _reload(restart=bool(staged.get("restart")))
     if r["ok"]:
         return r
     rollback(staged)
-    _reload()
+    _reload(restart=bool(staged.get("restart")))
     return {"ok": False, "error": f"nginx: {r['error']}; предыдущий конфиг восстановлен"}
 
 
