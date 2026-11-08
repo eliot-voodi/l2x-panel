@@ -5817,22 +5817,17 @@ async def nodes_action(node_id: str, action: str, request: Request):
             if not nodes_mod.is_master(store):
                 flash(request, "Только мастер может обновлять ноды", "error")
                 return go("/nodes")
-            ssh_password = str(form.get("password") or "")
-            if node.get("nat") and not ssh_password:
+            # NAT: no inbound HTTP — update only via agent pull (master sets flag, node fetches it)
+            if node.get("nat"):
                 node["update_requested"] = True
                 name = node["name"]
-                queued_nat = True
-            else:
-                queued_nat = False
-        if queued_nat:
-            flash(request, f"{name}: обновление в очереди — NAT-нода заберёт его при следующем pull (≤20 с)", "info")
-            return go("/nodes")
-        with mutate() as store:
-            nodes = nodes_mod.ensure_list(store)
-            node = next((n for n in nodes if n["id"] == node_id), None)
-            if not node:
-                flash(request, "Нода не найдена", "error")
+                _tg_admin(
+                    f"⬆️ Нода <b>{tgbot.escape(name)}</b>: обновление через agent pull",
+                    flag="notify_nodes",
+                )
+                flash(request, f"{name}: обновление через agent — нода заберёт при следующем pull (≤20 с)", "info")
                 return go("/nodes")
+            ssh_password = str(form.get("password") or "")
             running = NODES_JOB.get("id")
             if running and ops.JOBS.get(running, {}).get("status") == "running":
                 flash(request, "Уже идёт операция с нодами", "info")
@@ -6644,7 +6639,11 @@ async def agent_pull(request: Request):
         return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
     if events:
         _tg_node_events(events)
-    extra = {"update": True} if want_update else {}
+    extra: dict = {}
+    if want_update:
+        extra["update"] = True
+        if isinstance(payload, dict):
+            payload = {**payload, "panel_update": True}
     if have_ver and have_ver == ver:
         return {"ok": True, "unchanged": True, "version": ver, **extra}
     return {"ok": True, "unchanged": False, "version": ver, "payload": payload, **extra}
@@ -6676,16 +6675,19 @@ def _agent_pull_cycle() -> None:
     res = nodes_mod.pull_request(str(pull["master_url"]), token, body, timeout=45)
     if not res.get("ok"):
         return
-    if res.get("update"):
+    payload = res.get("payload") if isinstance(res.get("payload"), dict) else {}
+    want_update = bool(res.get("update") or payload.get("panel_update"))
+    if want_update:
         running = PANEL_UPDATE_JOB.get("id")
         if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
             PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-pull", ops.update_panel)
+        # Prefer finishing the panel update; skip apply on this cycle
+        return
     if res.get("unchanged"):
         with mutate() as st:
             st.setdefault("settings", {}).setdefault("nodes", {})["pull_version"] = res.get("version") or have
         return
-    payload = res.get("payload")
-    if not isinstance(payload, dict):
+    if not payload:
         return
     applied = _agent_apply_payload(payload)
     with mutate() as st:

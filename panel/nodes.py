@@ -221,25 +221,22 @@ def apply_pull_seen(
         warns = [raw] if isinstance(raw, str) else [str(w) for w in raw if w]
     if version and master_version and version_tuple(version) < version_tuple(master_version):
         warns.insert(0, (
-            f"Нода на v{version}, мастер v{master_version} — NAT-туннель может не работать, "
-            "ноды с v1.9.50 обновляются сами, более старые — «Обновить» с SSH-паролем"
+            f"Нода на v{version}, мастер v{master_version} — обновление через agent pull"
         ))
+    if node.get("update_requested"):
+        warns.insert(0, "Обновление поставлено в очередь (agent pull ≤20 с)")
     node["last_warning"] = "; ".join(warns)[:600]
     return events
 
 
 def pull_wants_update(node: dict, agent_version: str, master_version: str) -> bool:
-    """Ask a NAT agent to self-update: manual request, or once per newer master version."""
-    if node.pop("update_requested", None):
-        return True
+    """NAT agent should self-update via pull: manual queue, or while behind master."""
+    manual = bool(node.pop("update_requested", None))
     if not agent_version or not master_version:
-        return False
-    if version_tuple(agent_version) >= version_tuple(master_version):
-        return False
-    if node.get("auto_update_for") == master_version:
-        return False
-    node["auto_update_for"] = master_version
-    return True
+        return manual
+    if version_tuple(agent_version) < version_tuple(master_version):
+        return True
+    return manual
 
 
 def pull_request(master_url: str, token: str, body: dict, timeout: int = 30) -> dict:

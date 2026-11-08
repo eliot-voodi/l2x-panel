@@ -117,10 +117,12 @@
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/mirror"><button class="btn ghost sm" title="Полная копия мастера (standby)" {% if job_running %}disabled{% endif %}>{% if n.mirror %}Зеркало ✓{% else %}+ Зеркало{% endif %}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.3rem"
-                  title="Обновить панель на этой ноде. Без пароля — через agent API; с паролем — по SSH."
-                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }} до последнего релиза?')">
+                  title="{% if n.nat %}NAT: обновление через agent pull (нода сама заберёт ≤20 с){% else %}Без пароля — agent API; с паролем — SSH{% endif %}"
+                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }}{% if n.nat %} через agent pull{% endif %}?')">
+              {% if not n.nat %}
               <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password"
                      style="width:6.5rem;padding:.25rem .4rem;font-size:.75rem">
+              {% endif %}
               <button class="btn sm" {% if job_running %}disabled{% endif %}>{{ t('Обновить') }}</button>
             </form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm" title="Использовать как outbound">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
@@ -191,8 +193,10 @@
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.35rem"
-                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }} до последнего релиза?')">
+                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }}{% if n.nat %} через agent pull{% endif %}?')">
+              {% if not n.nat %}
               <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password">
+              {% endif %}
               <button class="btn sm" {% if job_running %}disabled{% endif %}>{{ t('Обновить') }}</button>
             </form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/token" class="flex" style="gap:.35rem">
