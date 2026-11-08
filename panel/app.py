@@ -6624,13 +6624,18 @@ async def agent_pull(request: Request):
     if not token or not any(t and secrets.compare_digest(token, t) for t in accepted):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if not nodes_mod.is_master(store):
-        # Demoted master: point the NAT agent at the new master
+        # Demoted master: point the NAT agent at the new master. ok=True + update so agents
+        # older than the moved-aware code still self-update instead of looping on 403.
         moved_to = str(ns_local.get("master_pull_url") or "").rstrip("/")
         if moved_to:
-            return JSONResponse(
-                {"ok": False, "error": "not master", "moved": True, "master_url": moved_to},
-                status_code=409,
+            agent_ver = str(body.get("version") or "")
+            outdated = bool(agent_ver) and (
+                nodes_mod.version_tuple(agent_ver) < nodes_mod.version_tuple(panel_version())
             )
+            return {
+                "ok": True, "unchanged": True, "moved": True, "master_url": moved_to,
+                **({"update": True} if outdated else {}),
+            }
         return JSONResponse({"ok": False, "error": "not master"}, status_code=403)
     have_ver = str(body.get("have") or "").strip()
     status = body.get("status") if isinstance(body.get("status"), dict) else {}
@@ -6725,6 +6730,8 @@ def _agent_pull_cycle() -> None:
     }
     current = str(pull["master_url"]).rstrip("/")
     res = nodes_mod.pull_request(current, token, body, timeout=45)
+    if res.get("moved") and res.get("master_url"):
+        res = {**res, "ok": False}
     if not res.get("ok"):
         new_url = ""
         if res.get("moved") and res.get("master_url"):
@@ -6740,11 +6747,11 @@ def _agent_pull_cycle() -> None:
                     if not cand or cand == current:
                         continue
                     probe = nodes_mod.pull_request(cand, token, body, timeout=20)
-                    if probe.get("ok"):
-                        new_url = cand
-                        break
                     if probe.get("moved") and probe.get("master_url"):
                         new_url = str(probe["master_url"]).rstrip("/")
+                        break
+                    if probe.get("ok"):
+                        new_url = cand
                         break
         if new_url and new_url != current:
             with mutate() as st:
