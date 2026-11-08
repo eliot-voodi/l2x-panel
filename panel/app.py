@@ -2448,6 +2448,8 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     share = ib["share_host"] or front.public_domain({"settings": SETTINGS_CACHE}) or public_host()
     if mode == "http" and not front.is_domain(share):
         return f"Для {st['network']} задайте публичный домен в Настройках или URL share"
+    if mode == "raw" and not front.public_domain({"settings": SETTINGS_CACHE}):
+        return "RAW на :443 работает через публичный домен — задайте его в Настройки → Панель"
     if mode == "http" and not front.PATH_RE.match(P.front_http_path(ib)):
         return "Путь/serviceName: только латиница, цифры и /_.~-"
     return None

@@ -133,6 +133,16 @@ def _ipv6() -> bool:
 
 # ---------------------------------------------------------------- plan
 
+def raw_front_inbound(store: dict) -> dict | None:
+    """The one plain VLESS/Trojan RAW inbound served on the public domain :443 (Xray terminates TLS)."""
+    if not public_domain(store):
+        return None
+    for ib in store.get("inbounds") or []:
+        if ib.get("enabled", True) and not ib.get("_system") and P.front_mode(ib) == "raw":
+            return ib
+    return None
+
+
 def plan(store: dict) -> dict:
     """Routing table: SNI → Xray, HTTPS sites → panel/paths. Public domain always gets a panel site."""
     pub = public_domain(store)
@@ -225,7 +235,19 @@ def plan(store: dict) -> dict:
             del sites[domain]
     if pub and pub in sni:
         del sni[pub]
-    return {"sni": sni, "sites": sites, "problems": problems, "public_domain": pub}
+    raw_ib = raw_front_inbound(store)
+    raw = {"tag": raw_ib.get("tag"), "port": int(raw_ib.get("port") or 0)} if raw_ib else None
+    for ib in store.get("inbounds") or []:
+        if not ib.get("enabled", True) or P.front_mode(ib) != "raw" or ib is raw_ib:
+            continue
+        if not pub:
+            problems.append(f"{ib.get('tag')}: RAW на :443 требует публичный домен")
+        else:
+            problems.append(
+                f"{ib.get('tag')}: на :443 публикуется только один RAW-inbound "
+                f"({raw['tag'] if raw else '—'}) — этот доступен только локально"
+            )
+    return {"sni": sni, "sites": sites, "problems": problems, "public_domain": pub, "raw": raw}
 
 
 # ---------------------------------------------------------------- certificates
@@ -333,9 +355,22 @@ def render(store: dict) -> tuple[str, str, list[str]]:
     internal = f"127.0.0.1:{P.FRONT_INTERNAL_PORT}"
     listen6 = "        listen [::]:443;\n" if _ipv6() else ""
     sni_lines = "".join(f"        {name} 127.0.0.1:{port};\n" for name, port in sorted(p["sni"].items()))
+    raw = p.get("raw") if pub else None
+    raw_upstream = ""
+    if raw:
+        # Xray terminates TLS for the public domain (RAW + fallbacks to nginx). If Xray is down,
+        # the backup keeps the panel reachable via nginx TLS as before.
+        sni_lines += f"        {pub} l2x_pub_raw;\n"
+        raw_upstream = (
+            "    upstream l2x_pub_raw {\n"
+            f"        server 127.0.0.1:{raw['port']};\n"
+            f"        server {internal} backup;\n"
+            "    }\n"
+        )
     stream = (
         f"{MARK}\n"
         "stream {\n"
+        f"{raw_upstream}"
         "    map $ssl_preread_server_name $l2x_front_upstream {\n"
         "        hostnames;\n"
         f"        default {internal};\n"
@@ -380,6 +415,19 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         else:
             body.append("    location / {\n        return 404;\n    }")
         blocks.append("server {\n" + "\n".join(body) + "\n}")
+        if raw and domain == pub:
+            # Plain-HTTP twins of the public site for Xray fallbacks (TLS already terminated by Xray)
+            content = [
+                ln for ln in body
+                if not ln.lstrip().startswith(("listen ", "http2 ", "ssl_"))
+            ]
+            h1 = f"    listen 127.0.0.1:{P.FRONT_FALLBACK_H1_PORT} proxy_protocol;"
+            if new_http2:
+                h2 = [f"    listen 127.0.0.1:{P.FRONT_FALLBACK_H2_PORT} proxy_protocol;", "    http2 on;"]
+            else:
+                h2 = [f"    listen 127.0.0.1:{P.FRONT_FALLBACK_H2_PORT} proxy_protocol http2;"]
+            blocks.append("server {\n" + "\n".join([h1, *content]) + "\n}")
+            blocks.append("server {\n" + "\n".join([*h2, *content]) + "\n}")
     # Legacy subscription ports (HTTP): 3x-ui style http://host:2096/<path>/<token>
     # Cannot iptables-REDIRECT to :443 (TLS stream) — dedicated plain-HTTP listeners.
     leg_ports = legacy_sub_ports(store)

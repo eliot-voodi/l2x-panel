@@ -515,6 +515,32 @@ def reverse_portal_tags(store: dict) -> list[str]:
     return tags
 
 
+def _front_raw_tls(store: dict, ib: dict, built: dict) -> None:
+    """Plain RAW on :443: Xray terminates TLS (public cert); non-proxy traffic falls back to nginx."""
+    try:
+        import front as front_mod
+        sel = front_mod.raw_front_inbound(store)
+        if not sel or sel.get("tag") != ib.get("tag"):
+            return
+        domain = front_mod.public_domain(store)
+        crt, key, _ = front_mod.cert_for(domain)
+    except Exception:
+        return
+    ss = built.setdefault("streamSettings", {})
+    ss["security"] = "tls"
+    ss["tlsSettings"] = {
+        "serverName": domain,
+        "alpn": ["h2", "http/1.1"],
+        "minVersion": "1.2",
+        # Re-read certificate files hourly so Let's Encrypt renewals apply without restart
+        "certificates": [{"certificateFile": crt, "keyFile": key, "ocspStapling": 3600}],
+    }
+    built.setdefault("settings", {})["fallbacks"] = [
+        {"alpn": "h2", "dest": P.FRONT_FALLBACK_H2_PORT, "xver": 1},
+        {"dest": P.FRONT_FALLBACK_H1_PORT, "xver": 1},
+    ]
+
+
 def _inject_reverse(store: dict, cfg: dict) -> None:
     """VLESS Reverse Proxy (Xray ≥ 25.10; legacy bridge/portal is removed from core).
 
@@ -818,7 +844,10 @@ def ensure_inbounds(store: dict) -> list[dict]:
 
 def system_ports() -> set[int]:
     """Ports used by the panel itself on this host; inbounds may not take them."""
-    ports = {P.FRONT_INTERNAL_PORT, int(str(XRAY_API).rsplit(":", 1)[-1])}
+    ports = {
+        P.FRONT_INTERNAL_PORT, P.FRONT_FALLBACK_H1_PORT, P.FRONT_FALLBACK_H2_PORT,
+        int(str(XRAY_API).rsplit(":", 1)[-1]),
+    }
     try:
         ports.add(int(os.environ.get("PORT") or 8090))
     except ValueError:
@@ -1242,6 +1271,8 @@ def build_config(store: dict) -> dict:
             dest = built["sniffing"]["destOverride"]
             if "fakedns" not in dest:
                 dest.append("fakedns")
+        if P.front_mode(ib) == "raw":
+            _front_raw_tls(store, ib, built)
         inbounds.append(built)
 
     inbounds.append({

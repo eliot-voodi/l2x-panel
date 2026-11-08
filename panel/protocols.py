@@ -61,6 +61,10 @@ TLS_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
 # Inbounds are published only through the nginx front on :443; Xray itself never binds a public address.
 FRONT_PORT = 443
 FRONT_INTERNAL_PORT = 7443
+# Plain-HTTP nginx listeners that Xray (TLS terminator for RAW on the public domain) falls back to
+FRONT_FALLBACK_H1_PORT = 7444
+FRONT_FALLBACK_H2_PORT = 7445
+FRONT_RAW_PROTOCOLS = ("vless", "trojan")
 INBOUND_LISTEN = "127.0.0.1"
 RESERVED_PORTS = frozenset({22, 80, 443})
 FRONT_HTTP_NETWORKS = ("ws", "grpc", "httpupgrade", "xhttp")
@@ -585,6 +589,8 @@ def front_mode(ib: dict) -> str | None:
              (ws / grpc / httpupgrade / xhttp). Several inbounds share one domain.
     "sni"  — TLS passthrough by SNI (Reality, or TLS terminated by Xray) for a
              *different* hostname than the public panel domain;
+    "raw"  — plain VLESS/Trojan RAW on the public domain: Xray terminates TLS with the
+             public certificate and falls back to nginx for everything that is not a proxy client;
     None   — not reachable from outside.
     """
     if ib.get("protocol") not in FRONT_PROTOCOLS:
@@ -597,6 +603,12 @@ def front_mode(ib: dict) -> str | None:
         return "sni"
     if net in FRONT_HTTP_NETWORKS:
         return "http"
+    if (
+        net == "raw"
+        and ib.get("protocol") in FRONT_RAW_PROTOCOLS
+        and (st.get("raw") or {}).get("header") != "http"
+    ):
+        return "raw"
     return None
 
 
@@ -643,6 +655,8 @@ def supports_flow(ib: dict) -> bool:
     sec = st.get("security") or "none"
     if net == "raw" and sec in ("tls", "reality"):
         return True
+    if front_mode(ib) == "raw":
+        return True  # TLS is terminated by Xray itself on :443
     return _vless_enc_on(ib.get("settings"))
 
 
@@ -721,7 +735,7 @@ def build_inbound(ib: dict, identities: list[dict]) -> dict:
     elif proto in USER_PROTOCOLS:
         out["streamSettings"] = build_stream_settings(ib.get("stream") or {})
         mode = front_mode(ib)
-        if mode == "sni":
+        if mode in ("sni", "raw"):
             # nginx stream sends PROXY protocol so Xray sees the real client IP
             out["streamSettings"].setdefault("sockopt", {})["acceptProxyProtocol"] = True
         elif mode == "http":
@@ -927,6 +941,17 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         ep["port"] = FRONT_PORT
     if mode == "sni" and sec == "tls" and not ep.get("sni"):
         ep["sni"] = ib.get("share_host") or ""
+    elif mode == "raw":
+        # Certificate is the public domain's — share_host of path inbounds may differ
+        domain = host or ib.get("share_host") or ""
+        ep.update({
+            "address": domain,
+            "security": "tls",
+            "sni": domain,
+            "fp": fp,
+            "alpn": "h2,http/1.1",
+            "allow_insecure": False,
+        })
     elif mode == "http":
         domain = ib.get("share_host") or host
         ep.update({
