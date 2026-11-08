@@ -18,6 +18,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -682,17 +683,43 @@ def _reload(*, restart: bool = False) -> dict:
     return {"ok": ok, "error": "" if ok else (r["stderr"] or r["stdout"] or "nginx не слушает :443")}
 
 
-def commit(staged: dict) -> dict:
-    """Load the verified config; restore the previous one if nginx does not come up on :443."""
+def commit(staged: dict, *, defer_reload_sec: float = 0) -> dict:
+    """Load the verified config; restore the previous one if nginx does not come up on :443.
+
+    defer_reload_sec > 0: schedule reload shortly after returning so an in-flight
+    HTTP response (e.g. /agent/apply through this same nginx) can flush first.
+    nginx -t already passed in stage(), so a deferred reload almost always succeeds.
+    """
     if staged.get("skipped"):
         return {"ok": True, "skipped": True}
     if not staged.get("changed") and _listening(P.FRONT_PORT, 1) and _listening(P.FRONT_INTERNAL_PORT, 1):
         return {"ok": True}
-    r = _reload(restart=bool(staged.get("restart")))
+    restart = bool(staged.get("restart"))
+    if defer_reload_sec and defer_reload_sec > 0:
+        snap = staged  # keep snapshot for possible late rollback
+
+        def _later() -> None:
+            try:
+                r = _reload(restart=restart)
+                if not r.get("ok"):
+                    rollback(snap)
+                    _reload(restart=restart)
+            except Exception:
+                try:
+                    rollback(snap)
+                    _reload(restart=restart)
+                except Exception:
+                    pass
+
+        t = threading.Timer(float(defer_reload_sec), _later)
+        t.daemon = True
+        t.start()
+        return {"ok": True, "deferred_reload": True}
+    r = _reload(restart=restart)
     if r["ok"]:
         return r
     rollback(staged)
-    _reload(restart=bool(staged.get("restart")))
+    _reload(restart=restart)
     return {"ok": False, "error": f"nginx: {r['error']}; предыдущий конфиг восстановлен"}
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -1039,8 +1040,16 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             return {"ok": False, "error": self_err}
     result = _push_once(node, payload, timeout=timeout)
     err = str(result.get("error") or "")
-    # Transient network / busy agent: one retry with a longer timeout
-    if not result.get("ok") and any(x in err.lower() for x in ("timed out", "timeout", "temporarily", "connection reset")):
+    # Transient network / busy agent / nginx reload mid-response: one retry
+    # "Remote end closed without response" is common when agent reloads nginx while
+    # answering /agent/apply — config is often already applied; retry usually succeeds.
+    _transient = (
+        "timed out", "timeout", "temporarily", "connection reset",
+        "remote end closed", "remotdisconnected", "connection aborted",
+        "broken pipe", "connection refused",
+    )
+    if not result.get("ok") and any(x in err.lower() for x in _transient):
+        time.sleep(1.2)
         result = _push_once(node, payload, timeout=max(timeout, 180))
         err = str(result.get("error") or "")
     # Auto-heal: agent was turned off by update/restart — re-enable via manage API and retry once.

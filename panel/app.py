@@ -243,11 +243,14 @@ FRONT_CERT_RETRY = 3600
 _front_cert_tried: dict[str, float] = {}
 
 
-def _apply_xray(store: dict, *, persist: bool = True) -> dict:
+def _apply_xray(store: dict, *, persist: bool = True, defer_front_reload: float = 0) -> dict:
     """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails.
 
     On agent nodes, Xray is built from a runtime view (no local L2TP) while the persisted
     store may still hold a full mirror of the master for fast failover.
+
+    defer_front_reload: seconds to delay nginx reload after a successful stage (used by
+    /agent/apply so the sync HTTP response is not cut by reload of the proxying nginx).
     """
     ns = (store.get("settings") or {}).get("nodes") or {}
     is_agent = bool(ns.get("agent_enabled") and (ns.get("role") or "") == "agent")
@@ -264,7 +267,7 @@ def _apply_xray(store: dict, *, persist: bool = True) -> dict:
             if persist:
                 _save_store(store)
             return result
-        fr = front.commit(staged)
+        fr = front.commit(staged, defer_reload_sec=defer_front_reload)
         if not fr["ok"]:
             result = {**result, "ok": False, "error": fr["error"]}
         elif staged.get("problems"):
@@ -6642,7 +6645,9 @@ def _agent_apply_payload(payload: dict) -> dict:
         ):
             ns.pop("reverse_bridge", None)
             ns.pop("nat", None)
-    res = _apply_xray(_load_store())
+    # Defer nginx reload so the master's /agent/apply HTTP response can flush first;
+    # otherwise reload drops the proxied connection → "Remote end closed without response".
+    res = _apply_xray(_load_store(), defer_front_reload=0.6)
     err = res.get("error") or ""
     try:
         err = xray.clean_xray_error(err) or err
