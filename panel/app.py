@@ -6451,7 +6451,22 @@ async def agent_apply(request: Request):
                 else nodes_mod._agent_safe_clients(payload["clients"])
             )
         if payload.get("inbounds") is not None:
-            st["inbounds"] = payload["inbounds"]
+            inbounds = payload["inbounds"]
+            local_host = front.public_domain(st) or (
+                (st.get("settings") or {}).get("panel") or {}
+            ).get("public_host") or ""
+            local_host = nodes_mod._normalize_domain(str(local_host or ""))
+            if local_host:
+                old = {
+                    nodes_mod._normalize_domain(ib.get("share_host") or "")
+                    for ib in (inbounds or []) if isinstance(ib, dict)
+                }
+                old.discard("")
+                old.discard(local_host)
+                inbounds = nodes_mod.remap_inbounds_for_host(
+                    inbounds, new_host=local_host, old_hosts=old,
+                )
+            st["inbounds"] = inbounds
         if payload.get("outbounds_custom") is not None:
             if mirror:
                 st["outbounds_custom"] = list(payload["outbounds_custom"] or [])

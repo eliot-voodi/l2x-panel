@@ -356,6 +356,14 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         node["sync_clients"] = True
         node["sync_inbounds"] = True
     inbounds = list(store.get("inbounds") or [])
+    # Path/TLS share domains must be the node hostname, not the master
+    node_dom = node_public_domain(node)
+    if node_dom and (node.get("sync_inbounds", True) or mirror or node.get("as_outbound")):
+        inbounds = remap_inbounds_for_host(
+            inbounds,
+            new_host=node_dom,
+            old_hosts=master_public_domains(store),
+        )
     # Ensure bridge inbound exists on agent when used as outbound
     if node.get("as_outbound"):
         ensure_bridge(node)
@@ -808,7 +816,29 @@ def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
     if payload.get("clients") is not None:
         store["clients"] = payload["clients"]
     if payload.get("inbounds") is not None:
-        store["inbounds"] = payload["inbounds"]
+        inbounds = payload["inbounds"]
+        # Safety: force inbound domains to this agent's public host (master may still send its own)
+        local_host = ""
+        try:
+            import front as front_mod
+            local_host = _normalize_domain(front_mod.public_domain(store) or "")
+        except Exception:
+            local_host = ""
+        if not local_host:
+            local_host = _normalize_domain(
+                ((store.get("settings") or {}).get("panel") or {}).get("public_host") or ""
+            )
+        if local_host:
+            # Treat any non-local share_host in the payload as "old" (master)
+            old = {
+                _normalize_domain(ib.get("share_host") or "")
+                for ib in (inbounds or [])
+                if isinstance(ib, dict)
+            }
+            old.discard("")
+            old.discard(local_host)
+            inbounds = remap_inbounds_for_host(inbounds, new_host=local_host, old_hosts=old)
+        store["inbounds"] = inbounds
     if payload.get("outbounds_custom") is not None:
         store["outbounds_custom"] = payload["outbounds_custom"]
     if payload.get("routes") is not None:
@@ -1355,29 +1385,126 @@ def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
         panel["public_host"] = keep_host
 
 
+def node_public_domain(node: dict) -> str:
+    """Hostname clients use for this node (panel domain / URL host)."""
+    domain = _normalize_domain(node.get("domain") or "")
+    if domain:
+        return domain
+    from urllib.parse import urlparse
+    return _normalize_domain(urlparse(node.get("url") or "").hostname or "")
+
+
+def master_public_domains(store: dict) -> set[str]:
+    """Domains that identify the master — rewritten to the node domain on sync."""
+    out: set[str] = set()
+    settings = store.get("settings") or {}
+    for raw in (
+        (settings.get("panel") or {}).get("public_host"),
+        (settings.get("sub") or {}).get("domain"),
+    ):
+        d = _normalize_domain(str(raw or ""))
+        if d:
+            out.add(d)
+    try:
+        import front as front_mod
+        d = _normalize_domain(front_mod.public_domain(store) or "")
+        if d:
+            out.add(d)
+    except Exception:
+        pass
+    return out
+
+
+def remap_inbounds_for_host(
+    inbounds: list | None,
+    *,
+    new_host: str,
+    old_hosts: set[str] | list[str] | None = None,
+) -> list:
+    """Deep-copy inbounds with share_host / TLS SNI / transport Host pointed at new_host.
+
+    Used when syncing master → node so Path/TLS inbounds advertise the node domain,
+    not the master. Reality camouflage SNIs that are not in old_hosts are left alone.
+    """
+    new_host = _normalize_domain(new_host)
+    if not new_host:
+        return json.loads(json.dumps(inbounds or []))
+    old = {_normalize_domain(h) for h in (old_hosts or []) if h}
+    for ib in inbounds or []:
+        if not isinstance(ib, dict):
+            continue
+        sh = _normalize_domain(ib.get("share_host") or "")
+        if sh and sh != new_host:
+            old.add(sh)
+    old.discard("")
+    old.discard(new_host)
+
+    def _swap(val: str) -> str:
+        dn = _normalize_domain(val)
+        return new_host if dn and dn in old else val
+
+    out = json.loads(json.dumps(inbounds or []))
+    for ib in out:
+        if not isinstance(ib, dict):
+            continue
+        # Always publish the node domain in share links / nginx Path sites
+        ib["share_host"] = new_host
+        stream = ib.get("stream")
+        if not isinstance(stream, dict):
+            continue
+        tls = stream.get("tls")
+        if isinstance(tls, dict) and tls.get("server_name"):
+            tls["server_name"] = _swap(str(tls.get("server_name") or ""))
+        reality = stream.get("reality")
+        if isinstance(reality, dict):
+            names = reality.get("server_names")
+            if isinstance(names, list) and names:
+                reality["server_names"] = [
+                    _swap(str(n)) if _normalize_domain(str(n)) in old else n for n in names
+                ]
+            dest = str(reality.get("dest") or "")
+            if dest:
+                host_part, _, port = dest.partition(":")
+                if _normalize_domain(host_part) in old:
+                    reality["dest"] = f"{new_host}:{port or '443'}"
+        for key in ("ws", "httpupgrade", "xhttp", "splithttp"):
+            cfg = stream.get(key)
+            if isinstance(cfg, dict) and cfg.get("host"):
+                cfg["host"] = _swap(str(cfg.get("host") or ""))
+        for key in ("raw", "tcp"):
+            cfg = stream.get(key)
+            if isinstance(cfg, dict) and cfg.get("http_host"):
+                parts = [p.strip() for p in str(cfg.get("http_host") or "").split(",")]
+                cfg["http_host"] = ",".join(_swap(p) if p else p for p in parts)
+        grpc = stream.get("grpc")
+        if isinstance(grpc, dict) and grpc.get("authority"):
+            grpc["authority"] = _swap(str(grpc.get("authority") or ""))
+        for ep in ib.get("external_proxies") or []:
+            if not isinstance(ep, dict) or not ep.get("address"):
+                continue
+            addr = str(ep["address"])
+            host_part, sep, rest = addr.partition(":")
+            if _normalize_domain(host_part) in old:
+                ep["address"] = new_host + (sep + rest if sep else "")
+    return out
+
+
 def remap_inbound_share_hosts(store: dict, *, new_host: str, old_hosts: list[str] | None = None) -> int:
-    """Point inbound share_host at the new master domain after promote.
+    """Point inbound share_host (+ related domain fields) at the new master domain after promote.
 
     Without this, subscriptions keep advertising the old master (n/a after cutover).
     """
     new_host = _normalize_domain(new_host)
     if not new_host:
         return 0
-    old = {_normalize_domain(h) for h in (old_hosts or []) if h}
-    old.discard("")
-    n = 0
-    for ib in store.get("inbounds") or []:
-        sh = _normalize_domain(ib.get("share_host") or "")
-        if not sh:
-            ib["share_host"] = new_host
-            n += 1
-            continue
-        if sh == new_host:
-            continue
-        if not old or sh in old:
-            ib["share_host"] = new_host
-            n += 1
-    return n
+    before = json.dumps(store.get("inbounds") or [], sort_keys=True)
+    store["inbounds"] = remap_inbounds_for_host(
+        store.get("inbounds") or [],
+        new_host=new_host,
+        old_hosts=old_hosts,
+    )
+    after = json.dumps(store.get("inbounds") or [], sort_keys=True)
+    return 0 if before == after else sum(1 for _ in store.get("inbounds") or [])
 
 
 def promote_via_api(node: dict, payload: dict, timeout: int = 180) -> dict:
