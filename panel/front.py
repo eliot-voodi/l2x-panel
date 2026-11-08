@@ -161,6 +161,11 @@ def plan(store: dict) -> dict:
         P.normalize_http_inbound(ib)
         mode = P.front_mode(ib)
         tag, port = ib.get("tag") or "?", int(ib.get("port") or 0)
+        if tag == "rv-in" and ib.get("_system"):
+            rv = ((store.get("settings") or {}).get("nodes") or {}).get("rv") or {}
+            port = int(rv.get("port") or port)
+            if rv.get("path"):
+                ib.setdefault("stream", {}).setdefault("ws", {})["path"] = rv["path"]
         if mode == "sni":
             names = P.front_snis(ib)
             if not names:
