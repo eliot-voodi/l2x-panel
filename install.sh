@@ -119,6 +119,37 @@ case "$(uname -m)" in
 esac
 
 # ---------------------------------------------------------------- actions
+fetch_retry() {
+  # fetch_retry <url> <dest-file>: retries GitHub 5xx / network errors; empty dest = failure
+  local url=$1 dest=$2 attempt code
+  for attempt in 1 2 3 4 5; do
+    code=$(curl -sS -L --connect-timeout 20 --max-time 300 \
+      -o "$dest" -w '%{http_code}' -H 'User-Agent: L2XPanel-Installer/1.0' "$url" || true)
+    if [ "$code" = "200" ] && [ -s "$dest" ]; then
+      return 0
+    fi
+    warn "$url → HTTP ${code:-?}, повтор через $((attempt * 3))с ($attempt/5)" >&2
+    rm -f "$dest"
+    sleep $((attempt * 3))
+  done
+  return 1
+}
+
+xray_latest_tag() {
+  # GitHub API first; on 5xx fall back to the releases/latest redirect (no API quota/outage)
+  local tmp tag=""
+  tmp=$(mktemp)
+  if fetch_retry https://api.github.com/repos/XTLS/Xray-core/releases/latest "$tmp"; then
+    tag=$(jq -r '.tag_name // empty' "$tmp" 2>/dev/null || true)
+  fi
+  rm -f "$tmp"
+  if [ -z "$tag" ]; then
+    tag=$(curl -sS -o /dev/null -w '%{redirect_url}' --connect-timeout 20 --max-time 60 \
+      https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null | sed -E 's|.*/tag/||' || true)
+  fi
+  printf '%s' "$tag"
+}
+
 _download_repo_tarball() {
   # GitHub archive endpoints flake with 503; try several URLs with retries.
   # Never pipe curl|tar — a failed HTML/error body corrupts the extract.
@@ -160,14 +191,13 @@ fetch_source() {
   fi
   command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null; }
   SRC=$(mktemp -d)
-  local tarball
-  tarball=$(mktemp)
-  # shellcheck disable=SC2064
-  trap 'rm -rf "$SRC" "$tarball"' EXIT
+  # Global (not local): the EXIT trap runs after this function returns, under set -u
+  SRC_TARBALL=$(mktemp)
+  trap 'rm -rf "${SRC:-}" "${SRC_TARBALL:-}"' EXIT
   info "Загрузка $REPO_URL ($BRANCH)"
-  _download_repo_tarball "$tarball" || die "Не удалось скачать исходники с GitHub (503/сеть). Повторите позже или задайте L2X_REPO на зеркало."
-  tar -xz -C "$SRC" --strip-components=1 -f "$tarball"
-  rm -f "$tarball"
+  _download_repo_tarball "$SRC_TARBALL" || die "Не удалось скачать исходники с GitHub (503/сеть). Повторите позже или задайте L2X_REPO на зеркало."
+  tar -xz -C "$SRC" --strip-components=1 -f "$SRC_TARBALL"
+  rm -f "$SRC_TARBALL"
   [ -f "$SRC/panel/app.py" ] || die "В архиве нет panel/app.py"
 }
 
@@ -199,10 +229,14 @@ install_xray() {
     ok "Уже установлен: $("$XRAY_BIN" version | head -1 | awk '{print $2}')"
   else
     local ver=${XRAY_VERSION:-latest} tmp
-    [ "$ver" = latest ] && ver=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    if [ "$ver" = latest ]; then
+      ver=$(xray_latest_tag)
+      [ -n "$ver" ] || die "Не удалось определить последнюю версию Xray-core (GitHub недоступен). Повторите позже или задайте XRAY_VERSION."
+    fi
     info "Загрузка Xray-core $ver"
     tmp=$(mktemp -d)
-    curl -fsSL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/$ver/$XRAY_ASSET"
+    fetch_retry "https://github.com/XTLS/Xray-core/releases/download/$ver/$XRAY_ASSET" "$tmp/xray.zip" \
+      || die "Не удалось скачать Xray-core $ver с GitHub. Повторите позже."
     unzip -qo "$tmp/xray.zip" -d "$tmp"
     install -m 755 "$tmp/xray" "$XRAY_BIN"
     mkdir -p "$GEO_DIR"
