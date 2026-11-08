@@ -6662,6 +6662,18 @@ def _agent_pull_cycle() -> None:
     if not token:
         return
     have = str(ns.get("pull_version") or "")
+    warnings: list[str] = []
+    reverse_ok = False
+    try:
+        cfg_path = Path("/etc/xray/config.json")
+        if cfg_path.is_file():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            tags = {o.get("tag") for o in (cfg.get("outbounds") or [])}
+            reverse_ok = "rv-up" in tags and "rv-direct" in tags
+            if ns.get("reverse_bridge") and not reverse_ok:
+                warnings.append("reverse outbound не собран (нет rv-up/rv-direct)")
+    except Exception:
+        pass
     body = {
         "node_id": pull["node_id"],
         "have": have,
@@ -6669,7 +6681,8 @@ def _agent_pull_cycle() -> None:
         "status": {
             "ok": True,
             "error": str(ns.get("last_apply_error") or ""),
-            "warnings": [],
+            "warnings": warnings,
+            "reverse_ok": reverse_ok,
         },
     }
     res = nodes_mod.pull_request(str(pull["master_url"]), token, body, timeout=45)

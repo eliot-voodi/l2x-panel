@@ -531,9 +531,20 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     rb = ns.get("reverse_bridge") if isinstance(ns.get("reverse_bridge"), dict) else None
     if rb and rb.get("uuid") and rb.get("path") and rb.get("master_host"):
         up_tag = "rv-up"
-        in_tag = "rv-in"
+        in_tag = "rv-bridge"
+        direct_tag = "rv-direct"
         outs = cfg.setdefault("outbounds", [])
-        outs[:] = [o for o in outs if o.get("tag") != up_tag]
+        outs[:] = [o for o in outs if o.get("tag") not in (up_tag, direct_tag)]
+        # Xray ≥26.5: traffic from vless-reverse is blocked by default unless freedom
+        # has an explicit finalRules allow (otherwise tunnel connects but egress is blackholed).
+        outs.insert(1 if outs else 0, {
+            "tag": direct_tag,
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIPv4",
+                "finalRules": [{"action": "allow", "network": "tcp,udp"}],
+            },
+        })
         outs.append({
             "tag": up_tag,
             "protocol": "vless",
@@ -543,7 +554,13 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
                 "id": rb["uuid"],
                 "encryption": "none",
                 "flow": "",
-                "reverse": {"tag": in_tag},
+                "reverse": {
+                    "tag": in_tag,
+                    "sniffing": {
+                        "enabled": True,
+                        "destOverride": ["http", "tls", "quic"],
+                    },
+                },
             },
             "streamSettings": {
                 "network": "ws",
@@ -562,9 +579,15 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
             },
         })
         rules = cfg.setdefault("routing", {}).setdefault("rules", [])
-        egress = {"type": "field", "inboundTag": [in_tag], "outboundTag": "direct"}
-        if not any(r.get("inboundTag") == [in_tag] for r in rules):
-            rules.insert(1 if rules else 0, egress)
+        # Drop stale rules from earlier builds (rv-in → direct)
+        rules[:] = [
+            r for r in rules
+            if r.get("inboundTag") not in ([in_tag], ["rv-in"])
+            or r.get("outboundTag") not in ("direct", direct_tag)
+        ]
+        rules.insert(1 if rules else 0, {
+            "type": "field", "inboundTag": [in_tag], "outboundTag": direct_tag,
+        })
         return
 
     # --- Master: shared reverse inbound behind nginx Path ---

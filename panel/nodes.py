@@ -225,6 +225,10 @@ def apply_pull_seen(
         ))
     if node.get("update_requested"):
         warns.insert(0, "Обновление поставлено в очередь (agent pull ≤20 с)")
+    if st.get("reverse_ok") is False and node.get("nat") and node.get("as_outbound"):
+        warns.append("NAT reverse на ноде не поднят (нет rv-up/rv-direct)")
+    elif st.get("reverse_ok") is True:
+        node["reverse_ok"] = True
     node["last_warning"] = "; ".join(warns)[:600]
     return events
 
