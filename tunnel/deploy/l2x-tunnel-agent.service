@@ -1,0 +1,15 @@
+[Unit]
+Description=L2X Tunnel Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/l2x-tunnel-agent -config /etc/l2x-tunnel/agent.yaml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

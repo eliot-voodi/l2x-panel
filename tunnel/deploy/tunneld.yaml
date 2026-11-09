@@ -1,0 +1,12 @@
+role: portal
+tunnel:
+  psk: "CHANGE_ME_PSK_32chars_minimum!!"
+  token: "CHANGE_ME_TOKEN"
+  listen_udp: "0.0.0.0:4443"
+  path_count: 8
+  cipher: chacha20poly1305
+  max_streams: 4000
+proxy_listen: "127.0.0.1:18080"
+default_dial: "1.1.1.1:80"
+metrics:
+  listen: "127.0.0.1:9109"
