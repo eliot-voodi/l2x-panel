@@ -704,6 +704,81 @@ def fetch_3xui_api(
 
 # ---------------------------------------------------------------- PasarGuard / Marzban-like
 
+def _pg_as_dict(value: Any) -> dict:
+    """proxies / proxy_settings may arrive as dict or JSON string (sqlite/sql dumps)."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except Exception:
+            return {}
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.upper() == "NULL":
+            return {}
+        try:
+            data = json.loads(s)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _pg_proxy_blob(u: dict) -> dict:
+    """Modern PasarGuard uses proxy_settings; Marzban used proxies."""
+    blob = _pg_as_dict(u.get("proxy_settings"))
+    if blob:
+        return blob
+    return _pg_as_dict(u.get("proxies"))
+
+
+def _pg_uuid_password(u: dict) -> tuple[str, str]:
+    proxies = _pg_proxy_blob(u)
+    vless = proxies.get("vless") if isinstance(proxies.get("vless"), dict) else {}
+    vmess = proxies.get("vmess") if isinstance(proxies.get("vmess"), dict) else {}
+    trojan = proxies.get("trojan") if isinstance(proxies.get("trojan"), dict) else {}
+    ss = proxies.get("shadowsocks") if isinstance(proxies.get("shadowsocks"), dict) else {}
+    uuid = str(
+        u.get("uuid")
+        or vless.get("id")
+        or vless.get("uuid")
+        or vmess.get("id")
+        or vmess.get("uuid")
+        or ""
+    ).strip()
+    password = str(
+        u.get("password")
+        or trojan.get("password")
+        or ss.get("password")
+        or ""
+    ).strip()
+    return uuid, password
+
+
+def _pg_expire_at(u: dict) -> str:
+    """PasarGuard expire is DateTime; older Marzban used unix seconds."""
+    for key in ("expire_at", "expireAt", "expire"):
+        raw = u.get(key)
+        if raw in (None, "", 0, "0"):
+            continue
+        if isinstance(raw, datetime):
+            return expire_from_iso(raw.isoformat())
+        s = str(raw).strip()
+        if not s or s.upper() == "NULL":
+            continue
+        # Numeric unix / ms
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            exp = expire_from_unix(s)
+            if exp:
+                return exp
+            continue
+        exp = expire_from_iso(s)
+        if exp:
+            return exp
+    return ""
+
+
 def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser | None:
     email = _norm_email(u.get("username") or u.get("email") or u.get("name") or "")
     if not email:
@@ -712,36 +787,38 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
         str(u.get("subscription_token") or "").strip()
         or token_from_url(str(u.get("subscription_url") or u.get("subscriptionUrl") or ""))
     )
-    used = _safe_int(u.get("lifetime_used_traffic") or u.get("used_traffic") or u.get("usedTraffic"), 0)
+    used = _safe_int(
+        u.get("lifetime_used_traffic")
+        or u.get("lifetimeUsedTraffic")
+        or u.get("used_traffic")
+        or u.get("usedTraffic"),
+        0,
+    )
     limit = _safe_int(u.get("data_limit") or u.get("dataLimit") or 0, 0)
     status = str(u.get("status") or "active").lower()
     enabled = status not in ("disabled", "on_hold", "expired") and status != "false"
     if "enabled" in u:
         enabled = bool(u["enabled"])
-    exp = ""
-    if u.get("expire"):
-        exp = expire_from_unix(u.get("expire"))
-    elif u.get("expire_at") or u.get("expireAt"):
-        exp = expire_from_iso(u.get("expire_at") or u.get("expireAt"))
+    uuid, password = _pg_uuid_password(u)
+    # File dumps often have no subscription_url (it is computed by PasarGuard).
+    # Fall back to a stable token from username so import still creates usable clients;
+    # for exact old links prefer API import.
+    if not sub:
+        sub = re.sub(r"[^A-Za-z0-9_-]", "", email)[:64] or email
     return NormalizedUser(
         email=email,
-        uuid=str(u.get("uuid") or u.get("proxies", {}).get("vless", {}).get("id") or "").strip(),
-        password=str(
-            u.get("password")
-            or (u.get("proxies") or {}).get("trojan", {}).get("password")
-            or (u.get("proxies") or {}).get("shadowsocks", {}).get("password")
-            or ""
-        ).strip(),
+        uuid=uuid,
+        password=password,
         sub_token=sub,
         limit_gb=bytes_to_limit_gb(limit),
-        expire_at=exp,
+        expire_at=_pg_expire_at(u),
         enabled=enabled,
         comment=str(u.get("note") or u.get("comment") or ""),
         tg_id=str(u.get("telegram_id") or u.get("telegramId") or ""),
         up=0,
         down=used,
         source=source,
-        extra={"status": status},
+        extra={"status": status, "id": u.get("id")},
     )
 
 
@@ -791,50 +868,6 @@ def _extract_archive_members(raw: bytes) -> list[tuple[str, bytes]]:
     return [("upload", raw)]
 
 
-def _parse_users_sql_dump(text: str) -> list[NormalizedUser]:
-    """Best-effort parse INSERT INTO users (...) VALUES (...); from Marzban/PasarGuard dumps."""
-    out: list[NormalizedUser] = []
-    # Find column order
-    m = re.search(
-        r"INSERT\s+INTO\s+[\"`]?users[\"`]?\s*\(([^)]+)\)\s*VALUES",
-        text,
-        re.I,
-    )
-    if not m:
-        return out
-    cols = [c.strip().strip('`"') for c in m.group(1).split(",")]
-    # All value tuples after INSERT ... VALUES
-    for block in re.finditer(
-        r"INSERT\s+INTO\s+[\"`]?users[\"`]?\s*\([^)]+\)\s*VALUES\s*(.+?);",
-        text,
-        re.I | re.S,
-    ):
-        vals_blob = block.group(1)
-        # Split roughly on "),(" while respecting quotes — simplified
-        rows = re.findall(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", vals_blob)
-        for row in rows:
-            fields = _split_sql_values(row)
-            if len(fields) < len(cols):
-                continue
-            rec = {cols[i]: fields[i] for i in range(len(cols))}
-            nu = _pg_user_from_dict({
-                "username": _sql_unquote(rec.get("username")),
-                "uuid": _sql_unquote(rec.get("uuid")),
-                "used_traffic": _sql_unquote(rec.get("used_traffic")),
-                "lifetime_used_traffic": _sql_unquote(rec.get("lifetime_used_traffic")),
-                "data_limit": _sql_unquote(rec.get("data_limit")),
-                "expire": _sql_unquote(rec.get("expire")),
-                "status": _sql_unquote(rec.get("status")),
-                "note": _sql_unquote(rec.get("note")),
-                "telegram_id": _sql_unquote(rec.get("telegram_id")),
-                "subscription_url": "",
-            })
-            # subscription token sometimes stored separately — leave empty if missing
-            if nu:
-                out.append(nu)
-    return out
-
-
 def _sql_unquote(v: Any) -> Any:
     if v is None:
         return None
@@ -842,7 +875,7 @@ def _sql_unquote(v: Any) -> Any:
     if s.upper() == "NULL":
         return None
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        return s[1:-1].replace("''", "'")
+        return s[1:-1].replace("''", "'").replace('\\"', '"')
     return s
 
 
@@ -880,39 +913,166 @@ def _split_sql_values(row: str) -> list[str]:
     return parts
 
 
+def _pg_rec_from_sql_cols(cols: list[str], fields: list[Any]) -> dict:
+    rec_raw = {cols[i]: fields[i] for i in range(min(len(cols), len(fields)))}
+    return {
+        "id": _sql_unquote(rec_raw.get("id")),
+        "username": _sql_unquote(rec_raw.get("username")),
+        "uuid": _sql_unquote(rec_raw.get("uuid")),
+        "used_traffic": _sql_unquote(rec_raw.get("used_traffic")),
+        "lifetime_used_traffic": _sql_unquote(rec_raw.get("lifetime_used_traffic")),
+        "data_limit": _sql_unquote(rec_raw.get("data_limit")),
+        "expire": _sql_unquote(rec_raw.get("expire")),
+        "status": _sql_unquote(rec_raw.get("status")),
+        "note": _sql_unquote(rec_raw.get("note")),
+        "telegram_id": _sql_unquote(rec_raw.get("telegram_id")),
+        "proxy_settings": _sql_unquote(rec_raw.get("proxy_settings")),
+        "proxies": _sql_unquote(rec_raw.get("proxies")),
+        "subscription_url": _sql_unquote(rec_raw.get("subscription_url") or ""),
+    }
+
+
+def _parse_users_sql_insert(text: str) -> list[NormalizedUser]:
+    """Parse INSERT INTO users (...) VALUES (...); dumps (MySQL / some Postgres)."""
+    out: list[NormalizedUser] = []
+    for block in re.finditer(
+        r"INSERT\s+INTO\s+(?:[\"`]?[\w]+[\"`]?\.)?[\"`]?users[\"`]?\s*\(([^)]+)\)\s*VALUES\s*(.+?);",
+        text,
+        re.I | re.S,
+    ):
+        cols = [c.strip().strip('`"') for c in block.group(1).split(",")]
+        vals_blob = block.group(2)
+        rows = re.findall(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", vals_blob)
+        for row in rows:
+            fields = _split_sql_values(row)
+            if len(fields) < len(cols):
+                continue
+            nu = _pg_user_from_dict(_pg_rec_from_sql_cols(cols, fields))
+            if nu:
+                out.append(nu)
+    return out
+
+
+def _parse_pg_copy_field(raw: str) -> Any:
+    """One Postgres COPY text field (tab-separated, \\N = NULL, escapes \\t \\n \\\\)."""
+    if raw == r"\N":
+        return None
+    out: list[str] = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            out.append({"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "\\": "\\"}.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _parse_users_sql_copy(text: str) -> list[NormalizedUser]:
+    """Parse Postgres/Timescale ``COPY ... users (...) FROM stdin;`` blocks from pg_dump."""
+    out: list[NormalizedUser] = []
+    for block in re.finditer(
+        r"COPY\s+(?:(?P<schema>[\"\w]+)\.)?(?P<table>[\"\w]+)\s*\((?P<cols>[^)]+)\)\s+FROM\s+stdin\s*;\r?\n(?P<body>.*?)(?<!\S)\\\.\s*(?:\r?\n|$)",
+        text,
+        re.I | re.S,
+    ):
+        table = block.group("table").strip().strip('"')
+        if table.lower() != "users":
+            continue
+        cols = [c.strip().strip('"') for c in block.group("cols").split(",")]
+        body = block.group("body") or ""
+        for line in body.splitlines():
+            if not line or line == r"\.":
+                continue
+            # COPY text format: fields separated by tab
+            raw_fields = line.split("\t")
+            if len(raw_fields) < len(cols):
+                continue
+            fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+            nu = _pg_user_from_dict(_pg_rec_from_sql_cols(cols, fields))
+            if nu:
+                out.append(nu)
+    return out
+
+
+def _parse_users_sql_dump(text: str) -> list[NormalizedUser]:
+    """Best-effort parse users from SQL dumps (INSERT and Postgres COPY)."""
+    users = _parse_users_sql_insert(text)
+    if users:
+        return users
+    return _parse_users_sql_copy(text)
+
+
+def _pg_looks_like_sql(content: bytes) -> bool:
+    head = content[:24000].upper()
+    return (
+        (b"COPY " in head and b"USERS" in head)
+        or (b"INSERT INTO" in head and b"USERS" in head)
+        or (b"CREATE TABLE" in head and b"USERS" in head)
+    )
+
+
+def _pg_member_priority(name: str, content: bytes) -> int:
+    """Lower = try earlier. Prefer real DB dumps over random JSON configs in the zip."""
+    low = name.lower().replace("\\", "/")
+    base = low.rsplit("/", 1)[-1]
+    if content[:15] == b"SQLite format 3" or base in ("db.sqlite3", "db.sqlite", "x-ui.db"):
+        return 0
+    if base.endswith((".sqlite3", ".sqlite", ".db")):
+        return 1
+    if "db_dump/" in low or "pg_dump/" in low or (base.startswith("db-") and base.endswith(".sql")):
+        return 2
+    if base in ("db_backup.sql", "dump.sql", "backup.sql") or base.endswith(".sql") or _pg_looks_like_sql(content):
+        return 3
+    if base.endswith(".json") and (b'"users"' in content[:8000] or b'"username"' in content[:4000]):
+        return 4
+    if b'"username"' in content[:4000]:
+        return 5
+    return 100
+
+
 def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
     members = _extract_archive_members(raw)
-    # Prefer JSON / sqlite / sql
-    for name, content in members:
+    ordered = sorted(members, key=lambda it: (_pg_member_priority(it[0], it[1]), it[0].lower()))
+    errors: list[str] = []
+    for name, content in ordered:
+        if _pg_member_priority(name, content) >= 100:
+            continue
         low = name.lower()
-        if low.endswith(".json") or b'"username"' in content[:4000]:
-            try:
-                users = parse_pasarguard_json(content)
+        try:
+            if content[:15] == b"SQLite format 3" or low.endswith((".db", ".sqlite", ".sqlite3")):
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                    tmp.write(content)
+                    path = Path(tmp.name)
+                try:
+                    users = _parse_pg_sqlite(path)
+                finally:
+                    path.unlink(missing_ok=True)
                 if users:
                     return users
-            except Exception:
-                pass
-        if low.endswith(".db") or low.endswith(".sqlite") or low.endswith(".sqlite3") or content[:15] == b"SQLite format 3":
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-                tmp.write(content)
-                path = Path(tmp.name)
-            try:
-                users = _parse_pg_sqlite(path)
-                if users:
-                    return users
-            finally:
-                path.unlink(missing_ok=True)
-        if low.endswith(".sql") or b"INSERT INTO" in content[:8000] or b"CREATE TABLE" in content[:8000]:
-            try:
+                continue
+            if low.endswith(".sql") or _pg_looks_like_sql(content):
                 text = content.decode("utf-8", "replace")
                 users = _parse_users_sql_dump(text)
                 if users:
                     return users
-            except Exception:
-                pass
+                continue
+            if low.endswith(".json") or b'"username"' in content[:4000]:
+                users = parse_pasarguard_json(content)
+                if users:
+                    return users
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{name}: {exc}")
+            continue
+    hint = ("; ".join(errors[:3]) + " — ") if errors else ""
     raise RuntimeError(
         "PasarGuard: не удалось разобрать бэкап. "
-        "Загрузите JSON users или используйте API (логин/пароль или API key)."
+        f"{hint}"
+        "Нужен zip/tar.gz с db.sqlite3 или SQL dump (pg_dump/mysqldump), "
+        "либо JSON users. Для сохранения старых ссылок подписки лучше API."
     )
 
 
@@ -920,14 +1080,32 @@ def _parse_pg_sqlite(path: Path) -> list[NormalizedUser]:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     try:
-        try:
-            rows = conn.execute("SELECT * FROM users")
-        except sqlite3.Error:
+        tables = {
+            r[0].lower()
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "users" not in tables:
             return []
-        out = []
-        for row in rows:
+        # lifetime = current used_traffic + sum of reset logs (PasarGuard hybrid property)
+        has_reset = "user_usage_reset_logs" in tables
+        if has_reset:
+            sql = (
+                "SELECT u.*, "
+                "COALESCE(u.used_traffic,0) + COALESCE(("
+                "  SELECT SUM(r.used_traffic_at_reset) FROM user_usage_reset_logs r "
+                "  WHERE r.user_id = u.id"
+                "), 0) AS lifetime_used_traffic "
+                "FROM users u"
+            )
+        else:
+            sql = "SELECT * FROM users"
+        out: list[NormalizedUser] = []
+        for row in conn.execute(sql):
             rec = {k: row[k] for k in row.keys()}
-            nu = _pg_user_from_dict(rec)
+            try:
+                nu = _pg_user_from_dict(rec)
+            except Exception:
+                continue
             if nu:
                 out.append(nu)
         return out
