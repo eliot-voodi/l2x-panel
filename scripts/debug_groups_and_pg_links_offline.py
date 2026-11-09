@@ -62,11 +62,20 @@ def test_group_overrides_client():
     c2 = xray.ensure_client({"email": "u2", "sub_token": "t2"})
     if not xray.tag_allowed_for_client(store, c2, other):
         fail("group", "client without group should see all")
-    # Group outbound overrides client default
+    # Group outbound always wins (personal ignored while grouped)
     g["outbound"] = l2_de
     c["outbound"] = "direct"
     if xray.client_default_outbound(store, c) != l2_de:
         fail("group", "group outbound not applied")
+    # No group.outbound → first allowed_tags
+    g["outbound"] = ""
+    if xray.client_default_outbound(store, c) != l2_de:
+        fail("group", "expected first group allowed_tags as default outbound")
+    # Personal extras merge into group tags
+    c["allowed_tags"] = [other]
+    merged = xray.client_effective_allowed_tags(store, c)
+    if l2_de not in merged or other not in merged:
+        fail("group", f"expected group∪personal, got {merged}")
     ok("group allowed_tags + outbound override")
 
 

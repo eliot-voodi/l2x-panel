@@ -1078,26 +1078,56 @@ def client_group(store: dict, client: dict) -> dict | None:
     return get_group(store, client.get("group_id"))
 
 
+def _merge_tag_lists(base: list[str], extra: list[str]) -> list[str]:
+    """Union preserving order. Empty ``base`` means «all» — personal ``extra`` ignored."""
+    if not base:
+        return []
+    seen = set(base)
+    out = list(base)
+    for tag in extra or []:
+        t = str(tag or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def client_effective_allowed_tags(store: dict, client: dict) -> list[str]:
-    """Outbound tags allowed in subscription. Empty list = all."""
+    """Outbound tags allowed in subscription. Empty list = all.
+
+    With a group: group list is the base; personal tags may add extras.
+    Without a group: personal list only.
+    """
+    personal = list(client.get("allowed_tags") or [])
     g = client_group(store, client)
     if g is not None:
-        return list(g.get("allowed_tags") or [])
-    return list(client.get("allowed_tags") or [])
+        return _merge_tag_lists(list(g.get("allowed_tags") or []), personal)
+    return personal
 
 
 def client_effective_inbounds(store: dict, client: dict) -> list[str]:
-    """Inbound tags for the client. Empty list = all capable."""
+    """Inbound tags for the client. Empty list = all capable.
+
+    With a group: group list is the base; personal inbounds may add extras.
+    """
+    personal = list(client.get("inbounds") or [])
     g = client_group(store, client)
     if g is not None:
-        return list(g.get("inbounds") or [])
-    return list(client.get("inbounds") or [])
+        return _merge_tag_lists(list(g.get("inbounds") or []), personal)
+    return personal
 
 
 def client_default_outbound(store: dict, client: dict) -> str:
+    """Main subscription link. Group (if any) always owns this; else personal."""
     g = client_group(store, client)
-    if g is not None and g.get("outbound"):
-        return str(g["outbound"])
+    if g is not None:
+        ob = str(g.get("outbound") or "").strip()
+        if ob:
+            return ob
+        for tag in g.get("allowed_tags") or []:
+            if tag:
+                return str(tag)
+        return "direct"
     return str(client.get("outbound") or "direct")
 
 

@@ -25,27 +25,24 @@
     </div>
     <label class="f">Группа</label>
     <select name="group_id" id="client-group">
-      <option value="">— без группы (личные подключения) —</option>
+      <option value="">— без группы (личные настройки) —</option>
       {% for g in (groups or []) %}
-      <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
+      <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.allowed_tags %} · {{ g.allowed_tags|length }} подкл.{% endif %}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
       {% endfor %}
     </select>
-    <div class="hint">{% if groups %}Группа задаёт набор подключений и inbounds для подписки.
+    <div class="hint">{% if groups %}Группа задаёт основную ссылку, подключения и inbounds.
+      Личные поля ниже необязательны — можно дописать вручную.
       <a href="{{ bp }}/groups">Управление группами</a>.
       {% else %}Групп пока нет — <a href="{{ bp }}/groups/new">создайте</a>, чтобы назначать наборы подключений.{% endif %}</div>
-    <label class="f">Группа</label>
-    <select name="group_id" id="group_id">
-      <option value="" {% if not c.group_id %}selected{% endif %}>— без группы (личные настройки) —</option>
-      {% for g in groups %}<option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.allowed_tags %} · {{ g.allowed_tags|length }} подкл.{% endif %}</option>{% endfor %}
-    </select>
-    <div class="hint">Группа задаёт подключения и inbounds в подписке. <a href="{{ bp }}/groups">Управление группами</a>.
-      {% if group and group.outbound %} Outbound группы: <b>{{ outbound_label(store, group.outbound) }}</b> (перекрывает поле ниже).{% endif %}</div>
-    <label class="f">Outbound по умолчанию (основная ссылка)</label>
-    <select name="outbound">
-      <option value="direct" {% if c.outbound == 'direct' %}selected{% endif %}>🏠 Direct</option>
+    <label class="f">Outbound по умолчанию (основная ссылка){% if group %} <span class="badge">из группы</span>{% endif %}</label>
+    <select name="outbound" id="client-outbound">
+      {% if group %}<option value="" {% if not c.outbound or c.outbound == 'direct' %}selected{% endif %}>— из группы —</option>{% endif %}
+      <option value="direct" {% if c.outbound == 'direct' and not group %}selected{% endif %}>🏠 Direct</option>
       {% for tg in tags %}<option value="{{ tg.tag }}" {% if tg.tag == c.outbound %}selected{% endif %}>{{ tg.label }}{% if tg.status and tg.status not in ('connected', 'enabled') %} ({{ tg.status }}){% endif %}</option>{% endfor %}
     </select>
-    {% if group and group.outbound %}<div class="hint">Сейчас из группы: <b>{{ outbound_label(store, group.outbound) }}</b> (перекрывает значение выше).</div>{% endif %}
+    {% if group %}
+    <div class="hint">Сейчас основная ссылка: <b>{{ outbound_label(store, eff_outbound or group.outbound or (eff_tags[0] if eff_tags else 'direct')) }}</b> (из группы). Личный outbound не обязателен.</div>
+    {% endif %}
     <div class="mt">
       <input type="hidden" name="enabled" value="0">{{ m.check('enabled', c.enabled, t('Включён')) }}
       <input type="hidden" name="sub_enabled" value="0">{{ m.check('sub_enabled', c.sub_enabled, 'Подписка доступна') }}
@@ -143,21 +140,23 @@
   </div>
 
   {% if group %}
-  <div class="card" style="border-color:var(--accent)">
+  <div class="card" style="border-color:var(--accent)" id="group-summary">
     <h3>Группа «{{ group.name }}»</h3>
     <div class="small">
-      <div><span class="dim">Подключения:</span>
+      <div><span class="dim">Основная ссылка:</span>
+        <b>{{ outbound_label(store, eff_outbound or group.outbound or (eff_tags[0] if eff_tags else 'direct')) }}</b></div>
+      <div class="mt"><span class="dim">Подключения:</span>
         {% if eff_tags %}{% for tg in eff_tags %}<span class="badge accent" style="margin:0 .2rem .2rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}{% else %}все{% endif %}</div>
       <div class="mt"><span class="dim">Inbounds:</span> {% if eff_inbounds %}{{ eff_inbounds|join(', ') }}{% else %}все{% endif %}</div>
     </div>
-    <div class="hint mt">Личные галочки inbounds/подключений ниже не применяются, пока назначена группа. Лимиты GB по подключениям — личные.</div>
+    <div class="hint mt">База из группы. Ниже можно вручную дописать личные inbounds/подключения (добавятся к группе). Лимиты GB — личные.</div>
   </div>
   {% endif %}
 
-  <div class="card" {% if group %}style="opacity:.55"{% endif %}>
-    <div class="card-head"><h3>Inbounds{% if group %} <span class="badge">из группы</span>{% endif %}</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if not c.inbounds %}checked{% endif %}> все</label>
-        <label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="select" {% if c.inbounds %}checked{% endif %}> выбранные</label></div>
+  <div class="card" id="card-inbounds">
+    <div class="card-head"><h3>Inbounds{% if group %} <span class="badge">группа + личные</span>{% endif %}</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if not c.inbounds %}checked{% endif %}> {% if group %}не дописывать{% else %}все{% endif %}</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="select" {% if c.inbounds %}checked{% endif %}> {% if group %}дописать{% else %}выбранные{% endif %}</label></div>
     </div>
     <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
       <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
@@ -167,12 +166,13 @@
       <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if not c.inbounds or ib.tag in c.inbounds %}checked{% endif %}>
         <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }} <span class="dim small">:{{ ib.port }}</span></label><br>
     {% else %}<div class="dim">Нет inbounds для клиентов</div>{% endfor %}
+    {% if group %}<div class="hint">При группе поле необязательно: пусто = только inbounds группы; «дописать» — union с группой.</div>{% endif %}
   </div>
 
-  <div class="card">
-    <div class="card-head"><h3>Подключения в подписке и лимиты по ним{% if group %} <span class="badge">выбор из группы</span>{% endif %}</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if not c.allowed_tags %}checked{% endif %}> все</label>
-        <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if c.allowed_tags %}checked{% endif %}> выбранные</label></div>
+  <div class="card" id="card-allowed">
+    <div class="card-head"><h3>Подключения в подписке и лимиты по ним{% if group %} <span class="badge">группа + личные</span>{% endif %}</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if not c.allowed_tags %}checked{% endif %}> {% if group %}не дописывать{% else %}все{% endif %}</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if c.allowed_tags %}checked{% endif %}> {% if group %}дописать{% else %}выбранные{% endif %}</label></div>
     </div>
     <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
       <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
@@ -189,7 +189,7 @@
       <tbody>
       {% for tg in tags %}
         <tr>
-          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if group %}{% if not eff_tags or tg.tag in eff_tags %}checked{% endif %} disabled title="Задаётся группой"{% else %}{% if not c.allowed_tags or tg.tag in c.allowed_tags %}checked{% endif %}{% endif %}></td>
+          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if not c.allowed_tags or tg.tag in c.allowed_tags %}checked{% endif %}></td>
           <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
           {% if not is_new %}
           <td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>
@@ -201,7 +201,8 @@
       {% endfor %}
       </tbody>
     </table>
-    <div class="hint">Лимиты по outbound отдельно от общего. Дневной — сброс в 00:00 UTC. Исчерпанный outbound пропадает из подписки до обновления лимита.</div>
+    <div class="hint">Лимиты по outbound отдельно от общего. Дневной — сброс в 00:00 UTC. Исчерпанный outbound пропадает из подписки до обновления лимита.
+      {% if group %}При группе выбор подключений необязателен: пусто = только группа; «дописать» — добавит отмеченные к группе.{% endif %}</div>
   </div>
 
   <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/clients">{{ t('Отмена') }}</a></div>
@@ -352,6 +353,8 @@
     });
     boxes('inbounds').forEach(function (x) { x.addEventListener('change', function () { setMode('ib_mode', 'select'); }); });
     form.addEventListener('submit', function (e) {
+      var groupEl = document.getElementById('client-group');
+      if (groupEl && groupEl.value) return; // with group: outbound/inbounds/tags are optional
       var checks = [['allowed_tags', 'select_mode', 'подключение'], ['inbounds', 'ib_mode', 'inbound']];
       for (var i = 0; i < checks.length; i++) {
         var c = checks[i], sel = form.querySelector('input[name="' + c[1] + '"][value="select"]');

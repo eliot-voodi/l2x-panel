@@ -2933,12 +2933,23 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         return "Некорректный email (без пробелов и ~)"
     if email != client.get("email") and any(c["email"] == email for c in store["clients"]):
         return "Такой email уже есть"
-    outbound = str(form.get("outbound") or "direct")
-    if outbound not in _allowed_outbounds(store):
-        return f"Неизвестный outbound {outbound}"
+    gid = str(form.get("group_id") or "").strip()
+    if gid and not xray.get_group(store, gid):
+        return "Неизвестная группа"
+    allowed_obs = _allowed_outbounds(store)
+    outbound = str(form.get("outbound") or "").strip()
+    if gid:
+        # Personal outbound optional while grouped (effective main link comes from group).
+        if outbound and outbound not in allowed_obs:
+            return f"Неизвестный outbound {outbound}"
+        client["outbound"] = outbound  # empty = use group
+    else:
+        outbound = outbound or "direct"
+        if outbound not in allowed_obs:
+            return f"Неизвестный outbound {outbound}"
+        client["outbound"] = outbound
     old_email = client.get("email")
     client["email"] = email
-    client["outbound"] = outbound
     client["enabled"] = form.get("enabled", "1") == "1"
     client["comment"] = str(form.get("comment") or "").strip()
     client["tg_id"] = str(form.get("tg_id") or "").strip()
@@ -2986,19 +2997,20 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         client["doh_token"] = doh_mod.new_token()
     if client["doh_in_tunnel"] and not client["doh_enabled"]:
         client["doh_enabled"] = True
-    gid = str(form.get("group_id") or "").strip()
-    if gid and not xray.get_group(store, gid):
-        return "Неизвестная группа"
     client["group_id"] = gid
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
-    # Personal inbounds/tags apply only when no group is assigned
-    if not gid:
-        client["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
+    # Always save personal lists (optional extras when grouped; sole source without group).
+    if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib:
+        client["inbounds"] = []
+    else:
+        client["inbounds"] = sel_ib
     known = {t_["tag"] for t_ in xray.selectable_outbound_tags(store)}
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
-    if not gid:
-        client["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
+    if form.get("select_mode", "all") == "all" or not selected:
+        client["allowed_tags"] = []
+    else:
+        client["allowed_tags"] = selected
     limits = {}
     daily_limits = {}
     for tag in known:
@@ -3029,7 +3041,7 @@ def client_new(request: Request):
     return page(request, "client_edit.html", active="clients", c=c, row=None, is_new=True, store=store,
                 tags=xray.selectable_outbound_tags(store), inbounds=xray.client_capable_inbounds(store),
                 groups=xray.ensure_groups(store), group=None,
-                eff_tags=[], eff_inbounds=[],
+                eff_tags=[], eff_inbounds=[], eff_outbound="",
                 hwids=[], bans=[], links=[], wg_confs=[], doh_url="",
                 doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
 
@@ -3304,6 +3316,7 @@ def client_edit(email: str, request: Request):
                 groups=xray.ensure_groups(store), group=grp,
                 eff_tags=xray.client_effective_allowed_tags(store, c),
                 eff_inbounds=xray.client_effective_inbounds(store, c),
+                eff_outbound=xray.client_default_outbound(store, c) if grp else "",
                 wg_confs=wg_confs, hwids=hwid.public_list(c),
                 doh_url=doh_mod.public_url(store, c),
                 doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
