@@ -18,6 +18,7 @@ const (
 	TypePUNCH   uint8 = 5
 	TypeHELLO   uint8 = 6
 	TypeHELLOOK uint8 = 7
+	TypeOPENACK uint8 = 8
 )
 
 const Version uint8 = 1

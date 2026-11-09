@@ -28,6 +28,9 @@ type stream struct {
 	conn   net.Conn
 	pathID uint8
 	closed atomic.Bool
+	ready  chan struct{}
+	buf    [][]byte
+	bufMu  sync.Mutex
 }
 
 type Engine struct {
@@ -193,6 +196,17 @@ func (e *Engine) handlePacket(path *pool.Path, addr *net.UDPAddr, packet []byte)
 		if e.Role == "agent" {
 			go e.acceptOpen(fr)
 		}
+	case proto.TypeOPENACK:
+		e.mu.RLock()
+		st := e.streams[fr.StreamID]
+		e.mu.RUnlock()
+		if st != nil && st.ready != nil {
+			select {
+			case <-st.ready:
+			default:
+				close(st.ready)
+			}
+		}
 	case proto.TypeDATA:
 		e.onData(fr)
 	case proto.TypeCLOSE:
@@ -254,23 +268,33 @@ func (e *Engine) acceptOpen(fr proto.Frame) {
 		_ = e.send(proto.Frame{Type: proto.TypeCLOSE, StreamID: fr.StreamID}, 0)
 		return
 	}
-	conn, err := net.DialTimeout("tcp", target, 8*time.Second)
-	if err != nil {
-		log.Printf("dial %s: %v", target, err)
-		_ = e.send(proto.Frame{Type: proto.TypeCLOSE, StreamID: fr.StreamID}, 0)
-		return
-	}
-	st := &stream{id: fr.StreamID, conn: conn, pathID: 0}
+	// Register immediately so early DATA is buffered before dial completes.
+	st := &stream{id: fr.StreamID, pathID: 0, ready: make(chan struct{})}
 	e.mu.Lock()
 	if len(e.streams) >= e.MaxStr {
 		e.mu.Unlock()
-		_ = conn.Close()
 		_ = e.send(proto.Frame{Type: proto.TypeCLOSE, StreamID: fr.StreamID}, 0)
 		return
 	}
 	e.streams[fr.StreamID] = st
 	e.mu.Unlock()
 	e.Stats.Streams.Add(1)
+
+	conn, err := net.DialTimeout("tcp", target, 8*time.Second)
+	if err != nil {
+		log.Printf("dial %s: %v", target, err)
+		e.closeStream(fr.StreamID, true)
+		return
+	}
+	st.conn = conn
+	_ = e.send(proto.Frame{Type: proto.TypeOPENACK, StreamID: fr.StreamID}, 0)
+	st.bufMu.Lock()
+	pending := st.buf
+	st.buf = nil
+	st.bufMu.Unlock()
+	for _, p := range pending {
+		_, _ = conn.Write(p)
+	}
 	go e.pipeConn(st)
 }
 
@@ -279,6 +303,16 @@ func (e *Engine) onData(fr proto.Frame) {
 	st := e.streams[fr.StreamID]
 	e.mu.RUnlock()
 	if st == nil || st.closed.Load() {
+		return
+	}
+	if st.conn == nil {
+		st.bufMu.Lock()
+		if len(st.buf) < 64 {
+			cp := make([]byte, len(fr.Payload))
+			copy(cp, fr.Payload)
+			st.buf = append(st.buf, cp)
+		}
+		st.bufMu.Unlock()
 		return
 	}
 	_, _ = st.conn.Write(fr.Payload)
@@ -293,7 +327,16 @@ func (e *Engine) closeStream(id uint32, notify bool) {
 		return
 	}
 	if st.closed.CompareAndSwap(false, true) {
-		_ = st.conn.Close()
+		if st.ready != nil {
+			select {
+			case <-st.ready:
+			default:
+				close(st.ready)
+			}
+		}
+		if st.conn != nil {
+			_ = st.conn.Close()
+		}
 		e.Stats.Streams.Add(-1)
 		if notify {
 			_ = e.send(proto.Frame{Type: proto.TypeCLOSE, StreamID: id}, st.pathID)
@@ -348,13 +391,28 @@ func (e *Engine) handleProxyConn(conn net.Conn, dialTarget string) {
 		return
 	}
 	id := e.nextID.Add(1)
-	st := &stream{id: id, conn: conn, pathID: uint8(id % uint32(len(e.Pool.Paths())))}
+	nPaths := len(e.Pool.Paths())
+	if nPaths < 1 {
+		nPaths = 1
+	}
+	st := &stream{
+		id: id, conn: conn,
+		pathID: uint8(id % uint32(nPaths)),
+		ready:  make(chan struct{}),
+	}
 	e.mu.Lock()
 	e.streams[id] = st
 	e.mu.Unlock()
 	e.Stats.Streams.Add(1)
 	if err := e.send(proto.Frame{Type: proto.TypeOPEN, StreamID: id, Payload: []byte(dialTarget)}, st.pathID); err != nil {
 		e.closeStream(id, false)
+		return
+	}
+	select {
+	case <-st.ready:
+	case <-time.After(8 * time.Second):
+		log.Printf("stream %d open ack timeout", id)
+		e.closeStream(id, true)
 		return
 	}
 	e.pipeConn(st)
