@@ -1456,6 +1456,27 @@ def build_config(store: dict) -> dict:
         "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"},
     })
 
+    # Telegram Bot API via panel outbound (VLESS/Trojan/…): local SOCKS → chosen outbound.
+    tg_proxy = ((store.get("settings") or {}).get("tg") or {}).get("proxy") or {}
+    tg_via = ""
+    if (
+        tg_proxy.get("enabled")
+        and str(tg_proxy.get("type") or "").lower() == "outbound"
+        and str(tg_proxy.get("outbound") or "").strip()
+    ):
+        try:
+            import tgbot as _tgbot
+            tg_via = str(tg_proxy.get("outbound") or "").strip()
+            inbounds.append({
+                "tag": _tgbot.TG_LOCAL_SOCKS_TAG,
+                "listen": "127.0.0.1",
+                "port": int(_tgbot.TG_LOCAL_SOCKS_PORT),
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": False},
+            })
+        except Exception:
+            tg_via = ""
+
     # sockopt on freedom: BBR/NoDelay on egress (client upload path through the proxy)
     _egress_sock = {"tcpCongestion": "bbr", "tcpNoDelay": True, "tcpFastOpen": True}
     outbounds = [
@@ -1500,6 +1521,17 @@ def build_config(store: dict) -> dict:
             )
 
     rules: list[dict] = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
+    if tg_via:
+        try:
+            import tgbot as _tgbot
+            # Prefer explicit outbound; if balancer/missing — _route_target falls back safely.
+            rules.append({
+                "type": "field",
+                "inboundTag": [_tgbot.TG_LOCAL_SOCKS_TAG],
+                **_route_target(store, tg_via, known_outbounds=known_outbounds),
+            })
+        except Exception:
+            pass
     for r in store.get("routes") or []:
         rule = _rule_from_route(store, r, known_outbounds=known_outbounds)
         if rule:

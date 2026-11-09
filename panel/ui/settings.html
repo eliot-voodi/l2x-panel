@@ -160,6 +160,59 @@
     <div><label class="f">Отчёт каждые, ч (0 — нет)</label><input name="report_hours" type="number" step="0.5" value="{{ tg.report_hours }}"></div>
     <div><label class="f">Бэкап каждые, ч (0 — нет)</label><input name="backup_hours" type="number" step="0.5" value="{{ tg.backup_hours }}"></div>
   </div>
+
+  {% set px = tg.proxy if tg.proxy is defined else {} %}
+  <h3 class="mt">Прокси для Telegram</h3>
+  <div class="hint">Весь трафик бота и уведомлений к <code>api.telegram.org</code> (long-poll, sendMessage, бэкапы) идёт через прокси.
+    <b>MTProto</b> для Bot API не подходит (это протокол клиентов) — используйте HTTP/SOCKS5 или outbound VLESS из панели.</div>
+  {{ m.check('proxy_enabled', px.enabled, 'Прокси включён') }}
+  <div class="row">
+    <div>
+      <label class="f">Тип</label>
+      <select name="proxy_type" id="tg-proxy-type">
+        <option value="socks5" {% if (px.type or 'socks5') == 'socks5' %}selected{% endif %}>SOCKS5</option>
+        <option value="socks4" {% if px.type == 'socks4' %}selected{% endif %}>SOCKS4</option>
+        <option value="http" {% if px.type == 'http' %}selected{% endif %}>HTTP / HTTPS</option>
+        <option value="outbound" {% if px.type == 'outbound' %}selected{% endif %}>Outbound панели (VLESS / Trojan / …)</option>
+      </select>
+    </div>
+  </div>
+  <div id="tg-proxy-direct">
+    <label class="f">URL (опционально)</label>
+    <input name="proxy_url" class="mono" value="{{ px.url or '' }}" placeholder="socks5://user:pass@host:1080  или  http://host:8080" style="max-width:520px">
+    <div class="row">
+      <div style="flex:1.4"><label class="f">Хост</label><input name="proxy_host" value="{{ px.host or '' }}" placeholder="1.2.3.4 / proxy.example.com"></div>
+      <div style="max-width:120px"><label class="f">Порт</label><input name="proxy_port" type="number" min="1" max="65535" value="{{ px.port or 1080 }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Логин</label><input name="proxy_user" value="{{ px.user or '' }}" autocomplete="off"></div>
+      <div><label class="f">Пароль</label><input name="proxy_password" type="password" value="" autocomplete="off" placeholder="{{ '•••• сохранён — оставьте пустым' if px.password else 'пароль прокси' }}"></div>
+    </div>
+  </div>
+  <div id="tg-proxy-outbound" style="display:none">
+    <label class="f">Outbound</label>
+    <select name="proxy_outbound">
+      <option value="">— выберите —</option>
+      {% for o in (tg_outbounds or []) %}
+      <option value="{{ o.tag }}" {% if px.outbound == o.tag %}selected{% endif %}>{{ o.label }}</option>
+      {% endfor %}
+    </select>
+    <div class="hint">Панель поднимет локальный SOCKS <code>127.0.0.1:10929</code> в Xray и направит его в выбранный outbound (VLESS и т.п.).</div>
+  </div>
+  <script>
+  (function () {
+    var sel = document.getElementById('tg-proxy-type');
+    var direct = document.getElementById('tg-proxy-direct');
+    var ob = document.getElementById('tg-proxy-outbound');
+    function sync() {
+      var v = (sel && sel.value) || 'socks5';
+      if (direct) direct.style.display = v === 'outbound' ? 'none' : '';
+      if (ob) ob.style.display = v === 'outbound' ? '' : 'none';
+    }
+    if (sel) { sel.addEventListener('change', sync); sync(); }
+  })();
+  </script>
+
   <div class="hint">Команды админа: /status /report /online /clients /tunnels /usage &lt;email&gt; /backup /restart_xray.
     Клиент может <b>привязать Telegram на странице подписки</b> — в боте /status (срок, оставшиеся ГБ), /unlink.
     Уведомления пользователю: за N дней до конца срока — раз в день; если осталось &lt; 5 ГБ — один раз (до сброса трафика).</div>

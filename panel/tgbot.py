@@ -14,6 +14,9 @@ import uuid
 from typing import Callable
 
 API = "https://api.telegram.org/bot{token}/{method}"
+# Local SOCKS injected into Xray when Telegram proxy type = outbound (VLESS/etc.).
+TG_LOCAL_SOCKS_TAG = "l2x-tg-proxy"
+TG_LOCAL_SOCKS_PORT = 10929
 log = logging.getLogger("l2x.tgbot")
 
 # Who triggered a panel change (login + IP). Copied into background jobs via ops.start_job.
@@ -72,7 +75,131 @@ def default_settings() -> dict:
         "cpu_threshold": 85,
         "report_hours": 24,
         "backup_hours": 24,
+        # All Bot API traffic (notify + long-poll) via proxy.
+        # type: http | socks5 | socks4 | outbound
+        # outbound = route through an existing panel outbound (VLESS/Trojan/…) via local Xray SOCKS.
+        # MTProto is for Telegram clients only — Bot API is HTTPS and cannot speak MTProxy.
+        "proxy": {
+            "enabled": False,
+            "type": "socks5",
+            "url": "",
+            "host": "",
+            "port": 1080,
+            "user": "",
+            "password": "",
+            "outbound": "",
+        },
     }
+
+
+def parse_proxy_url(url: str) -> dict:
+    """Parse http://user:pass@host:port or socks5://… into proxy fields."""
+    raw = str(url or "").strip()
+    if not raw:
+        return {}
+    if "://" not in raw:
+        raw = "socks5://" + raw
+    u = urllib.parse.urlparse(raw)
+    scheme = (u.scheme or "socks5").lower()
+    if scheme in ("socks", "socks5h"):
+        scheme = "socks5"
+    elif scheme == "socks4a":
+        scheme = "socks4"
+    elif scheme in ("https",):
+        scheme = "http"
+    host = u.hostname or ""
+    port = int(u.port or (443 if scheme == "http" and raw.lower().startswith("https") else 1080))
+    if scheme == "http" and not u.port:
+        port = 8080
+    return {
+        "type": scheme if scheme in ("http", "socks5", "socks4") else "socks5",
+        "host": host,
+        "port": port,
+        "user": urllib.parse.unquote(u.username or ""),
+        "password": urllib.parse.unquote(u.password or ""),
+    }
+
+
+def proxy_endpoint(settings: dict) -> dict | None:
+    """Resolved proxy for urllib: {type, host, port, user, password} or None."""
+    proxy = (settings or {}).get("proxy") or {}
+    if not proxy.get("enabled"):
+        return None
+    ptype = str(proxy.get("type") or "socks5").lower().strip()
+    if ptype in ("mtproto", "mtproxy", "tg"):
+        # Not usable for Bot API HTTPS — caller should surface this.
+        return None
+    if ptype == "outbound":
+        if not str(proxy.get("outbound") or "").strip():
+            return None
+        return {
+            "type": "socks5",
+            "host": "127.0.0.1",
+            "port": TG_LOCAL_SOCKS_PORT,
+            "user": "",
+            "password": "",
+            "via": "outbound",
+            "outbound": str(proxy.get("outbound") or "").strip(),
+        }
+    # Prefer explicit URL when set
+    url = str(proxy.get("url") or "").strip()
+    if url:
+        parsed = parse_proxy_url(url)
+        if parsed.get("host"):
+            return {
+                "type": parsed.get("type") or ptype,
+                "host": parsed["host"],
+                "port": int(parsed.get("port") or 0),
+                "user": parsed.get("user") or "",
+                "password": parsed.get("password") or "",
+            }
+    host = str(proxy.get("host") or "").strip()
+    port = int(proxy.get("port") or 0)
+    if not host or port <= 0:
+        return None
+    return {
+        "type": ptype if ptype in ("http", "socks5", "socks4") else "socks5",
+        "host": host,
+        "port": port,
+        "user": str(proxy.get("user") or "").strip(),
+        "password": str(proxy.get("password") or ""),
+    }
+
+
+def build_opener(settings: dict) -> urllib.request.OpenerDirector:
+    """urllib opener that sends all Telegram HTTPS via the configured proxy."""
+    ep = proxy_endpoint(settings)
+    if not ep:
+        return urllib.request.build_opener()
+    ptype = ep["type"]
+    host, port = ep["host"], int(ep["port"])
+    user, password = ep.get("user") or None, ep.get("password") or None
+    if ptype == "http":
+        auth = ""
+        if user:
+            auth = f"{urllib.parse.quote(user)}:{urllib.parse.quote(password or '')}@"
+        proxy_url = f"http://{auth}{host}:{port}"
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
+        )
+    try:
+        import socks
+        from sockshandler import SocksiPyHandler
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("Для SOCKS-прокси установите PySocks (pip install PySocks)") from exc
+    kind = socks.SOCKS5 if ptype != "socks4" else socks.SOCKS4
+    return urllib.request.build_opener(
+        SocksiPyHandler(kind, host, port, username=user, password=password),
+    )
+
+
+def needs_xray_socks(settings: dict) -> bool:
+    proxy = (settings or {}).get("proxy") or {}
+    return bool(
+        proxy.get("enabled")
+        and str(proxy.get("type") or "").lower() == "outbound"
+        and str(proxy.get("outbound") or "").strip()
+    )
 
 
 def escape(text: str) -> str:
@@ -118,14 +245,23 @@ class Bot:
         self._webhook_cleared = False
 
     # ------------------------------------------------------------ transport
+    def _opener(self) -> urllib.request.OpenerDirector:
+        return build_opener(self.get_settings())
+
     def _call(self, method: str, params: dict | None = None, timeout: int = 30) -> dict:
         s = self.get_settings()
         if not s.get("token"):
             return {"ok": False, "error": "no token"}
+        proxy = s.get("proxy") or {}
+        if proxy.get("enabled") and str(proxy.get("type") or "").lower() in ("mtproto", "mtproxy", "tg"):
+            return {
+                "ok": False,
+                "error": "MTProto-прокси нельзя использовать для Bot API — выберите HTTP, SOCKS5 или outbound (VLESS)",
+            }
         data = urllib.parse.urlencode(params or {}).encode()
         req = urllib.request.Request(API.format(token=s["token"], method=method), data=data)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with self._opener().open(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as exc:
             body = ""
@@ -215,7 +351,7 @@ class Bot:
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             )
             try:
-                urllib.request.urlopen(req, timeout=60).read()
+                self._opener().open(req, timeout=60).read()
             except Exception as exc:  # noqa: BLE001
                 log.warning("sendDocument failed: %s", exc)
 

@@ -5134,6 +5134,14 @@ def settings_page(request: Request):
         ctx["bbr"] = ops.bbr_status()
         ctx["store"] = store
         ctx["panel_releases"] = ops.panel_releases(20)
+    if tab == "tg":
+        # Outbounds suitable for Telegram proxy (skip balancers/direct/block)
+        skip = {"direct", "block", "dns-out", "api"}
+        ctx["tg_outbounds"] = [
+            {"tag": t["tag"], "label": t["label"]}
+            for t in xray.selectable_outbound_tags(store)
+            if t.get("tag") and t["tag"] not in skip and t.get("kind") != "balancer"
+        ]
     new_token = request.session.pop("new_api_token", None)
     me = _admin_record_for_user(_user(request))
     return page(request, "settings.html", active="settings", tab=tab, s=s, admin=me, admins=admins.public_rows(),
@@ -5284,6 +5292,34 @@ async def settings_save(request: Request):
                     continue
                 seen.add(aid)
                 admin_ids.append(aid)
+            prev_proxy = dict(tg.get("proxy") or {})
+            ptype = str(form.get("proxy_type") or "socks5").strip().lower()
+            if ptype not in ("http", "socks5", "socks4", "outbound"):
+                ptype = "socks5"
+            new_proxy_pass = str(form.get("proxy_password") or "")
+            # Empty password field keeps previous (same UX as bot token)
+            if new_proxy_pass == "" and prev_proxy.get("password") and not str(form.get("proxy_url") or "").strip():
+                new_proxy_pass = str(prev_proxy.get("password") or "")
+            proxy = {
+                "enabled": form.get("proxy_enabled") == "1",
+                "type": ptype,
+                "url": str(form.get("proxy_url") or "").strip(),
+                "host": str(form.get("proxy_host") or "").strip(),
+                "port": _int(form.get("proxy_port"), int(prev_proxy.get("port") or 1080)),
+                "user": str(form.get("proxy_user") or "").strip(),
+                "password": new_proxy_pass,
+                "outbound": str(form.get("proxy_outbound") or "").strip(),
+            }
+            if proxy["url"] and ptype != "outbound":
+                parsed = tgbot.parse_proxy_url(proxy["url"])
+                if parsed.get("host"):
+                    proxy["type"] = parsed.get("type") or ptype
+                    proxy["host"] = parsed["host"]
+                    proxy["port"] = int(parsed.get("port") or proxy["port"] or 1080)
+                    if parsed.get("user"):
+                        proxy["user"] = parsed["user"]
+                    if parsed.get("password"):
+                        proxy["password"] = parsed["password"]
             tg.update({
                 "enabled": form.get("enabled") == "1", "token": new_token,
                 "admin_ids": admin_ids,
@@ -5296,13 +5332,14 @@ async def settings_save(request: Request):
                 "notify_expire_days": _float(form.get("notify_expire_days"), 3),
                 "cpu_threshold": _float(form.get("cpu_threshold"), 85), "report_hours": _float(form.get("report_hours"), 24),
                 "backup_hours": _float(form.get("backup_hours"), 24),
+                "proxy": proxy,
             })
         elif section == "iplimit":
             s["iplimit"]["ban_minutes"] = _int(form.get("ban_minutes"), 30)
     _refresh_settings_cache()
     _sync_servers()
     if section == "tg":
-        # Force restart so token/enabled/admin_ids take effect immediately
+        # Force restart so token/enabled/admin_ids/proxy take effect immediately
         BOT.restart()
     _tg_change(f"⚙️ Настройки: секция <b>{tgbot.escape(section)}</b> сохранена")
     if section in ("panel", "sub"):
@@ -5310,6 +5347,9 @@ async def settings_save(request: Request):
             "Настройки сохранены, nginx/front обновлён" if section == "sub" else "Настройки сохранены, HTTPS :443 обновлён",
             _apply_xray(_load_store()),
         ))
+    elif section == "tg":
+        # Always refresh Xray so l2x-tg-proxy SOCKS appears/disappears with outbound mode.
+        flash(request, *_ok_msg("Настройки сохранены", _apply_xray(_load_store(), xray_only=True)))
     else:
         flash(request, "Настройки сохранены", "info")
     return go(f"/settings?tab={section}")
