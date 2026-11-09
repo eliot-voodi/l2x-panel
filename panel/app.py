@@ -5358,6 +5358,7 @@ def _nodes_health_cycle() -> None:
             for key in (
                 "online", "fail_streak", "last_seen", "last_probe",
                 "last_probe_error", "panel_version",
+                "xray_version", "xray_active",
             ):
                 if key in src:
                     n[key] = src[key]
@@ -5405,34 +5406,39 @@ def _nodes_sync_loop() -> None:
             return
 
 
+_MASTER_XRAY_CACHE: dict[str, Any] = {"at": 0.0, "version": ""}
+
+
+def _cached_master_xray(ttl: float = 30.0) -> str:
+    """Avoid systemctl+xray version on every Nodes page render."""
+    now = time.time()
+    if now - float(_MASTER_XRAY_CACHE.get("at") or 0) < ttl and _MASTER_XRAY_CACHE.get("version") is not None:
+        return str(_MASTER_XRAY_CACHE.get("version") or "")
+    try:
+        ver = str((xray.xray_status() or {}).get("version") or "")
+    except Exception:
+        ver = str(_MASTER_XRAY_CACHE.get("version") or "")
+    _MASTER_XRAY_CACHE["at"] = now
+    _MASTER_XRAY_CACHE["version"] = ver
+    return ver
+
+
 @app.get("/nodes", response_class=HTMLResponse)
 def nodes_page(request: Request):
     if redir := _require(request):
         return redir
+    # Fast render from store. Reachability / panel+xray versions come from the
+    # background _nodes_health_cycle — do NOT probe every node on GET (was N×4s).
     with mutate() as store:
         nodes_mod.ensure_list(store)
         nodes_mod.agent_token(store)
-        nodes_mod.sync_all_node_outbounds(store)
-        # Refresh remote panel versions (best-effort, short timeout)
-        if nodes_mod.is_master(store):
-            for n in store.get("nodes") or []:
-                if not n.get("enabled", True):
-                    continue
-                try:
-                    nodes_mod.probe_health(n, timeout=4)
-                except Exception:
-                    pass
     store = _load_store()
     running = NODES_JOB.get("id")
-    try:
-        master_xray = (xray.xray_status() or {}).get("version") or ""
-    except Exception:
-        master_xray = ""
     return page(request, "nodes.html", active="nodes", items=store["nodes"],
                 ns=store["settings"].get("nodes") or {},
                 is_master=nodes_mod.is_master(store),
                 master_version=panel_version(),
-                master_xray=master_xray,
+                master_xray=_cached_master_xray(),
                 sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
@@ -5572,22 +5578,32 @@ def settings_node_page(request: Request):
     log_n = 300
     if is_master and node:
         login_url = nodes_mod.panel_login_url(node)
-        if tab == "logs":
+        # NAT has no inbound manage HTTP — use registry / last pull only (instant).
+        if node.get("nat"):
+            remote = {
+                "ok": False, "error": "NAT: manage недоступен", "nat": True,
+                "version": node.get("panel_version") or "",
+                "xray": {
+                    "version": node.get("xray_version") or "",
+                    "active": node.get("xray_active"),
+                },
+            }
+        elif tab == "logs":
             log_src = (request.query_params.get("src") or "xray").strip() or "xray"
             log_n = max(50, min(2000, _int(request.query_params.get("n"), 300)))
             log_q = request.query_params.get("q") or ""
             remote = nodes_mod.manage_request(
                 node, action="get_logs",
                 params={"src": log_src, "n": log_n, "q": log_q},
-                timeout=45,
+                timeout=12,
             )
             log_text = remote.get("text") or remote.get("error") or ""
-            # still fetch snapshot for header
-            snap = nodes_mod.manage_request(node, timeout=25)
+            snap = nodes_mod.manage_request(node, timeout=8)
             if snap.get("ok"):
                 remote = {**snap, **remote, "ok": True}
         else:
-            remote = nodes_mod.manage_request(node, timeout=30)
+            # Short timeout so a dead node does not hang Settings Node for 30s
+            remote = nodes_mod.manage_request(node, timeout=8)
             if remote.get("ok"):
                 with mutate() as st:
                     for n in nodes_mod.ensure_list(st):
@@ -5606,13 +5622,15 @@ def settings_node_page(request: Request):
                 xs = remote.get("xray") if isinstance(remote.get("xray"), dict) else {}
                 if xs.get("version"):
                     node["xray_version"] = str(xs.get("version") or "")
+            elif not remote.get("error"):
+                remote = {"ok": False, "error": "нет ответа (timeout)"}
     return page(
         request, "settings_node.html", active="settings_node",
         items=items, node=node, remote=remote, is_master=is_master,
         tab=tab, login_url=login_url,
         log_text=log_text, log_src=log_src or "xray", log_n=log_n, log_q=log_q,
         xray_releases=ops.xray_releases(12) if tab == "system" else [],
-        master_xray=(xray.xray_status() or {}).get("version") or "",
+        master_xray=_cached_master_xray(),
     )
 
 
