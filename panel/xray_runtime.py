@@ -1527,7 +1527,8 @@ def test_config(cfg: dict) -> dict:
     if not Path(XRAY_BIN).is_file():
         return {"ok": False, "tmp": None, "error": f"xray binary not found: {XRAY_BIN}"}
     tmp = XRAY_CONFIG.parent / (XRAY_CONFIG.stem + ".tmp.json")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Compact JSON: faster write/parse for large client lists; xray only needs valid JSON
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     test = _run([XRAY_BIN, "run", "-test", "-config", str(tmp)])
     err = clean_xray_error(test["stderr"] or test["stdout"])
     return {"ok": test["exit_code"] == 0, "tmp": tmp, "error": err}
@@ -1557,7 +1558,7 @@ def _restore_prev_config() -> str:
     return restart["stderr"] or restart["stdout"] or "xray still inactive after rollback"
 
 
-def apply_config(store: dict) -> dict:
+def apply_config(store: dict, *, clients_only: bool = False) -> dict:
     """Build, verify, then atomically install Xray config. Never skips verification.
 
     Flow (hardcoded, not configurable):
@@ -1566,12 +1567,23 @@ def apply_config(store: dict) -> dict:
       3. keep a copy of the previous live config
       4. replace live config + restart
       5. if Xray is not active — restore previous config and restart again
+
+    clients_only: skip traffic harvest and iptables port-ban refresh (inbound ports /
+    nginx front are unchanged when only clients are added/edited). Still builds,
+    tests, and restarts Xray so the new client is live.
     """
-    try:
-        harvest_traffic(store)
-        enforce_quotas(store)
-    except Exception:
-        pass
+    if not clients_only:
+        try:
+            harvest_traffic(store)
+            enforce_quotas(store)
+        except Exception:
+            pass
+    else:
+        # Quotas still matter (expired/limited clients must leave the config)
+        try:
+            enforce_quotas(store)
+        except Exception:
+            pass
     for c in store.get("clients") or []:
         ensure_client(c)
         ensure_wg_peer(store, c)
@@ -1607,7 +1619,8 @@ def apply_config(store: dict) -> dict:
 
     restart = _restart_xray()
     if _xray_active():
-        ban_inbound_ports(store)
+        if not clients_only:
+            ban_inbound_ports(store)
         return {"ok": True, "error": "", "config": cfg, "verified": True}
 
     # New config passed -test but broke the running service — roll back.

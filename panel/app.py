@@ -266,6 +266,7 @@ def _apply_xray(
     persist: bool = True,
     defer_front_reload: float = 0,
     hold_front_commit: bool = False,
+    clients_only: bool = False,
 ) -> dict:
     """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails.
 
@@ -275,30 +276,37 @@ def _apply_xray(
     hold_front_commit: stage+test nginx but leave reload to the caller (BackgroundTasks on
     /agent/apply) so the sync HTTP response is not cut by reloading the proxying nginx.
     defer_front_reload: legacy Timer-based delay inside commit (prefer hold_front_commit).
+    clients_only: client add/edit/delete — skip nginx stage/reload, cert jobs, and iptables
+    port refresh (those only change with inbounds/front). Still rebuilds+tests+restarts Xray.
     """
     ns = (store.get("settings") or {}).get("nodes") or {}
     is_agent = bool(ns.get("agent_enabled") and (ns.get("role") or "") == "agent")
     runtime = nodes_mod.agent_runtime_store(store) if is_agent else store
     with STORE_LOCK:
         xray.ensure_inbounds(runtime)
-        # Register rv-in Path in store before nginx stage (otherwise first reverse
-        # enable ships nginx without the location and agents dial into a 404).
-        if not is_agent:
-            try:
-                xray.ensure_reverse_front_inbound(store)
-            except Exception:
-                pass
-        # Front/certs use the real store (domains, base_path); Xray uses runtime
-        staged = front.stage(store)
-        if not staged["ok"]:
-            return {"ok": False, "error": staged["error"], "verified": False}
-        result = xray.apply_config(runtime)
+        staged = {"ok": True, "skipped": True, "changed": False, "problems": [], "error": ""}
+        if not clients_only:
+            # Register rv-in Path in store before nginx stage (otherwise first reverse
+            # enable ships nginx without the location and agents dial into a 404).
+            if not is_agent:
+                try:
+                    xray.ensure_reverse_front_inbound(store)
+                except Exception:
+                    pass
+            # Front/certs use the real store (domains, base_path); Xray uses runtime
+            staged = front.stage(store)
+            if not staged["ok"]:
+                return {"ok": False, "error": staged["error"], "verified": False}
+        result = xray.apply_config(runtime, clients_only=clients_only)
         if not result.get("ok"):
-            front.rollback(staged)
+            if not clients_only:
+                front.rollback(staged)
             if persist:
                 _save_store(store)
             return result
-        if hold_front_commit:
+        if clients_only:
+            pass
+        elif hold_front_commit:
             result = {**result, "_front_staged": staged}
             if staged.get("problems"):
                 result["warning"] = "; ".join(staged["problems"])
@@ -310,7 +318,7 @@ def _apply_xray(
                 result = {**result, "warning": "; ".join(staged["problems"])}
         if persist:
             _save_store(store)
-    if result.get("ok"):
+    if result.get("ok") and not clients_only:
         direct_ports = [
             int(ib.get("port") or 0) for ib in runtime.get("inbounds") or []
             if ib.get("enabled", True) and P.is_direct(ib)
@@ -320,7 +328,7 @@ def _apply_xray(
                 ops.ensure_ports_open(direct_ports)
             except Exception:
                 pass
-    if not hold_front_commit:
+    if not clients_only and not hold_front_commit:
         _issue_front_certs(store)
     return result
 
@@ -3023,7 +3031,7 @@ async def client_save(request: Request):
         if not original:
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
-    result = _apply_xray(_load_store())
+    result = _apply_xray(_load_store(), clients_only=True)
     act = "создан" if not original else "обновлён"
     bits = []
     if c.get("limit_gb"):
@@ -3035,10 +3043,9 @@ async def client_save(request: Request):
     ibs = c.get("inbounds") or []
     if ibs:
         bits.append("inbounds: " + ", ".join(f"<code>{tgbot.escape(str(x))}</code>" for x in ibs[:8]))
-    _tg_change(
-        f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}",
-        " · ".join(bits),
-    )
+    summary = f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}"
+    detail = " · ".join(bits)
+    threading.Thread(target=_tg_change, args=(summary, detail), daemon=True).start()
     flash(request, *_ok_msg(f"Клиент {c['email']} сохранён", result))
     return go(f"/clients/{c['email']}/edit")
 
@@ -3100,8 +3107,10 @@ async def clients_bulk(request: Request):
         else:
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
-    result = _apply_xray(_load_store())
-    _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
+    result = _apply_xray(_load_store(), clients_only=True)
+    threading.Thread(
+        target=_tg_change, args=(f"👤 Клиенты (bulk): {tgbot.escape(msg)}",), daemon=True,
+    ).start()
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
 
@@ -3145,8 +3154,13 @@ def client_action(email: str, action: str, request: Request):
         else:
             flash(request, "Неизвестное действие", "error")
             return go("/clients")
-    result = _apply_xray(_load_store()) if action not in ("regen_sub", "clear_ips", "clear_hwids") else {"ok": True}
-    _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
+    need_xray = action not in ("regen_sub", "clear_ips", "clear_hwids")
+    result = _apply_xray(_load_store(), clients_only=True) if need_xray else {"ok": True}
+    threading.Thread(
+        target=_tg_change,
+        args=(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}",),
+        daemon=True,
+    ).start()
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
         return go("/clients")
@@ -5252,7 +5266,7 @@ async def rest_api(path: str, request: Request):
                 return _api_err(err)
             st["clients"].append(c)
             xray.ensure_wg_peer(st, c)
-        res = _apply_xray(_load_store())
+        res = _apply_xray(_load_store(), clients_only=True)
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if len(parts) == 3 and parts[:2] == ["clients", "update"] and request.method == "POST":
         with mutate() as st:
@@ -5262,7 +5276,7 @@ async def rest_api(path: str, request: Request):
             err = _api_apply_client(st, c, data)
             if err:
                 return _api_err(err)
-        res = _apply_xray(_load_store())
+        res = _apply_xray(_load_store(), clients_only=True)
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if len(parts) == 3 and parts[0] == "clients" and parts[1] in ("delete", "reset") and request.method in ("POST", "DELETE"):
         with mutate() as st:
@@ -5273,13 +5287,13 @@ async def rest_api(path: str, request: Request):
                 st["clients"].remove(c)
             else:
                 xray.reset_client_traffic(c)
-        _apply_xray(_load_store())
+        _apply_xray(_load_store(), clients_only=True)
         return _api_ok(None, f"{parts[1]} ok")
     if parts == ["clients", "resetAll"] and request.method == "POST":
         with mutate() as st:
             for c in st["clients"]:
                 xray.reset_client_traffic(c)
-        _apply_xray(_load_store())
+        _apply_xray(_load_store(), clients_only=True)
         return _api_ok(None, "reset all")
     if parts == ["l2tp", "list"]:
         return _api_ok([{k: v for k, v in x.items() if k not in ("password",)} for x in store["l2tp"]])
