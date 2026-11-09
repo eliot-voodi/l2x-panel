@@ -46,7 +46,7 @@
       {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}<option value="{{ ob }}" {% if b.fallback == ob %}selected{% endif %}>{{ outbound_label(store, ob) }} ({{ l.status }})</option>{% endfor %}
       {% for o in custom %}<option value="{{ o.tag }}" {% if b.fallback == o.tag %}selected{% endif %}>{{ outbound_label(store, o.tag) }}</option>{% endfor %}
     </select>
-    <div class="hint">none — в Xray не ставится fallbackTag; при пустом пуле маршрут идёт в blackhole, а не в direct.</div>
+    <div class="hint">none → <code>fallbackTag=block</code> (blackhole). Без fallbackTag Xray при мёртвом пуле уходит в default outbound (= direct).</div>
     <label class="f">Участники (пусто / всё = авто: подключённые L2TP + включённые custom/node)</label>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.1rem .5rem">
       {% for l in l2tp %}{% set ob = l.outbound or ('l2tp_' ~ l.name) %}

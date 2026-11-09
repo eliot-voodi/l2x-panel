@@ -280,14 +280,16 @@ def default_balancers() -> dict:
     }
 
 
-def balancer_fallback_tag(balancer: dict) -> str | None:
+def balancer_fallback_tag(balancer: dict) -> str:
     """Outbound used when all balancer members are down.
 
-    ``none`` / empty → no fallback to direct (omit Xray fallbackTag; empty pool → block).
+    ``none`` / empty → ``block`` (blackhole). Must always set Xray ``fallbackTag``:
+    if omitted and Observatory marks every member dead, Xray returns an empty pick
+    and falls through to the default outbound (first in list = ``direct``).
     """
     fb = str(balancer.get("fallback") or "").strip()
     if not fb or fb.lower() in ("none", "-", "off", "null"):
-        return None
+        return "block"
     return fb
 
 
@@ -355,12 +357,42 @@ def custom_outbound_healthy(o: dict) -> bool:
     return True
 
 
+def _reverse_portal_member_ok(store: dict, outbound: dict) -> bool:
+    """NAT/reverse portal is live only while the node keeps the tunnel up."""
+    try:
+        import nodes as nodes_mod
+        node = next(
+            (n for n in nodes_mod.ensure_list(store) if n.get("id") == outbound.get("node_id")),
+            None,
+        )
+    except Exception:
+        node = None
+    if not node or not node.get("enabled", True):
+        return False
+    if node.get("online") is False:
+        return False
+    try:
+        import nodes as nodes_mod
+        if node.get("nat") or nodes_mod.uses_reverse(node):
+            if not nodes_mod.pull_fresh(node):
+                return False
+            if node.get("reverse_ok") is False:
+                return False
+            conns = node.get("rv_conns")
+            if isinstance(conns, int) and conns <= 0:
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def outbound_member_ok(store: dict, tag: str) -> bool:
     """Whether tag can sit in a balancer selector / Xray observatory pool.
 
-    Custom outbounds are included when enabled — Xray observatory does the live
-    probe. Requiring panel last_test here emptied balancers after sync/probe and
-    wiped subscription configs for clients that only use leastPing/leastLoad.
+    Custom dial outbounds are included when enabled — Xray observatory does the
+    live probe. Requiring panel last_test here emptied balancers after sync/probe
+    and wiped subscription configs for clients that only use leastPing/leastLoad.
+    Reverse/NAT portals have no dial path: gate on pull/online instead.
     """
     tag = str(tag or "").strip()
     if not tag or tag in ("direct", "block", "blackhole"):
@@ -382,7 +414,11 @@ def outbound_member_ok(store: dict, tag: str) -> bool:
     for o in store.get("outbounds_custom") or []:
         if o.get("tag") != tag:
             continue
-        return bool(o.get("enabled", True))
+        if not o.get("enabled", True):
+            return False
+        if o.get("reverse") or (o.get("kind") == "node" and not (o.get("config") or {})):
+            return _reverse_portal_member_ok(store, o)
+        return True
     return True
 
 
@@ -867,8 +903,7 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
                 continue
             if balancer_member_tags(store, b):
                 return {"balancerTag": tag}
-            fb = balancer_fallback_tag(b)
-            return {"outboundTag": fb if fb else "block"}
+            return {"outboundTag": balancer_fallback_tag(b)}
         return {"outboundTag": "direct"}
     if known_outbounds is not None and tag not in known_outbounds:
         return {"outboundTag": "direct"}
@@ -1706,10 +1741,10 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
     if ping_b.get("enabled", True):
         members = balancer_member_tags(store, ping_b, healthy_only=True)
         if members:
-            entry = {"tag": ping_b["tag"], "selector": members, "strategy": {"type": "leastPing"}}
-            fb = balancer_fallback_tag(ping_b)
-            if fb:
-                entry["fallbackTag"] = fb
+            entry = {
+                "tag": ping_b["tag"], "selector": members, "strategy": {"type": "leastPing"},
+                "fallbackTag": balancer_fallback_tag(ping_b),
+            }
             out.append(entry)
             obs_subjects.update(members)
             observatory = {
@@ -1728,10 +1763,8 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
                 "strategy": {"type": "leastLoad", "settings": {
                     "expected": int(load_b.get("expected") or 1), "maxRTT": load_b.get("max_rtt") or "1s",
                     "tolerance": float(load_b.get("tolerance") or 0.15), "baselines": ["1s"]}},
+                "fallbackTag": balancer_fallback_tag(load_b),
             }
-            fb = balancer_fallback_tag(load_b)
-            if fb:
-                entry["fallbackTag"] = fb
             out.append(entry)
             burst = {
                 "subjectSelector": sorted(set(members)),
@@ -1747,10 +1780,10 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
     if rand_b.get("enabled", True):
         members = balancer_member_tags(store, rand_b, healthy_only=True)
         if members:
-            entry = {"tag": rand_b["tag"], "selector": members, "strategy": {"type": "random"}}
-            fb = balancer_fallback_tag(rand_b)
-            if fb:
-                entry["fallbackTag"] = fb
+            entry = {
+                "tag": rand_b["tag"], "selector": members, "strategy": {"type": "random"},
+                "fallbackTag": balancer_fallback_tag(rand_b),
+            }
             out.append(entry)
             # Probe the same pool so leastPing (if on) sees them; random itself
             # still picks only from the healthy selector rebuilt by the panel.

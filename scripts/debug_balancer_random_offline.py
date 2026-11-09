@@ -97,10 +97,68 @@ def test_empty_pool_no_emit():
     ok("empty pool → no balancer emit, route→fallback")
 
 
+def test_fallback_none_emits_block():
+    store = {
+        "balancers": {},
+        "l2tp": [{"name": "de", "status": "connected", "outbound": "l2tp_de"}],
+        "outbounds_custom": [],
+        "settings": {"sub": {"hide_unhealthy": True}},
+    }
+    xray.ensure_balancers(store)
+    for key in ("least_ping", "least_load", "random"):
+        store["balancers"][key]["fallback"] = "none"
+        store["balancers"][key]["enabled"] = True
+    cfg, _, _ = xray._balancers_cfg(store)
+    by_tag = {e["tag"]: e for e in cfg}
+    for tag in ("lb_least_ping", "lb_least_load", "lb_random"):
+        if tag not in by_tag:
+            fail("fallback_none", f"missing {tag}: {cfg}")
+        if by_tag[tag].get("fallbackTag") != "block":
+            fail("fallback_none", f"{tag} fallbackTag={by_tag[tag].get('fallbackTag')}")
+    store["l2tp"] = []
+    if xray._route_target(store, "lb_least_ping") != {"outboundTag": "block"}:
+        fail("fallback_none", f"empty pool route={xray._route_target(store, 'lb_least_ping')}")
+    if xray.balancer_fallback_tag({"fallback": "none"}) != "block":
+        fail("fallback_none", "balancer_fallback_tag(none) != block")
+    ok("fallback none → fallbackTag=block")
+
+
+def test_offline_nat_excluded_from_selector():
+    from datetime import datetime, timedelta, timezone
+
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    store = {
+        "balancers": {},
+        "l2tp": [],
+        "nodes": [{
+            "id": 1, "name": "root", "enabled": True, "nat": True, "as_outbound": True,
+            "online": False, "last_pull": stale, "rv_conns": 0, "role": "agent",
+        }],
+        "outbounds_custom": [{
+            "tag": "node_root", "enabled": True, "kind": "node", "reverse": True,
+            "node_id": 1, "config": {},
+        }],
+        "settings": {"sub": {"hide_unhealthy": True}},
+    }
+    xray.ensure_balancers(store)
+    store["balancers"]["random"]["members"] = ["node_root"]
+    store["balancers"]["least_ping"]["enabled"] = False
+    store["balancers"]["least_load"]["enabled"] = False
+    members = xray.balancer_member_tags(store, store["balancers"]["random"], healthy_only=True)
+    if members:
+        fail("nat_offline", f"dead NAT still in pool: {members}")
+    cfg, _, _ = xray._balancers_cfg(store)
+    if any(e.get("tag") == "lb_random" for e in cfg):
+        fail("nat_offline", f"should not emit random with dead NAT: {cfg}")
+    ok("offline NAT excluded from balancer selector")
+
+
 def test_ui_and_route():
     html = (PANEL / "ui" / "balancers.html").read_text(encoding="utf-8")
     if "lb_random" not in html and "random" not in html:
         fail("ui", "balancers.html missing random hints")
+    if "fallbackTag=block" not in html:
+        fail("ui", "balancers.html must document fallbackTag=block")
     app = (PANEL / "app.py").read_text(encoding="utf-8")
     if '"random"' not in app.split("balancers_save")[1][:800]:
         fail("app", "balancers_save must allow key=random")
@@ -119,6 +177,8 @@ def main():
     test_ensure_migrates()
     test_cfg_emits_random_live_only()
     test_empty_pool_no_emit()
+    test_fallback_none_emits_block()
+    test_offline_nat_excluded_from_selector()
     test_ui_and_route()
     test_ast()
     print("ALL PASSED")
