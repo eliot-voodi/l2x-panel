@@ -420,7 +420,7 @@ PORT=$port
 EOF
   chmod 600 "$ENV_FILE"
   # the panel creates admin.json from PANEL_ADMIN_* only when it is missing
-  rm -f "$DATA_DIR/admin.json"
+  rm -f "$DATA_DIR/admin.json" "$DATA_DIR/admins.json"
   python3 - "$DATA_DIR/store.json" "$PANEL_PATH" "$PUBLIC_HOST" <<'EOF'
 import json, os, sys
 path, base_path, host = sys.argv[1:4]

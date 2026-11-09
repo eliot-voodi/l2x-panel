@@ -28,6 +28,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
+import admins
 import front
 import hwid
 import l2tp_runtime as l2tp
@@ -67,7 +68,6 @@ ADMIN_USER_ENV = os.environ.get("PANEL_ADMIN_USER", "admin")
 ADMIN_PASSWORD_ENV = os.environ.get("PANEL_ADMIN_PASSWORD", "").strip()
 PUBLIC_HOST_ENV = os.environ.get("L2XPANEL_PUBLIC_HOST", "127.0.0.1")
 STORE = DATA / "store.json"
-ADMIN_FILE = DATA / "admin.json"
 CREDS_FILE = DATA / "initial_credentials.txt"
 STORE_LOCK = threading.RLock()
 STARTED_AT = time.time()
@@ -444,39 +444,37 @@ def _write_initial_credentials(username: str, password: str) -> None:
     )
 
 
+def _ensure_admins() -> None:
+    admins.ensure(
+        default_user=ADMIN_USER_ENV,
+        default_password_env=ADMIN_PASSWORD_ENV,
+        on_new_password=_write_initial_credentials,
+    )
+
+
 def _admin() -> dict:
-    if ADMIN_FILE.exists():
-        try:
-            return json.loads(ADMIN_FILE.read_text(encoding="utf-8"))
-        except ValueError:
-            pass
-    legacy = DATA / "admin.bcrypt"
-    if legacy.exists():
-        password = None
-        pw_hash = legacy.read_bytes().decode()
-    else:
-        password = ADMIN_PASSWORD_ENV or secrets.token_urlsafe(16)
-        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    admin = {"username": ADMIN_USER_ENV, "password_hash": pw_hash}
-    _save_admin(admin)
-    if password is not None and not ADMIN_PASSWORD_ENV:
-        _write_initial_credentials(ADMIN_USER_ENV, password)
-    return admin
+    """Primary administrator (legacy helpers / node snapshots)."""
+    _ensure_admins()
+    return admins.primary()
 
 
-def _save_admin(admin: dict) -> None:
-    ADMIN_FILE.write_text(json.dumps(admin), encoding="utf-8")
-    os.chmod(ADMIN_FILE, 0o600)
+def _admin_record_for_user(username: str | None) -> dict | None:
+    _ensure_admins()
+    if not username:
+        return admins.primary()
+    return admins.get_by_username(username) or admins.primary()
 
 
 def _check_credentials(username: str, password: str) -> bool:
-    admin = _admin()
-    if not secrets.compare_digest(username, admin["username"]):
+    _ensure_admins()
+    return admins.check_credentials(username, password)
+
+
+def _verify_current_password(request: Request, current: str) -> bool:
+    user = _user(request)
+    if not user:
         return False
-    try:
-        return bcrypt.checkpw(password.encode(), admin["password_hash"].encode())
-    except ValueError:
-        return False
+    return _check_credentials(str(user), current)
 
 
 def _hash_token(token: str) -> str:
@@ -1971,7 +1969,7 @@ def _ensure_agent_sticky() -> None:
 
 @app.on_event("startup")
 def _startup():
-    _admin()
+    _ensure_admins()
     _ensure_base_path()
     _ensure_agent_sticky()
     _refresh_settings_cache()
@@ -5120,7 +5118,8 @@ def settings_page(request: Request):
     if tab == "security" and not s["security"].get("totp_enabled"):
         secret = request.session.get("totp_pending") or totp.new_secret()
         request.session["totp_pending"] = secret
-        uri = totp.otpauth_uri(secret, _admin()["username"], app_title())
+        totp_user = _user(request) or _admin().get("username") or "admin"
+        uri = totp.otpauth_uri(secret, totp_user, app_title())
         ctx.update(totp_secret=secret, totp_qr=qr_svg(uri, 5))
     if tab in ("certs", "panel", "sub"):
         ctx["certs"] = ops.list_certs()
@@ -5129,7 +5128,9 @@ def settings_page(request: Request):
         ctx["store"] = store
         ctx["panel_releases"] = ops.panel_releases(20)
     new_token = request.session.pop("new_api_token", None)
-    return page(request, "settings.html", active="settings", tab=tab, s=s, admin=_admin(), new_token=new_token,
+    me = _admin_record_for_user(_user(request))
+    return page(request, "settings.html", active="settings", tab=tab, s=s, admin=me, admins=admins.public_rows(),
+                session_user=_user(request), new_token=new_token,
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5],
                 sub_running=SUB_SERVER.running, sub_error=SUB_SERVER.error, panel_tls_running=PANEL_TLS.running,
                 panel_tls_error=PANEL_TLS.error, **ctx)
@@ -5307,25 +5308,74 @@ async def settings_save(request: Request):
     return go(f"/settings?tab={section}")
 
 
+@app.post("/settings/admins/add")
+def settings_admins_add(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    current: str = Form(...),
+):
+    if redir := _require(request):
+        return redir
+    if not _verify_current_password(request, current):
+        flash(request, "Текущий пароль неверный", "error")
+        return go("/settings?tab=security")
+    ok, err = admins.add_admin(username.strip(), password)
+    if not ok:
+        flash(request, err or "Не удалось добавить", "error")
+        return go("/settings?tab=security")
+    _tg_change(f"➕ Администратор <b>{tgbot.escape(username.strip())}</b> добавлен")
+    flash(request, f"Администратор {username.strip()} добавлен", "info")
+    return go("/settings?tab=security")
+
+
+@app.post("/settings/admins/{admin_id}/remove")
+def settings_admins_remove(admin_id: str, request: Request, current: str = Form(...)):
+    if redir := _require(request):
+        return redir
+    if not _verify_current_password(request, current):
+        flash(request, "Текущий пароль неверный", "error")
+        return go("/settings?tab=security")
+    target = admins.get_by_id(admin_id)
+    if not target:
+        flash(request, "Администратор не найден", "error")
+        return go("/settings?tab=security")
+    me = _user(request)
+    if me and secrets.compare_digest(str(me), target.get("username") or ""):
+        flash(request, "Сначала смените пароль в «Моя учётная запись» или попросите другого админа удалить вас", "error")
+        return go("/settings?tab=security")
+    ok, err = admins.delete_admin(admin_id)
+    if not ok:
+        flash(request, err or "Не удалось удалить", "error")
+        return go("/settings?tab=security")
+    _tg_change(f"➖ Администратор <b>{tgbot.escape(target.get('username') or '?')}</b> удалён")
+    flash(request, "Администратор удалён", "info")
+    return go("/settings?tab=security")
+
+
 @app.post("/settings/account")
 def settings_account(request: Request, username: str = Form(...), current: str = Form(...), new_password: str = Form("")):
     if redir := _require(request):
         return redir
-    admin = _admin()
-    if not _check_credentials(admin["username"], current):
+    rec = _admin_record_for_user(_user(request))
+    if not rec or not rec.get("id"):
+        flash(request, "Учётная запись не найдена", "error")
+        return go("/settings?tab=security")
+    if not _verify_current_password(request, current):
         flash(request, "Текущий пароль неверный", "error")
         return go("/settings?tab=security")
-    old_user = admin["username"]
-    username = username.strip() or admin["username"]
-    admin["username"] = username
-    pwd_changed = False
-    if new_password:
-        if len(new_password) < 8:
-            flash(request, "Пароль минимум 8 символов", "error")
-            return go("/settings?tab=security")
-        admin["password_hash"] = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-        pwd_changed = True
-    _save_admin(admin)
+    old_user = rec["username"]
+    username = username.strip() or old_user
+    ok, err, updated = admins.update_account(
+        rec["id"],
+        username=username,
+        new_password=new_password or None,
+    )
+    if not ok:
+        flash(request, err or "Ошибка сохранения", "error")
+        return go("/settings?tab=security")
+    pwd_changed = bool(new_password)
+    username = (updated or rec).get("username") or username
     request.session["user"] = username
     tgbot.bind_actor(username, _client_ip(request))
     bits = []
@@ -7090,6 +7140,7 @@ def _manage_snapshot(store: dict) -> dict:
             "timezone": panel.get("timezone") or "",
         },
         "admin_user": (_admin() or {}).get("username") or "admin",
+        "admin_count": len(admins.public_rows()),
         "counts": {
             "clients": len(store.get("clients") or []),
             "inbounds": len(store.get("inbounds") or []),
@@ -7260,11 +7311,18 @@ def _manage_action(action: str, payload: dict) -> dict:
 
     if action == "set_admin_password":
         password = str(payload.get("password") or "")
-        if len(password) < 8:
-            return {"ok": False, "error": "пароль минимум 8 символов"}
-        admin = _admin()
-        admin["password_hash"] = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-        _save_admin(admin)
+        uname = str(payload.get("username") or "").strip()
+        if uname:
+            rec = admins.get_by_username(uname)
+            if not rec:
+                return {"ok": False, "error": "администратор не найден"}
+            ok, err, _ = admins.update_account(rec["id"], new_password=password)
+            if not ok:
+                return {"ok": False, "error": err or "ошибка"}
+            return {"ok": True, "error": ""}
+        ok, err = admins.set_primary_password(password)
+        if not ok:
+            return {"ok": False, "error": err or "ошибка"}
         return {"ok": True, "error": ""}
 
     if action == "update_panel":

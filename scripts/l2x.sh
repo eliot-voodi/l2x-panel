@@ -77,22 +77,42 @@ show_status() {
   echo "  Xray: $(/usr/local/bin/xray version 2>/dev/null | head -1)"
   echo "  Версия панели: $(tr -d '[:space:]' <"${APP_DIR:-/opt/l2xpanel}/VERSION" 2>/dev/null || echo '?')"
   echo "  Панель: $(panel_url)"
-  echo "  Админ: $("$PY" -c "import json;print(json.load(open('$DATA/admin.json'))['username'])" 2>/dev/null)"
+  echo "  Админ: $("$PY" -c "
+import json, os
+p=os.path.join(os.environ.get('L2XPANEL_DATA',''),'admins.json')
+if os.path.isfile(p):
+  a=json.load(open(p)).get('admins') or []
+  print(', '.join(x.get('username','?') for x in a) or '?')
+else:
+  print(json.load(open(os.path.join(os.environ['L2XPANEL_DATA'],'admin.json')))['username'])
+" 2>/dev/null)"
   echo "  BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"
   echo "  Аптайм: $(uptime -p)"
 }
 
 reset_password() {
-  read -r -p "Новый логин [admin]: " u; u=${u:-admin}
+  read -r -p "Логин администратора [первый в списке]: " u
   read -r -s -p "Новый пароль (мин. 8): " p; echo
   [ ${#p} -ge 8 ] || { c_err "Слишком короткий"; return; }
   pyrun "$u" "$p" <<'EOF'
-import bcrypt, json, os, sys
-p = os.path.join(os.environ["L2XPANEL_DATA"], "admin.json")
-json.dump({"username": sys.argv[1], "password_hash": bcrypt.hashpw(sys.argv[2].encode(), bcrypt.gensalt()).decode()}, open(p, "w"))
-os.chmod(p, 0o600)
+import os, sys
+sys.path.insert(0, "/opt/l2xpanel")
+import admins as ad
+u = (sys.argv[1] or "").strip()
+ad.ensure()
+if u:
+  rec = ad.get_by_username(u)
+  if not rec:
+    print("Администратор не найден:", u, file=sys.stderr)
+    raise SystemExit(1)
+  ok, err, _ = ad.update_account(rec["id"], new_password=sys.argv[2])
+else:
+  ok, err = ad.set_primary_password(sys.argv[2])
+if not ok:
+  print(err or "error", file=sys.stderr)
+  raise SystemExit(1)
 EOF
-  c_ok "Логин/пароль обновлены"
+  c_ok "Пароль обновлён"
 }
 
 disable_2fa() {

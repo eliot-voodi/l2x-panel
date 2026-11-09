@@ -167,9 +167,46 @@
 </form>
 
 {% elif tab == 'security' %}
+<div class="card mb">
+  <h3>Администраторы панели</h3>
+  <div class="hint">Несколько учётных записей с полным доступом. 2FA ниже — общая для всех входов.</div>
+  <table class="tbl mt">
+    <thead><tr><th>Логин</th><th></th></tr></thead>
+    <tbody>
+    {% for a in admins %}
+      <tr>
+        <td class="mono">
+          {{ a.username }}
+          {% if session_user and a.username == session_user %}<span class="badge sm">вы</span>{% endif %}
+        </td>
+        <td class="right">
+          {% if a.username != session_user %}
+          <form method="post" action="{{ bp }}/settings/admins/{{ a.id }}/remove" class="inline"
+                onsubmit="return confirm('Удалить администратора {{ a.username }}?');">
+            <input name="current" type="password" required placeholder="Ваш пароль" autocomplete="current-password" class="sm">
+            <button type="submit" class="btn danger sm">Удалить</button>
+          </form>
+          {% else %}
+          <span class="small muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <form class="mt" method="post" action="{{ bp }}/settings/admins/add">
+    <h4 class="mb">Добавить администратора</h4>
+    <div class="grid g2">
+      <label class="f">Логин<input name="username" required minlength="1" maxlength="64" autocomplete="username"></label>
+      <label class="f">Пароль (мин. 8)<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>
+    </div>
+    <label class="f mt">Ваш текущий пароль (подтверждение)<input name="current" type="password" required autocomplete="current-password"></label>
+    <div class="actions mt"><button class="btn">Добавить</button></div>
+  </form>
+</div>
 <div class="grid g2">
   <form class="card" method="post" action="{{ bp }}/settings/account">
-    <h3>Учётная запись</h3>
+    <h3>Моя учётная запись</h3>
     <label class="f">{{ t('Логин') }}</label><input name="username" value="{{ admin.username }}" required>
     <label class="f">Новый пароль (пусто — не менять)</label><input name="new_password" type="password" minlength="8" autocomplete="new-password">
     <label class="f">Текущий пароль</label><input name="current" type="password" required autocomplete="current-password">

@@ -107,7 +107,7 @@ def test_client_ip():
 
 def test_imports_and_syntax():
     import ast
-    for name in ("app.py", "security.py", "webhooks.py", "ops.py", "nodes.py", "front.py"):
+    for name in ("app.py", "admins.py", "security.py", "webhooks.py", "ops.py", "nodes.py", "front.py"):
         src = (PANEL / name).read_text(encoding="utf-8")
         ast.parse(src)
     ok("AST parse core modules")
