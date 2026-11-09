@@ -41,6 +41,7 @@ import sysmon
 import tgbot
 import totp
 import webhooks
+import security as sec
 import xray_runtime as xray
 from copy import deepcopy
 
@@ -145,7 +146,11 @@ def default_settings() -> dict:
         },
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
-        "nodes": {"agent_enabled": False, "agent_token": "", "role": "master", "agent_manual_off": False},
+        "nodes": {
+            "agent_enabled": False, "agent_token": "", "role": "master", "agent_manual_off": False,
+            # When True, /agent/manage may mutate this host even if role=master (default off).
+            "allow_master_manage": False,
+        },
         "panel_update": {"auto_check": True, "interval_hours": 12},
         "iplimit": {"ban_minutes": 30},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
@@ -158,7 +163,11 @@ def default_settings() -> dict:
             "auto_refresh": True, "reconnect_hours": 24, "last_refresh_at": "",
             "last_reconnect_at": "", "last_error": "", "last_ok_at": "",
         },
-        "security": {"totp_enabled": False, "totp_secret": ""},
+        "security": {
+            "totp_enabled": False, "totp_secret": "",
+            # Direct peers allowed to send X-Forwarded-For (nginx on localhost by default)
+            "trusted_proxies": ["127.0.0.1", "::1"],
+        },
         "api_tokens": [],
         "geo_custom": [],
         "geo_update": {"auto": True, "interval_hours": 168},
@@ -482,7 +491,8 @@ app = FastAPI(title=APP_NAME_DEFAULT, docs_url=None, redoc_url=None, openapi_url
 class BasePathMiddleware:
     """Serve the panel under a secret prefix; public sub/API paths stay reachable."""
 
-    PUBLIC = ("/sub/", "/api/sub/", "/health", "/panel/api/", "/static/")
+    # /panel/api/ is intentionally NOT public — only reachable under secret base_path
+    PUBLIC = ("/sub/", "/api/sub/", "/health", "/static/")
 
     def __init__(self, inner):
         self.inner = inner
@@ -534,7 +544,108 @@ class BasePathMiddleware:
         await self.inner(scope, receive, send)
 
 
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=12 * 3600, same_site="lax")
+class CsrfMiddleware:
+    """Require csrf_token on browser form POSTs (session cookie auth).
+
+    Must sit inside SessionMiddleware (so session works) and inside BasePathMiddleware
+    (so path is already stripped of the secret prefix).
+    """
+
+    EXEMPT_PREFIXES = (
+        "/agent/", "/panel/api/", "/sub/", "/api/sub/", "/doh/", "/health", "/static/",
+    )
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def _exempt(self, path: str) -> bool:
+        return any(path == p.rstrip("/") or path.startswith(p) for p in self.EXEMPT_PREFIXES)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method", "GET").upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+            await self.inner(scope, receive, send)
+            return
+        path = scope.get("path") or "/"
+        if self._exempt(path):
+            await self.inner(scope, receive, send)
+            return
+        headers = {k.decode().lower(): v.decode() for k, v in (scope.get("headers") or [])}
+        auth = headers.get("authorization") or ""
+        if auth.lower().startswith("bearer ") or headers.get("x-api-key"):
+            await self.inner(scope, receive, send)
+            return
+
+        chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                async def _once():
+                    return message
+                await self.inner(scope, _once, send)
+                return
+            chunks.append(message.get("body") or b"")
+            if not message.get("more_body"):
+                break
+        body = b"".join(chunks)
+
+        sent = {"n": 0}
+
+        async def replay():
+            if sent["n"] == 0:
+                sent["n"] = 1
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        from starlette.requests import Request as StarletteRequest
+        req = StarletteRequest(scope, replay)
+        try:
+            session = req.session
+        except AssertionError:
+            sent["n"] = 0
+            await self.inner(scope, replay, send)
+            return
+
+        got = headers.get("x-csrf-token") or ""
+        ctype = (headers.get("content-type") or "").lower()
+        if not got and "application/json" not in ctype:
+            if "application/x-www-form-urlencoded" in ctype:
+                from urllib.parse import parse_qs
+                got = (parse_qs(body.decode("utf-8", "replace")).get("csrf_token") or [""])[0]
+            elif "multipart/form-data" in ctype:
+                marker = b'name="csrf_token"'
+                idx = body.find(marker)
+                if idx >= 0:
+                    rest = body[idx + len(marker):]
+                    sep = rest.find(b"\r\n\r\n")
+                    if sep >= 0:
+                        val = rest[sep + 4:]
+                        end = val.find(b"\r\n")
+                        got = val[:end].decode("utf-8", "replace") if end >= 0 else ""
+
+        if path == "/login" or session.get("user"):
+            if not sec.csrf_ok(session, got):
+                resp = PlainTextResponse("CSRF rejected", status_code=403)
+
+                async def _empty():
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                await resp(scope, _empty, send)
+                return
+
+        sent["n"] = 0
+        await self.inner(scope, replay, send)
+
+
+# Innermost → outermost: Csrf → Session → BasePath
+_COOKIE_INSECURE = os.environ.get("L2XPANEL_COOKIE_INSECURE", "").strip() in ("1", "true", "yes")
+app.add_middleware(CsrfMiddleware)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    max_age=12 * 3600,
+    same_site="lax",
+    https_only=not _COOKIE_INSECURE,
+)
 app.add_middleware(BasePathMiddleware)
 templates = Jinja2Templates(directory=str(ROOT / "ui"))
 
@@ -677,13 +788,19 @@ def _user(request: Request):
     return request.session.get("user")
 
 
+def _trusted_proxies() -> list[str]:
+    sec_cfg = (SETTINGS_CACHE.get("security") or {}) if SETTINGS_CACHE else {}
+    raw = sec_cfg.get("trusted_proxies")
+    if isinstance(raw, list) and raw:
+        return [str(x) for x in raw]
+    env = os.environ.get("L2XPANEL_TRUSTED_PROXIES", "").strip()
+    if env:
+        return [x.strip() for x in env.split(",") if x.strip()]
+    return list(sec.DEFAULT_TRUSTED_PROXIES)
+
+
 def _client_ip(request: Request) -> str:
-    xf = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    if xf:
-        return xf
-    if request.client and request.client.host:
-        return str(request.client.host)
-    return "?"
+    return sec.client_ip(request, _trusted_proxies())
 
 
 def _require(request: Request):
@@ -711,6 +828,7 @@ def _cur_path(request: Request) -> str:
 
 def page(request: Request, template: str, active: str = "", status_code: int = 200, **ctx) -> HTMLResponse:
     s = SETTINGS_CACHE or _refresh_settings_cache()
+    csrf = sec.ensure_csrf(request.session)
     base = {
         "request": request, "app_name": app_title(), "user": _user(request), "flash": pop_flash(request),
         "bp": base_path(), "active": active, "theme": (s.get("panel") or {}).get("theme") or "dark",
@@ -720,6 +838,7 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
         "panel_update": panel_update_banner() if _user(request) else None,
         "cur_path": _cur_path(request),
         "is_master": nodes_mod.is_master(_load_store()) if _user(request) else True,
+        "csrf_token": csrf,
     }
     base.update(ctx)
     return templates.TemplateResponse(template, base, status_code=status_code)
@@ -2118,19 +2237,37 @@ def sub_dedicated_tg_unlink(path: str, token: str, request: Request):
     return sub_tg_unlink(token, request)
 
 
+def _health_detail_authorized(request: Request) -> bool:
+    """Detail /health fields require a valid agent token (or panel session)."""
+    if _user(request):
+        return True
+    auth = request.headers.get("authorization") or ""
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        return False
+    store = _load_store()
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    accepted = [ns.get("agent_token") or ""]
+    accepted += [n.get("token") or "" for n in (store.get("nodes") or [])]
+    return sec.any_token_eq(token, accepted)
+
+
 @app.get("/health")
-def health():
+def health(request: Request):
+    # Public surface is minimal; version/role/xray only with agent Bearer or session
+    out = {"status": "ok"}
+    if not _health_detail_authorized(request):
+        return out
     store = _load_store()
     ns = (store.get("settings") or {}).get("nodes") or {}
     role = "agent" if (ns.get("agent_enabled") and (ns.get("role") or "") == "agent") else "master"
-    out = {
-        "status": "ok",
+    out.update({
         "app": app_title(),
         "version": panel_version(),
         "role": role,
         "agent": role == "agent",
         "time": datetime.now(timezone.utc).isoformat(),
-    }
+    })
     try:
         xs = xray.xray_status()
         out["xray_version"] = xs.get("version") or ""
@@ -2156,13 +2293,21 @@ def login_page(request: Request):
 @app.post("/login")
 def login(request: Request, username: str = Form(...), password: str = Form(...), code: str = Form("")):
     ip = _client_ip(request)
+    # Dual limit: per-IP (trusted XFF) + direct peer, so spoofed XFF cannot wipe the bucket
+    peer = str(request.client.host) if request.client else "?"
+    if not sec.LOGIN_LIMITER.allow(f"login:{ip}", limit=8, window_sec=900):
+        return page(request, "login.html", error="Слишком много попыток, подождите 15 минут",
+                    totp_enabled=_settings()["security"].get("totp_enabled"), status_code=429)
+    if not sec.LOGIN_LIMITER.allow(f"login-peer:{peer}", limit=20, window_sec=900):
+        return page(request, "login.html", error="Слишком много попыток, подождите 15 минут",
+                    totp_enabled=_settings()["security"].get("totp_enabled"), status_code=429)
     fails = [t_ for t_ in _login_fail.get(ip, []) if time.time() - t_ < 900]
-    sec = _settings()["security"]
+    security_cfg = _settings()["security"]
     if len(fails) >= 8:
         return page(request, "login.html", error="Слишком много попыток, подождите 15 минут",
-                    totp_enabled=sec.get("totp_enabled"), status_code=429)
+                    totp_enabled=security_cfg.get("totp_enabled"), status_code=429)
     ok = _check_credentials(username, password)
-    if ok and sec.get("totp_enabled") and not totp.verify(sec.get("totp_secret") or "", code):
+    if ok and security_cfg.get("totp_enabled") and not totp.verify(security_cfg.get("totp_secret") or "", code):
         ok = False
     if not ok:
         fails.append(time.time())
@@ -2170,9 +2315,12 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         if _bot_settings().get("notify_login"):
             BOT.send(f"⚠️ Неудачный вход в панель: {username} с {ip}")
         return page(request, "login.html", error="Неверный логин, пароль или код 2FA",
-                    totp_enabled=sec.get("totp_enabled"), status_code=401)
+                    totp_enabled=security_cfg.get("totp_enabled"), status_code=401)
     _login_fail.pop(ip, None)
     hours = _float(_settings()["panel"].get("session_hours"), 12) or 12
+    # Rotate session id material on login
+    request.session.clear()
+    sec.ensure_csrf(request.session)
     request.session["user"] = username
     request.session["exp"] = time.time() + hours * 3600
     if _bot_settings().get("notify_login"):
@@ -4295,6 +4443,9 @@ async def xray_settings_save(request: Request):
                 for line in str(form.get("geo_custom") or "").splitlines():
                     if "|" in line:
                         n, u = [x.strip() for x in line.split("|", 1)]
+                        if not n or not u:
+                            continue
+                        u = sec.validate_outbound_url(u, allow_http=False)
                         items.append({"name": n, "url": u})
                 store["settings"]["geo_custom"] = items
         except ValueError as exc:
@@ -5016,10 +5167,20 @@ async def settings_save(request: Request):
             wh = webhooks.ensure(s)
             wh["enabled"] = form.get("enabled") == "1"
             wh["secret"] = str(form.get("secret") or "").strip()
-            wh["urls"] = [u for u in _split_lines(str(form.get("urls") or "")) if u.startswith("http")]
+            safe_urls = []
+            for u in _split_lines(str(form.get("urls") or "")):
+                if not u.startswith("http"):
+                    continue
+                try:
+                    safe_urls.append(sec.validate_outbound_url(u, allow_http=True))
+                except ValueError as exc:
+                    flash(request, f"Webhook URL отклонён: {exc}", "error")
+                    return go("/settings?tab=webhooks")
+            wh["urls"] = safe_urls
             wh["events"] = [e for e in webhooks.EVENTS if form.get(f"ev_{e}") == "1"] or list(webhooks.EVENTS)
         elif section == "nodes":
             ns = s.setdefault("nodes", {})
+            ns["allow_master_manage"] = form.get("allow_master_manage") == "1"
             want_agent = form.get("agent_enabled") == "1"
             ns["agent_enabled"] = want_agent
             # Manual off is sticky: only an explicit uncheck turns agent off permanently.
@@ -5134,15 +5295,30 @@ def settings_totp(action: str, request: Request, code: str = Form("")):
 
 
 @app.post("/settings/api-token/{action}")
-def settings_api_token(action: str, request: Request, name: str = Form(""), token_id: str = Form("")):
+async def settings_api_token(action: str, request: Request):
     if redir := _require(request):
         return redir
+    form = await request.form()
+    name = str(form.get("name") or "")
+    token_id = str(form.get("token_id") or "")
     with mutate() as store:
         tokens = store["settings"]["api_tokens"]
         if action == "create":
+            scopes = []
+            for key, _label in sec.API_SCOPE_CHOICES:
+                if form.get(f"scope_{key}") == "1":
+                    scopes.append(key)
+            if not scopes:
+                scopes = ["read", "clients"]
+            if "admin" in scopes:
+                scopes = ["admin"]
             raw = "l2x_" + secrets.token_urlsafe(32)
-            tokens.append({"id": secrets.token_hex(4), "name": name.strip() or "token", "hash": _hash_token(raw),
-                           "last4": raw[-4:], "created": xray.now_utc().isoformat()})
+            tokens.append({
+                "id": secrets.token_hex(4), "name": name.strip() or "token",
+                "hash": _hash_token(raw), "last4": raw[-4:],
+                "created": xray.now_utc().isoformat(),
+                "scopes": scopes,
+            })
             request.session["new_api_token"] = raw
         elif action == "delete":
             store["settings"]["api_tokens"] = [x for x in tokens if x["id"] != token_id]
@@ -5232,15 +5408,19 @@ def job_status(job_id: str, request: Request):
 
 # ================================================================ REST API (/panel/api)
 
-def _api_auth(request: Request) -> bool:
+def _api_auth(request: Request) -> dict | None:
+    """Return token record (or session stub) on success, else None."""
     if _user(request):
-        return True
+        return {"id": "session", "name": "session", "scopes": ["admin"]}
     auth = request.headers.get("authorization") or ""
-    token = auth[7:].strip() if auth.lower().startswith("bearer ") else request.headers.get("x-api-key", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else (request.headers.get("x-api-key") or "")
     if not token:
-        return False
+        return None
     h = _hash_token(token)
-    return any(secrets.compare_digest(h, x["hash"]) for x in (SETTINGS_CACHE.get("api_tokens") or []))
+    for x in (SETTINGS_CACHE.get("api_tokens") or []):
+        if sec.token_eq(h, x.get("hash") or ""):
+            return x
+    return None
 
 
 def _api_err(msg: str, code: int = 400) -> JSONResponse:
@@ -5296,13 +5476,21 @@ def _api_apply_client(store: dict, c: dict, data: dict) -> str | None:
 
 @app.api_route("/panel/api/{path:path}", methods=["GET", "POST", "DELETE"])
 async def rest_api(path: str, request: Request):
-    if not _api_auth(request):
+    tok = _api_auth(request)
+    if not tok:
         return _api_err("unauthorized", 401)
+    ip = _client_ip(request)
+    tid = str(tok.get("id") or "tok")
+    if not sec.API_LIMITER.allow(f"api:{tid}:{ip}", limit=120, window_sec=60):
+        return _api_err("rate limited", 429)
     try:
         data = await request.json() if request.method == "POST" and (request.headers.get("content-type") or "").startswith("application/json") else {}
     except ValueError:
         return _api_err("bad json")
     parts = [p for p in path.split("/") if p]
+    scopes = tok.get("scopes")
+    if not sec.scope_allows(scopes, parts):
+        return _api_err(f"forbidden: need scope '{sec.required_scope(parts)}'", 403)
     store = _load_store()
     if parts == ["server", "status"]:
         return _api_ok({**sysmon.snapshot(), "xray": xray.xray_status(), "online": len(ONLINE)})
@@ -5766,6 +5954,8 @@ async def settings_node_action(node_id: str, request: Request):
     form = await request.form()
     action = str(form.get("action") or "").strip()
     params = {k: str(v) for k, v in form.items() if k != "action"}
+    if action in sec.MANAGE_ADMIN:
+        params.setdefault("confirm", "yes")
     # Map form fields for save_panel / password
     tab = "overview"
     if action == "save_panel":
@@ -6498,8 +6688,17 @@ def nodes_sync_all(request: Request):
     return go("/nodes")
 
 
+def _agent_rate_ok(request: Request, bucket: str) -> JSONResponse | None:
+    ip = _client_ip(request)
+    if not sec.AGENT_LIMITER.allow(f"{bucket}:{ip}", limit=90, window_sec=60):
+        return JSONResponse({"ok": False, "error": "rate limited"}, status_code=429)
+    return None
+
+
 def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
     """Validate Bearer agent_token. Returns (store, None) or (None, error response)."""
+    if err := _agent_rate_ok(request, "agent"):
+        return None, err
     store = _load_store()
     ns = store["settings"].get("nodes") or {}
     # Auto-heal: role=agent and not manually disabled → keep accepting pushes
@@ -6515,19 +6714,21 @@ def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
     auth = request.headers.get("authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     expected = ns.get("agent_token") or ""
-    if not expected or not token or not secrets.compare_digest(token, expected):
+    if not expected or not token or not sec.token_eq(token, expected):
         return None, JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     return store, None
 
 
 def _agent_manage_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
     """Bearer agent_token auth for remote management — works even when this host is master."""
+    if err := _agent_rate_ok(request, "manage"):
+        return None, err
     store = _load_store()
     ns = store["settings"].get("nodes") or {}
     auth = request.headers.get("authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     expected = ns.get("agent_token") or ""
-    if not expected or not token or not secrets.compare_digest(token, expected):
+    if not expected or not token or not sec.token_eq(token, expected):
         return None, JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     return store, None
 
@@ -6604,8 +6805,19 @@ def _manage_snapshot(store: dict) -> dict:
 def _manage_action(action: str, payload: dict) -> dict:
     """Execute a remote-management action on this host."""
     action = (action or "").strip()
+    store0 = _load_store()
+    ns0 = (store0.get("settings") or {}).get("nodes") or {}
+    is_master = nodes_mod.is_master(store0)
+    allow_mm = bool(ns0.get("allow_master_manage"))
+    ok_act, why = sec.manage_action_allowed(
+        action=action, is_master=is_master, allow_master_manage=allow_mm,
+    )
+    if not ok_act:
+        return {"ok": False, "error": why}
+    if action in sec.MANAGE_ADMIN and str(payload.get("confirm") or "") != "yes":
+        return {"ok": False, "error": "confirm=yes required for this action"}
     if action in ("", "snapshot", "status"):
-        return _manage_snapshot(_load_store())
+        return _manage_snapshot(store0)
 
     if action == "enable_agent":
         # Master re-enables a node that lost agent mode. Never overrides Settings → uncheck
@@ -7122,12 +7334,14 @@ async def agent_pull(request: Request):
     auth = request.headers.get("authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     ns_local = (store.get("settings") or {}).get("nodes") or {}
+    if err := _agent_rate_ok(request, "pull"):
+        return err
     accepted = [ns_local.get("agent_token") or ""]
     accepted += [
         n.get("token") or "" for n in (store.get("nodes") or [])
         if n.get("id") == node_id
     ]
-    if not token or not any(t and secrets.compare_digest(token, t) for t in accepted):
+    if not token or not sec.any_token_eq(token, accepted):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if not nodes_mod.is_master(store):
         # Demoted master: point the NAT agent at the new master. ok=True + update so agents

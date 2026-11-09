@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
   <title>{% block title %}{{ app_name }}{% endblock %}</title>
   <script>
     (function () {
@@ -287,6 +288,39 @@
 <script>setTimeout(function () { var t = document.getElementById('toast'); if (t) t.remove(); }, 7000);</script>
 {% endif %}
 <script>
+  (function () {
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    var tok = meta ? meta.getAttribute('content') : '';
+    function injectForms() {
+      if (!tok) return;
+      document.querySelectorAll('form').forEach(function (f) {
+        var m = (f.getAttribute('method') || 'get').toLowerCase();
+        if (m !== 'post' && m !== 'put' && m !== 'patch' && m !== 'delete') return;
+        if (f.querySelector('input[name="csrf_token"]')) return;
+        var i = document.createElement('input');
+        i.type = 'hidden'; i.name = 'csrf_token'; i.value = tok;
+        f.appendChild(i);
+      });
+    }
+    injectForms();
+    document.addEventListener('DOMContentLoaded', injectForms);
+    var _fetch = window.fetch;
+    if (_fetch && tok) {
+      window.fetch = function (input, init) {
+        init = init || {};
+        var method = (init.method || 'GET').toUpperCase();
+        if (method !== 'GET' && method !== 'HEAD') {
+          var headers = new Headers(init.headers || {});
+          if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', tok);
+          init.headers = headers;
+          if (init.body && typeof FormData !== 'undefined' && init.body instanceof FormData && !init.body.has('csrf_token')) {
+            init.body.append('csrf_token', tok);
+          }
+        }
+        return _fetch.call(this, input, init);
+      };
+    }
+  })();
   function toggleTheme() {
     var cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', cur);

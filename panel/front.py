@@ -345,7 +345,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         *[_sub_location(sp, proxy) for sp in sub_uri_paths(store)],
         f"    location ^~ /api/sub/ {{\n{proxy}    }}",
         doh_loc,
-        f"    location ^~ /panel/api/ {{\n{proxy}    }}",
+        # REST API only under secret base_path (not at site root)
         f"    location = /health {{\n{proxy}    }}",
     ]
     if base:

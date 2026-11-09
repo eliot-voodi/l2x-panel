@@ -123,12 +123,14 @@
 <form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
   <input type="hidden" name="section" value="nodes">
   {{ m.check('agent_enabled', ns.agent_enabled, 'Режим агента: принимать конфиг с мастер-панели') }}
+  {{ m.check('allow_master_manage', ns.allow_master_manage, 'Разрешить remote /agent/manage на этом хосте, даже если role=master (опасно)') }}
   <label class="f">Agent token</label>
   <input value="{{ ns.agent_token }}" class="mono" readonly>
   {{ m.check('regen_token', False, 'Сгенерировать новый token') }}
   <div class="hint">
     Агент остаётся включённым после обновлений и перезапусков. Выключить можно только сняв эту галочку.
     На мастер-панели: Nodes → добавить ноду с URL <code>https://{{ public_host }}</code> и этим token (<code>POST /agent/apply</code>).
+    По умолчанию на master опасные manage-действия (пароль, update, restart) запрещены — включайте только если другой сервер должен удалённо управлять этим хостом.
   </div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
@@ -200,6 +202,7 @@
 {% elif tab == 'api' %}
 <div class="card">
   <div class="card-head"><h3>API-токены</h3><a class="btn ghost sm" href="{{ bp }}/api-docs">Документация API</a></div>
+  <div class="hint">Базовый URL: <code>{{ bp }}/panel/api/…</code> (только под секретным путём панели). Старые токены без scopes = полный доступ; новые по умолчанию read+clients (без backup/xray).</div>
   {% if new_token %}
   <div class="card" style="background:var(--ok-soft);border-color:var(--ok)">
     <b>Новый токен — сохраните сейчас, больше он не будет показан:</b>
@@ -207,16 +210,29 @@
   </div>
   {% endif %}
   <table>
-    <thead><tr><th>Имя</th><th>Токен</th><th>Создан</th><th></th></tr></thead>
+    <thead><tr><th>Имя</th><th>Токен</th><th>Scopes</th><th>Создан</th><th></th></tr></thead>
     <tbody>
     {% for tk in s.api_tokens %}
-      <tr><td>{{ tk.name }}</td><td class="mono">l2x_…{{ tk.last4 }}</td><td class="small">{{ fmt_dt(tk.created) }}</td>
+      <tr><td>{{ tk.name }}</td><td class="mono">l2x_…{{ tk.last4 }}</td>
+        <td class="small mono">{{ (tk.scopes or ['admin'])|join(', ') }}</td>
+        <td class="small">{{ fmt_dt(tk.created) }}</td>
         <td class="right"><form method="post" action="{{ bp }}/settings/api-token/delete" onsubmit="return confirm('Отозвать токен?')"><input type="hidden" name="token_id" value="{{ tk.id }}"><button class="btn danger sm">Отозвать</button></form></td></tr>
-    {% else %}<tr><td colspan="4" class="empty">Токенов нет</td></tr>{% endfor %}
+    {% else %}<tr><td colspan="5" class="empty">Токенов нет</td></tr>{% endfor %}
     </tbody>
   </table>
-  <form method="post" action="{{ bp }}/settings/api-token/create" class="flex mt">
-    <input name="name" placeholder="имя (например, billing-bot)" style="max-width:320px"><button class="btn">Создать токен</button>
+  <form method="post" action="{{ bp }}/settings/api-token/create" class="mt">
+    <div class="flex" style="gap:.75rem;flex-wrap:wrap;align-items:end">
+      <div style="flex:1;min-width:200px"><label class="f">Имя</label><input name="name" placeholder="billing-bot"></div>
+      <button class="btn">Создать токен</button>
+    </div>
+    <div class="mt" style="display:flex;flex-wrap:wrap;gap:.5rem 1rem">
+      <label class="check"><input type="checkbox" name="scope_read" value="1" checked> read</label>
+      <label class="check"><input type="checkbox" name="scope_clients" value="1" checked> clients</label>
+      <label class="check"><input type="checkbox" name="scope_inbounds" value="1"> inbounds</label>
+      <label class="check"><input type="checkbox" name="scope_xray" value="1"> xray</label>
+      <label class="check"><input type="checkbox" name="scope_backup" value="1"> backup</label>
+      <label class="check"><input type="checkbox" name="scope_admin" value="1"> admin (всё)</label>
+    </div>
   </form>
 </div>
 

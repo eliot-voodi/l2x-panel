@@ -263,16 +263,25 @@ GEO_PACKS = {
 
 
 def update_geo(custom: list[dict] | None = None) -> dict:
+    import security as sec
     GEO_DIR.mkdir(parents=True, exist_ok=True)
     log = []
     sources = dict(GEO_SOURCES)
     for item in custom or []:
         name = str(item.get("name") or "").strip()
         if name and item.get("url"):
-            sources[name if name.endswith(".dat") else f"{name}.dat"] = item["url"]
+            try:
+                safe = sec.validate_outbound_url(str(item["url"]), allow_http=False)
+            except ValueError as exc:
+                log.append(f"{name}: BLOCKED {exc}")
+                continue
+            sources[name if name.endswith(".dat") else f"{name}.dat"] = safe
     ok = True
     for name, url in sources.items():
         try:
+            # Built-in GitHub sources are fixed; custom already validated above
+            if name not in GEO_SOURCES:
+                sec.validate_outbound_url(url, allow_http=False)
             data = _http(url, 180)
             if len(data) < 1024:
                 raise ValueError("file too small")

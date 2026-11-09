@@ -8,6 +8,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+import security as sec
 
 EVENTS = (
     "client.created", "client.updated", "client.deleted", "client.expired", "client.limited",
@@ -47,7 +48,14 @@ def fire(settings: dict, event: str, data: dict[str, Any] | None = None) -> None
         return
     if event not in (wh.get("events") or EVENTS):
         return
-    urls = [u for u in (wh.get("urls") or []) if isinstance(u, str) and u.startswith("http")]
+    urls: list[str] = []
+    for u in wh.get("urls") or []:
+        if not isinstance(u, str) or not u.startswith("http"):
+            continue
+        try:
+            urls.append(sec.validate_outbound_url(u, allow_http=True))
+        except ValueError:
+            continue
     if not urls:
         return
     payload = {

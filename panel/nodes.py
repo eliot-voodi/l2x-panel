@@ -40,6 +40,7 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("domain", "")
         n.setdefault("ssh_user", "")
         n.setdefault("ssh_port", 22)
+        n.setdefault("ssh_hostkey_fp", "")
         n.setdefault("bridge_uuid", "")
         n.setdefault("bridge_path", "")
         n.setdefault("base_path", "")
@@ -517,7 +518,7 @@ def _peer_node_export(n: dict) -> dict:
     keys = (
         "id", "name", "url", "token", "enabled", "sync_clients", "sync_inbounds",
         "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
-        "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "rv_mode",
+        "ssh_hostkey_fp", "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "rv_mode",
         "rv_uuid", "rv_domain", "rv_tag",
     )
     return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
@@ -782,11 +783,19 @@ def health_url(node: dict) -> str:
 
 
 def probe_health(node: dict, timeout: int = 8) -> dict:
-    """Fetch node /health (does not mutate reachability fields — use apply_health_probe)."""
+    """Fetch node /health (does not mutate reachability fields — use apply_health_probe).
+
+    Sends Bearer agent token when known so the node returns detail fields
+    (version/role/xray). Without a token only ``status=ok`` is public.
+    """
     url = health_url(node)
     if not url:
         return {"ok": False, "error": "no url"}
-    req = urllib.request.Request(url, headers={"User-Agent": "L2XPanel-NodeProbe/1.0"})
+    headers = {"User-Agent": "L2XPanel-NodeProbe/1.0"}
+    token = str(node.get("token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "replace")
@@ -953,7 +962,12 @@ def update_via_ssh(node: dict, ssh_password: str, ssh_user: str = "", ssh_port: 
     log: list[str] = [f"ssh {user}@{host}:{port} update"]
     client = None
     try:
-        client = _ssh_connect(host, user, ssh_password, port=port, timeout=45)
+        client, fp = _ssh_connect(
+            host, user, ssh_password, port=port, timeout=45,
+            expected_fp=str(node.get("ssh_hostkey_fp") or ""),
+        )
+        if fp:
+            node["ssh_hostkey_fp"] = fp
         cmd = (
             "set -e; "
             "if [ -x /usr/local/bin/l2x ]; then /usr/local/bin/l2x update; "
@@ -1191,14 +1205,62 @@ def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
 
 # ---------------------------------------------------------------- SSH provision
 
-def _ssh_connect(host: str, user: str, password: str, port: int = 22, timeout: int = 30):
+def _ssh_connect(
+    host: str,
+    user: str,
+    password: str,
+    port: int = 22,
+    timeout: int = 30,
+    expected_fp: str = "",
+) -> tuple:
+    """Connect over SSH with host-key pinning.
+
+    Returns (client, fingerprint). On first connect (no expected_fp) the key is
+    accepted once and the fingerprint returned for persistence. Later connects
+    reject a mismatched key (MITM protection).
+    """
     import paramiko
+    import security as sec
+
+    class _PinPolicy(paramiko.MissingHostKeyPolicy):
+        def __init__(self):
+            self.fp = ""
+
+        def missing_host_key(self, client, hostname, key):
+            fp = sec.ssh_key_fingerprint(key)
+            self.fp = fp
+            want = (expected_fp or "").strip()
+            if want and not sec.token_eq(fp, want):
+                raise paramiko.SSHException(
+                    f"SSH host key mismatch for {hostname}: got {fp}, expected {want}"
+                )
+            client.get_host_keys().add(hostname, key.get_name(), key)
+
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, port=int(port or 22), username=user, password=password,
-                   timeout=timeout, banner_timeout=60, auth_timeout=30,
-                   look_for_keys=False, allow_agent=False)
-    return client
+    policy = _PinPolicy()
+    client.set_missing_host_key_policy(policy)
+    # If we already trust a fingerprint, also seed HostKeys so paramiko does not
+    # treat a cached mismatch silently — Reject via policy on missing only.
+    client.connect(
+        host, port=int(port or 22), username=user, password=password,
+        timeout=timeout, banner_timeout=60, auth_timeout=30,
+        look_for_keys=False, allow_agent=False,
+    )
+    fp = policy.fp or (expected_fp or "").strip()
+    # When the key was already in an empty HostKeys and paramiko accepted via
+    # transport — ensure we still capture fingerprint from the remote key.
+    if not fp:
+        try:
+            tkey = client.get_transport().get_remote_server_key()
+            fp = sec.ssh_key_fingerprint(tkey)
+            if expected_fp and not sec.token_eq(fp, expected_fp.strip()):
+                client.close()
+                raise paramiko.SSHException(
+                    f"SSH host key mismatch for {host}: got {fp}, expected {expected_fp}"
+                )
+        except AttributeError:
+            pass
+    return client, fp
 
 
 def _ssh_run(client, cmd: str, timeout: int = 600) -> dict:
@@ -1314,7 +1376,9 @@ def provision_via_ssh(
     log: list[str] = [f"provision {name} @ {domain}" + (" [NAT/reverse]" if nat else "")]
 
     try:
-        client = _ssh_connect(domain, ssh_user, ssh_password, int(ssh_port or 22))
+        client, fp = _ssh_connect(domain, ssh_user, ssh_password, int(ssh_port or 22))
+        if fp:
+            node["ssh_hostkey_fp"] = fp
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"SSH: {exc}", "log": "\n".join(log)}
 
@@ -1953,7 +2017,12 @@ def promote_via_ssh(
         return {"ok": False, "error": "нужны domain и SSH-пароль ноды"}
     log = [f"promote {node.get('name')} → master"]
     try:
-        client = _ssh_connect(domain, user, ssh_password, port)
+        client, fp = _ssh_connect(
+            domain, user, ssh_password, port,
+            expected_fp=str(node.get("ssh_hostkey_fp") or ""),
+        )
+        if fp:
+            node["ssh_hostkey_fp"] = fp
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"SSH: {exc}"}
 
