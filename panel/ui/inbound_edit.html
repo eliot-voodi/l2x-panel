@@ -186,7 +186,7 @@
     </div>
     <label class="f">Headers (Key: Value)</label>
     <textarea name="ws_headers" class="mono" rows="2">{{ st.ws.headers or '' }}</textarea>
-    <div class="hint">Без Mux каждое соединение приложения = новый WS (сотни рукопожатий). JSON-подписка включает Mux автоматически; в v2rayN/NG/Hiddify для URI-ссылок включите Mux вручную.</div>
+    <div class="hint">Mux ускоряет handshake для WS, но режет скорость (особенно upload). В JSON-подписке Mux выключен по умолчанию — включите в Настройки → Подписки → Mux JSON при необходимости. Для URI-ссылок в клиенте включайте Mux вручную только если нужен.</div>
   </div>
   <div data-net="grpc">
     <div class="row">

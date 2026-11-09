@@ -458,7 +458,13 @@ def _l2tp_outbounds(store: dict) -> list[dict]:
             "tag": _l2tp_tag(t),
             "protocol": "freedom",
             "settings": {"domainStrategy": "UseIPv4"},
-            "streamSettings": {"sockopt": {"interface": t.get("ifname") or f"l2x-{t['name']}"}},
+            "streamSettings": {
+                "sockopt": {
+                    "interface": t.get("ifname") or f"l2x-{t['name']}",
+                    "tcpCongestion": "bbr",
+                    "tcpNoDelay": True,
+                },
+            },
         })
     return out
 
@@ -658,11 +664,12 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         rules.insert(1 if rules else 0, {
             "type": "field", "inboundTag": [in_tag], "outboundTag": direct_tag,
         })
-        # Larger buffers help high-BDP reverse tunnels
+        # Larger buffers help high-BDP reverse tunnels (never lower an existing value)
         try:
             levels = cfg.setdefault("policy", {}).setdefault("levels", {})
             lvl = levels.setdefault("0", {})
-            lvl.setdefault("bufferSize", 512)
+            if int(lvl.get("bufferSize") or 0) < 1024:
+                lvl["bufferSize"] = 1024
         except Exception:
             pass
         return
@@ -717,7 +724,8 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     try:
         levels = cfg.setdefault("policy", {}).setdefault("levels", {})
         lvl = levels.setdefault("0", {})
-        lvl.setdefault("bufferSize", 512)
+        if int(lvl.get("bufferSize") or 0) < 1024:
+            lvl["bufferSize"] = 1024
     except Exception:
         pass
 
@@ -1441,8 +1449,14 @@ def build_config(store: dict) -> dict:
         "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"},
     })
 
+    # sockopt on freedom: BBR/NoDelay on egress (client upload path through the proxy)
+    _egress_sock = {"tcpCongestion": "bbr", "tcpNoDelay": True, "tcpFastOpen": True}
     outbounds = [
-        {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
+        {
+            "tag": "direct", "protocol": "freedom",
+            "settings": {"domainStrategy": "UseIPv4"},
+            "streamSettings": {"sockopt": dict(_egress_sock)},
+        },
         {"tag": "block", "protocol": "blackhole", "settings": {}},
     ]
     outbounds.extend(_l2tp_outbounds(store))
@@ -1515,7 +1529,13 @@ def build_config(store: dict) -> dict:
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService", "HandlerService", "RoutingService"]},
         "policy": {
-            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}},
+            # bufferSize is KB; 1024 helps high-RTT paths (upload often starved with default)
+            "levels": {
+                "0": {
+                    "statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True,
+                    "bufferSize": 1024, "connIdle": 300, "handshake": 8, "uplinkOnly": 2, "downlinkOnly": 5,
+                },
+            },
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True,
                        "statsOutboundUplink": True, "statsOutboundDownlink": True},
         },

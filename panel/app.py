@@ -1856,6 +1856,11 @@ def _startup():
     _ensure_base_path()
     _ensure_agent_sticky()
     _refresh_settings_cache()
+    # BBR + TCP buffers — without this, upload on ~100ms RTT often caps at ~10–30 Mbps
+    try:
+        ops.ensure_network_perf()
+    except Exception:
+        pass
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
                    _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
                    _agent_pull_loop):

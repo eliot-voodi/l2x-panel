@@ -413,6 +413,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
             *(["    http2 on;"] if new_http2 else []),
             f"    server_name {domain};",
             "    server_tokens off;",
+            "    tcp_nodelay on;",
             f"    ssl_certificate {crt};",
             f"    ssl_certificate_key {key};",
             "    ssl_protocols TLSv1.2 TLSv1.3;",
@@ -478,8 +479,10 @@ def _location(loc: dict) -> str:
             f"    location ^~ {path} {{\n"
             "        if ($content_type !~ \"application/grpc\") { return 404; }\n"
             "        client_max_body_size 0;\n"
-            "        client_body_buffer_size 512k;\n"
+            "        client_body_buffer_size 1m;\n"
             "        client_body_timeout 52w;\n"
+            "        grpc_socket_keepalive on;\n"
+            "        grpc_buffer_size 4m;\n"
             f"        grpc_pass grpc://127.0.0.1:{port};\n"
             "        grpc_read_timeout 52w;\n"
             "        grpc_send_timeout 52w;\n"
@@ -493,8 +496,10 @@ def _location(loc: dict) -> str:
         return (
             f"    location ^~ {path} {{\n"
             "        client_max_body_size 0;\n"
-            "        client_body_buffer_size 512k;\n"
+            "        client_body_buffer_size 1m;\n"
             "        client_body_timeout 52w;\n"
+            "        grpc_socket_keepalive on;\n"
+            "        grpc_buffer_size 4m;\n"
             f"        grpc_pass grpc://127.0.0.1:{port};\n"
             "        grpc_read_timeout 52w;\n"
             "        grpc_send_timeout 52w;\n"
@@ -517,6 +522,8 @@ def _location(loc: dict) -> str:
         "        proxy_read_timeout 1d;\n"
         "        proxy_send_timeout 1d;\n"
         "        proxy_buffering off;\n"
+        "        proxy_request_buffering off;\n"
+        "        tcp_nodelay on;\n"
         "    }"
     )
 

@@ -74,7 +74,10 @@ FRONT_PROTOCOLS = ("vless", "vmess", "trojan")
 # Mux.Cool keeps ~concurrency streams on a few long-lived WS sessions (client-side).
 MUX_NETWORKS = frozenset({"ws", "httpupgrade"})
 DEFAULT_WS_HEARTBEAT = 10  # seconds; Ping frames keep the long WS alive through nginx
+# Opt-in only via Settings → Sub → json_mux. Auto-Mux.Cool caps multi-thread and
+# upload throughput (often ~10–30 Mbps up while download looks fine).
 DEFAULT_SUB_MUX = {
+    "enabled": False,
     "concurrency": 8,
     "xudpConcurrency": 16,
     "xudpProxyUDP443": "reject",
@@ -1300,9 +1303,8 @@ def _mux_compatible(ep: dict | None, proxy: dict | None = None) -> bool:
 def apply_sub_json_extras(cfg: dict, extras: dict | None, *, ep: dict | None = None) -> dict:
     """Inject Fragment / Noise / Mux into a JSON subscription client config.
 
-    Empty Mux setting → auto-enable Mux.Cool for WS/httpupgrade so clients keep
-    one long WebSocket instead of a new handshake per app request.
-    Set json_mux to {"enabled": false} to opt out.
+    Mux is OFF by default (throughput). Enable explicitly via Settings → Sub →
+    json_mux, e.g. {"enabled": true, "concurrency": 8}.
     """
     outs = cfg.get("outbounds") or []
     proxy = next((o for o in outs if o.get("tag") == "proxy"), outs[0] if outs else None)
@@ -1324,9 +1326,8 @@ def apply_sub_json_extras(cfg: dict, extras: dict | None, *, ep: dict | None = N
     if noise and isinstance(noise, (dict, list)):
         st = proxy.setdefault("streamSettings", {})
         st["finalmask"] = {"udp": noise if isinstance(noise, list) else [noise]}
-    if mux is None and _mux_compatible(ep, proxy):
-        mux = dict(DEFAULT_SUB_MUX)
-    if isinstance(mux, dict) and mux.get("enabled", True) is not False:
+    # Only enable Mux when admin JSON explicitly asks for it (and network allows)
+    if isinstance(mux, dict) and mux.get("enabled", True) is not False and _mux_compatible(ep, proxy):
         body = {k: v for k, v in mux.items() if k != "enabled"}
         proxy["mux"] = {"enabled": True, **body}
     cfg["outbounds"] = outs

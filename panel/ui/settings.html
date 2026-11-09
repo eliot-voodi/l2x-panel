@@ -77,13 +77,13 @@
   <div class="hint">L2TP не в <code>connected</code>, custom с проваленным тестом, или loss выше порога — не попадают в подписку (и в balancer), пока не восстановятся. Клиент увидит изменения после обновления подписки.</div>
 
   <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
-  <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. Для <b>WS / httpupgrade</b> Mux включается сам (одно длинное WS вместо рукопожатия на каждый запрос приложения). Пустой Fragment/Noise = не трогать. Mux: пусто = авто; <code>{"enabled":false}</code> = выключить.</div>
+  <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. <b>Mux по умолчанию выключен</b> (иначе сильно режет скорость, особенно upload). Включайте явно: <code>{"enabled":true,"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}</code>. Пустой Fragment/Noise = не трогать.</div>
   <label class="f">Fragment JSON</label>
   <textarea name="json_fragment" class="mono" rows="4" placeholder='{"packets":"tlshello","length":"100-200","interval":"10-20"}'>{{ sb.json_fragment }}</textarea>
   <label class="f">Noise / finalmask.udp JSON</label>
   <textarea name="json_noise" class="mono" rows="3" placeholder='[{"type":"rand","packet":"100-200","delay":"10-20"}]'>{{ sb.json_noise }}</textarea>
   <label class="f">Mux JSON</label>
-  <textarea name="json_mux" class="mono" rows="2" placeholder='авто для WS: {"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}'>{{ sb.json_mux }}</textarea>
+  <textarea name="json_mux" class="mono" rows="2" placeholder='выкл; для WS: {"enabled":true,"concurrency":8,"xudpConcurrency":16}'>{{ sb.json_mux }}</textarea>
 
   <h3 class="mt">HWID и смена адреса (Happ)</h3>
   {{ m.check('hwid_required', sb.hwid_required, 'Обязательный HWID: без заголовка X-HWID подписка не выдаётся') }}

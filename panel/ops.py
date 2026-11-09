@@ -387,6 +387,21 @@ def tail(path: str, lines: int = 300) -> str:
 
 # ---------------------------------------------------------------- BBR
 
+PERF_SYSCTL_PATH = Path("/etc/sysctl.d/99-l2xpanel-perf.conf")
+PERF_SYSCTL_BODY = (
+    "# managed by l2x-panel — TCP throughput (BBR + larger buffers)\n"
+    "net.core.default_qdisc = fq\n"
+    "net.ipv4.tcp_congestion_control = bbr\n"
+    "net.core.rmem_max = 16777216\n"
+    "net.core.wmem_max = 16777216\n"
+    "net.ipv4.tcp_rmem = 4096 87380 16777216\n"
+    "net.ipv4.tcp_wmem = 4096 65536 16777216\n"
+    "net.ipv4.tcp_fastopen = 3\n"
+    "net.ipv4.tcp_slow_start_after_idle = 0\n"
+    "net.ipv4.tcp_mtu_probing = 1\n"
+)
+
+
 def bbr_status() -> dict:
     cc = _run(["sysctl", "-n", "net.ipv4.tcp_congestion_control"])["stdout"].strip()
     qd = _run(["sysctl", "-n", "net.core.default_qdisc"])["stdout"].strip()
@@ -397,10 +412,34 @@ def bbr_set(enable: bool) -> dict:
     conf = Path("/etc/sysctl.d/99-l2x-bbr.conf")
     if enable:
         conf.write_text("net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n")
+        try:
+            PERF_SYSCTL_PATH.write_text(PERF_SYSCTL_BODY, encoding="utf-8")
+        except OSError:
+            pass
     else:
         conf.write_text("net.core.default_qdisc=fq_codel\nnet.ipv4.tcp_congestion_control=cubic\n")
     r = _run(["sysctl", "-p", str(conf)])
+    if enable and PERF_SYSCTL_PATH.is_file():
+        _run(["sysctl", "-p", str(PERF_SYSCTL_PATH)])
     return {"ok": r["ok"], **bbr_status(), "error": r["stderr"]}
+
+
+def ensure_network_perf() -> dict:
+    """Idempotent: enable BBR + TCP buffer sysctls (fixes slow upload on high-RTT paths)."""
+    try:
+        cur = (PERF_SYSCTL_PATH.read_text(encoding="utf-8") if PERF_SYSCTL_PATH.is_file() else "")
+    except OSError:
+        cur = ""
+    wrote = False
+    if cur.strip() != PERF_SYSCTL_BODY.strip():
+        try:
+            PERF_SYSCTL_PATH.write_text(PERF_SYSCTL_BODY, encoding="utf-8")
+            wrote = True
+        except OSError as exc:
+            return {"ok": False, "error": str(exc), **bbr_status()}
+    r = _run(["sysctl", "-p", str(PERF_SYSCTL_PATH)])
+    st = bbr_status()
+    return {"ok": r["ok"] and st.get("enabled"), "wrote": wrote, "error": "" if r["ok"] else (r["stderr"] or "sysctl"), **st}
 
 
 # ---------------------------------------------------------------- ACME
