@@ -300,11 +300,11 @@
   {% elif pu.latest %}
   <div class="hint mt">Установлена актуальная версия.</div>
   {% endif %}
-  <div class="hint">То же, что <code>l2x update</code>: код с GitHub, store и секреты не трогаются.</div>
+  <div class="hint">Быстрое обновление (<code>l2x update</code>): только код + restart панели. При падении /health — авто-откат на предыдущую рабочую версию. Полный цикл: <code>l2x update --full</code>.</div>
 </div>
 <div class="card">
   <h3>Откат / установка версии панели</h3>
-  <div class="hint">Выберите любой релиз GitHub. Данные и Xray не меняются. Сервис панели перезапустится.</div>
+  <div class="hint">Выберите любой релиз GitHub. Данные и Xray не меняются. При ошибке запуска — авто-откат на снимок.</div>
   <form method="post" action="{{ bp }}/panel/update/rollback" class="mt"
         onsubmit="return confirm('Установить панель '+this.version.value+'?\nТекущая: v{{ panel_version }}\nДанные сохранятся, Xray не трогаем.')">
     <input type="hidden" name="confirm" value="yes">

@@ -7,8 +7,9 @@
 #
 # Flags:
 #   --yes, -y     non-interactive: take answers from the environment or defaults
-#   --update [TAG]  update code, keep data and settings (optional Git tag, e.g. v1.9.72)
-#   --uninstall     remove services and code (data in /var/lib/l2xpanel is kept)
+#   --update [TAG]      fast update (code only) + auto-rollback on health fail; optional Git tag
+#   --update-full [TAG] full update (apt + xray + systemd/nginx) — slower
+#   --uninstall         remove services and code (data in /var/lib/l2xpanel is kept)
 #
 # Environment (non-interactive answers):
 #   L2X_HOST      public IP or domain           (default: detected IPv4)
@@ -262,6 +263,55 @@ install_xray() {
 EOF
 }
 
+_req_hash() {
+  # Stable hash of requirements.txt for conditional pip
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  else
+    cksum "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+snapshot_panel() {
+  # Keep last known-good code (no .venv — large & shared) for auto-rollback.
+  local prev=$APP_DIR.prev
+  rm -rf "$prev"
+  mkdir -p "$prev"
+  # Copy live panel files except venv / caches
+  if [ -d "$APP_DIR" ]; then
+    shopt -s dotglob nullglob
+    for item in "$APP_DIR"/*; do
+      base=$(basename "$item")
+      case "$base" in
+        .venv|__pycache__|*.pyc) continue ;;
+      esac
+      cp -a "$item" "$prev/"
+    done
+    shopt -u dotglob nullglob
+    printf '%s\n' "$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo unknown)" >"$prev/.snapshot_version"
+    ok "Снимок рабочей панели → $prev (v$(cat "$prev/.snapshot_version" 2>/dev/null || echo '?'))"
+  fi
+}
+
+restore_panel_snapshot() {
+  local prev=$APP_DIR.prev
+  [ -d "$prev" ] || { warn "Нет снимка $prev — откат невозможен"; return 1; }
+  step "Откат панели на предыдущую рабочую версию"
+  # Remove current code files (keep .venv)
+  find "$APP_DIR" -maxdepth 1 -mindepth 1 ! -name '.venv' -exec rm -rf {} +
+  shopt -s dotglob nullglob
+  for item in "$prev"/*; do
+    base=$(basename "$item")
+    [ "$base" = ".snapshot_version" ] && continue
+    cp -a "$item" "$APP_DIR/"
+  done
+  shopt -u dotglob nullglob
+  local ver
+  ver=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
+  ok "Восстановлено v$ver из $prev"
+  return 0
+}
+
 install_code() {
   step "Панель"
   mkdir -p "$APP_DIR" "$DATA_DIR" "$ETC_DIR/certs"
@@ -277,7 +327,18 @@ install_code() {
     python3 -m venv "$APP_DIR/.venv"
     "$APP_DIR/.venv/bin/pip" install -q --upgrade pip
   fi
-  "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+  local req=$APP_DIR/requirements.txt
+  local hash_file=$APP_DIR/.venv/.req_hash
+  local new_hash old_hash=""
+  new_hash=$(_req_hash "$req")
+  [ -f "$hash_file" ] && old_hash=$(cat "$hash_file" 2>/dev/null || true)
+  if [ ! -x "$APP_DIR/.venv/bin/uvicorn" ] || [ "$new_hash" != "$old_hash" ]; then
+    info "pip install (requirements изменились или venv пуст)"
+    "$APP_DIR/.venv/bin/pip" install -q -r "$req"
+    printf '%s\n' "$new_hash" >"$hash_file"
+  else
+    ok "pip пропущен — requirements без изменений"
+  fi
   install -m 755 "$SRC/scripts/l2x.sh" /usr/local/bin/l2x
   local ver
   ver=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
@@ -382,17 +443,26 @@ scrub_env_password() {
   chmod 600 "$ENV_FILE"
 }
 
-wait_panel() {
-  local port
+wait_panel_health() {
+  # Return 0 if /health answers; do not die (caller may rollback).
+  local port secs=${1:-40}
   port=$(sed -n 's/^PORT=//p' "$ENV_FILE")
-  systemctl restart xray l2xpanel
-  for _ in $(seq 1 40); do
+  local i
+  for i in $(seq 1 "$secs"); do
     if curl -fsS "http://127.0.0.1:${port:-8090}/health" >/dev/null 2>&1; then
       scrub_env_password
       return 0
     fi
     sleep 1
   done
+  return 1
+}
+
+wait_panel() {
+  systemctl restart xray l2xpanel
+  if wait_panel_health 40; then
+    return 0
+  fi
   die "Панель не запустилась: journalctl -u l2xpanel -n 50"
 }
 
@@ -468,17 +538,58 @@ uninstall() {
 
 current_mode() { grep -q '^HOST=0.0.0.0' "$ENV_FILE" 2>/dev/null && echo direct || echo nginx; }
 
-update() {
+update_full() {
+  # Slow path: apt + xray + systemd/nginx — for major upgrades / broken hosts.
   MODE=$(current_mode)
   SSL=none
-  info "Источник: $REPO_URL @ $BRANCH${SKIP_XRAY:+ (Xray не трогаем)}"
+  info "Полное обновление: $REPO_URL @ $BRANCH${SKIP_XRAY:+ (Xray не трогаем)}"
+  snapshot_panel
   fetch_source
   install_packages
   install_xray
   install_code
   install_system
-  wait_panel
+  systemctl restart xray l2xpanel
+  if ! wait_panel_health 45; then
+    warn "Новая версия не поднялась — откат на снимок"
+    restore_panel_snapshot || true
+    systemctl restart xray l2xpanel
+    wait_panel_health 40 || die "Откат не помог: journalctl -u l2xpanel -n 80"
+    die "Обновление не удалось, восстановлена предыдущая рабочая версия $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')"
+  fi
   ok "Панель обновлена до $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?'), данные сохранены"
+  printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
+  exit 0
+}
+
+update() {
+  # Fast path (default): code + conditional pip + restart panel only; auto-rollback on fail.
+  MODE=$(current_mode)
+  SSL=none
+  SKIP_XRAY=${SKIP_XRAY:-1}
+  export SKIP_XRAY
+  info "Быстрое обновление: $REPO_URL @ $BRANCH (Xray/apt/nginx не трогаем)"
+  local before
+  before=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
+  snapshot_panel
+  fetch_source
+  install_code
+  # Panel unit may have changed in rare cases — refresh without full install_system
+  if [ -f "$SRC/deploy/l2xpanel.service" ]; then
+    install -m 644 "$SRC/deploy/l2xpanel.service" /etc/systemd/system/l2xpanel.service
+    systemctl daemon-reload
+  fi
+  systemctl restart l2xpanel
+  if ! wait_panel_health 40; then
+    warn "v$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?') не ответила на /health — откат на v$before"
+    restore_panel_snapshot || true
+    systemctl restart l2xpanel
+    if wait_panel_health 40; then
+      die "Обновление не удалось, восстановлена рабочая v$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo "$before")"
+    fi
+    die "Обновление и откат не подняли панель: journalctl -u l2xpanel -n 80"
+  fi
+  ok "Панель: v$before → $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?') (fast, данные сохранены)"
   printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
   exit 0
 }
@@ -560,24 +671,31 @@ summary() {
 
 # ---------------------------------------------------------------- main
 banner
-# Parse --update [TAG] / --uninstall; TAG may be v1.9.72 (sets L2X_BRANCH).
+# Parse --update/--update-full [TAG] / --uninstall; TAG may be v1.9.72 (sets L2X_BRANCH).
 _args=("$@")
 _i=0
+_take_tag() {
+  next="${_args[$((_i + 1))]:-}"
+  if [ -n "$next" ] && [[ "$next" != -* ]]; then
+    BRANCH=$next
+    export L2X_BRANCH=$BRANCH
+    [ -n "${XRAY_VERSION:-}" ] || SKIP_XRAY=${SKIP_XRAY:-1}
+    export SKIP_XRAY
+    _i=$((_i + 1))
+  fi
+}
 while [ "$_i" -lt "${#_args[@]}" ]; do
   a="${_args[$_i]}"
   case "$a" in
     --uninstall) uninstall ;;
+    --update-full)
+      [ -f "$ENV_FILE" ] || die "Панель не установлена"
+      _take_tag
+      update_full
+      ;;
     --update)
       [ -f "$ENV_FILE" ] || die "Панель не установлена"
-      next="${_args[$((_i + 1))]:-}"
-      if [ -n "$next" ] && [[ "$next" != -* ]]; then
-        BRANCH=$next
-        export L2X_BRANCH=$BRANCH
-        # Panel pin/rollback: do not replace a working Xray unless XRAY_VERSION is set
-        [ -n "${XRAY_VERSION:-}" ] || SKIP_XRAY=${SKIP_XRAY:-1}
-        export SKIP_XRAY
-        _i=$((_i + 1))
-      fi
+      _take_tag
       update
       ;;
   esac
@@ -588,12 +706,14 @@ if [ -f "$ENV_FILE" ] && [ -f "$APP_DIR/app.py" ]; then
   info "L2X Panel уже установлена"
   if [ "$INTERACTIVE" = 0 ]; then update; fi
   choose act "Что сделать?" 1 \
-    "1|Обновить панель (данные и настройки сохраняются)" \
-    "2|Удалить панель" \
+    "1|Быстрое обновление панели (с авто-откатом)" \
+    "2|Полное обновление (apt + xray + nginx)" \
+    "3|Удалить панель" \
     "0|Выход"
   case "$act" in
     1) update ;;
-    2) uninstall ;;
+    2) update_full ;;
+    3) uninstall ;;
     *) exit 0 ;;
   esac
 fi

@@ -257,10 +257,21 @@ case "${1:-}" in
   reset-path) reset_base_path ;;
   backup) backup ;;
   update)
-    if [ -n "${2:-}" ]; then
-      SKIP_XRAY=1 run_installer --update "$2"
+    # l2x update [--full] [TAG]
+    full=0; tag=""
+    for a in "${@:2}"; do
+      case "$a" in
+        --full) full=1 ;;
+        -*) ;;
+        *) tag=$a ;;
+      esac
+    done
+    if [ "$full" = 1 ]; then
+      if [ -n "$tag" ]; then SKIP_XRAY=1 run_installer --update-full "$tag"
+      else run_installer --update-full; fi
     else
-      run_installer --update
+      if [ -n "$tag" ]; then SKIP_XRAY=1 run_installer --update "$tag"
+      else run_installer --update; fi
     fi
     ;;
   rollback-xray)

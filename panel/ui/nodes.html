@@ -6,6 +6,10 @@
 {% block page_sub %}{% if is_master %}Мастер: SSH-установка нод, sync, outbound, зеркало, передача роли{% else %}Режим агента — конфиг приходит с мастера{% endif %}{% endblock %}
 {% block top_actions %}
 {% if is_master %}
+<form method="post" action="{{ bp }}/nodes/update-all" style="display:inline"
+      onsubmit="return confirm('Поставить в очередь обновление всех нод с устаревшей панелью?\nНоды обновятся строго по одной.')">
+  <button class="btn" title="Очередь: по одной ноде">Обновить устаревшие</button>
+</form>
 <form method="post" action="{{ bp }}/nodes/xray-check-all" style="display:inline" title="Проверить версию Xray на всех нодах"><button class="btn ghost" {% if job_running %}disabled{% endif %}>Проверить Xray</button></form>
 <form method="post" action="{{ bp }}/nodes/sync-all" style="display:inline"><button class="btn ghost" {% if job_running %}disabled{% endif %}>Синхронизировать все</button></form>
 {% endif %}
@@ -77,6 +81,62 @@
 {% include "_jobs.html" %}
 
 {% if is_master %}
+{% set uq = update_queue if update_queue is defined else {} %}
+<div class="card">
+  <div class="card-head">
+    <h3>Очередь обновления нод</h3>
+    <div class="actions">
+      {% if uq.pending %}
+      <form method="post" action="{{ bp }}/nodes/update-queue/clear"
+            onsubmit="return confirm('Очистить ожидающие в очереди? Текущее обновление продолжится.')">
+        <button class="btn ghost sm">Очистить очередь</button>
+      </form>
+      {% endif %}
+      <a class="btn ghost sm" href="{{ bp }}/nodes">{{ ic.icon('refresh') }}</a>
+    </div>
+  </div>
+  <div class="hint">Панель на нодах обновляется <b>строго по одной</b> (fast update + авто-откат на ноде). Параллельный апдейт запрещён, чтобы кластер не «лёг» разом.</div>
+  {% if uq.current %}
+  <div class="mt" style="padding:.65rem .85rem;border:1px solid var(--accent);border-radius:10px;background:var(--accent-soft)">
+    <b>Сейчас:</b> <span class="mono">{{ uq.current.name }}</span>
+    <span class="badge ok">{{ uq.current.status or 'running' }}</span>
+    <span class="dim small">{{ uq.current.via }} · с {{ fmt_dt(uq.current.started_at) if uq.current.started_at else '—' }}</span>
+  </div>
+  {% else %}
+  <div class="hint mt">Сейчас никто не обновляется.</div>
+  {% endif %}
+  {% if uq.pending %}
+  <table class="mt"><thead><tr><th>#</th><th>Нода</th><th>Через</th><th>В очереди</th></tr></thead>
+    <tbody>
+    {% for p in uq.pending %}
+      <tr>
+        <td class="mono">{{ loop.index }}</td>
+        <td><b>{{ p.name }}</b></td>
+        <td class="small">{{ p.via }}</td>
+        <td class="small dim">{{ fmt_dt(p.enqueued_at) if p.enqueued_at else '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if uq.history %}
+  <details class="mt"><summary class="small" style="cursor:pointer">Недавние результаты ({{ uq.history|length }})</summary>
+    <table class="mt"><thead><tr><th>Нода</th><th>Результат</th><th>Версия</th><th>Когда</th></tr></thead>
+      <tbody>
+      {% for h in uq.history|reverse %}
+        <tr>
+          <td>{{ h.name }}</td>
+          <td>{% if h.ok %}<span class="badge ok">ok</span>{% else %}<span class="badge err" title="{{ h.error }}">fail</span>{% endif %}</td>
+          <td class="mono small">{% if h.before and h.version %}{{ h.before }} → {{ h.version }}{% else %}{{ h.version or '—' }}{% endif %}</td>
+          <td class="small dim">{{ fmt_dt(h.finished_at) if h.finished_at else '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+</div>
+
 <div class="card" style="padding:0">
   {# —— Desktop —— #}
   <div class="table-wrap nodes-desktop">
@@ -91,6 +151,9 @@
         <td class="small mono">{{ n.domain or n.url }}{% if n.base_path %}<div class="dim">/{{ n.base_path }}/</div>{% endif %}</td>
         <td class="small mono">
           {% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn" title="мастер {{ master_version }}"{% endif %}>{{ n.panel_version }}</span>{% else %}<span class="dim">?</span>{% endif %}
+          {% if n.update_queue_status == 'running' %}<div class="badge ok">обновляется</div>
+          {% elif n.update_queue_status == 'queued' %}<div class="badge warn">в очереди</div>
+          {% elif n.update_queue_status == 'failed' %}<div class="badge err">update fail</div>{% endif %}
           <div class="dim" title="Xray{% if master_xray %} · мастер {{ master_xray }}{% endif %}">xray {% if n.xray_version %}<span {% if n.xray_available %}class="badge warn"{% elif master_xray and n.xray_version != master_xray %}class="badge warn"{% endif %}>{{ n.xray_version }}</span>{% else %}?{% endif %}{% if n.xray_available and n.xray_latest %} → {{ n.xray_latest }}{% endif %}</div>
           {% if n.last_update %}<div class="dim">{{ fmt_dt(n.last_update) }}</div>{% endif %}
         </td>
@@ -129,13 +192,15 @@
             </form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/mirror"><button class="btn ghost sm" title="Полная копия мастера (standby)" {% if job_running %}disabled{% endif %}>{% if n.mirror %}Зеркало ✓{% else %}+ Зеркало{% endif %}</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.3rem"
-                  title="{% if n.nat %}NAT: обновление через agent pull (нода сама заберёт ≤20 с){% else %}Без пароля — agent API; с паролем — SSH{% endif %}"
-                  onsubmit="return confirm('Обновить панель на ноде {{ n.name }}{% if n.nat %} через agent pull{% endif %}?')">
+                  title="В очередь (по одной). {% if n.nat %}NAT: agent pull{% else %}Без пароля — agent; с паролем — SSH{% endif %}"
+                  onsubmit="return confirm('Поставить {{ n.name }} в очередь обновления панели?\nНоды обновляются строго по одной.')">
               {% if not n.nat %}
               <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password"
                      style="width:6.5rem;padding:.25rem .4rem;font-size:.75rem">
               {% endif %}
-              <button class="btn sm" {% if job_running %}disabled{% endif %}>{{ t('Обновить') }}</button>
+              <button class="btn sm" {% if n.update_queue_status == 'running' or n.update_queue_status == 'queued' %}disabled{% endif %}>
+                {% if n.update_queue_status == 'running' %}⏳{% elif n.update_queue_status == 'queued' %}…{% else %}{{ t('Обновить') }}{% endif %}
+              </button>
             </form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm" title="Использовать как outbound">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
             {% if not n.nat %}

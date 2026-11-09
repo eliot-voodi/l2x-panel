@@ -5645,6 +5645,252 @@ async def rest_api(path: str, request: Request):
 NODES_JOB: dict[str, str] = {}
 NODES_SCHED_LOCK = threading.Lock()
 
+# Serial panel-update queue: never update multiple nodes at once (avoids cluster-wide outage).
+_NODE_UPD_LOCK = threading.Lock()
+_NODE_UPD: dict[str, Any] = {
+    "pending": [],       # [{id, name, via, ssh_password, enqueued_at}]
+    "current": None,     # {id, name, via, started_at, status} or None
+    "history": [],       # last ~20 [{id, name, ok, error, version, finished_at}]
+    "worker": False,
+}
+
+
+def node_update_queue_snapshot() -> dict:
+    with _NODE_UPD_LOCK:
+        return {
+            "pending": list(_NODE_UPD["pending"]),
+            "current": dict(_NODE_UPD["current"]) if _NODE_UPD["current"] else None,
+            "history": list(_NODE_UPD["history"][-12:]),
+            "busy": bool(_NODE_UPD["current"]) or bool(_NODE_UPD["pending"]),
+        }
+
+
+def _node_upd_set_status(node_id: str, status: str, **extra) -> None:
+    with mutate() as st:
+        for n in nodes_mod.ensure_list(st):
+            if n.get("id") != node_id:
+                continue
+            n["update_queue_status"] = status
+            for k, v in extra.items():
+                if v is not None:
+                    n[k] = v
+            break
+
+
+def enqueue_node_update(
+    node_id: str,
+    *,
+    name: str = "",
+    ssh_password: str = "",
+    via: str = "",
+) -> dict:
+    """Add node to serial update queue. Returns {ok, queued, position, error}."""
+    with _NODE_UPD_LOCK:
+        cur = _NODE_UPD["current"] or {}
+        if cur.get("id") == node_id:
+            return {"ok": True, "queued": False, "already": "running", "position": 0}
+        for i, item in enumerate(_NODE_UPD["pending"]):
+            if item.get("id") == node_id:
+                return {"ok": True, "queued": True, "already": "pending", "position": i + 1}
+        via = via or ("SSH" if ssh_password else "agent")
+        _NODE_UPD["pending"].append({
+            "id": node_id,
+            "name": name or node_id[:8],
+            "via": via,
+            "ssh_password": ssh_password or "",
+            "enqueued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        pos = len(_NODE_UPD["pending"])
+        start_worker = not _NODE_UPD["worker"]
+        if start_worker:
+            _NODE_UPD["worker"] = True
+    _node_upd_set_status(node_id, "queued")
+    if start_worker:
+        threading.Thread(target=_node_update_worker, daemon=True, name="node-upd-queue").start()
+    return {"ok": True, "queued": True, "position": pos}
+
+
+def enqueue_outdated_nodes(*, master_ver: str) -> dict:
+    """Enqueue all enabled nodes whose panel_version differs from master."""
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        return {"ok": False, "error": "not master", "added": 0}
+    mv = str(master_ver or panel_version()).lstrip("vV")
+    added = 0
+    skipped = 0
+    for n in nodes_mod.ensure_list(store):
+        if not n.get("enabled", True):
+            continue
+        nv = str(n.get("panel_version") or "").lstrip("vV")
+        if nv and mv and nv == mv:
+            skipped += 1
+            continue
+        r = enqueue_node_update(n["id"], name=str(n.get("name") or ""), via="agent" if not n.get("nat") else "NAT-pull")
+        if r.get("queued") and not r.get("already"):
+            added += 1
+        else:
+            skipped += 1
+    return {"ok": True, "added": added, "skipped": skipped}
+
+
+def _run_one_node_update(item: dict) -> dict:
+    """Execute a single node panel update and wait until version settles (or timeout)."""
+    import time as _time
+    node_id = item["id"]
+    ssh_password = item.get("ssh_password") or ""
+    store = _load_store()
+    node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
+    if not node:
+        return {"ok": False, "error": "node gone", "name": item.get("name")}
+    name = node.get("name") or item.get("name") or node_id[:8]
+    node_copy = dict(node)
+    before = str(node_copy.get("panel_version") or "")
+
+    if node_copy.get("nat"):
+        with mutate() as st:
+            for n in nodes_mod.ensure_list(st):
+                if n.get("id") == node_id:
+                    n["update_requested"] = True
+                    break
+        # Wait until pull clears the flag / version changes (≤ ~3 min)
+        last_ver = before
+        ok = False
+        err = ""
+        for i in range(36):
+            _time.sleep(5)
+            st = _load_store()
+            live = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
+            if not live:
+                err = "node removed"
+                break
+            if not live.get("update_requested"):
+                last_ver = str(live.get("panel_version") or last_ver)
+                ok = True
+                break
+            last_ver = str(live.get("panel_version") or last_ver)
+            if last_ver and before and last_ver != before:
+                ok = True
+                break
+        else:
+            err = "таймаут ожидания NAT pull update"
+        with mutate() as st:
+            for n in nodes_mod.ensure_list(st):
+                if n.get("id") != node_id:
+                    continue
+                if last_ver:
+                    n["panel_version"] = last_ver
+                n["update_queue_status"] = "ok" if ok else "failed"
+                if ok:
+                    n["last_update"] = nodes_mod.now_iso()
+                    n["last_error"] = ""
+                else:
+                    n["last_error"] = err
+                break
+        return {"ok": ok, "error": err, "version": last_ver, "name": name, "before": before}
+
+    # Reachable node: agent API or SSH
+    if ssh_password:
+        res = nodes_mod.update_via_ssh(node_copy, ssh_password=ssh_password)
+    else:
+        res = nodes_mod.trigger_update(node_copy)
+        if res.get("ok") and (res.get("started") or res.get("already")):
+            before = str(res.get("current") or before or "")
+            last_ver = before
+            for i in range(24):
+                _time.sleep(5 if i else 12)
+                probe = nodes_mod.probe_health(node_copy, timeout=8)
+                if not probe.get("ok"):
+                    continue
+                last_ver = str(probe.get("version") or last_ver)
+                if last_ver and last_ver != before:
+                    break
+            if last_ver:
+                node_copy["panel_version"] = last_ver
+            res = dict(res)
+            res["version"] = last_ver or res.get("version") or ""
+    ok = bool(res.get("ok"))
+    ver = str(node_copy.get("panel_version") or res.get("version") or "")
+    with mutate() as st:
+        for n in nodes_mod.ensure_list(st):
+            if n.get("id") != node_id:
+                continue
+            if ver:
+                n["panel_version"] = ver
+            if node_copy.get("last_update"):
+                n["last_update"] = node_copy["last_update"]
+            elif ok:
+                n["last_update"] = nodes_mod.now_iso()
+            n["update_queue_status"] = "ok" if ok else "failed"
+            if ok:
+                n["last_error"] = ""
+                n["last_ok"] = True
+            else:
+                n["last_error"] = str(res.get("error") or node_copy.get("last_error") or "update failed")
+            break
+    return {
+        "ok": ok,
+        "error": "" if ok else (res.get("error") or "update failed"),
+        "version": ver,
+        "name": name,
+        "before": before,
+        "log": res.get("log") or "",
+    }
+
+
+def _node_update_worker() -> None:
+    """Process `_NODE_UPD["pending"]` one-by-one."""
+    try:
+        while True:
+            with _NODE_UPD_LOCK:
+                if not _NODE_UPD["pending"]:
+                    _NODE_UPD["current"] = None
+                    _NODE_UPD["worker"] = False
+                    return
+                item = _NODE_UPD["pending"].pop(0)
+                _NODE_UPD["current"] = {
+                    "id": item["id"],
+                    "name": item.get("name"),
+                    "via": item.get("via"),
+                    "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "status": "running",
+                }
+            _node_upd_set_status(item["id"], "running")
+            try:
+                result = _run_one_node_update(item)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": str(exc), "name": item.get("name"), "version": ""}
+                _node_upd_set_status(item["id"], "failed", last_error=str(exc))
+            finished = {
+                "id": item["id"],
+                "name": result.get("name") or item.get("name"),
+                "ok": bool(result.get("ok")),
+                "error": result.get("error") or "",
+                "version": result.get("version") or "",
+                "before": result.get("before") or "",
+                "via": item.get("via"),
+                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            with _NODE_UPD_LOCK:
+                _NODE_UPD["history"] = (_NODE_UPD["history"] + [finished])[-20:]
+                _NODE_UPD["current"] = None
+            name = finished["name"]
+            if finished["ok"]:
+                ver_s = f" → v{tgbot.escape(finished['version'])}" if finished["version"] else ""
+                _tg_admin(
+                    f"⬆️ Нода <b>{tgbot.escape(name)}</b>: обновление OK{ver_s}",
+                    flag="notify_nodes",
+                )
+            else:
+                _tg_admin(
+                    f"❌ Нода <b>{tgbot.escape(name)}</b>: обновление — "
+                    f"{tgbot.escape(finished['error'] or 'fail')}",
+                    flag="notify_nodes",
+                )
+    finally:
+        with _NODE_UPD_LOCK:
+            _NODE_UPD["worker"] = False
+            _NODE_UPD["current"] = None
+
 
 def _nodes_health_cycle() -> None:
     """Probe all enabled nodes; persist reachability; Telegram on connect/disconnect/version."""
@@ -5747,6 +5993,7 @@ def nodes_page(request: Request):
                 master_version=panel_version(),
                 master_xray=_cached_master_xray(),
                 sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
+                update_queue=node_update_queue_snapshot(),
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
 
@@ -6034,6 +6281,18 @@ async def settings_node_action(node_id: str, request: Request):
     elif action in ("update_panel", "rollback_panel", "restore_master", "restart_panel",
                     "check_xray", "update_xray", "rollback_xray", "restart_xray"):
         tab = "system"
+
+    # Panel update on a node → serial queue (never parallel with other nodes)
+    if action == "update_panel":
+        via = "NAT-pull" if node.get("nat") else "agent"
+        r = enqueue_node_update(node_id, name=str(node.get("name") or ""), via=via)
+        if r.get("already") == "running":
+            flash(request, f"{node.get('name')}: уже обновляется", "info")
+        elif r.get("already") == "pending":
+            flash(request, f"{node.get('name')}: уже в очереди #{r.get('position')}", "info")
+        else:
+            flash(request, f"{node.get('name')}: в очереди обновления #{r.get('position')}", "info")
+        return go(f"/settings-node?id={node_id}&tab={tab}")
 
     # NAT has no inbound manage HTTP — queue Xray update / local check from last pull
     if action in ("check_xray", "update_xray") and node.get("nat"):
@@ -6463,102 +6722,36 @@ async def nodes_action(node_id: str, action: str, request: Request):
         return go("/nodes")
 
     if action == "update":
-        with mutate() as store:
-            nodes = nodes_mod.ensure_list(store)
-            node = next((n for n in nodes if n["id"] == node_id), None)
-            if not node:
-                flash(request, "Нода не найдена", "error")
-                return go("/nodes")
-            if not nodes_mod.is_master(store):
-                flash(request, "Только мастер может обновлять ноды", "error")
-                return go("/nodes")
-            # NAT: no inbound HTTP — update only via agent pull (master sets flag, node fetches it)
-            if node.get("nat"):
-                node["update_requested"] = True
-                name = node["name"]
-                _tg_admin(
-                    f"⬆️ Нода <b>{tgbot.escape(name)}</b>: обновление через agent pull",
-                    flag="notify_nodes",
-                )
-                flash(request, f"{name}: обновление через agent — нода заберёт при следующем pull (≤20 с)", "info")
-                return go("/nodes")
-            ssh_password = str(form.get("password") or "")
-            running = NODES_JOB.get("id")
-            if running and ops.JOBS.get(running, {}).get("status") == "running":
-                flash(request, "Уже идёт операция с нодами", "info")
-                return go("/nodes")
-            node_copy = dict(node)
-            node_id_local = node["id"]
-            name = node["name"]
-
-        def job():
-            import time as _time
-            before = str(node_copy.get("panel_version") or "")
-            if ssh_password:
-                res = nodes_mod.update_via_ssh(node_copy, ssh_password=ssh_password)
-            else:
-                res = nodes_mod.trigger_update(node_copy)
-                # trigger_update returns pre-update "current"; wait until health version changes
-                # (or settle after enough time if already newest).
-                if res.get("ok") and (res.get("started") or res.get("already")):
-                    before = str(res.get("current") or before or "")
-                    last_ver = before
-                    for i in range(24):  # up to ~2 min
-                        _time.sleep(5 if i else 15)
-                        probe = nodes_mod.probe_health(node_copy, timeout=8)
-                        if not probe.get("ok"):
-                            continue
-                        last_ver = str(probe.get("version") or last_ver)
-                        if last_ver and last_ver != before:
-                            break
-                    if last_ver:
-                        node_copy["panel_version"] = last_ver
-            with mutate() as st:
-                for n in nodes_mod.ensure_list(st):
-                    if n.get("id") != node_id_local:
-                        continue
-                    if node_copy.get("panel_version"):
-                        n["panel_version"] = node_copy["panel_version"]
-                    if node_copy.get("last_update"):
-                        n["last_update"] = node_copy["last_update"]
-                    if res.get("ok"):
-                        n["last_error"] = ""
-                        n["last_ok"] = True
-                    elif node_copy.get("last_error"):
-                        n["last_error"] = node_copy["last_error"]
-                    break
-            log = res.get("log") or ""
-            ver = node_copy.get("panel_version") or res.get("version") or ""
-            if before:
-                log = (log + f"\nbefore: {before}").strip()
-            if ver:
-                log = (log + f"\nversion: {ver}").strip()
-            if res.get("ok"):
-                ver_s = f" → v{tgbot.escape(ver)}" if ver else ""
-                before_s = f" (было v{tgbot.escape(before)})" if before and before != ver else ""
-                _tg_admin(
-                    f"⬆️ Нода <b>{tgbot.escape(name)}</b>: обновление OK{ver_s}{before_s}",
-                    flag="notify_nodes",
-                )
-            else:
-                _tg_admin(
-                    f"❌ Нода <b>{tgbot.escape(name)}</b>: обновление — "
-                    f"{tgbot.escape(res.get('error') or 'fail')}",
-                    flag="notify_nodes",
-                )
-            return {
-                "ok": bool(res.get("ok")),
-                "log": log or ("" if res.get("ok") else res.get("error") or "update failed"),
-                "error": "" if res.get("ok") else (res.get("error") or "update failed"),
-            }
-
-        NODES_JOB["id"] = ops.start_job(f"node-update-{name}", job)
-        via = "SSH" if ssh_password else "agent API"
-        _tg_admin(
-            f"⬆️ Обновление ноды <b>{tgbot.escape(name)}</b> запущено ({via})",
-            flag="notify_nodes",
+        store = _load_store()
+        if not nodes_mod.is_master(store):
+            flash(request, "Только мастер может обновлять ноды", "error")
+            return go("/nodes")
+        node = next((n for n in nodes_mod.ensure_list(store) if n["id"] == node_id), None)
+        if not node:
+            flash(request, "Нода не найдена", "error")
+            return go("/nodes")
+        ssh_password = str(form.get("password") or "")
+        via = "NAT-pull" if node.get("nat") else ("SSH" if ssh_password else "agent")
+        r = enqueue_node_update(
+            node_id, name=str(node.get("name") or ""), ssh_password=ssh_password, via=via,
         )
-        flash(request, f"Обновление ноды {name} запущено ({via}). Смотрите фоновые задачи.", "info")
+        name = node.get("name") or node_id[:8]
+        if r.get("already") == "running":
+            flash(request, f"{name}: уже обновляется", "info")
+        elif r.get("already") == "pending":
+            flash(request, f"{name}: уже в очереди (#{r.get('position')})", "info")
+        else:
+            _tg_admin(
+                f"⬆️ Нода <b>{tgbot.escape(name)}</b> в очереди обновления "
+                f"(#{r.get('position')}, {tgbot.escape(via)}) — по одной, без параллели",
+                flag="notify_nodes",
+            )
+            flash(
+                request,
+                f"{name}: в очереди обновления #{r.get('position')} ({via}). "
+                "Ноды обновляются строго по одной.",
+                "info",
+            )
         return go("/nodes")
 
     if action == "promote":
@@ -6702,6 +6895,48 @@ def nodes_restore_master(request: Request):
         ns.pop("master_pull_url", None)
     xr = _apply_xray(_load_store())
     flash(request, *_ok_msg("Роль MASTER восстановлена на этой панели", xr))
+    return go("/nodes")
+
+
+@app.post("/nodes/update-all")
+def nodes_update_all(request: Request):
+    """Enqueue panel updates for all outdated nodes (serial queue)."""
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        flash(request, "Только мастер", "error")
+        return go("/nodes")
+    r = enqueue_outdated_nodes(master_ver=panel_version())
+    if not r.get("ok"):
+        flash(request, r.get("error") or "ошибка", "error")
+        return go("/nodes")
+    _tg_admin(
+        f"⬆️ В очередь обновления нод: <b>{r.get('added', 0)}</b> "
+        f"(пропущено актуальных: {r.get('skipped', 0)})",
+        flag="notify_nodes",
+    )
+    flash(
+        request,
+        f"В очередь: {r.get('added', 0)} нод (пропущено {r.get('skipped', 0)}). "
+        "Обновление строго по одной — смотрите очередь на этой вкладке.",
+        "info",
+    )
+    return go("/nodes")
+
+
+@app.post("/nodes/update-queue/clear")
+def nodes_update_queue_clear(request: Request):
+    if redir := _require(request):
+        return redir
+    with _NODE_UPD_LOCK:
+        cleared = len(_NODE_UPD["pending"])
+        pending_ids = [x.get("id") for x in _NODE_UPD["pending"]]
+        _NODE_UPD["pending"] = []
+    for nid in pending_ids:
+        if nid:
+            _node_upd_set_status(str(nid), "")
+    flash(request, f"Очередь очищена ({cleared}). Текущее обновление не прервано.", "info")
     return go("/nodes")
 
 

@@ -155,11 +155,13 @@ def panel_latest(include_prerelease: bool = False) -> dict:
     }
 
 
-def update_panel(version: str = "", *, skip_xray: bool | None = None) -> dict:
-    """Run install.sh --update [TAG] (keeps data). Panel process will restart.
+def update_panel(version: str = "", *, skip_xray: bool | None = None, full: bool = False) -> dict:
+    """Run install.sh --update/--update-full [TAG] (keeps data). Panel restarts.
+
+    Fast path (default): code + conditional pip + restart l2xpanel; auto-rollback
+    to /opt/l2xpanel.prev if /health fails. ``full=True`` also refreshes apt/xray/nginx.
 
     ``version`` pins/rolls back to a GitHub release tag (e.g. v1.9.72).
-    When a tag is set, Xray is left untouched unless skip_xray=False.
     """
     tag = normalize_tag(version)
     env = os.environ.copy()
@@ -167,33 +169,43 @@ def update_panel(version: str = "", *, skip_xray: bool | None = None) -> dict:
         env["L2X_BRANCH"] = tag
         if skip_xray is None:
             skip_xray = True
-    if skip_xray:
+    if skip_xray or not full:
         env["SKIP_XRAY"] = "1"
     elif "SKIP_XRAY" in env:
         env.pop("SKIP_XRAY", None)
 
+    flag = "--update-full" if full else "--update"
     if Path("/usr/local/bin/l2x").exists():
-        cmd = ["/usr/local/bin/l2x", "update"] + ([tag] if tag else [])
+        # l2x update [TAG] → fast; l2x update --full [TAG] → full
+        cmd = ["/usr/local/bin/l2x", "update"]
+        if full:
+            cmd.append("--full")
+        if tag:
+            cmd.append(tag)
         r = _run(cmd, timeout=900, env=env)
     else:
-        args = "--update" + (f" {tag}" if tag else "")
+        args = flag + (f" {tag}" if tag else "")
         script = (
             "curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
             f"| bash -s -- {args}"
         )
         r = _run(["bash", "-lc", script], timeout=900, env=env)
     log = (r.get("stdout") or "")[-3000:] + ("\n" + (r.get("stderr") or "")[-1000:] if r.get("stderr") else "")
+    # install.sh dies (nonzero) after successful rollback — treat as failed update
+    rolled = "восстановлена" in (log or "").lower() or "rolled back" in (log or "").lower()
     ver = ""
     try:
         ver = Path("/opt/l2xpanel/VERSION").read_text(encoding="utf-8").strip().splitlines()[0]
     except OSError:
         pass
+    ok = bool(r.get("ok")) and not rolled
     return {
-        "ok": bool(r.get("ok")),
+        "ok": ok,
         "log": log or f"exit {r.get('code')}",
         "version": ver,
         "requested": tag or "latest",
-        "error": "" if r.get("ok") else (r.get("stderr") or "update failed"),
+        "rolled_back": rolled,
+        "error": "" if ok else (r.get("stderr") or log[-500:] or "update failed"),
     }
 
 
