@@ -156,18 +156,30 @@ _download_repo_tarball() {
   # GitHub archive endpoints flake with 503; try several URLs with retries.
   # Never pipe curl|tar — a failed HTML/error body corrupts the extract.
   # BRANCH may be a branch (main) or a release tag (v1.9.72).
+  # Prefer heads for branch-like refs and tags for version-like refs — otherwise a
+  # fresh install with L2X_BRANCH=main wastes ~45s retrying the non-existent tags/main.
   local dest=$1 owner repo
   owner=$(printf '%s' "$REPO_URL" | sed -E 's|https?://github.com/||;s|/+$||' | cut -d/ -f1)
   repo=$(printf '%s' "$REPO_URL" | sed -E 's|https?://github.com/||;s|/+$||' | cut -d/ -f2)
   [ -n "$owner" ] && [ -n "$repo" ] || die "Некорректный L2X_REPO: $REPO_URL"
-  local urls=(
+  local tag_urls=(
     "https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${BRANCH}"
     "https://github.com/${owner}/${repo}/archive/refs/tags/${BRANCH}.tar.gz"
+  )
+  local head_urls=(
     "https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${BRANCH}"
     "https://github.com/${owner}/${repo}/archive/refs/heads/${BRANCH}.tar.gz"
+  )
+  local fallback_urls=(
     "https://github.com/${owner}/${repo}/archive/${BRANCH}.tar.gz"
     "https://codeload.github.com/${owner}/${repo}/tar.gz/${BRANCH}"
   )
+  local urls=()
+  if [[ "$BRANCH" =~ ^[vV]?[0-9]+\.[0-9]+ ]]; then
+    urls=("${tag_urls[@]}" "${head_urls[@]}" "${fallback_urls[@]}")
+  else
+    urls=("${head_urls[@]}" "${tag_urls[@]}" "${fallback_urls[@]}")
+  fi
   local url attempt code
   for url in "${urls[@]}"; do
     for attempt in 1 2 3 4 5; do
@@ -179,6 +191,12 @@ _download_repo_tarball() {
       if [ "$code" = "200" ] && [ -s "$dest" ] && gzip -t "$dest" 2>/dev/null; then
         ok "архив скачан ($(wc -c <"$dest") байт)"
         return 0
+      fi
+      # 404 = wrong ref type (tag vs branch) — skip retries, try next URL immediately
+      if [ "$code" = "404" ]; then
+        warn "HTTP 404 — нет такого ref, следующий URL"
+        rm -f "$dest"
+        break
       fi
       warn "HTTP ${code:-?} / битый архив — повтор через $((attempt * 3))с"
       rm -f "$dest"
