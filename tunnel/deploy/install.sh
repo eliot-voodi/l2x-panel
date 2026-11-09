@@ -17,7 +17,7 @@ export PATH="/usr/local/go/bin:${PATH:-}"
 go version
 go mod tidy
 CGO_ENABLED=0 go build -ldflags="-s -w" -o "$PREFIX/bin/l2x-tunneld" ./cmd/l2x-tunneld
-CGO_ENABLED=0 go build -ldflags="-s -w" -o "$PREFIX/bin/l2x-tunnel-agent" ./cmd/l2x-tunnel-agent"
+CGO_ENABLED=0 go build -ldflags="-s -w" -o "$PREFIX/bin/l2x-tunnel-agent" ./cmd/l2x-tunnel-agent
 
 mkdir -p "$CFG_DIR"
 if [[ ! -f "$CFG_DIR/tunneld.yaml" ]]; then
