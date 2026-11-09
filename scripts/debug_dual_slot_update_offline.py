@@ -106,8 +106,60 @@ def test_front_preserves_upstream():
     ok("front.py preserves upstream across panel start")
 
 
+def test_detach_from_panel_cgroup():
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    if "detach_from_panel_cgroup" not in text or "L2X_DETACHED" not in text:
+        fail("install.sh", "missing self-detach from panel cgroup")
+    call = text.find('detach_from_panel_cgroup "$@"')
+    parse = text.find("_args=(\"$@\")")
+    if call < 0 or parse < 0 or call > parse:
+        fail("install.sh", "detach must run before argument parsing / update")
+
+    sys.path.insert(0, str(PANEL))
+    import ops
+    from unittest import mock
+
+    calls: list = []
+
+    def fake_run(cmd, timeout=120, shell=False, env=None, cwd=None):
+        calls.append(cmd)
+        return {"ok": True, "code": 0, "stdout": "", "stderr": ""}
+
+    # Inside panel cgroup → transient unit via systemd-run, rc file read back.
+    with mock.patch.object(ops, "_in_panel_cgroup", return_value=True), \
+            mock.patch.object(ops.shutil, "which", return_value="/usr/bin/systemd-run"), \
+            mock.patch.object(ops, "_run", side_effect=fake_run), \
+            mock.patch.object(ops, "UPDATE_RC") as rc, \
+            mock.patch.object(ops, "UPDATE_LOG") as lg, \
+            mock.patch.object(ops.time, "sleep", lambda *_: None):
+        rc.is_file.return_value = True
+        rc.read_text.return_value = "0\n"
+        lg.read_text.return_value = "Панель: v1 → v2 (dual-slot live→next, без простоя)"
+        r = ops.update_panel()
+    if not calls or calls[0][0] != "systemd-run":
+        fail("ops.update_panel", f"expected systemd-run, got {calls[:1]}")
+    if not any(str(a).startswith("--unit=") for a in calls[0]):
+        fail("ops.update_panel", "systemd-run without --unit")
+    if not r.get("ok"):
+        fail("ops.update_panel", f"detached update result not ok: {r}")
+
+    calls.clear()
+    with mock.patch.object(ops, "_in_panel_cgroup", return_value=False), \
+            mock.patch.object(ops, "_run", side_effect=fake_run):
+        ops.update_panel()
+    if calls and calls[0][0] == "systemd-run":
+        fail("ops.update_panel", "must not detach outside the panel cgroup")
+
+    if "systemctl restart l2xpanel\"" in (PANEL / "ops.py").read_text(encoding="utf-8"):
+        fail("ops.py", "hard-coded restart l2xpanel")
+    if '"restart", "l2xpanel"]' in (PANEL / "app.py").read_text(encoding="utf-8"):
+        fail("app.py", "hard-coded restart l2xpanel")
+    ok("update survives panel unit stop (systemd-run detach)")
+
+
 def main():
     print("== L2X dual-slot update offline debug ==")
+    test_detach_from_panel_cgroup()
     test_install_sh_dual_slot()
     test_unit_files()
     test_l2x_cli()

@@ -21,6 +21,74 @@ UA = {"User-Agent": "l2xpanel"}
 
 JOBS: dict[str, dict] = {}
 
+PANEL_SLOT_FILE = Path("/etc/l2xpanel/panel_slot")
+UPDATE_UNIT = "l2xpanel-update"
+UPDATE_LOG = Path("/var/log/l2xpanel-update.log")
+UPDATE_RC = Path("/run/l2xpanel-update.rc")
+# Shell snippet: resolve the active panel unit at run time (slot may change after scheduling).
+ACTIVE_UNIT_SH = ('u=l2xpanel; [ "$(tr -d "[:space:]" </etc/l2xpanel/panel_slot 2>/dev/null)" = next ] '
+                  '&& u=l2xpanel-next')
+
+
+def active_panel_unit() -> str:
+    """systemd unit currently serving the panel (dual-slot: l2xpanel or l2xpanel-next)."""
+    try:
+        if PANEL_SLOT_FILE.read_text(encoding="utf-8").strip() == "next":
+            return "l2xpanel-next"
+    except OSError:
+        pass
+    return "l2xpanel"
+
+
+def _in_panel_cgroup() -> bool:
+    """True when this process lives inside a panel unit — stopping that unit would kill our children."""
+    try:
+        cg = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "l2xpanel.service" in cg or "l2xpanel-next.service" in cg
+
+
+def _run_detached(cmd: list[str], env: dict, timeout: int = 900) -> dict:
+    """Run cmd in a transient systemd unit so it survives the panel unit being stopped.
+
+    The dual-slot cutover stops the old panel unit; with KillMode=control-group a plain
+    child of the panel would be killed mid-update and leave the panel down.
+    """
+    passthrough = ("L2X_BRANCH", "SKIP_XRAY", "XRAY_VERSION", "L2X_REPO", "PATH", "HOME")
+    try:
+        UPDATE_RC.unlink(missing_ok=True)
+    except OSError:
+        pass
+    quoted = " ".join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
+    script = (f"{quoted} >{UPDATE_LOG} 2>&1; rc=$?; echo $rc >{UPDATE_RC}; exit $rc")
+    run = ["systemd-run", f"--unit={UPDATE_UNIT}", "--collect", "--quiet",
+           "-p", "KillMode=process", "-p", f"RuntimeMaxSec={timeout}"]
+    for k in passthrough:
+        if env.get(k):
+            run.append(f"--setenv={k}={env[k]}")
+    run += ["/bin/bash", "-c", script]
+    started = _run(run, 30, env=env)
+    if not started["ok"]:
+        err = (started.get("stderr") or "").strip()
+        if "already" in err.lower() or "exists" in err.lower():
+            return {"ok": False, "code": 1, "stdout": "", "stderr": "обновление панели уже выполняется"}
+        return started
+    deadline = time.time() + timeout + 30
+    while time.time() < deadline:
+        if UPDATE_RC.is_file():
+            break
+        time.sleep(2)
+    try:
+        log = UPDATE_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log = ""
+    try:
+        code = int(UPDATE_RC.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return {"ok": False, "code": 124, "stdout": log, "stderr": "таймаут обновления панели"}
+    return {"ok": code == 0, "code": code, "stdout": log, "stderr": ""}
+
 
 def _run(
     cmd: list[str] | str,
@@ -184,14 +252,17 @@ def update_panel(version: str = "", *, skip_xray: bool | None = None, full: bool
             cmd.append("--full")
         if tag:
             cmd.append(tag)
-        r = _run(cmd, timeout=900, env=env)
     else:
         args = flag + (f" {tag}" if tag else "")
         script = (
             "curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
             f"| bash -s -- {args}"
         )
-        r = _run(["bash", "-lc", script], timeout=900, env=env)
+        cmd = ["bash", "-lc", script]
+    if _in_panel_cgroup() and shutil.which("systemd-run"):
+        r = _run_detached(cmd, env, timeout=900)
+    else:
+        r = _run(cmd, timeout=900, env=env)
     log = (r.get("stdout") or "")[-3000:] + ("\n" + (r.get("stderr") or "")[-1000:] if r.get("stderr") else "")
     # install.sh dies (nonzero) after successful rollback — treat as failed update
     rolled = "восстановлена" in (log or "").lower() or "rolled back" in (log or "").lower()
@@ -657,7 +728,7 @@ def issue_cert(domain: str, email: str) -> dict:
     crt, key = CERT_DIR / f"{domain}.crt", CERT_DIR / f"{domain}.key"
     r2 = _run([str(acme), "--install-cert", "-d", domain, "--fullchain-file", str(crt), "--key-file", str(key),
                "--reloadcmd", "systemctl restart xray; systemctl reload nginx 2>/dev/null; "
-                              "systemd-run --on-active=5 systemctl restart l2xpanel"],
+                              f"{ACTIVE_UNIT_SH}; systemd-run --on-active=5 systemctl restart $u"],
               120, env=env)
     log.append(r2["stdout"][-1500:])
     ok = crt.exists() and key.exists()

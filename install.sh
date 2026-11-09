@@ -984,7 +984,36 @@ summary() {
 }
 
 # ---------------------------------------------------------------- main
+detach_from_panel_cgroup() {
+  # Cutover stops the old panel unit; systemd kills its whole cgroup. When the update was
+  # started by the panel itself (master → agent), re-run in a transient unit that survives it.
+  [ "${L2X_DETACHED:-0}" = 1 ] && return 0
+  grep -qE 'l2xpanel(-next)?\.service' /proc/self/cgroup 2>/dev/null || return 0
+  command -v systemd-run >/dev/null 2>&1 || return 0
+  local tmp=/root/.l2x-install.sh log=/var/log/l2xpanel-update-sh.log rc a args=""
+  for a in "$@"; do
+    case "$a" in *[!A-Za-z0-9._-]*) return 0 ;; esac
+    args="$args $a"
+  done
+  curl -fsSL "${L2X_INSTALL_URL:-https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh}" -o "$tmp" \
+    || { warn "Не удалось скачать install.sh для detach — продолжаю в cgroup панели"; return 0; }
+  info "Обновление запущено из панели — выполняю вне её cgroup (systemd-run)"
+  set +e
+  systemd-run --unit=l2xpanel-update-sh --collect --quiet --wait -p KillMode=process \
+    --setenv=L2X_DETACHED=1 --setenv=L2X_BRANCH="$BRANCH" \
+    --setenv=SKIP_XRAY="${SKIP_XRAY:-}" --setenv=XRAY_VERSION="${XRAY_VERSION:-}" \
+    --setenv=L2X_REPO="$REPO_URL" \
+    /bin/bash -c "bash '$tmp'$args </dev/null >'$log' 2>&1"
+  rc=$?
+  set -e
+  cat "$log" 2>/dev/null || true
+  exit "$rc"
+}
+
 banner
+case " $* " in
+  *" --update "*|*" --update-full "*) detach_from_panel_cgroup "$@" ;;
+esac
 # Parse --update/--update-full [TAG] / --uninstall; TAG may be v1.9.72 (sets L2X_BRANCH).
 _args=("$@")
 _i=0

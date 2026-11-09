@@ -7374,7 +7374,7 @@ def _manage_action(action: str, payload: dict) -> dict:
         def _restart():
             import time as _t
             _t.sleep(1.5)
-            return ops._run(["systemctl", "restart", "l2xpanel"], 30)
+            return ops._run(["systemctl", "restart", ops.active_panel_unit()], 30)
         ops.start_job("panel-restart-remote", _restart)
         return {"ok": True, "error": "", "restarting": True}
 
