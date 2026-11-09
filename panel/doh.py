@@ -354,33 +354,11 @@ def _probe_query() -> bytes:
     return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + name + b"\x00\x01\x00\x01"
 
 
-def _env_quote(value: str) -> str:
-    """Quote a value for docker compose .env (safe with $, #, spaces, quotes)."""
-    s = str(value or "")
-    if re.fullmatch(r"[A-Za-z0-9_./:@%+=-]+", s):
-        return s
-    return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
-def _ftlconf_password_yaml(password: str) -> str:
-    """Embed password in compose.yml safely.
-
-    Docker Compose interpolates ``$VAR`` / ``${VAR}`` in the file *before* YAML
-    parse — even inside quotes — so every ``$`` must be written as ``$$``.
-    YAML single-quotes keep spaces / ``#`` / ``:`` literal.
-    """
-    raw = str(password or "").replace("\r", "").replace("\n", "")
-    escaped = raw.replace("$", "$$")
-    return "'" + escaped.replace("'", "''") + "'"
-
-
-def _compose_yml(password: str) -> str:
-    """Compose with password embedded (official Docker path for Pi-hole v6)."""
-    pwd_yaml = _ftlconf_password_yaml(password)
-    return f"""\
+COMPOSE_YML = """\
 # Managed by L2X Panel — Pi-hole + UDP DNS for DoH frontend
-# Password is embedded below (dollar-escaped for Compose). Do not reference
-# a .env variable here — Compose interpolation mangles secrets.
+# Admin password is set by: docker exec l2x-pihole pihole setpassword <pwd>
+# (panel runs as root). Do not pin FTLCONF_webserver_api_password — it makes
+# setpassword read-only / ignored.
 services:
   pihole:
     image: pihole/pihole:latest
@@ -388,7 +366,6 @@ services:
     restart: unless-stopped
     environment:
       TZ: Europe/Moscow
-      FTLCONF_webserver_api_password: {pwd_yaml}
       FTLCONF_dns_listeningMode: ALL
     ports:
       - "127.0.0.1:53:53/tcp"
@@ -402,16 +379,22 @@ services:
 """
 
 
+def _env_quote(value: str) -> str:
+    """Quote a value for .env backup (safe with $, #, spaces, quotes)."""
+    s = str(value or "")
+    if re.fullmatch(r"[A-Za-z0-9_./:@%+=-]+", s):
+        return s
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
 def write_compose(*, password: str = "") -> Path:
     COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
-    pwd = password or secrets.token_urlsafe(12)
-    (COMPOSE_DIR / "docker-compose.yml").write_text(_compose_yml(pwd), encoding="utf-8")
-    # Backup copy for operators (not referenced by compose — avoids interpolation)
+    (COMPOSE_DIR / "docker-compose.yml").write_text(COMPOSE_YML, encoding="utf-8")
     env = COMPOSE_DIR / ".env"
+    pwd = password or secrets.token_urlsafe(12)
     env.write_text(f"PIHOLE_PASSWORD={_env_quote(pwd)}\n", encoding="utf-8")
     try:
         os.chmod(env, 0o600)
-        os.chmod(COMPOSE_DIR / "docker-compose.yml", 0o600)
     except OSError:
         pass
     return COMPOSE_DIR
@@ -431,36 +414,14 @@ def _compose_base() -> list[str] | None:
     return None
 
 
-def wait_pihole_http(*, cfg: dict | None = None, timeout: float = 60) -> dict:
-    """Wait until local Pi-hole web/API answers (after up/recreate)."""
-    cfg = {**default_settings(), **(cfg or {})}
-    deadline = time.time() + max(5.0, float(timeout))
-    last = "timeout"
-    while time.time() < deadline:
-        r = _pihole_http("GET", "/api/auth", cfg=cfg, timeout=3)
-        if r.get("status") in (200, 401) or r.get("ok"):
-            return {"ok": True, "error": ""}
-        last = str(r.get("error") or f"HTTP {r.get('status') or '?'}")
-        time.sleep(1.5)
-    return {"ok": False, "error": last}
-
-
-def verify_pihole_password(password: str, *, cfg: dict | None = None, retries: int = 8) -> dict:
-    """Check that Pi-hole accepts this admin password via /api/auth."""
-    cfg = {**default_settings(), **(cfg or {}), "pihole_password": str(password or "")}
-    invalidate_pihole_session(cfg)
-    last = "auth failed"
-    for i in range(max(1, int(retries))):
-        r = _pihole_http("POST", "/api/auth", cfg=cfg, body={"password": str(password or "")}, timeout=8)
-        if r.get("ok"):
-            sess = (r.get("data") or {}).get("session") or {}
-            if sess.get("valid") or sess.get("sid"):
-                return {"ok": True, "error": ""}
-            last = "Pi-hole отклонил пароль"
-        else:
-            last = str(r.get("error") or f"HTTP {r.get('status') or '?'}")
-        time.sleep(1.2 + i * 0.3)
-    return {"ok": False, "error": last}
+def _compose_pins_ftlconf_password() -> bool:
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    if not yml.is_file():
+        return False
+    try:
+        return "FTLCONF_webserver_api_password:" in yml.read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def pihole_ready() -> dict:
@@ -561,63 +522,70 @@ def install_pihole(*, password: str = "") -> dict:
 
 
 def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
-    """Apply admin password the Docker-supported way and verify /api/auth.
+    """Set Pi-hole admin password via ``docker exec … pihole setpassword`` (root).
 
-    Embed FTLCONF_webserver_api_password in compose.yml with $$ escaping
-    (never interpolate from .env), force-recreate, wait, verify login.
-    update_env kept for call-site compat; compose is always rewritten.
+    No FTLCONF env password — that makes setpassword ignored. If an old compose
+    still pins FTLCONF_webserver_api_password, strip it and recreate once.
     """
     pwd = str(password or "").replace("\r", "").replace("\n", "")
     if not pwd:
         return {"ok": False, "error": "пустой пароль"}
     if not shutil.which("docker"):
         return {"ok": False, "error": "docker не установлен"}
-    _ = update_env  # always rewrite compose with embedded password
-    write_compose(password=pwd)
+
+    COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    need_recreate = (not yml.is_file()) or _compose_pins_ftlconf_password()
+    if need_recreate:
+        # Drop FTLCONF password pin so setpassword is not ignored
+        write_compose(password=pwd)
+    elif update_env:
+        if not yml.is_file():
+            write_compose(password=pwd)
+        else:
+            env = COMPOSE_DIR / ".env"
+            env.write_text(f"PIHOLE_PASSWORD={_env_quote(pwd)}\n", encoding="utf-8")
+            try:
+                os.chmod(env, 0o600)
+            except OSError:
+                pass
 
     base = _compose_base()
     if not base:
         return {"ok": False, "error": "docker compose недоступен"}
 
-    # Env password is only applied when the container is (re)created
-    up = _run(
-        [*base, "up", "-d", "--force-recreate", "pihole"],
-        timeout=180,
-        cwd=str(COMPOSE_DIR),
-    )
+    up_cmd = [*base, "up", "-d"]
+    if need_recreate:
+        up_cmd.append("--force-recreate")
+    up_cmd.append("pihole")
+    up = _run(up_cmd, timeout=180, cwd=str(COMPOSE_DIR))
     if not up["ok"]:
-        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "recreate failed").strip(), "log": up}
+        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "up failed").strip(), "log": up}
 
-    ready = wait_pihole_http(timeout=90)
-    if not ready.get("ok"):
-        return {
-            "ok": False,
-            "error": f"Pi-hole не отвечает после запуска: {ready.get('error') or 'timeout'}",
-            "log": (up.get("stdout") or "").strip(),
-        }
+    # Wait until container is running, then setpassword as root via docker exec
+    for _ in range(30):
+        st = _run(["docker", "inspect", "-f", "{{.State.Running}}", "l2x-pihole"], timeout=15)
+        if st.get("ok") and "true" in (st.get("stdout") or "").lower():
+            break
+        time.sleep(1)
+    else:
+        return {"ok": False, "error": "контейнер l2x-pihole не запущен", "log": up}
 
-    check = verify_pihole_password(pwd, retries=10)
-    if check.get("ok"):
-        return {"ok": True, "log": (up.get("stdout") or "").strip()}
-
-    # Fallback: some images still honor CLI into the volume if env did not stick
-    sp = _run(["docker", "exec", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
+    time.sleep(2)
+    # argv — no shell; panel service is root so docker.sock works
+    sp = _run(["docker", "exec", "-u", "0", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
     if not sp.get("ok"):
-        _run(
-            ["docker", "exec", "l2x-pihole", "pihole-FTL", "--config", "webserver.api.password", pwd],
-            timeout=60,
-        )
-    check2 = verify_pihole_password(pwd, retries=6)
-    if check2.get("ok"):
-        return {"ok": True, "log": (up.get("stdout") or "").strip(), "via": "setpassword-fallback"}
-    return {
-        "ok": False,
-        "error": f"пароль не принят Pi-hole API: {check2.get('error') or check.get('error') or 'HTTP 401'}",
-        "log": {
-            "up": (up.get("stdout") or "")[-500:],
-            "setpassword": (sp.get("stderr") or sp.get("stdout") or "")[-300:],
-        },
-    }
+        sp = _run(["docker", "exec", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
+    if not sp.get("ok"):
+        err = (sp.get("stderr") or sp.get("stdout") or "setpassword failed").strip()
+        return {"ok": False, "error": err, "log": sp}
+
+    try:
+        invalidate_pihole_session()
+    except Exception:
+        pass
+    log = ((up.get("stdout") or "") + "\n" + (sp.get("stdout") or "") + (sp.get("stderr") or "")).strip()
+    return {"ok": True, "log": log[-2000:]}
 
 
 def stop_pihole() -> dict:
