@@ -991,6 +991,13 @@ def client_inbounds(store: dict, client: dict) -> list[dict]:
 
 RESET_PERIODS = {"": None, "daily": 1, "weekly": 7, "monthly": 30}
 
+# What to do when expire_at / total limit_gb is hit.
+# block  — keep client, deny access (default)
+# disable — set enabled=False
+# delete — remove client
+# renew  — reset traffic counters and start a new period (same limit_gb / duration)
+LIMIT_ACTIONS = ("block", "disable", "delete", "renew")
+
 
 def ensure_client(client: dict) -> dict:
     client.setdefault("uuid", str(uuid.uuid4()))
@@ -999,12 +1006,19 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("outbound", "direct")
     client.setdefault("inbounds", [])
     client.setdefault("limit_gb", 0)
+    client.setdefault("daily_limit_gb", 0)
     client.setdefault("expire_at", "")
     client.setdefault("start_on_first_use", False)
     client.setdefault("duration_days", 0)
     client.setdefault("reset_period", "")
     client.setdefault("next_reset", "")
     client.setdefault("renew_on_reset", False)
+    client.setdefault("on_expire", "block")
+    client.setdefault("on_quota", "block")
+    if client.get("on_expire") not in LIMIT_ACTIONS:
+        client["on_expire"] = "block"
+    if client.get("on_quota") not in LIMIT_ACTIONS:
+        client["on_quota"] = "block"
     client.setdefault("limit_ip", 0)
     client.setdefault("limit_hwid", 0)
     client.setdefault("hwids", [])
@@ -1016,6 +1030,7 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("tg_fio", "")
     client.setdefault("allowed_tags", [])
     client.setdefault("outbound_limits", {})
+    client.setdefault("daily_outbound_limits", {})
     client.setdefault("sub_enabled", True)
     client.setdefault("doh_enabled", False)
     client.setdefault("doh_in_tunnel", False)
@@ -1028,6 +1043,7 @@ def ensure_client(client: dict) -> dict:
     traffic.setdefault("up", 0)
     traffic.setdefault("down", 0)
     traffic.setdefault("by_email", {})
+    _ensure_daily_bucket(client)
     return client
 
 
@@ -1077,6 +1093,39 @@ def client_remaining_gb(client: dict) -> float | None:
     return left / (1024 ** 3)
 
 
+def _utc_day(now: datetime | None = None) -> str:
+    return (now or now_utc()).strftime("%Y-%m-%d")
+
+
+def _ensure_daily_bucket(client: dict, now: datetime | None = None) -> dict:
+    """Roll calendar-day counters (UTC). Same limit_gb/daily_* values apply to the new day."""
+    day = _utc_day(now)
+    d = client.setdefault("daily_traffic", {})
+    if d.get("day") != day:
+        d.clear()
+        d["day"] = day
+        d["up"] = 0
+        d["down"] = 0
+        d["by_tag"] = {}
+        client["daily_exceeded"] = False
+        client["daily_tag_exceeded"] = {}
+    d.setdefault("by_tag", {})
+    d.setdefault("up", 0)
+    d.setdefault("down", 0)
+    return d
+
+
+def client_daily_used_bytes(client: dict) -> int:
+    d = _ensure_daily_bucket(client)
+    return int(d.get("up") or 0) + int(d.get("down") or 0)
+
+
+def client_daily_tag_used_bytes(client: dict, tag: str) -> int:
+    d = _ensure_daily_bucket(client)
+    row = (d.get("by_tag") or {}).get(tag) or {}
+    return int(row.get("up") or 0) + int(row.get("down") or 0)
+
+
 def client_tag_used_bytes(client: dict, tag: str) -> int:
     by = ensure_client(client)["traffic"].get("by_email") or {}
     email = client.get("email") or ""
@@ -1100,20 +1149,39 @@ def client_total_exceeded(client: dict) -> bool:
     return bool(limit and client_used_bytes(client) >= limit)
 
 
+def client_daily_exceeded(client: dict) -> bool:
+    limit = gb_to_bytes(client.get("daily_limit_gb"))
+    return bool(limit and client_daily_used_bytes(client) >= limit)
+
+
 def client_tag_exceeded(client: dict, tag: str) -> bool:
     limit = gb_to_bytes((client.get("outbound_limits") or {}).get(tag))
     return bool(limit and client_tag_used_bytes(client, tag) >= limit)
 
 
+def client_daily_tag_exceeded(client: dict, tag: str) -> bool:
+    limit = gb_to_bytes((client.get("daily_outbound_limits") or {}).get(tag))
+    return bool(limit and client_daily_tag_used_bytes(client, tag) >= limit)
+
+
 def client_access_ok(client: dict) -> bool:
-    return bool(client.get("enabled", True)) and not client_is_expired(client) and not client_total_exceeded(client)
+    return (
+        bool(client.get("enabled", True))
+        and not client_is_expired(client)
+        and not client_total_exceeded(client)
+        and not client_daily_exceeded(client)
+    )
 
 
 def tag_allowed_for_client(client: dict, tag: str) -> bool:
     allowed = client.get("allowed_tags") or []
     if allowed and tag not in allowed:
         return False
-    return not client_tag_exceeded(client, tag)
+    if client_tag_exceeded(client, tag):
+        return False
+    if client_daily_tag_exceeded(client, tag):
+        return False
+    return True
 
 
 def client_status(client: dict) -> str:
@@ -1123,7 +1191,34 @@ def client_status(client: dict) -> str:
         return "expired"
     if client_total_exceeded(client):
         return "limited"
+    if client_daily_exceeded(client):
+        return "daily_limited"
     return "active"
+
+
+def _renew_days(client: dict) -> int:
+    """Length of the next paid period for renew actions."""
+    days = int(client.get("duration_days") or 0)
+    if days > 0:
+        return days
+    period = client.get("reset_period") or ""
+    mapped = RESET_PERIODS.get(period)
+    if mapped:
+        return int(mapped)
+    return 30
+
+
+def renew_client_period(client: dict, *, now: datetime | None = None) -> None:
+    """Reset GB counters and start a new expire window with the same limits."""
+    now = now or now_utc()
+    reset_client_traffic(client)
+    days = _renew_days(client)
+    client["expire_at"] = (now + timedelta(days=days)).isoformat(timespec="seconds")
+    client["start_on_first_use"] = False
+    client["expired"] = False
+    client["quota_exceeded"] = False
+    if client.get("reset_period"):
+        client["next_reset"] = _period_delta(client["reset_period"], now).isoformat(timespec="seconds")
 
 
 def selectable_outbound_tags(store: dict) -> list[dict]:
@@ -1185,12 +1280,18 @@ def client_identities(store: dict, client: dict, ib: dict) -> list[dict]:
 
 
 def tag_quota_suffix(client: dict, tag: str) -> str:
+    bits: list[str] = []
     limits = client.get("outbound_limits") or {}
     limit = gb_to_bytes(limits.get(tag))
-    if limit <= 0:
-        return ""
-    used = client_tag_used_bytes(client, tag)
-    return f" · {format_traffic(used)} / {float(limits[tag]):g} ГБ · ост. {format_traffic(max(limit - used, 0))}"
+    if limit > 0:
+        used = client_tag_used_bytes(client, tag)
+        bits.append(f"{format_traffic(used)} / {float(limits[tag]):g} ГБ · ост. {format_traffic(max(limit - used, 0))}")
+    dlimits = client.get("daily_outbound_limits") or {}
+    dlim = gb_to_bytes(dlimits.get(tag))
+    if dlim > 0:
+        dused = client_daily_tag_used_bytes(client, tag)
+        bits.append(f"день {format_traffic(dused)} / {float(dlimits[tag]):g} ГБ")
+    return (" · " + " · ".join(bits)) if bits else ""
 
 
 def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
@@ -1814,16 +1915,27 @@ def harvest_traffic(store: dict) -> bool:
                     changed = True
         emails = {client["email"]} | {e["email"] for e in subscription_entries(store, client, ignore_quota=True)}
         active = False
+        daily = _ensure_daily_bucket(client)
         for email in emails:
             cur = users.get(email)
             if not cur:
                 continue
             row = by.setdefault(email, {"up": 0, "down": 0, "last_up": 0, "last_down": 0})
-            before = int(row.get("up") or 0) + int(row.get("down") or 0)
+            before_up = int(row.get("up") or 0)
+            before_down = int(row.get("down") or 0)
             if _accumulate(row, cur["up"], cur["down"]):
                 changed = True
-            if int(row.get("up") or 0) + int(row.get("down") or 0) > before:
+            d_up = int(row.get("up") or 0) - before_up
+            d_down = int(row.get("down") or 0) - before_down
+            if d_up or d_down:
                 active = True
+                daily["up"] = int(daily.get("up") or 0) + max(0, d_up)
+                daily["down"] = int(daily.get("down") or 0) + max(0, d_down)
+                tag = email.split("~", 1)[1] if "~" in email else (client.get("outbound") or "direct")
+                trow = daily.setdefault("by_tag", {}).setdefault(tag, {"up": 0, "down": 0})
+                trow["up"] = int(trow.get("up") or 0) + max(0, d_up)
+                trow["down"] = int(trow.get("down") or 0) + max(0, d_down)
+                changed = True
         if by:
             up = sum(int(r.get("up") or 0) for r in by.values())
             down = sum(int(r.get("down") or 0) for r in by.values())
@@ -1856,6 +1968,14 @@ def reset_client_traffic(client: dict) -> None:
     client["traffic"]["up"] = client["traffic"]["down"] = 0
     client["quota_exceeded"] = False
     client["tag_exceeded"] = {}
+    # Fresh daily bucket for the current UTC day
+    d = client.setdefault("daily_traffic", {})
+    d.clear()
+    d["day"] = _utc_day()
+    d["up"] = d["down"] = 0
+    d["by_tag"] = {}
+    client["daily_exceeded"] = False
+    client["daily_tag_exceeded"] = {}
     # Allow a fresh one-shot low-traffic Telegram alert after reset
     client.pop("tg_notify_low_gb", None)
 
@@ -1873,13 +1993,35 @@ def _period_delta(period: str, base: datetime) -> datetime:
     return base + timedelta(days=days)
 
 
+def _apply_limit_action(client: dict, *, kind: str, action: str, now: datetime, events: list[dict]) -> str | None:
+    """Apply on_expire / on_quota action. Returns email if client should be deleted."""
+    action = action if action in LIMIT_ACTIONS else "block"
+    email = client.get("email") or ""
+    if action == "renew":
+        renew_client_period(client, now=now)
+        events.append({"type": "renewed", "email": email, "reason": kind, "days": _renew_days(client)})
+        return None
+    if action == "disable":
+        if client.get("enabled", True):
+            client["enabled"] = False
+            events.append({"type": "auto_disable", "email": email, "reason": kind})
+        return None
+    if action == "delete":
+        events.append({"type": "auto_delete", "email": email, "reason": kind})
+        return email
+    # block — flag only; access denied via client_access_ok
+    return None
+
+
 def enforce_quotas(store: dict) -> bool:
-    """Delayed start, auto-reset, expiry and quota flags. True → Xray rebuild needed."""
+    """Delayed start, auto-reset, daily roll, expiry/quota actions. True → Xray rebuild needed."""
     changed = False
     events: list[dict] = store.setdefault("_events", [])
     now = now_utc()
+    to_delete: list[str] = []
     for client in store.get("clients") or []:
         ensure_client(client)
+        _ensure_daily_bucket(client, now)
         if client.get("start_on_first_use") and not client.get("expire_at") and client_used_bytes(client) > 0:
             days = int(client.get("duration_days") or 0)
             if days > 0:
@@ -1899,12 +2041,49 @@ def enforce_quotas(store: dict) -> bool:
                 client["next_reset"] = _period_delta(period, now).isoformat(timespec="seconds")
                 events.append({"type": "auto_reset", "email": client["email"]})
                 changed = True
-        for flag, value in (("expired", client_is_expired(client)), ("quota_exceeded", client_total_exceeded(client))):
-            if bool(client.get(flag)) != value:
-                client[flag] = value
-                changed = True
-                if value:
-                    events.append({"type": flag, "email": client["email"]})
+
+        # Expire action (renew may clear expired in the same cycle)
+        was_expired = bool(client.get("expired"))
+        is_expired = client_is_expired(client, now)
+        if is_expired and not was_expired:
+            victim = _apply_limit_action(
+                client, kind="expire", action=str(client.get("on_expire") or "block"), now=now, events=events,
+            )
+            if victim:
+                to_delete.append(victim)
+            changed = True
+            is_expired = client_is_expired(client, now)
+        if bool(client.get("expired")) != is_expired:
+            client["expired"] = is_expired
+            changed = True
+            if is_expired:
+                events.append({"type": "expired", "email": client["email"]})
+
+        # Total GB quota action
+        was_quota = bool(client.get("quota_exceeded"))
+        is_quota = client_total_exceeded(client)
+        if is_quota and not was_quota:
+            victim = _apply_limit_action(
+                client, kind="quota", action=str(client.get("on_quota") or "block"), now=now, events=events,
+            )
+            if victim:
+                to_delete.append(victim)
+            changed = True
+            is_quota = client_total_exceeded(client)
+        if bool(client.get("quota_exceeded")) != is_quota:
+            client["quota_exceeded"] = is_quota
+            changed = True
+            if is_quota:
+                events.append({"type": "quota_exceeded", "email": client["email"]})
+
+        # Daily total (auto-lifts next UTC day — no destructive action)
+        daily_hit = client_daily_exceeded(client)
+        if bool(client.get("daily_exceeded")) != daily_hit:
+            client["daily_exceeded"] = daily_hit
+            changed = True
+            if daily_hit:
+                events.append({"type": "daily_exceeded", "email": client["email"]})
+
         flags = client.setdefault("tag_exceeded", {})
         for tag in set((client.get("outbound_limits") or {}).keys()) | set(client.get("allowed_tags") or []):
             hit = client_tag_exceeded(client, tag)
@@ -1913,6 +2092,23 @@ def enforce_quotas(store: dict) -> bool:
                 changed = True
                 if hit:
                     events.append({"type": "tag_exceeded", "email": client["email"], "tag": tag})
+
+        dflags = client.setdefault("daily_tag_exceeded", {})
+        for tag in set((client.get("daily_outbound_limits") or {}).keys()) | set(client.get("allowed_tags") or []):
+            hit = client_daily_tag_exceeded(client, tag)
+            if bool(dflags.get(tag)) != hit:
+                dflags[tag] = hit
+                changed = True
+                if hit:
+                    events.append({"type": "daily_tag_exceeded", "email": client["email"], "tag": tag})
+
+    if to_delete:
+        drop = set(to_delete)
+        before = len(store.get("clients") or [])
+        store["clients"] = [c for c in (store.get("clients") or []) if c.get("email") not in drop]
+        if len(store["clients"]) != before:
+            changed = True
+
     for ib in ensure_inbounds(store):
         period = ib.get("traffic_reset") or "never"
         if period and period != "never":

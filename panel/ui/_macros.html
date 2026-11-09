@@ -2,6 +2,7 @@
 {%- if status == 'active' -%}<span class="badge ok">активен</span>
 {%- elif status == 'expired' -%}<span class="badge err">истёк</span>
 {%- elif status == 'limited' -%}<span class="badge warn">лимит</span>
+{%- elif status == 'daily_limited' -%}<span class="badge warn">день</span>
 {%- elif status == 'disabled' -%}<span class="badge">выключен</span>
 {%- elif status == 'connected' -%}<span class="badge ok">connected</span>
 {%- elif status == 'error' -%}<span class="badge err">error</span>

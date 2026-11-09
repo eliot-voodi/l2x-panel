@@ -56,7 +56,7 @@
 {% block content %}
 <div class="flex between mb0 clients-toolbar" style="flex-wrap:wrap;margin-bottom:1rem">
   <div class="seg">
-    {% for key, label in [('', t('Все')), ('online', t('Онлайн')), ('active', t('Активные')), ('expired', t('Истёкшие')), ('limited', t('Исчерпан')), ('disabled', t('Отключённые'))] %}
+    {% for key, label in [('', t('Все')), ('online', t('Онлайн')), ('active', t('Активные')), ('expired', t('Истёкшие')), ('limited', t('Исчерпан')), ('daily_limited', 'День'), ('disabled', t('Отключённые'))] %}
     <a href="?status={{ key }}&q={{ q }}" class="{% if status == key %}active{% endif %}">{{ label }}</a>
     {% endfor %}
   </div>

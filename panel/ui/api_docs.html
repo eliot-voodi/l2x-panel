@@ -24,7 +24,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
       ('GET', 'inbounds/onlines', 'Онлайн-клиенты: {email: [ip, …]}'),
       ('GET', 'clients/list', 'Все клиенты (статус, трафик, лимиты, ссылка подписки)'),
       ('GET', 'clients/get/{email}', 'Один клиент'),
-      ('POST', 'clients/add', 'Создать: email (обязательно), uuid, outbound, enabled, limit_gb, expire_at, limit_ip, limit_hwid, comment, tg_id, inbounds[], reset_period, renew_on_reset, start_on_first_use, duration_days, allowed_tags[], outbound_limits{tag: gb}, sub_enabled'),
+      ('POST', 'clients/add', 'Создать: email (обязательно), uuid, outbound, enabled, limit_gb, daily_limit_gb, expire_at, limit_ip, limit_hwid, comment, tg_id, inbounds[], reset_period, renew_on_reset, on_expire, on_quota, start_on_first_use, duration_days, allowed_tags[], outbound_limits{tag: gb}, daily_outbound_limits{tag: gb}, sub_enabled'),
       ('POST', 'clients/update/{email}', 'Изменить любые из полей выше'),
       ('POST|DELETE', 'clients/delete/{email}', 'Удалить клиента'),
       ('POST', 'clients/reset/{email}', 'Сбросить трафик клиента'),

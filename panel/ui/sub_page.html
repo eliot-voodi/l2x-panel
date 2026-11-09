@@ -30,7 +30,8 @@
         <div style="font-size:1.4rem;font-weight:700">{{ client.email }}</div>
         <div class="mt">
           {% if status == 'active' %}<span class="badge ok">активна</span>{% elif status == 'expired' %}<span class="badge err">срок истёк</span>
-          {% elif status == 'limited' %}<span class="badge warn">трафик исчерпан</span>{% else %}<span class="badge">отключена</span>{% endif %}
+          {% elif status == 'limited' %}<span class="badge warn">трафик исчерпан</span>
+          {% elif status == 'daily_limited' %}<span class="badge warn">дневной лимит</span>{% else %}<span class="badge">отключена</span>{% endif %}
         </div>
       </div>
       <div class="grid g2" style="flex:1.4;min-width:280px">

@@ -77,7 +77,10 @@
   <div class="card">
     <h3>Лимиты и срок</h3>
     <div class="row">
-      <div><label class="f">Общий лимит трафика, GB</label><input name="limit_gb" type="number" step="0.01" min="0" value="{{ c.limit_gb or '' }}" placeholder="∞"></div>
+      <div><label class="f">Общий лимит трафика, GB</label><input name="limit_gb" type="number" step="0.01" min="0" value="{{ c.limit_gb or '' }}" placeholder="∞">
+        <div class="hint">За весь период до сброса / истечения срока.</div></div>
+      <div><label class="f">Дневной лимит, GB</label><input name="daily_limit_gb" type="number" step="0.01" min="0" value="{{ c.daily_limit_gb or '' }}" placeholder="∞">
+        <div class="hint">Счётчик за календарный день (UTC). Завтра снова полный лимит.</div></div>
       <div><label class="f">Лимит одновременных IP</label><input name="limit_ip" type="number" min="0" value="{{ c.limit_ip or '' }}" placeholder="∞"></div>
       <div><label class="f">Лимит устройств HWID</label><input name="limit_hwid" type="number" min="0" value="{{ c.limit_hwid or '' }}" placeholder="∞">
         <div class="hint">0 = без лимита. Считается при обновлении подписки: по X-HWID, а у приложений без него — по приложению, ОС и модели (Настройки → Подписки).</div></div>
@@ -91,16 +94,33 @@
     </div>
     <div class="row">
       <div>{{ m.check('start_on_first_use', c.start_on_first_use, 'Отложенный старт: срок с первого подключения') }}</div>
-      <div><label class="f">Длительность, дней</label><input name="duration_days" type="number" min="0" value="{{ c.duration_days or '' }}"></div>
+      <div><label class="f">Длительность периода, дней</label><input name="duration_days" type="number" min="0" value="{{ c.duration_days or '' }}">
+        <div class="hint">Для отложенного старта и действия «обновить период» (renew).</div></div>
     </div>
     <div class="row">
-      <div><label class="f">Авто-сброс трафика</label>
+      <div><label class="f">Авто-сброс счётчика GB</label>
         <select name="reset_period">
           {% for k, l in [('', 'нет'), ('daily', 'ежедневно'), ('weekly', 'еженедельно'), ('monthly', 'ежемесячно')] %}<option value="{{ k }}" {% if c.reset_period == k %}selected{% endif %}>{{ l }}</option>{% endfor %}
         </select>
         {% if c.next_reset %}<div class="hint">следующий: {{ fmt_dt(c.next_reset) }}</div>{% endif %}
+        <div class="hint">Обнуляет потраченные GB, сам лимит (числа выше) остаётся прежним — начинается новый период учёта.</div>
       </div>
-      <div>{{ m.check('renew_on_reset', c.renew_on_reset, 'При сбросе продлевать срок на период') }}</div>
+      <div>{{ m.check('renew_on_reset', c.renew_on_reset, 'При авто-сбросе также продлевать «действует до»') }}</div>
+    </div>
+    <div class="row">
+      <div><label class="f">При истечении срока</label>
+        <select name="on_expire">
+          {% for k, l in [('block', 'блокировать доступ'), ('renew', 'обновить период: сброс GB + новый срок'), ('disable', 'выключить клиента'), ('delete', 'удалить клиента')] %}
+          <option value="{{ k }}" {% if (c.on_expire or 'block') == k %}selected{% endif %}>{{ l }}</option>{% endfor %}
+        </select>
+      </div>
+      <div><label class="f">При исчерпании общего лимита GB</label>
+        <select name="on_quota">
+          {% for k, l in [('block', 'блокировать доступ'), ('renew', 'сброс GB + новый период'), ('disable', 'выключить клиента'), ('delete', 'удалить клиента')] %}
+          <option value="{{ k }}" {% if (c.on_quota or 'block') == k %}selected{% endif %}>{{ l }}</option>{% endfor %}
+        </select>
+        <div class="hint">«Обновить период» обнуляет трафик и ставит новый срок = сейчас + длительность (или период авто-сброса / 30 дн).</div>
+      </div>
     </div>
   </div>
 
@@ -129,19 +149,29 @@
       <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
     </div>
     <table>
-      <thead><tr><th><input type="checkbox" data-master="allowed_tags" data-mode="select_mode" title="Выделить все / снять все"></th><th>Подключение</th>{% if not is_new %}<th>Потрачено</th>{% endif %}<th style="width:140px">Лимит, GB</th></tr></thead>
+      <thead><tr>
+        <th><input type="checkbox" data-master="allowed_tags" data-mode="select_mode" title="Выделить все / снять все"></th>
+        <th>Подключение</th>
+        {% if not is_new %}<th>Потрачено</th><th>Сегодня</th>{% endif %}
+        <th style="width:120px">Лимит, GB</th>
+        <th style="width:120px">День, GB</th>
+      </tr></thead>
       <tbody>
       {% for tg in tags %}
         <tr>
           <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if not c.allowed_tags or tg.tag in c.allowed_tags %}checked{% endif %}></td>
           <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
-          {% if not is_new %}<td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>{% endif %}
-          <td><input name="limit_{{ tg.tag }}" type="number" step="0.01" min="0" value="{{ tg.limit if tg.limit is defined else (c.outbound_limits.get(tg.tag) or '') }}" placeholder="∞"></td>
+          {% if not is_new %}
+          <td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>
+          <td class="small nowrap">{{ format_traffic(tg.daily_used) }}{% if tg.daily_exceeded %} <span class="badge warn">день</span>{% endif %}</td>
+          {% endif %}
+          <td><input name="limit_{{ tg.tag }}" type="number" step="0.01" min="0" value="{{ tg.limit if tg.limit is defined else ((c.outbound_limits or {}).get(tg.tag) or '') }}" placeholder="∞"></td>
+          <td><input name="daily_limit_{{ tg.tag }}" type="number" step="0.01" min="0" value="{{ tg.daily_limit if tg.daily_limit is defined else ((c.daily_outbound_limits or {}).get(tg.tag) or '') }}" placeholder="∞"></td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
-    <div class="hint">Лимит по подключению считается отдельно от общего; в подписке строка показывает «потрачено / осталось».</div>
+    <div class="hint">Лимиты по outbound отдельно от общего. Дневной — сброс в 00:00 UTC. Исчерпанный outbound пропадает из подписки до обновления лимита.</div>
   </div>
 
   <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/clients">{{ t('Отмена') }}</a></div>
@@ -152,13 +182,14 @@
   <div class="card">
     <h3>{{ t('Трафик') }}</h3>
     <div class="flex between"><div class="stat"><div class="value">{{ format_traffic(row.used) }}</div>
-      <div class="hint">↑{{ format_traffic(c.traffic.up) }} ↓{{ format_traffic(c.traffic.down) }}{% if c.limit_gb %} · лимит {{ c.limit_gb }} GB{% endif %}</div></div>
+      <div class="hint">↑{{ format_traffic(c.traffic.up) }} ↓{{ format_traffic(c.traffic.down) }}{% if c.limit_gb %} · лимит {{ c.limit_gb }} GB{% endif %}{% if c.daily_limit_gb %} · день {{ format_traffic(row.daily_used) }} / {{ c.daily_limit_gb }} GB{% endif %}</div></div>
       <div class="right small">
         <div>{% if c.expire_at %}до {{ fmt_dt(c.expire_at) }}{% elif c.start_on_first_use %}{{ c.duration_days }} дн с 1-го подключения{% else %}бессрочно{% endif %}</div>
         <div class="dim">создан {{ fmt_dt(c.created_at, False) }}</div>
       </div>
     </div>
     {{ m.progress(row.used, row.limit_bytes) }}
+    {% if row.daily_limit_bytes %}<div class="hint mt">День (UTC)</div>{{ m.progress(row.daily_used, row.daily_limit_bytes) }}{% endif %}
     <div class="mt small"><b>Онлайн:</b> {% if row.online_ips %}<span class="mono">{{ row.online_ips|join(', ') }}</span>{% else %}нет · был {{ ago(c.last_online) }}{% endif %}</div>
   </div>
 

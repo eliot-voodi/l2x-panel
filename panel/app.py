@@ -943,6 +943,9 @@ def _client_summary(c: dict) -> str:
             traffic += f"\nОсталось: <b>{rem:.2f} ГБ</b>"
     else:
         traffic = f"Трафик: {xray.format_traffic(used)} / ∞"
+    if c.get("daily_limit_gb"):
+        dused = xray.client_daily_used_bytes(c)
+        traffic += f"\nДень: {xray.format_traffic(dused)} / {c['daily_limit_gb']:g} ГБ"
     left = xray.days_left(c)
     if c.get("expire_at"):
         expire = f"Срок: {fmt_dt(c.get('expire_at'))}"
@@ -1166,26 +1169,38 @@ def _notify_events(events: list[dict]) -> None:
     s = _bot_settings()
     for e in events:
         typ = e.get("type")
-        if typ in ("expired", "quota_exceeded", "tag_exceeded", "auto_reset") and s.get("notify_quota"):
+        if typ in (
+            "expired", "quota_exceeded", "tag_exceeded", "auto_reset",
+            "daily_exceeded", "daily_tag_exceeded", "renewed", "auto_disable", "auto_delete",
+        ) and s.get("notify_quota"):
             text = {
                 "expired": f"⏰ {e['email']}: срок истёк",
                 "quota_exceeded": f"📛 {e['email']}: исчерпан общий лимит трафика",
                 "tag_exceeded": f"📛 {e['email']}: исчерпан лимит на {e.get('tag')}",
+                "daily_exceeded": f"📅 {e['email']}: исчерпан дневной лимит",
+                "daily_tag_exceeded": f"📅 {e['email']}: дневной лимит на {e.get('tag')}",
                 "auto_reset": f"🔄 {e['email']}: трафик сброшен по расписанию",
-            }[typ]
+                "renewed": f"♻️ {e['email']}: новый период (+{e.get('days') or '?'} дн), трафик обнулён ({e.get('reason')})",
+                "auto_disable": f"⛔️ {e['email']}: отключён ({e.get('reason')})",
+                "auto_delete": f"🗑 {e['email']}: удалён ({e.get('reason')})",
+            }.get(typ) or f"{e.get('email')}: {typ}"
             BOT.send(text)
             # Also notify the linked subscriber
             email = e.get("email")
-            if email and typ in ("expired", "quota_exceeded", "auto_reset"):
+            if email and typ in ("expired", "quota_exceeded", "auto_reset", "daily_exceeded", "renewed", "auto_disable"):
                 store = _load_store()
                 c = next((x for x in store.get("clients") or [] if x.get("email") == email), None)
                 if c and c.get("tg_id"):
                     user_text = {
                         "expired": f"⏰ Срок вашей подписки <b>{email}</b> истёк.",
                         "quota_exceeded": f"📛 Трафик по подписке <b>{email}</b> исчерпан.",
+                        "daily_exceeded": f"📅 Дневной лимит по подписке <b>{email}</b> исчерпан. Завтра лимит обновится.",
                         "auto_reset": f"🔄 Трафик по подписке <b>{email}</b> сброшен по расписанию.",
-                    }[typ]
-                    BOT.send(user_text + "\n\n" + _client_summary(c), c["tg_id"])
+                        "renewed": f"♻️ Подписка <b>{email}</b> продлена, счётчик трафика обнулён.",
+                        "auto_disable": f"⛔️ Подписка <b>{email}</b> отключена.",
+                    }.get(typ)
+                    if user_text:
+                        BOT.send(user_text + "\n\n" + _client_summary(c), c["tg_id"])
         elif typ == "ip_ban" and s.get("notify_iplimit"):
             BOT.send(f"🚫 {e['email']}: превышен лимит IP, заблокирован {e['ip']}")
         elif typ == "tunnel_down" and s.get("notify_tunnel"):
@@ -2686,8 +2701,12 @@ def inbound_export(ib_id: int, request: Request):
 def _client_row(store: dict, c: dict) -> dict:
     used = xray.client_used_bytes(c)
     limit = xray.gb_to_bytes(c.get("limit_gb"))
+    daily_used = xray.client_daily_used_bytes(c)
+    daily_limit = xray.gb_to_bytes(c.get("daily_limit_gb"))
     return {
         **c, "used": used, "limit_bytes": limit, "pct": min(100, int(100 * used / limit)) if limit else 0,
+        "daily_used": daily_used, "daily_limit_bytes": daily_limit,
+        "daily_pct": min(100, int(100 * daily_used / daily_limit)) if daily_limit else 0,
         "status": xray.client_status(c), "online_ips": ONLINE.get(c["email"], []), "sub_url": sub_url(c),
         "inbound_tags": [i["tag"] for i in xray.client_inbounds(store, c)], "days_left": xray.days_left(c),
     }
@@ -2739,6 +2758,7 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     if not client["tg_id"]:
         client["tg_username"] = client["tg_first_name"] = client["tg_last_name"] = client["tg_fio"] = ""
     client["limit_gb"] = _float(form.get("limit_gb"))
+    client["daily_limit_gb"] = _float(form.get("daily_limit_gb"))
     client["limit_ip"] = _int(form.get("limit_ip"))
     client["limit_hwid"] = _int(form.get("limit_hwid"))
     hwid.ensure(client)
@@ -2760,6 +2780,10 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         client["next_reset"] = ""
     client["reset_period"] = period
     client["renew_on_reset"] = form.get("renew_on_reset") == "1"
+    on_expire = str(form.get("on_expire") or "block")
+    on_quota = str(form.get("on_quota") or "block")
+    client["on_expire"] = on_expire if on_expire in xray.LIMIT_ACTIONS else "block"
+    client["on_quota"] = on_quota if on_quota in xray.LIMIT_ACTIONS else "block"
     client["sub_enabled"] = form.get("sub_enabled", "1") == "1"
     doh_mod.ensure_client_doh(client)
     client["doh_enabled"] = form.get("doh_enabled") == "1"
@@ -2775,11 +2799,16 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
     client["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
     limits = {}
+    daily_limits = {}
     for tag in known:
         gb = _float(form.get(f"limit_{tag}"))
         if gb > 0:
             limits[tag] = gb
+        dgb = _float(form.get(f"daily_limit_{tag}"))
+        if dgb > 0:
+            daily_limits[tag] = dgb
     client["outbound_limits"] = limits
+    client["daily_outbound_limits"] = daily_limits
     if old_email and old_email != email:
         for r in store.get("routes") or []:
             if isinstance(r.get("user"), list):
@@ -3013,9 +3042,15 @@ def client_edit(email: str, request: Request):
         return go("/clients")
     tags = []
     for tg in xray.selectable_outbound_tags(store):
-        tags.append({**tg, "used": xray.client_tag_used_bytes(c, tg["tag"]),
-                     "limit": (c.get("outbound_limits") or {}).get(tg["tag"], ""),
-                     "exceeded": xray.client_tag_exceeded(c, tg["tag"])})
+        tags.append({
+            **tg,
+            "used": xray.client_tag_used_bytes(c, tg["tag"]),
+            "limit": (c.get("outbound_limits") or {}).get(tg["tag"], ""),
+            "exceeded": xray.client_tag_exceeded(c, tg["tag"]),
+            "daily_used": xray.client_daily_tag_used_bytes(c, tg["tag"]),
+            "daily_limit": (c.get("daily_outbound_limits") or {}).get(tg["tag"], ""),
+            "daily_exceeded": xray.client_daily_tag_exceeded(c, tg["tag"]),
+        })
     bans = [b for b in store.get("ip_bans") or [] if b.get("email") == email]
     eps = xray.client_endpoints(store, c, store["settings"]["sub"].get("domain") or None)
     links = [(e, P.endpoint_to_link(e)) for e in eps]
@@ -5215,20 +5250,28 @@ def _public_client(store: dict, c: dict) -> dict:
     return {
         "email": c["email"], "uuid": c["uuid"], "enabled": c.get("enabled", True), "status": xray.client_status(c),
         "outbound": c.get("outbound"), "inbounds": [i["tag"] for i in xray.client_inbounds(store, c)],
-        "limit_gb": c.get("limit_gb"), "expire_at": c.get("expire_at"), "limit_ip": c.get("limit_ip"),
+        "limit_gb": c.get("limit_gb"), "daily_limit_gb": c.get("daily_limit_gb"),
+        "expire_at": c.get("expire_at"), "limit_ip": c.get("limit_ip"),
         "limit_hwid": c.get("limit_hwid"), "hwid": hwid.status(c),
-        "up": c["traffic"].get("up"), "down": c["traffic"].get("down"), "online": c["email"] in ONLINE,
+        "up": c["traffic"].get("up"), "down": c["traffic"].get("down"),
+        "daily_used": xray.client_daily_used_bytes(c),
+        "online": c["email"] in ONLINE,
         "last_online": c.get("last_online"), "comment": c.get("comment"), "tg_id": c.get("tg_id"),
         "tg_username": c.get("tg_username"), "tg_fio": c.get("tg_fio"),
         "tg_first_name": c.get("tg_first_name"), "tg_last_name": c.get("tg_last_name"),
-        "sub_url": sub_url(c), "reset_period": c.get("reset_period"), "outbound_limits": c.get("outbound_limits"),
+        "sub_url": sub_url(c), "reset_period": c.get("reset_period"),
+        "outbound_limits": c.get("outbound_limits"),
+        "daily_outbound_limits": c.get("daily_outbound_limits"),
+        "on_expire": c.get("on_expire"), "on_quota": c.get("on_quota"),
         "allowed_tags": c.get("allowed_tags"),
     }
 
 
-API_CLIENT_FIELDS = ("outbound", "enabled", "limit_gb", "expire_at", "limit_ip", "limit_hwid", "comment", "tg_id", "inbounds",
-                     "reset_period", "renew_on_reset", "start_on_first_use", "duration_days", "allowed_tags",
-                     "outbound_limits", "sub_enabled")
+API_CLIENT_FIELDS = (
+    "outbound", "enabled", "limit_gb", "daily_limit_gb", "expire_at", "limit_ip", "limit_hwid", "comment", "tg_id",
+    "inbounds", "reset_period", "renew_on_reset", "start_on_first_use", "duration_days", "allowed_tags",
+    "outbound_limits", "daily_outbound_limits", "on_expire", "on_quota", "sub_enabled",
+)
 
 
 def _api_apply_client(store: dict, c: dict, data: dict) -> str | None:
@@ -5239,6 +5282,10 @@ def _api_apply_client(store: dict, c: dict, data: dict) -> str | None:
         return f"unknown outbound {c.get('outbound')}"
     if c.get("expire_at") and not xray.parse_expire_at(c["expire_at"]):
         return "bad expire_at"
+    if c.get("on_expire") not in xray.LIMIT_ACTIONS:
+        c["on_expire"] = "block"
+    if c.get("on_quota") not in xray.LIMIT_ACTIONS:
+        c["on_quota"] = "block"
     return None
 
 
