@@ -969,8 +969,12 @@ def import_doh_bundle(items: list | None, *, recreate: bool = True) -> dict:
 
 # ---------------------------------------------------------------- WARP / NordVPN
 
-def warp_register() -> dict:
-    """Register a Cloudflare WARP device; returns Xray wireguard outbound config."""
+def warp_register(license_key: str = "") -> dict:
+    """Register a Cloudflare WARP device; optionally attach a WARP+ license key.
+
+    Flow: POST /reg → (optional) PUT /reg/{id}/account with ``{"license": "..."}``.
+    Returns Xray wireguard outbound config + account meta (warp_plus / quota).
+    """
     keys = _run([str(XRAY_BIN), "wg"])
     priv = pub = ""
     for line in keys["stdout"].splitlines():
@@ -980,15 +984,54 @@ def warp_register() -> dict:
             pub = line.split(":", 1)[1].strip()
     if not priv:
         return {"ok": False, "error": "xray wg failed"}
+    api = "https://api.cloudflareclient.com/v0a2158"
+    hdr = {
+        "Content-Type": "application/json",
+        "CF-Client-Version": "a-6.30-3596",
+        "User-Agent": "okhttp/3.12.1",
+    }
     body = json.dumps({
-        "key": pub, "install_id": "", "fcm_token": "", "tos": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-        "model": "PC", "serial_number": "", "locale": "en_US",
+        "key": pub, "install_id": "", "fcm_token": "",
+        "tos": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "model": "PC", "serial_number": "", "locale": "en_US", "type": "Android",
+        "warp_enabled": True,
     }).encode()
     try:
-        resp = json.loads(_http("https://api.cloudflareclient.com/v0a2158/reg", 30, data=body,
-                                headers={"Content-Type": "application/json", "CF-Client-Version": "a-6.30-3596"}, method="POST"))
+        resp = json.loads(_http(f"{api}/reg", 30, data=body, headers=hdr, method="POST"))
     except Exception as exc:
         return {"ok": False, "error": f"WARP API: {exc}"}
+    device_id = str(resp.get("id") or "")
+    token = str(resp.get("token") or "")
+    account = resp.get("account") if isinstance(resp.get("account"), dict) else {}
+    license_key = str(license_key or "").strip()
+    warp_plus = bool(account.get("warp_plus"))
+    premium = account.get("premium_data")
+    quota = account.get("quota")
+    account_type = str(account.get("account_type") or "")
+    if license_key:
+        if not device_id or not token:
+            return {"ok": False, "error": "WARP: нет id/token после регистрации"}
+        try:
+            acc = json.loads(_http(
+                f"{api}/reg/{device_id}/account", 30,
+                data=json.dumps({"license": license_key}).encode(),
+                headers={**hdr, "Authorization": f"Bearer {token}"},
+                method="PUT",
+            ))
+            if isinstance(acc, dict):
+                account = acc
+                warp_plus = bool(acc.get("warp_plus"))
+                premium = acc.get("premium_data", premium)
+                quota = acc.get("quota", quota)
+                account_type = str(acc.get("account_type") or account_type or "")
+                if not warp_plus and str(acc.get("account_type") or "").lower() in ("unlimited", "team", "plus"):
+                    warp_plus = True
+        except Exception as exc:
+            return {"ok": False, "error": f"WARP+ license: {exc}"}
+        # PUT succeeded — treat as WARP+ even if flag lags in the response
+        if not warp_plus:
+            warp_plus = True
+
     cfg = resp.get("config") or {}
     peer = (cfg.get("peers") or [{}])[0]
     iface = (cfg.get("interface") or {}).get("addresses") or {}
@@ -1011,7 +1054,22 @@ def warp_register() -> dict:
             "domainStrategy": "ForceIPv4v6",
         },
     }
-    return {"ok": True, "config": outbound, "account": {"id": resp.get("id"), "token": resp.get("token")}}
+    label = "Cloudflare WARP+" if (warp_plus or license_key) else "Cloudflare WARP"
+    return {
+        "ok": True,
+        "config": outbound,
+        "label": label,
+        "warp_plus": bool(warp_plus or license_key),
+        "account": {
+            "id": device_id,
+            "token": token,
+            "warp_plus": bool(warp_plus or license_key),
+            "account_type": account_type,
+            "premium_data": premium,
+            "quota": quota,
+            "license_hint": (license_key[-4:] if len(license_key) >= 4 else ""),
+        },
+    }
 
 
 def nord_servers(country_id: int | None = None, limit: int = 10) -> list[dict]:

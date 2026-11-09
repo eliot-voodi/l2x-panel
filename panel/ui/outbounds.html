@@ -330,7 +330,13 @@
       <label class="f">Xray outbound JSON — изменения применяются к форме при переключении на вкладку «Форма»</label>
       <textarea id="ob-json" class="mono" spellcheck="false"></textarea>
     </div>
-    <div data-m="warp" hidden><div class="hint">Будет зарегистрировано новое устройство WARP (бесплатный аккаунт) и создан WireGuard outbound.</div></div>
+    <div data-m="warp" hidden>
+      <div class="hint">Регистрируется новое устройство Cloudflare WARP и создаётся WireGuard outbound. С ключом WARP+ — премиум-квота на этом устройстве.</div>
+      <label class="f">WARP+ license key (пусто = бесплатный WARP)</label>
+      <input name="warp_license" id="warp_license" class="mono" autocomplete="off" spellcheck="false"
+             placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+      <div class="hint">Ключ из приложения 1.1.1.1 / Zero Trust (Account → License). Без ключа — обычный free WARP.</div>
+    </div>
     <div data-m="nord" hidden>
       <label class="f">Access token NordVPN</label><input name="nord_token" type="password" placeholder="из личного кабинета Nord Account → Manual setup">
       <label class="f">Страна</label>

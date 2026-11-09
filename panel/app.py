@@ -3991,11 +3991,18 @@ async def outbound_add(request: Request):
             tag = tag or str(config.get("tag") or "")
             info = _outbound_info(config)
         elif mode == "warp":
-            res = ops.warp_register()
+            license_key = str(form.get("warp_license") or "").strip()
+            res = ops.warp_register(license_key)
             if not res.get("ok"):
                 raise ValueError(res.get("error"))
-            config, info, remark = res["config"], "Cloudflare WARP", remark or "Cloudflare WARP"
-            tag = tag or "warp"
+            plus = bool(res.get("warp_plus") or license_key)
+            label = res.get("label") or ("Cloudflare WARP+" if plus else "Cloudflare WARP")
+            acc = res.get("account") if isinstance(res.get("account"), dict) else {}
+            hint = str(acc.get("license_hint") or "")
+            info = label + (f" · …{hint}" if hint else "")
+            config, remark = res["config"], remark or label
+            tag = tag or ("warp-plus" if plus else "warp")
+            country = country or "CF"
         elif mode == "nord":
             key = ops.nord_private_key(str(form.get("nord_token") or "").strip())
             if not key.get("ok") or not key.get("private_key"):
