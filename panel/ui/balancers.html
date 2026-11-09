@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}{{ t('Балансировщики') }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ t('Балансировщики') }}{% endblock %}
-{% block page_sub %}Автовыбор лучшего выхода через Observatory · watchdog каждые {{ watchdog_sec }} с{% endblock %}
+{% block page_sub %}Пинг / нагрузка / распределение по живым · watchdog каждые {{ watchdog_sec }} с{% endblock %}
 {% block top_actions %}<form method="post" action="{{ bp }}/xray/apply"><button class="btn ghost">{{ ic.icon('refresh') }}{{ t('Применить') }} Xray</button></form>{% endblock %}
 {% block content %}
 <div class="grid g2">
@@ -15,14 +15,22 @@
       <span class="badge {% if b.enabled %}ok{% endif %}">{{ 'включён' if b.enabled else 'выключен' }}</span>
     </div>
     <div class="small muted">strategy <code>{{ b.strategy }}</code> · tag <code>{{ b.tag }}</code> · в пуле сейчас: <b>{{ act|length }}</b></div>
+    {% if key == 'random' %}
+    <div class="hint">Случайно распределяет соединения по <b>живым</b> участникам (connected L2TP без превышения loss, включённые custom). Упавший выпадает при следующем apply/watchdog.</div>
+    {% endif %}
     {% if act %}<div class="mt">{% for tg in act %}<span class="badge accent" style="margin:0 .25rem .25rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}</div>
     {% else %}<div class="hint">Нет активных участников — {% if b.fallback == 'none' %}трафик режется (fallback none){% else %}трафик идёт в fallback{% endif %}.</div>{% endif %}
 
     <div class="mt">{{ m.check('enabled', b.enabled, t('Включён')) }}</div>
+    {% if key != 'random' %}
     <div class="row">
       <div><label class="f">Probe URL</label><input name="probe_url" value="{{ b.probe_url }}"></div>
       <div style="max-width:140px"><label class="f">Интервал</label><input name="probe_interval" value="{{ b.probe_interval }}"></div>
     </div>
+    {% else %}
+    <input type="hidden" name="probe_url" value="{{ b.probe_url }}">
+    <input type="hidden" name="probe_interval" value="{{ b.probe_interval }}">
+    {% endif %}
     {% if key == 'least_load' %}
     <div class="row">
       <div><label class="f">expected (лучших нод)</label><input name="expected" type="number" min="1" max="10" value="{{ b.expected or 1 }}"></div>
@@ -53,5 +61,5 @@
   </form>
 {% endfor %}
 </div>
-<div class="hint">Клиент выбирает балансировщик как outbound (или получает его строкой в подписке). Observatory проверяет участников; упавший выпадает из пула. Если все мертвы — срабатывает Fallback (direct / другой outbound / none).</div>
+<div class="hint">Клиент выбирает балансировщик как outbound (или получает его строкой в подписке). <code>leastPing</code>/<code>leastLoad</code> — Observatory выбирает лучший; <code>random</code> (<code>lb_random</code>) — равномерно раскидывает по живым. Упавший выпадает из пула. Если все мертвы — Fallback.</div>
 {% endblock %}

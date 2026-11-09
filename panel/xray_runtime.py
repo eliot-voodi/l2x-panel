@@ -253,9 +253,11 @@ def flag_emoji(code: str) -> str:
 
 BALANCER_LEAST_PING = "lb_least_ping"
 BALANCER_LEAST_LOAD = "lb_least_load"
+BALANCER_RANDOM = "lb_random"
 BALANCER_LABELS = {
     BALANCER_LEAST_PING: "⚡ Авто: наименьший пинг",
     BALANCER_LEAST_LOAD: "⚖️ Авто: наименьшая загрузка",
+    BALANCER_RANDOM: "🎲 Авто: распределение по живым",
 }
 
 
@@ -269,6 +271,11 @@ def default_balancers() -> dict:
             "tag": BALANCER_LEAST_LOAD, "enabled": True, "strategy": "leastLoad", "members": [],
             "probe_url": "https://www.gstatic.com/generate_204", "probe_interval": "20s",
             "expected": 1, "max_rtt": "1s", "tolerance": 0.15, "fallback": "direct",
+        },
+        # Spreads connections across currently live outbounds (panel health gate + Xray random).
+        "random": {
+            "tag": BALANCER_RANDOM, "enabled": True, "strategy": "random", "members": [],
+            "probe_url": "https://www.gstatic.com/generate_204", "probe_interval": "15s", "fallback": "direct",
         },
     }
 
@@ -1578,12 +1585,15 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
 
     leastPing/leastLoad require observatory/burstObservatory — emitting a balancer
     with selector [direct] and no observatory makes Xray fail with
-    'not all dependencies are resolved'. Routes to empty balancers fall back via
-    _route_target().
+    'not all dependencies are resolved'. ``random`` only needs a non-empty selector
+    of healthy members (panel drops dead L2TP / disabled customs on each apply).
+    Routes to empty balancers fall back via _route_target().
     """
     bals = ensure_balancers(store)
     out: list[dict] = []
     observatory = burst = None
+    obs_subjects: set[str] = set()
+
     ping_b = bals.get("least_ping") or {}
     if ping_b.get("enabled", True):
         members = balancer_member_tags(store, ping_b, healthy_only=True)
@@ -1593,12 +1603,14 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
             if fb:
                 entry["fallbackTag"] = fb
             out.append(entry)
+            obs_subjects.update(members)
             observatory = {
-                "subjectSelector": sorted(set(members)),
+                "subjectSelector": sorted(obs_subjects),
                 "probeURL": ping_b.get("probe_url") or "https://www.gstatic.com/generate_204",
                 "probeInterval": ping_b.get("probe_interval") or "15s",
                 "enableConcurrency": True,
             }
+
     load_b = bals.get("least_load") or {}
     if load_b.get("enabled", True):
         members = balancer_member_tags(store, load_b, healthy_only=True)
@@ -1621,6 +1633,29 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
                     "connectivity": "http://connectivitycheck.gstatic.com/generate_204",
                 },
             }
+
+    # Distribute connections across live outbounds (not “everyone → best ping”).
+    rand_b = bals.get("random") or {}
+    if rand_b.get("enabled", True):
+        members = balancer_member_tags(store, rand_b, healthy_only=True)
+        if members:
+            entry = {"tag": rand_b["tag"], "selector": members, "strategy": {"type": "random"}}
+            fb = balancer_fallback_tag(rand_b)
+            if fb:
+                entry["fallbackTag"] = fb
+            out.append(entry)
+            # Probe the same pool so leastPing (if on) sees them; random itself
+            # still picks only from the healthy selector rebuilt by the panel.
+            if observatory is None:
+                observatory = {
+                    "subjectSelector": sorted(set(members)),
+                    "probeURL": rand_b.get("probe_url") or "https://www.gstatic.com/generate_204",
+                    "probeInterval": rand_b.get("probe_interval") or "15s",
+                    "enableConcurrency": True,
+                }
+            else:
+                observatory["subjectSelector"] = sorted(set(observatory["subjectSelector"]) | set(members))
+
     return out, observatory, burst
 
 

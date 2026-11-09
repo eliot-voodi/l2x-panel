@@ -4246,7 +4246,7 @@ def balancers_page(request: Request):
 async def balancers_save(key: str, request: Request):
     if redir := _require(request):
         return redir
-    if key not in ("least_ping", "least_load"):
+    if key not in ("least_ping", "least_load", "random"):
         return go("/balancers")
     form = await request.form()
     with mutate() as store:
