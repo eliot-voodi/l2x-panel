@@ -7,8 +7,9 @@
 #
 # Flags:
 #   --yes, -y     non-interactive: take answers from the environment or defaults
-#   --update [TAG]      fast update (code only) + auto-rollback on health fail; optional Git tag
-#   --update-full [TAG] full update (apt + xray + systemd/nginx) — slower
+#   --update [TAG]      dual-slot update (download → start 2nd service → health → nginx flip →
+#                       stop old); auto-rollback on health fail; optional Git tag
+#   --update-full [TAG] full update (apt + xray + systemd/nginx) + dual-slot cutover
 #   --uninstall         remove services and code (data in /var/lib/l2xpanel is kept)
 #
 # Environment (non-interactive answers):
@@ -28,10 +29,22 @@ set -euo pipefail
 
 REPO_URL=${L2X_REPO:-https://github.com/eliot-voodi/l2x-panel}
 BRANCH=${L2X_BRANCH:-main}
+# Dual-slot layout: only one unit serves traffic; /opt/l2xpanel is a symlink to the active slot.
+LIVE_DIR=/opt/l2xpanel-live
+NEXT_DIR=/opt/l2xpanel-next
 APP_DIR=/opt/l2xpanel
+STAGE_DIR=$NEXT_DIR
+LIVE_PORT=8090
+NEXT_PORT=8091
+STAGE_PORT=$NEXT_PORT
+PANEL_LIVE_ADDR=127.0.0.1:$LIVE_PORT
+PANEL_NEXT_ADDR=127.0.0.1:$NEXT_PORT
 DATA_DIR=/var/lib/l2xpanel
 ETC_DIR=/etc/l2xpanel
 ENV_FILE=$ETC_DIR/panel.env
+PANEL_UPSTREAM_CONF=/etc/nginx/conf.d/l2x-panel-upstream.conf
+PANEL_UPSTREAM_STATE=$ETC_DIR/panel_upstream
+PANEL_SLOT_FILE=$ETC_DIR/panel_slot
 XRAY_BIN=/usr/local/bin/xray
 GEO_DIR=/usr/local/share/xray
 ACME_WEBROOT=/var/www/l2x-acme
@@ -290,15 +303,90 @@ _req_hash() {
   fi
 }
 
+# ---- dual-slot helpers (live :8090 / next :8091; nginx flips once; old unit stops after health)
+active_slot() { tr -d '[:space:]' <"$PANEL_SLOT_FILE" 2>/dev/null || echo live; }
+slot_dir()  { [ "${1:-}" = next ] && echo "$NEXT_DIR" || echo "$LIVE_DIR"; }
+slot_port() { [ "${1:-}" = next ] && echo "$NEXT_PORT" || echo "$LIVE_PORT"; }
+slot_unit() { [ "${1:-}" = next ] && echo l2xpanel-next || echo l2xpanel; }
+slot_addr() { echo "127.0.0.1:$(slot_port "${1:-live}")"; }
+active_dir()  { slot_dir "$(active_slot)"; }
+active_port() { slot_port "$(active_slot)"; }
+active_unit() { slot_unit "$(active_slot)"; }
+active_addr() { slot_addr "$(active_slot)"; }
+inactive_slot() { [ "$(active_slot)" = next ] && echo live || echo next; }
+inactive_dir()  { slot_dir "$(inactive_slot)"; }
+inactive_port() { slot_port "$(inactive_slot)"; }
+inactive_unit() { slot_unit "$(inactive_slot)"; }
+inactive_addr() { slot_addr "$(inactive_slot)"; }
+
+link_app_dir() {
+  # /opt/l2xpanel → active slot (CLI, py(), VERSION readers).
+  # Safe to call only when nothing must keep serving from a classic real /opt/l2xpanel.
+  local target=${1:-$(active_dir)}
+  mkdir -p "$target"
+  if [ -L "$APP_DIR" ]; then
+    ln -sfn "$target" "$APP_DIR"
+    return 0
+  fi
+  if [ -e "$APP_DIR" ]; then
+    # Retire classic real directory in favour of the symlink (panel unit already stopped).
+    rm -rf "$APP_DIR"
+  fi
+  ln -sfn "$target" "$APP_DIR"
+}
+
+write_panel_slot() {
+  local slot=${1:-live}
+  mkdir -p "$ETC_DIR"
+  printf '%s\n' "$slot" >"$PANEL_SLOT_FILE"
+  link_app_dir "$(slot_dir "$slot")"
+}
+
+ensure_slot_layout() {
+  # Migrate classic /opt/l2xpanel (real dir) + optional .stage into live/next slots.
+  # Never mv/rm the running tree here — only copy; symlink is created at cutover (write_panel_slot).
+  mkdir -p "$ETC_DIR" "$LIVE_DIR" "$NEXT_DIR"
+  if [ -L "$APP_DIR" ]; then
+    [ -f "$PANEL_SLOT_FILE" ] || printf 'live\n' >"$PANEL_SLOT_FILE"
+    return 0
+  fi
+  if [ -d "$APP_DIR" ]; then
+    if [ ! -f "$LIVE_DIR/app.py" ]; then
+      info "Миграция в dual-slot: копирование $APP_DIR → $LIVE_DIR (процесс не трогаем)"
+      cp -a "$APP_DIR"/. "$LIVE_DIR"/
+    fi
+    [ -f "$PANEL_SLOT_FILE" ] || printf 'live\n' >"$PANEL_SLOT_FILE"
+  else
+    write_panel_slot live
+  fi
+  # Old blue-green stage path → next slot
+  if [ -d /opt/l2xpanel.stage ] && [ ! -f "$NEXT_DIR/app.py" ]; then
+    cp -a /opt/l2xpanel.stage/. "$NEXT_DIR"/ 2>/dev/null || true
+  fi
+  rm -rf /opt/l2xpanel.stage 2>/dev/null || true
+  if [ ! -f "$PANEL_UPSTREAM_STATE" ]; then
+    write_panel_upstream "$PANEL_LIVE_ADDR"
+  fi
+}
+
+enable_active_unit() {
+  local on off
+  on=$(active_unit)
+  off=$(inactive_unit)
+  systemctl disable "$off" 2>/dev/null || true
+  systemctl enable "$on" 2>/dev/null || true
+}
+
 snapshot_panel() {
-  # Keep last known-good code (no .venv — large & shared) for auto-rollback.
-  local prev=$APP_DIR.prev
+  # Extra copy of the active slot (dual-slot already keeps the other tree for rollback).
+  local prev=/opt/l2xpanel.prev src
+  ensure_slot_layout
+  src=$(active_dir)
   rm -rf "$prev"
   mkdir -p "$prev"
-  # Copy live panel files except venv / caches
-  if [ -d "$APP_DIR" ]; then
+  if [ -d "$src" ]; then
     shopt -s dotglob nullglob
-    for item in "$APP_DIR"/*; do
+    for item in "$src"/*; do
       base=$(basename "$item")
       case "$base" in
         .venv|__pycache__|*.pyc) continue ;;
@@ -306,61 +394,91 @@ snapshot_panel() {
       cp -a "$item" "$prev/"
     done
     shopt -u dotglob nullglob
-    printf '%s\n' "$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo unknown)" >"$prev/.snapshot_version"
-    ok "Снимок рабочей панели → $prev (v$(cat "$prev/.snapshot_version" 2>/dev/null || echo '?'))"
+    printf '%s\n' "$(tr -d '[:space:]' <"$src/VERSION" 2>/dev/null || echo unknown)" >"$prev/.snapshot_version"
+    ok "Снимок активного слота → $prev (v$(cat "$prev/.snapshot_version" 2>/dev/null || echo '?'))"
   fi
 }
 
 restore_panel_snapshot() {
-  local prev=$APP_DIR.prev
+  # Emergency: restore into the currently active slot dir from /opt/l2xpanel.prev
+  local prev=/opt/l2xpanel.prev dest
+  ensure_slot_layout
+  dest=$(active_dir)
   [ -d "$prev" ] || { warn "Нет снимка $prev — откат невозможен"; return 1; }
-  step "Откат панели на предыдущую рабочую версию"
-  # Remove current code files (keep .venv)
-  find "$APP_DIR" -maxdepth 1 -mindepth 1 ! -name '.venv' -exec rm -rf {} +
+  step "Откат панели на предыдущую рабочую версию ($dest)"
+  find "$dest" -maxdepth 1 -mindepth 1 ! -name '.venv' -exec rm -rf {} +
   shopt -s dotglob nullglob
   for item in "$prev"/*; do
     base=$(basename "$item")
     [ "$base" = ".snapshot_version" ] && continue
-    cp -a "$item" "$APP_DIR/"
+    cp -a "$item" "$dest/"
   done
   shopt -u dotglob nullglob
+  link_app_dir "$dest"
   local ver
-  ver=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
+  ver=$(tr -d '[:space:]' <"$dest/VERSION" 2>/dev/null || echo '?')
   ok "Восстановлено v$ver из $prev"
   return 0
 }
 
-install_code() {
-  step "Панель"
-  mkdir -p "$APP_DIR" "$DATA_DIR" "$ETC_DIR/certs"
+install_code_into() {
+  # Install panel code into $1 (a concrete slot dir — never the symlink alone).
+  local dest=$1
+  local venv_src=""
+  [ -n "$dest" ] || die "install_code_into: пустой путь"
+  mkdir -p "$dest" "$DATA_DIR" "$ETC_DIR/certs"
   chmod 700 "$DATA_DIR" "$ETC_DIR"
-  rm -rf "$APP_DIR/ui" "$APP_DIR"/*.py
-  cp -a "$SRC/panel/." "$APP_DIR/"
+  rm -rf "$dest/ui"
+  # shellcheck disable=SC2086
+  rm -f "$dest"/*.py
+  cp -a "$SRC/panel/." "$dest/"
   # Prefer repo-root VERSION (release source of truth) over a stale panel/VERSION copy.
   if [ -f "$SRC/VERSION" ]; then
-    install -m 644 "$SRC/VERSION" "$APP_DIR/VERSION"
+    install -m 644 "$SRC/VERSION" "$dest/VERSION"
   fi
-  find "$APP_DIR" -name '__pycache__' -prune -exec rm -rf {} +
-  if [ ! -x "$APP_DIR/.venv/bin/uvicorn" ]; then
-    python3 -m venv "$APP_DIR/.venv"
-    "$APP_DIR/.venv/bin/pip" install -q --upgrade pip
+  find "$dest" -name '__pycache__' -prune -exec rm -rf {} +
+  # Prefer cloning venv from the other (running) slot to skip cold pip when possible.
+  if [ -x "$(active_dir)/.venv/bin/uvicorn" ]; then
+    venv_src=$(active_dir)
+  elif [ -x "$LIVE_DIR/.venv/bin/uvicorn" ]; then
+    venv_src=$LIVE_DIR
+  elif [ -x "$NEXT_DIR/.venv/bin/uvicorn" ]; then
+    venv_src=$NEXT_DIR
   fi
-  local req=$APP_DIR/requirements.txt
-  local hash_file=$APP_DIR/.venv/.req_hash
+  if [ ! -x "$dest/.venv/bin/uvicorn" ]; then
+    if [ -n "$venv_src" ] && [ "$venv_src" != "$dest" ] && [ -x "$venv_src/.venv/bin/uvicorn" ]; then
+      info "Клон .venv с $venv_src → $dest"
+      rm -rf "$dest/.venv"
+      cp -a "$venv_src/.venv" "$dest/.venv"
+    else
+      python3 -m venv "$dest/.venv"
+      "$dest/.venv/bin/pip" install -q --upgrade pip
+    fi
+  fi
+  local req=$dest/requirements.txt
+  local hash_file=$dest/.venv/.req_hash
   local new_hash old_hash=""
   new_hash=$(_req_hash "$req")
   [ -f "$hash_file" ] && old_hash=$(cat "$hash_file" 2>/dev/null || true)
-  if [ ! -x "$APP_DIR/.venv/bin/uvicorn" ] || [ "$new_hash" != "$old_hash" ]; then
-    info "pip install (requirements изменились или venv пуст)"
-    "$APP_DIR/.venv/bin/pip" install -q -r "$req"
+  if [ ! -x "$dest/.venv/bin/uvicorn" ] || [ "$new_hash" != "$old_hash" ]; then
+    info "pip install → $dest (requirements изменились или venv пуст)"
+    "$dest/.venv/bin/pip" install -q -r "$req"
     printf '%s\n' "$new_hash" >"$hash_file"
   else
-    ok "pip пропущен — requirements без изменений"
+    ok "pip пропущен — requirements без изменений ($dest)"
   fi
-  install -m 755 "$SRC/scripts/l2x.sh" /usr/local/bin/l2x
   local ver
-  ver=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
-  ok "Код в $APP_DIR (v$ver), данные в $DATA_DIR"
+  ver=$(tr -d '[:space:]' <"$dest/VERSION" 2>/dev/null || echo '?')
+  ok "Код в $dest (v$ver)"
+}
+
+install_code() {
+  step "Панель"
+  ensure_slot_layout
+  install_code_into "$LIVE_DIR"
+  write_panel_slot live
+  install -m 755 "$SRC/scripts/l2x.sh" /usr/local/bin/l2x
+  ok "Данные в $DATA_DIR"
 }
 
 backup_unmanaged() {
@@ -388,13 +506,17 @@ install_system() {
 
   install -m 644 "$SRC/deploy/xray.service" /etc/systemd/system/xray.service
   install -m 644 "$SRC/deploy/l2xpanel.service" /etc/systemd/system/l2xpanel.service
+  install -m 644 "$SRC/deploy/l2xpanel-next.service" /etc/systemd/system/l2xpanel-next.service
   systemctl daemon-reload
-  systemctl enable -q strongswan-starter xl2tpd xray l2xpanel 2>/dev/null || true
+  systemctl enable -q strongswan-starter xl2tpd xray 2>/dev/null || true
+  ensure_slot_layout
+  enable_active_unit
   systemctl restart strongswan-starter xl2tpd 2>/dev/null || warn "strongSwan/xl2tpd не запустились — L2TP-туннели будут недоступны"
 
   mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge" /etc/nginx/l2x
   if [ "$MODE" = nginx ]; then
     install -m 644 "$SRC/deploy/nginx.conf" "$NGINX_SITE"
+    write_panel_upstream "$(active_addr)"
   else
     install -m 644 "$SRC/deploy/nginx-acme.conf" "$NGINX_SITE"
   fi
@@ -461,14 +583,11 @@ scrub_env_password() {
   chmod 600 "$ENV_FILE"
 }
 
-wait_panel_health() {
-  # Return 0 if /health answers; do not die (caller may rollback).
-  local port secs=${1:-40}
-  port=$(sed -n 's/^PORT=//p' "$ENV_FILE")
-  local i
+wait_panel_health_port() {
+  # Return 0 if /health answers on $1; do not die (caller may rollback).
+  local port=${1:-8090} secs=${2:-40} i
   for i in $(seq 1 "$secs"); do
-    if curl -fsS "http://127.0.0.1:${port:-8090}/health" >/dev/null 2>&1; then
-      scrub_env_password
+    if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -476,15 +595,160 @@ wait_panel_health() {
   return 1
 }
 
+wait_panel_health() {
+  local secs=${1:-40} port
+  ensure_slot_layout
+  port=$(active_port)
+  if wait_panel_health_port "${port:-8090}" "$secs"; then
+    scrub_env_password
+    return 0
+  fi
+  return 1
+}
+
 wait_panel() {
-  systemctl restart xray l2xpanel
+  ensure_slot_layout
+  systemctl restart xray "$(active_unit)"
   if wait_panel_health 40; then
     return 0
   fi
-  die "Панель не запустилась: journalctl -u l2xpanel -n 50"
+  die "Панель не запустилась: journalctl -u $(active_unit) -n 50"
 }
 
-py() { (cd "$APP_DIR" && set -a && . "$ENV_FILE" && set +a && HOME=/root "$APP_DIR/.venv/bin/python" - "$@"); }
+write_panel_upstream() {
+  # Named nginx upstream used by front configs (dual-slot cutover flips only this file).
+  local addr=${1:-$PANEL_LIVE_ADDR}
+  mkdir -p "$(dirname "$PANEL_UPSTREAM_CONF")" "$ETC_DIR"
+  cat >"$PANEL_UPSTREAM_CONF" <<EOF
+# managed by l2x-panel — generated, edits are overwritten
+upstream l2x_panel_backend {
+    server ${addr};
+    keepalive 32;
+}
+EOF
+  printf '%s\n' "$addr" >"$PANEL_UPSTREAM_STATE"
+}
+
+migrate_nginx_to_named_upstream() {
+  # Old panels proxied to 127.0.0.1:8090 directly — rewrite to named upstream once.
+  local f
+  write_panel_upstream "$(active_addr)"
+  for f in /etc/nginx/l2x/*.conf /etc/nginx/conf.d/l2x-front.conf; do
+    [ -f "$f" ] || continue
+    sed -i 's|proxy_pass http://127\.0\.0\.1:8090;|proxy_pass http://l2x_panel_backend;|g' "$f"
+    sed -i 's|proxy_pass http://127\.0\.0\.1:8091;|proxy_pass http://l2x_panel_backend;|g' "$f"
+  done
+}
+
+flip_panel_upstream() {
+  local addr=$1
+  write_panel_upstream "$addr"
+  nginx -t -q 2>/dev/null || return 1
+  systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || return 1
+  return 0
+}
+
+cleanup_inactive() {
+  # Abort path: new slot failed health — stop it, leave active untouched.
+  local unit
+  unit=$(inactive_unit)
+  systemctl stop "$unit" 2>/dev/null || true
+  systemctl disable "$unit" 2>/dev/null || true
+}
+
+prepare_inactive_slot() {
+  ensure_slot_layout
+  local dest
+  dest=$(inactive_dir)
+  step "Скачивание обновления в слот $(inactive_slot) ($dest)"
+  install_code_into "$dest"
+  install -m 755 "$SRC/scripts/l2x.sh" /usr/local/bin/l2x
+  install -m 644 "$SRC/deploy/l2xpanel.service" /etc/systemd/system/l2xpanel.service
+  install -m 644 "$SRC/deploy/l2xpanel-next.service" /etc/systemd/system/l2xpanel-next.service
+  systemctl daemon-reload
+}
+
+# Back-compat alias used by older call sites / docs
+prepare_stage_units() { prepare_inactive_slot; }
+cleanup_stage() { cleanup_inactive; }
+
+cutover_blue_green() {
+  # Dual-slot zero-downtime cutover (nginx mode):
+  #   1) new code already in inactive slot
+  #   2) start inactive unit → /health
+  #   3) nginx flip to new port (ONE flip — no promote / flip-back)
+  #   4) stop old unit; keep its tree for the next rollback/update
+  local before after new_slot old_slot new_unit old_unit new_port old_port new_dir old_dir new_addr
+  ensure_slot_layout
+  old_slot=$(active_slot)
+  new_slot=$(inactive_slot)
+  old_unit=$(slot_unit "$old_slot")
+  new_unit=$(slot_unit "$new_slot")
+  old_port=$(slot_port "$old_slot")
+  new_port=$(slot_port "$new_slot")
+  old_dir=$(slot_dir "$old_slot")
+  new_dir=$(slot_dir "$new_slot")
+  new_addr=$(slot_addr "$new_slot")
+  before=$(tr -d '[:space:]' <"$old_dir/VERSION" 2>/dev/null || echo '?')
+
+  migrate_nginx_to_named_upstream
+  # Keep traffic on the CURRENT active addr (do not force :8090 — may already be on next).
+  write_panel_upstream "$(active_addr)"
+  nginx -t -q 2>/dev/null || { cleanup_inactive; die "nginx -t после миграции upstream"; }
+  systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
+
+  step "Старт новой панели $new_unit :$new_port (старая $old_unit не трогаем)"
+  systemctl stop "$new_unit" 2>/dev/null || true
+  systemctl start "$new_unit"
+  if ! wait_panel_health_port "$new_port" 45; then
+    warn "Новая v$(tr -d '[:space:]' <"$new_dir/VERSION" 2>/dev/null || echo '?') не ответила на /health — активная панель работает"
+    cleanup_inactive
+    die "Обновление отменено: journalctl -u $new_unit -n 50"
+  fi
+  ok "Новая панель здорова на :$new_port"
+
+  step "Nginx → :$new_port (единственный flip)"
+  if ! flip_panel_upstream "$new_addr"; then
+    warn "Не удалось переключить upstream — трафик остаётся на :$old_port"
+    cleanup_inactive
+    flip_panel_upstream "$(slot_addr "$old_slot")" || true
+    die "nginx reload на новый слот не удался"
+  fi
+
+  step "Остановка старой службы $old_unit (клиенты уже на новой)"
+  systemctl stop "$old_unit" 2>/dev/null || true
+  write_panel_slot "$new_slot"
+  enable_active_unit
+
+  # Prove the new slot still answers after ownership flip (same process — should be instant).
+  if ! wait_panel_health_port "$new_port" 15; then
+    warn "Новый слот потерял /health после cutover — откат на старый слот"
+    systemctl start "$old_unit" 2>/dev/null || true
+    if wait_panel_health_port "$old_port" 40; then
+      flip_panel_upstream "$(slot_addr "$old_slot")" || true
+      write_panel_slot "$old_slot"
+      enable_active_unit
+      cleanup_inactive
+      die "Обновление не удалось, восстановлена рабочая v$before"
+    fi
+    die "Критично: оба слота не отвечают — journalctl -u $new_unit -u $old_unit -n 80"
+  fi
+
+  scrub_env_password
+  after=$(tr -d '[:space:]' <"$new_dir/VERSION" 2>/dev/null || echo '?')
+  ok "Панель: v$before → $after (dual-slot $old_slot→$new_slot, без простоя)"
+  printf '\n  Адрес панели: %s%s%s\n  Активный слот: %s%s%s (:%s)\n  Меню: %sl2x%s\n\n' \
+    "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" \
+    "$W" "$new_slot" "$N" "$new_port" \
+    "$W" "$N"
+}
+
+py() {
+  ensure_slot_layout
+  local home
+  home=$(active_dir)
+  (cd "$home" && set -a && . "$ENV_FILE" && set +a && HOME=/root "$home/.venv/bin/python" - "$@")
+}
 
 setup_ssl() {
   [ "$SSL" = none ] && return 0
@@ -508,7 +772,7 @@ EOF
     return 0
   fi
   CERT_FILE=$2 KEY_FILE=$3
-  systemctl stop l2xpanel
+  systemctl stop "$(active_unit)" 2>/dev/null || systemctl stop l2xpanel 2>/dev/null || true
   py "$name" "$CERT_FILE" "$KEY_FILE" "$MODE" "$SUB_PORT" "$PANEL_TLS_PORT" <<'EOF'
 import json, os, sys
 name, crt, key, mode, sub_port, tls_port = sys.argv[1:7]
@@ -540,75 +804,107 @@ open_firewall() {
 uninstall() {
   step "Удаление L2X Panel"
   if [ "$INTERACTIVE" = 1 ]; then confirm "Удалить панель и Xray? Данные в $DATA_DIR сохранятся" n || exit 0; fi
-  systemctl disable --now l2xpanel 2>/dev/null || true
+  systemctl disable --now l2xpanel l2xpanel-next 2>/dev/null || true
   systemctl disable --now xray 2>/dev/null || true
-  rm -f /etc/systemd/system/l2xpanel.service /etc/systemd/system/xray.service /usr/local/bin/l2x
+  rm -f /etc/systemd/system/l2xpanel.service /etc/systemd/system/l2xpanel-next.service \
+        /etc/systemd/system/xray.service /usr/local/bin/l2x
   systemctl daemon-reload
   if [ -f "$NGINX_SITE" ] || [ -d /etc/nginx/l2x ]; then
-    rm -rf "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf /etc/nginx/l2x /etc/nginx/conf.d/l2x-front.conf
+    rm -rf "$NGINX_SITE" /etc/nginx/sites-enabled/l2xpanel.conf /etc/nginx/l2x \
+           /etc/nginx/conf.d/l2x-front.conf "$PANEL_UPSTREAM_CONF"
     sed -i '/l2x-panel: public :443 front/d; \#include /etc/nginx/l2x/stream.conf;#d' /etc/nginx/nginx.conf 2>/dev/null || true
     systemctl reload nginx 2>/dev/null || true
   fi
-  rm -rf "$APP_DIR"
+  rm -rf "$APP_DIR" "$LIVE_DIR" "$NEXT_DIR" /opt/l2xpanel.stage /opt/l2xpanel.prev
   ok "Удалено. Данные остались в $DATA_DIR и $ETC_DIR — удалите вручную, если не нужны"
   exit 0
 }
 
 current_mode() { grep -q '^HOST=0.0.0.0' "$ENV_FILE" 2>/dev/null && echo direct || echo nginx; }
 
+update_inplace_direct() {
+  # Direct mode shares one public port — validate on next:8091, then brief restart of live.
+  local before after
+  ensure_slot_layout
+  write_panel_slot live
+  before=$(tr -d '[:space:]' <"$LIVE_DIR/VERSION" 2>/dev/null || echo '?')
+  step "Скачивание обновления в $NEXT_DIR"
+  install_code_into "$NEXT_DIR"
+  install -m 755 "$SRC/scripts/l2x.sh" /usr/local/bin/l2x
+  install -m 644 "$SRC/deploy/l2xpanel.service" /etc/systemd/system/l2xpanel.service
+  install -m 644 "$SRC/deploy/l2xpanel-next.service" /etc/systemd/system/l2xpanel-next.service
+  systemctl daemon-reload
+  step "Проверка новой версии на :$NEXT_PORT (direct)"
+  systemctl stop l2xpanel-next 2>/dev/null || true
+  systemctl start l2xpanel-next
+  if ! wait_panel_health_port "$NEXT_PORT" 45; then
+    warn "Новая версия не прошла /health на next — live не трогаем"
+    cleanup_inactive
+    die "Обновление отменено: journalctl -u l2xpanel-next -n 50"
+  fi
+  systemctl stop l2xpanel-next 2>/dev/null || true
+  step "Установка проверенного кода в live + рестарт (краткий простой)"
+  systemctl stop l2xpanel 2>/dev/null || true
+  install_code_into "$LIVE_DIR"
+  link_app_dir "$LIVE_DIR"
+  enable_active_unit
+  systemctl start l2xpanel
+  if ! wait_panel_health 40; then
+    warn "v$(tr -d '[:space:]' <"$LIVE_DIR/VERSION" 2>/dev/null || echo '?') не ответила — откат на v$before"
+    restore_panel_snapshot || true
+    systemctl restart l2xpanel
+    if wait_panel_health 40; then
+      die "Обновление не удалось, восстановлена рабочая v$(tr -d '[:space:]' <"$LIVE_DIR/VERSION" 2>/dev/null || echo "$before")"
+    fi
+    die "Обновление и откат не подняли панель: journalctl -u l2xpanel -n 80"
+  fi
+  after=$(tr -d '[:space:]' <"$LIVE_DIR/VERSION" 2>/dev/null || echo '?')
+  ok "Панель: v$before → $after (direct, минимальный простой)"
+  printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
+}
+
 update_full() {
   # Slow path: apt + xray + systemd/nginx — for major upgrades / broken hosts.
   MODE=$(current_mode)
   SSL=none
   info "Полное обновление: $REPO_URL @ $BRANCH${SKIP_XRAY:+ (Xray не трогаем)}"
+  ensure_slot_layout
   snapshot_panel
   fetch_source
   install_packages
   install_xray
-  install_code
   install_system
-  systemctl restart xray l2xpanel
-  if ! wait_panel_health 45; then
-    warn "Новая версия не поднялась — откат на снимок"
-    restore_panel_snapshot || true
-    systemctl restart xray l2xpanel
-    wait_panel_health 40 || die "Откат не помог: journalctl -u l2xpanel -n 80"
-    die "Обновление не удалось, восстановлена предыдущая рабочая версия $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')"
+  systemctl restart xray 2>/dev/null || true
+  if [ "$MODE" = nginx ]; then
+    info "Dual-slot cutover (nginx) — панель не должна падать"
+    prepare_inactive_slot
+    cutover_blue_green
+  else
+    update_inplace_direct
   fi
-  ok "Панель обновлена до $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?'), данные сохранены"
-  printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
   exit 0
 }
 
 update() {
-  # Fast path (default): code + conditional pip + restart panel only; auto-rollback on fail.
+  # Fast path: download to inactive slot → start 2nd service → health → nginx flip → stop old.
   MODE=$(current_mode)
   SSL=none
   SKIP_XRAY=${SKIP_XRAY:-1}
   export SKIP_XRAY
-  info "Быстрое обновление: $REPO_URL @ $BRANCH (Xray/apt/nginx не трогаем)"
-  local before
-  before=$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?')
+  if [ "$MODE" = nginx ]; then
+    info "Dual-slot обновление: $REPO_URL @ $BRANCH (без простоя панели)"
+  else
+    info "Обновление (direct): $REPO_URL @ $BRANCH — сначала проверка на next :$NEXT_PORT"
+  fi
+  ensure_slot_layout
   snapshot_panel
   fetch_source
-  install_code
-  # Panel unit may have changed in rare cases — refresh without full install_system
-  if [ -f "$SRC/deploy/l2xpanel.service" ]; then
-    install -m 644 "$SRC/deploy/l2xpanel.service" /etc/systemd/system/l2xpanel.service
-    systemctl daemon-reload
+  if [ "$MODE" = nginx ]; then
+    prepare_inactive_slot
+    cutover_blue_green
+  else
+    update_inplace_direct
   fi
-  systemctl restart l2xpanel
-  if ! wait_panel_health 40; then
-    warn "v$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?') не ответила на /health — откат на v$before"
-    restore_panel_snapshot || true
-    systemctl restart l2xpanel
-    if wait_panel_health 40; then
-      die "Обновление не удалось, восстановлена рабочая v$(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo "$before")"
-    fi
-    die "Обновление и откат не подняли панель: journalctl -u l2xpanel -n 80"
-  fi
-  ok "Панель: v$before → $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?') (fast, данные сохранены)"
-  printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
   exit 0
 }
 
@@ -720,11 +1016,13 @@ while [ "$_i" -lt "${#_args[@]}" ]; do
   _i=$((_i + 1))
 done
 
-if [ -f "$ENV_FILE" ] && [ -f "$APP_DIR/app.py" ]; then
+# Heal classic → dual-slot layout before the manage menu (APP_DIR becomes a symlink).
+[ -f "$ENV_FILE" ] && ensure_slot_layout 2>/dev/null || true
+if [ -f "$ENV_FILE" ] && { [ -f "$APP_DIR/app.py" ] || [ -f "$LIVE_DIR/app.py" ]; }; then
   info "L2X Panel уже установлена"
   if [ "$INTERACTIVE" = 0 ]; then update; fi
   choose act "Что сделать?" 1 \
-    "1|Быстрое обновление панели (с авто-откатом)" \
+    "1|Обновить панель (dual-slot, без простоя)" \
     "2|Полное обновление (apt + xray + nginx)" \
     "3|Удалить панель" \
     "0|Выход"

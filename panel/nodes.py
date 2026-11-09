@@ -993,7 +993,9 @@ def update_via_ssh(node: dict, ssh_password: str, ssh_user: str = "", ssh_port: 
             "if [ -x /usr/local/bin/l2x ]; then /usr/local/bin/l2x update; "
             "else curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
             "| bash -s -- --update; fi; "
-            "sleep 2; curl -sS http://127.0.0.1:8090/health || true"
+            "sleep 2; "
+            "port=$(tr -d '[:space:]' </etc/l2xpanel/panel_upstream 2>/dev/null | awk -F: '{print $NF}'); "
+            "port=${port:-8090}; curl -sS \"http://127.0.0.1:${port}/health\" || true"
         )
         r = _ssh_run(client, cmd, timeout=900)
         log.append((r.get("stdout") or "")[-2500:])
@@ -1559,25 +1561,27 @@ except Exception as exc:
             client,
             "set -a; . /etc/l2xpanel/panel.env; set +a; "
             "export L2X_FORCE_AGENT=1; "
-            "systemctl stop l2xpanel || true; "
+            "_slot=$(tr -d '[:space:]' </etc/l2xpanel/panel_slot 2>/dev/null || echo live); "
+            "case $_slot in next) _unit=l2xpanel-next; _port=8091;; *) _unit=l2xpanel; _port=8090;; esac; "
+            "systemctl stop $_unit || true; "
             "cd /opt/l2xpanel; PYTHONPATH=/opt/l2xpanel .venv/bin/python /tmp/l2x_agent_setup.py; "
             "ec=$?; "
-            "systemctl start l2xpanel; "
+            "systemctl start $_unit; "
             "for i in 1 2 3 4 5 6 7 8 9 10; do "
-            "  sleep 1; curl -sf http://127.0.0.1:8090/health >/dev/null && break; "
+            "  sleep 1; curl -sf http://127.0.0.1:$_port/health >/dev/null && break; "
             "done; "
             # acme may schedule restart +5s — rewrite agent flags again after settle
             "sleep 6; "
-            "systemctl stop l2xpanel || true; "
+            "systemctl stop $_unit || true; "
             "PYTHONPATH=/opt/l2xpanel .venv/bin/python /tmp/l2x_agent_setup.py; "
-            "systemctl start l2xpanel; "
+            "systemctl start $_unit; "
             "sleep 2; "
-            "curl -s http://127.0.0.1:8090/health || true; echo; "
+            "curl -s http://127.0.0.1:$_port/health || true; echo; "
             # verify agent endpoint (wrong token → 401 means agent is ON; 403 = disabled)
             "bp=$(python3 -c \"import json;from pathlib import Path;s=json.loads(Path('/var/lib/l2xpanel/store.json').read_text());print((s.get('settings') or {}).get('panel',{}).get('base_path') or '')\"); "
             "code=$(curl -s -o /tmp/l2x_agent_probe.json -w '%{http_code}' -X POST "
             "  -H 'Content-Type: application/json' -H 'Authorization: Bearer probe' "
-            "  -d '{}' \"http://127.0.0.1:8090/${bp}/agent/apply\"); "
+            "  -d '{}' \"http://127.0.0.1:${_port}/${bp}/agent/apply\"); "
             "echo agent_probe $code $(cat /tmp/l2x_agent_probe.json 2>/dev/null); "
             "rm -f /tmp/l2x_agent_setup.py /tmp/l2x_agent_probe.json; "
             "test \"$code\" = \"401\" || test \"$code\" = \"200\"; exit $?",
@@ -2200,11 +2204,13 @@ print('promoted', 'l2tp', len(store.get('l2tp') or []), 'custom', len(store.get(
         r = _ssh_run(
             client,
             "set -a; . /etc/l2xpanel/panel.env; set +a; "
+            "_slot=$(tr -d '[:space:]' </etc/l2xpanel/panel_slot 2>/dev/null || echo live); "
+            "case $_slot in next) _unit=l2xpanel-next; _port=8091;; *) _unit=l2xpanel; _port=8090;; esac; "
             "cd /opt/l2xpanel; .venv/bin/python /tmp/l2x_promote.py; "
-            "systemctl restart l2xpanel; "
+            "systemctl restart $_unit; "
             "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; "
-            "  curl -sf http://127.0.0.1:8090/health >/dev/null && break; done; "
-            "curl -s http://127.0.0.1:8090/health; echo; "
+            "  curl -sf http://127.0.0.1:$_port/health >/dev/null && break; done; "
+            "curl -s http://127.0.0.1:$_port/health; echo; "
             "rm -f /tmp/l2x_promote.py /tmp/l2x_promote.json",
             timeout=300,
         )

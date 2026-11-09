@@ -22,15 +22,15 @@ def ok(name: str) -> None:
 
 def test_install_sh():
     text = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert "update_fast" not in text or "Быстрое обновление" in text
     assert "snapshot_panel" in text
     assert "restore_panel_snapshot" in text
     assert "wait_panel_health" in text
     assert "--update-full" in text
     assert "SKIP_XRAY=${SKIP_XRAY:-1}" in text or 'SKIP_XRAY=${SKIP_XRAY:-1}' in text
-    # default update is fast
-    assert "Быстрое обновление" in text
-    ok("install.sh fast update + snapshot/rollback")
+    assert "Dual-slot" in text or "dual-slot" in text
+    assert "prepare_inactive_slot" in text
+    assert "promote_stage_to_app" not in text
+    ok("install.sh dual-slot update + snapshot/rollback")
 
 
 def test_ops_update_panel_flags():

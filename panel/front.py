@@ -33,7 +33,11 @@ NGINX_SYSTEMD_DROPIN_DIR = Path("/etc/systemd/system/nginx.service.d")
 NGINX_SYSTEMD_DROPIN = NGINX_SYSTEMD_DROPIN_DIR / "l2x-nofile.conf"
 CERT_DIR = Path(os.environ.get("L2XPANEL_CERT_DIR", "/etc/l2xpanel/certs"))
 SELF_SIGNED_DIR = CERT_DIR / "self-signed"
-PANEL_UPSTREAM = "127.0.0.1:8090"
+# Named upstream — dual-slot updates flip /etc/nginx/conf.d/l2x-panel-upstream.conf
+# without rewriting the whole front (zero-downtime cutover).
+PANEL_UPSTREAM = "l2x_panel_backend"
+PANEL_UPSTREAM_CONF = Path("/etc/nginx/conf.d/l2x-panel-upstream.conf")
+PANEL_UPSTREAM_STATE = Path("/etc/l2xpanel/panel_upstream")
 MARK = "# managed by l2x-panel — generated, edits are overwritten"
 STREAM_INCLUDE_LINE = f"include {STREAM_CONF};"
 
@@ -589,6 +593,43 @@ def _ensure_nginx_systemd_nofile() -> tuple[str | None, bool]:
     return prev, True
 
 
+def panel_upstream_addr(default: str = "127.0.0.1:8090") -> str:
+    """Active panel backend host:port (dual-slot cutover state)."""
+    try:
+        if PANEL_UPSTREAM_STATE.is_file():
+            addr = PANEL_UPSTREAM_STATE.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            if addr and ":" in addr:
+                return addr
+    except (OSError, IndexError):
+        pass
+    return default
+
+
+def ensure_panel_upstream_conf(addr: str | None = None) -> bool:
+    """Ensure nginx upstream for the panel exists. Returns True if file changed."""
+    addr = (addr or panel_upstream_addr()).strip() or "127.0.0.1:8090"
+    body = (
+        f"{MARK}\n"
+        f"upstream {PANEL_UPSTREAM} {{\n"
+        f"    server {addr};\n"
+        f"    keepalive 32;\n"
+        f"}}\n"
+    )
+    changed = False
+    try:
+        PANEL_UPSTREAM_CONF.parent.mkdir(parents=True, exist_ok=True)
+        prev = PANEL_UPSTREAM_CONF.read_text(encoding="utf-8") if PANEL_UPSTREAM_CONF.is_file() else None
+        if prev != body:
+            PANEL_UPSTREAM_CONF.write_text(body, encoding="utf-8")
+            changed = True
+        PANEL_UPSTREAM_STATE.parent.mkdir(parents=True, exist_ok=True)
+        if not PANEL_UPSTREAM_STATE.is_file() or PANEL_UPSTREAM_STATE.read_text(encoding="utf-8").strip() != addr:
+            PANEL_UPSTREAM_STATE.write_text(addr + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return changed
+
+
 def _ensure_includes() -> tuple[dict[Path, str | None], bool]:
     """Hook generated files + FD limits into nginx.
 
@@ -597,6 +638,13 @@ def _ensure_includes() -> tuple[dict[Path, str | None], bool]:
     """
     touched: dict[Path, str | None] = {}
     need_restart = False
+    # Upstream must exist before nginx -t (blue-green cutover owns the live target)
+    try:
+        prev_up = PANEL_UPSTREAM_CONF.read_text(encoding="utf-8") if PANEL_UPSTREAM_CONF.is_file() else None
+    except OSError:
+        prev_up = None
+    if ensure_panel_upstream_conf():
+        touched[PANEL_UPSTREAM_CONF] = prev_up
     main = NGINX_CONF.read_text(encoding="utf-8")
     orig_main = main
     if STREAM_INCLUDE_LINE not in main:

@@ -1,0 +1,19 @@
+[Unit]
+Description=L2X Panel (slot next :8091)
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/l2xpanel-next
+EnvironmentFile=/etc/l2xpanel/panel.env
+Environment=HOME=/root
+Environment=HOST=127.0.0.1
+Environment=PORT=8091
+ExecStart=/bin/sh -c 'exec /opt/l2xpanel-next/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8091 --proxy-headers --forwarded-allow-ips 127.0.0.1'
+# Keep running across cutover; installer enables only the active slot for boot.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

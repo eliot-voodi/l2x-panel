@@ -4,7 +4,16 @@ set -u
 APP_DIR=${APP_DIR:-/opt/l2xpanel}
 DATA=${L2XPANEL_DATA:-/var/lib/l2xpanel}
 ENV_FILE=/etc/l2xpanel/panel.env
+PANEL_SLOT_FILE=/etc/l2xpanel/panel_slot
 INSTALL_URL=${L2X_INSTALL_URL:-https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh}
+panel_slot() { tr -d '[:space:]' <"$PANEL_SLOT_FILE" 2>/dev/null || echo live; }
+panel_unit() { [ "$(panel_slot)" = next ] && echo l2xpanel-next || echo l2xpanel; }
+panel_port() {
+  local addr
+  addr=$(tr -d '[:space:]' </etc/l2xpanel/panel_upstream 2>/dev/null || true)
+  if [ -n "$addr" ] && [[ "$addr" == *:* ]]; then echo "${addr##*:}"; return; fi
+  [ "$(panel_slot)" = next ] && echo 8091 || echo 8090
+}
 PY="$APP_DIR/.venv/bin/python"
 [ -x "$PY" ] || PY=python3
 
@@ -68,7 +77,7 @@ run_installer() {
 
 show_status() {
   c_head "Статус"
-  for u in l2xpanel xray nginx caddy xl2tpd strongswan-starter ipsec; do
+  for u in l2xpanel l2xpanel-next xray nginx caddy xl2tpd strongswan-starter ipsec; do
     systemctl list-unit-files "$u.service" >/dev/null 2>&1 || continue
     st=$(systemctl is-active "$u" 2>/dev/null)
     [ -z "$st" ] && continue
@@ -76,6 +85,7 @@ show_status() {
   done
   echo "  Xray: $(/usr/local/bin/xray version 2>/dev/null | head -1)"
   echo "  Версия панели: $(tr -d '[:space:]' <"${APP_DIR:-/opt/l2xpanel}/VERSION" 2>/dev/null || echo '?')"
+  echo "  Слот: $(panel_slot)  unit=$(panel_unit)  :$(panel_port)"
   echo "  Панель: $(panel_url)"
   echo "  Админ: $("$PY" -c "
 import json, os
@@ -116,13 +126,13 @@ EOF
 }
 
 disable_2fa() {
-  store_set settings.security.totp_enabled false && store_set settings.security.totp_secret "" && systemctl restart l2xpanel && c_ok "2FA отключена"
+  store_set settings.security.totp_enabled false && store_set settings.security.totp_secret "" && systemctl restart "$(panel_unit)" && c_ok "2FA отключена"
 }
 
 reset_base_path() {
   local bp
   bp=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
-  store_set settings.panel.base_path "$bp" && systemctl restart l2xpanel && sleep 3 && c_ok "Новый секретный путь: $(panel_url)"
+  store_set settings.panel.base_path "$bp" && systemctl restart "$(panel_unit)" && sleep 3 && c_ok "Новый секретный путь: $(panel_url)"
 }
 
 issue_ssl() {
@@ -231,7 +241,7 @@ EOF
   read -r -p "Выбор: " ch
   case "$ch" in
     1) show_status ;;
-    2) systemctl restart l2xpanel && c_ok "Панель перезапущена" ;;
+    2) systemctl restart "$(panel_unit)" && c_ok "Панель перезапущена" ;;
     3) systemctl restart xray && c_ok "Xray перезапущен" ;;
     4) echo "$(panel_url)" ;;
     5) reset_password ;;
@@ -270,7 +280,7 @@ EOF
 need_root
 case "${1:-}" in
   status) show_status ;;
-  restart) systemctl restart l2xpanel xray && c_ok "ok" ;;
+  restart) systemctl restart "$(panel_unit)" xray && c_ok "ok" ;;
   url) panel_url ;;
   reset-password) reset_password ;;
   disable-2fa) disable_2fa ;;

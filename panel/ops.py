@@ -156,10 +156,12 @@ def panel_latest(include_prerelease: bool = False) -> dict:
 
 
 def update_panel(version: str = "", *, skip_xray: bool | None = None, full: bool = False) -> dict:
-    """Run install.sh --update/--update-full [TAG] (keeps data). Panel restarts.
+    """Run install.sh --update/--update-full [TAG] (keeps data).
 
-    Fast path (default): code + conditional pip + restart l2xpanel; auto-rollback
-    to /opt/l2xpanel.prev if /health fails. ``full=True`` also refreshes apt/xray/nginx.
+    Fast path (default, nginx mode): dual-slot cutover — download into the inactive slot,
+    start the second service, /health, one nginx upstream flip, then stop the old unit.
+    The previous slot tree is kept for the next rollback/update. ``full=True`` also
+    refreshes apt/xray/nginx before the same cutover.
 
     ``version`` pins/rolls back to a GitHub release tag (e.g. v1.9.72).
     """
