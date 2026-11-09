@@ -102,59 +102,107 @@ def version_tuple(v: str) -> tuple[int, ...]:
     return tuple(nums)
 
 
+def normalize_tag(version: str) -> str:
+    v = str(version or "").strip()
+    if not v:
+        return ""
+    return v if v.startswith("v") or v.startswith("V") else f"v{v}"
+
+
 PANEL_REPO = os.environ.get("L2X_REPO_API", "eliot-voodi/l2x-panel")
 
 
-def panel_latest(include_prerelease: bool = False) -> dict:
-    """Newest L2X Panel release on GitHub."""
+def panel_releases(limit: int = 20, *, include_prerelease: bool = False) -> list[dict]:
+    """GitHub panel releases newest-first: [{tag, url, published, prerelease, notes}]."""
     try:
-        data = json.loads(_http(f"https://api.github.com/repos/{PANEL_REPO}/releases?per_page=15", 20))
-    except Exception as exc:
-        return {"ok": False, "error": f"GitHub: {exc}"}
-    best = None
+        data = json.loads(_http(f"https://api.github.com/repos/{PANEL_REPO}/releases?per_page={limit}", 20))
+    except Exception:
+        return []
+    out = []
     for r in data:
         if r.get("draft") or not r.get("tag_name"):
             continue
         if r.get("prerelease") and not include_prerelease:
             continue
-        if best is None or version_tuple(r["tag_name"]) > version_tuple(best["tag_name"]):
-            best = r
-    if not best:
-        # fall back to main VERSION file
+        out.append({
+            "tag": r["tag_name"],
+            "url": r.get("html_url") or "",
+            "published": r.get("published_at") or "",
+            "prerelease": bool(r.get("prerelease")),
+            "notes": (r.get("body") or "")[:2000],
+        })
+    return out
+
+
+def panel_latest(include_prerelease: bool = False) -> dict:
+    """Newest L2X Panel release on GitHub."""
+    releases = panel_releases(15, include_prerelease=include_prerelease)
+    if not releases:
         try:
             raw = _http(f"https://raw.githubusercontent.com/{PANEL_REPO}/main/VERSION", 15).decode().strip()
             return {"ok": True, "tag": raw if raw.startswith("v") else f"v{raw}", "url": "", "published": "",
                     "prerelease": False, "notes": ""}
         except Exception as exc:
             return {"ok": False, "error": f"нет релизов: {exc}"}
+    best = max(releases, key=lambda r: version_tuple(r["tag"]))
     return {
         "ok": True,
-        "tag": best["tag_name"],
-        "url": best.get("html_url") or "",
-        "published": best.get("published_at") or "",
+        "tag": best["tag"],
+        "url": best.get("url") or "",
+        "published": best.get("published") or "",
         "prerelease": bool(best.get("prerelease")),
-        "notes": (best.get("body") or "")[:4000],
+        "notes": best.get("notes") or "",
     }
 
 
-def update_panel() -> dict:
-    """Run install.sh --update (keeps data). Panel process will restart."""
-    script = (
-        "curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
-        "| bash -s -- --update"
-    )
+def update_panel(version: str = "", *, skip_xray: bool | None = None) -> dict:
+    """Run install.sh --update [TAG] (keeps data). Panel process will restart.
+
+    ``version`` pins/rolls back to a GitHub release tag (e.g. v1.9.72).
+    When a tag is set, Xray is left untouched unless skip_xray=False.
+    """
+    tag = normalize_tag(version)
+    env = os.environ.copy()
+    if tag:
+        env["L2X_BRANCH"] = tag
+        if skip_xray is None:
+            skip_xray = True
+    if skip_xray:
+        env["SKIP_XRAY"] = "1"
+    elif "SKIP_XRAY" in env:
+        env.pop("SKIP_XRAY", None)
+
     if Path("/usr/local/bin/l2x").exists():
-        r = _run(["/usr/local/bin/l2x", "update"], timeout=900)
+        cmd = ["/usr/local/bin/l2x", "update"] + ([tag] if tag else [])
+        r = _run(cmd, timeout=900, env=env)
     else:
-        r = _run(["bash", "-lc", script], timeout=900)
+        args = "--update" + (f" {tag}" if tag else "")
+        script = (
+            "curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
+            f"| bash -s -- {args}"
+        )
+        r = _run(["bash", "-lc", script], timeout=900, env=env)
     log = (r.get("stdout") or "")[-3000:] + ("\n" + (r.get("stderr") or "")[-1000:] if r.get("stderr") else "")
     ver = ""
     try:
         ver = Path("/opt/l2xpanel/VERSION").read_text(encoding="utf-8").strip().splitlines()[0]
     except OSError:
         pass
-    return {"ok": bool(r.get("ok")), "log": log or f"exit {r.get('code')}", "version": ver,
-            "error": "" if r.get("ok") else (r.get("stderr") or "update failed")}
+    return {
+        "ok": bool(r.get("ok")),
+        "log": log or f"exit {r.get('code')}",
+        "version": ver,
+        "requested": tag or "latest",
+        "error": "" if r.get("ok") else (r.get("stderr") or "update failed"),
+    }
+
+
+def rollback_panel(version: str) -> dict:
+    """Install a specific older (or any) panel release tag."""
+    tag = normalize_tag(version)
+    if not tag:
+        return {"ok": False, "error": "укажите версию панели (например v1.9.72)"}
+    return update_panel(tag, skip_xray=True)
 
 
 def xray_latest(include_prerelease: bool = False) -> dict:
@@ -192,8 +240,93 @@ def _xray_asset() -> str:
     return "Xray-linux-64.zip"
 
 
+def _xray_bin_version(path: Path) -> str:
+    r = _run([str(path), "version"], 15)
+    if not r.get("ok"):
+        return ""
+    # "Xray 26.10.31 (Xray, Penetrates Everything.) ..."
+    line = (r.get("stdout") or "").splitlines()[0] if r.get("stdout") else ""
+    parts = line.split()
+    for i, p in enumerate(parts):
+        if p.lower() == "xray" and i + 1 < len(parts):
+            return parts[i + 1].lstrip("vV")
+        if p[:1].isdigit():
+            return p.lstrip("vV")
+    return ""
+
+
+def xray_backup_info() -> dict:
+    """Info about the previous binary saved as xray.bak during the last install."""
+    backup = XRAY_BIN.with_suffix(".bak")
+    meta = XRAY_BIN.with_suffix(".bak.version")
+    if not backup.is_file():
+        return {"ok": False, "exists": False, "version": "", "path": str(backup)}
+    ver = ""
+    if meta.is_file():
+        try:
+            ver = meta.read_text(encoding="utf-8").strip().splitlines()[0].lstrip("vV")
+        except OSError:
+            ver = ""
+    if not ver:
+        ver = _xray_bin_version(backup)
+    return {
+        "ok": True,
+        "exists": True,
+        "version": ver,
+        "path": str(backup),
+        "mtime": int(backup.stat().st_mtime),
+    }
+
+
+def _activate_xray_binary(new_bin: Path, *, label: str) -> dict:
+    """Replace live binary with new_bin (already executable), test config, restart."""
+    cfg = os.environ.get("XRAY_CONFIG", "/etc/xray/config.json")
+    log = [label]
+    if Path(cfg).exists():
+        check = _run([str(new_bin), "run", "-test", "-config", cfg], 60)
+        if not check["ok"]:
+            return {
+                "ok": False,
+                "error": "конфиг не проходит xray -test:\n" + (check["stderr"] or check["stdout"])[-1500:],
+                "log": "\n".join(log),
+            }
+        log.append("config test: ok")
+    # Swap: keep current as .bak so rollback can be undone
+    backup = XRAY_BIN.with_suffix(".bak")
+    meta = XRAY_BIN.with_suffix(".bak.version")
+    had_old = XRAY_BIN.exists()
+    prev_ver = _xray_bin_version(XRAY_BIN) if had_old else ""
+    tmp_live = XRAY_BIN.with_suffix(".swap")
+    if had_old:
+        shutil.copy2(XRAY_BIN, tmp_live)
+    os.replace(new_bin, XRAY_BIN)
+    if had_old and tmp_live.exists():
+        os.replace(tmp_live, backup)
+        try:
+            meta.write_text(prev_ver or "", encoding="utf-8")
+        except OSError:
+            pass
+    r = _run(["systemctl", "restart", "xray"], 30)
+    time.sleep(3)
+    active = _run(["systemctl", "is-active", "xray"])["stdout"].strip() == "active"
+    if not (r["ok"] and active):
+        if had_old and backup.exists():
+            os.replace(backup, XRAY_BIN)
+            _run(["systemctl", "restart", "xray"], 30)
+        return {
+            "ok": False,
+            "error": f"Xray не запустился после {label}\n{(r.get('stderr') or '')[-800:]}",
+            "log": "\n".join(log),
+        }
+    ver = _xray_bin_version(XRAY_BIN)
+    log.append(f"active version={ver or '?'}")
+    return {"ok": True, "log": "\n".join(log), "version": ver}
+
+
 def install_xray(version: str) -> dict:
-    version = version if version.startswith("v") else f"v{version}"
+    version = normalize_tag(version)
+    if not version:
+        return {"ok": False, "error": "не указана версия Xray"}
     url = f"https://github.com/XTLS/Xray-core/releases/download/{version}/{_xray_asset()}"
     try:
         blob = _http(url, 180)
@@ -208,32 +341,27 @@ def install_xray(version: str) -> dict:
     if not test["ok"]:
         tmp.unlink(missing_ok=True)
         return {"ok": False, "error": test["stderr"] or "new binary does not run"}
-    backup = XRAY_BIN.with_suffix(".bak")
-    had_old = XRAY_BIN.exists()
-    if had_old:
-        shutil.copy2(XRAY_BIN, backup)
-    os.replace(tmp, XRAY_BIN)
-    # The current config must still pass with the new core, otherwise roll back
-    cfg = os.environ.get("XRAY_CONFIG", "/etc/xray/config.json")
-    log = [f"downloaded {version}", test["stdout"].splitlines()[0] if test["stdout"] else ""]
-    if Path(cfg).exists():
-        check = _run([str(XRAY_BIN), "run", "-test", "-config", cfg], 60)
-        if not check["ok"]:
-            if had_old:
-                os.replace(backup, XRAY_BIN)
-            return {"ok": False, "error": "текущий конфиг не проходит xray -test на новой версии, откат:\n"
-                                          + (check["stderr"] or check["stdout"])[-1500:]}
-        log.append("config test: ok")
-    r = _run(["systemctl", "restart", "xray"], 30)
-    time.sleep(3)
-    active = _run(["systemctl", "is-active", "xray"])["stdout"].strip() == "active"
-    if not (r["ok"] and active):
-        if had_old:
-            os.replace(backup, XRAY_BIN)
-            _run(["systemctl", "restart", "xray"], 30)
-        return {"ok": False, "error": f"Xray {version} не запустился, возвращена прежняя версия\n{r['stderr'][-800:]}"}
-    log.append(f"installed {version}, xray active")
-    return {"ok": True, "log": "\n".join(x for x in log if x), "version": version}
+    res = _activate_xray_binary(tmp, label=f"downloaded {version}")
+    if res.get("ok"):
+        res["version"] = version.lstrip("vV")
+    return res
+
+
+def rollback_xray(version: str = "") -> dict:
+    """Roll Xray back to ``version`` from GitHub, or to local ``xray.bak`` if version empty."""
+    tag = normalize_tag(version)
+    if tag:
+        return install_xray(tag)
+    info = xray_backup_info()
+    if not info.get("exists"):
+        return {"ok": False, "error": "нет локального xray.bak — укажите версию из GitHub releases"}
+    bak = Path(info["path"])
+    # Copy bak to .new so _activate can move current → bak (undo path)
+    tmp = XRAY_BIN.with_suffix(".new")
+    shutil.copy2(bak, tmp)
+    os.chmod(tmp, 0o755)
+    label = f"rollback from bak ({info.get('version') or 'unknown'})"
+    return _activate_xray_binary(tmp, label=label)
 
 
 def xray_control(action: str) -> dict:

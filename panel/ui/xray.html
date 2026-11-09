@@ -160,9 +160,24 @@
     <select name="version">
       {% for v in releases %}<option {% if v.lstrip('v') == xs.version %}selected{% endif %}>{{ v }}</option>{% else %}<option value="">не удалось получить список</option>{% endfor %}
     </select>
-    <div class="actions mt"><button class="btn">Установить</button></div>
-    <div class="hint">Бинарник проверяется <code>xray version</code> перед заменой; при ошибке остаётся старый.</div>
+    <div class="actions mt"><button class="btn">Установить / откатить на выбранную</button></div>
+    <div class="hint">Любой тег = установка или откат. Перед заменой — <code>xray -test</code>; текущий бинарник → <code>xray.bak</code>.</div>
   </form>
+  <div class="card">
+    <h3>Быстрый откат на предыдущий бинарник</h3>
+    {% set bak = xray_bak if xray_bak is defined else {} %}
+    {% if bak.exists %}
+    <div class="small">Сохранён: <b class="mono">{{ bak.version or '?' }}</b> · <span class="dim">{{ bak.path }}</span></div>
+    <form method="post" action="{{ bp }}/xray/rollback" class="mt"
+          onsubmit="return confirm('Вернуть Xray из .bak ({{ bak.version or "?" }})?\nТекущая {{ xs.version }} сохранится как новый .bak.')">
+      <input type="hidden" name="confirm" value="yes">
+      <input type="hidden" name="version" value="">
+      <div class="actions"><button class="btn danger">Откатить на {{ bak.version or '.bak' }}</button></div>
+    </form>
+    {% else %}
+    <div class="hint">Локального <code>xray.bak</code> ещё нет — он появляется после первой успешной установки/обновления ядра. Для отката выберите версию в списке слева.</div>
+    {% endif %}
+  </div>
   <div>{% include "_jobs.html" %}</div>
 </div>
 {% endif %}

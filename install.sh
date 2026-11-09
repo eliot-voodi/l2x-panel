@@ -7,8 +7,8 @@
 #
 # Flags:
 #   --yes, -y     non-interactive: take answers from the environment or defaults
-#   --update      update code, keep data and settings
-#   --uninstall   remove services and code (data in /var/lib/l2xpanel is kept)
+#   --update [TAG]  update code, keep data and settings (optional Git tag, e.g. v1.9.72)
+#   --uninstall     remove services and code (data in /var/lib/l2xpanel is kept)
 #
 # Environment (non-interactive answers):
 #   L2X_HOST      public IP or domain           (default: detected IPv4)
@@ -21,7 +21,8 @@
 #   L2X_DOMAIN    domain for L2X_SSL=domain
 #   L2X_EMAIL     e-mail for Let's Encrypt      (optional)
 #   XRAY_VERSION  Xray-core tag, e.g. v26.10.31 (default: latest)
-#   L2X_REPO, L2X_BRANCH  source repository     (default: eliot-voodi/l2x-panel, main)
+#   SKIP_XRAY=1   skip Xray install during --update (panel-only rollback)
+#   L2X_REPO, L2X_BRANCH  source repository / branch or tag (default: eliot-voodi/l2x-panel, main)
 set -euo pipefail
 
 REPO_URL=${L2X_REPO:-https://github.com/eliot-voodi/l2x-panel}
@@ -153,11 +154,14 @@ xray_latest_tag() {
 _download_repo_tarball() {
   # GitHub archive endpoints flake with 503; try several URLs with retries.
   # Never pipe curl|tar — a failed HTML/error body corrupts the extract.
+  # BRANCH may be a branch (main) or a release tag (v1.9.72).
   local dest=$1 owner repo
   owner=$(printf '%s' "$REPO_URL" | sed -E 's|https?://github.com/||;s|/+$||' | cut -d/ -f1)
   repo=$(printf '%s' "$REPO_URL" | sed -E 's|https?://github.com/||;s|/+$||' | cut -d/ -f2)
   [ -n "$owner" ] && [ -n "$repo" ] || die "Некорректный L2X_REPO: $REPO_URL"
   local urls=(
+    "https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/${BRANCH}"
+    "https://github.com/${owner}/${repo}/archive/refs/tags/${BRANCH}.tar.gz"
     "https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${BRANCH}"
     "https://github.com/${owner}/${repo}/archive/refs/heads/${BRANCH}.tar.gz"
     "https://github.com/${owner}/${repo}/archive/${BRANCH}.tar.gz"
@@ -225,6 +229,14 @@ install_packages() {
 
 install_xray() {
   step "Xray-core"
+  if [ "${SKIP_XRAY:-}" = "1" ]; then
+    if [ -x "$XRAY_BIN" ]; then
+      ok "Пропуск Xray (SKIP_XRAY=1): $("$XRAY_BIN" version 2>/dev/null | head -1 || echo installed)"
+    else
+      warn "SKIP_XRAY=1, но бинарник Xray не найден — пропускаю"
+    fi
+    return
+  fi
   if [ -x "$XRAY_BIN" ] && [ -z "${XRAY_VERSION:-}" ]; then
     ok "Уже установлен: $("$XRAY_BIN" version | head -1 | awk '{print $2}')"
   else
@@ -459,13 +471,14 @@ current_mode() { grep -q '^HOST=0.0.0.0' "$ENV_FILE" 2>/dev/null && echo direct 
 update() {
   MODE=$(current_mode)
   SSL=none
+  info "Источник: $REPO_URL @ $BRANCH${SKIP_XRAY:+ (Xray не трогаем)}"
   fetch_source
   install_packages
   install_xray
   install_code
   install_system
   wait_panel
-  ok "Панель обновлена, данные и настройки сохранены"
+  ok "Панель обновлена до $(tr -d '[:space:]' <"$APP_DIR/VERSION" 2>/dev/null || echo '?'), данные сохранены"
   printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
   exit 0
 }
@@ -547,11 +560,28 @@ summary() {
 
 # ---------------------------------------------------------------- main
 banner
-for a in "$@"; do
+# Parse --update [TAG] / --uninstall; TAG may be v1.9.72 (sets L2X_BRANCH).
+_args=("$@")
+_i=0
+while [ "$_i" -lt "${#_args[@]}" ]; do
+  a="${_args[$_i]}"
   case "$a" in
     --uninstall) uninstall ;;
-    --update) [ -f "$ENV_FILE" ] || die "Панель не установлена"; update ;;
+    --update)
+      [ -f "$ENV_FILE" ] || die "Панель не установлена"
+      next="${_args[$((_i + 1))]:-}"
+      if [ -n "$next" ] && [[ "$next" != -* ]]; then
+        BRANCH=$next
+        export L2X_BRANCH=$BRANCH
+        # Panel pin/rollback: do not replace a working Xray unless XRAY_VERSION is set
+        [ -n "${XRAY_VERSION:-}" ] || SKIP_XRAY=${SKIP_XRAY:-1}
+        export SKIP_XRAY
+        _i=$((_i + 1))
+      fi
+      update
+      ;;
   esac
+  _i=$((_i + 1))
 done
 
 if [ -f "$ENV_FILE" ] && [ -f "$APP_DIR/app.py" ]; then

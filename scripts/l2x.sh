@@ -202,8 +202,10 @@ menu() {
   12) Обновить geoip/geosite
   13) Бэкап в /root
   14) Логи
-  15) Обновить панель
-  16) Удалить панель
+  15) Обновить панель (latest)
+  16) Откатить панель на тег
+  17) Откатить Xray (.bak или тег)
+  18) Удалить панель
    0) Выход
 EOF
   read -r -p "Выбор: " ch
@@ -223,7 +225,23 @@ EOF
     13) backup ;;
     14) logs ;;
     15) run_installer --update ;;
-    16) run_installer --uninstall; exit 0 ;;
+    16)
+      read -r -p "Тег панели (например v1.9.72): " tag
+      [ -n "$tag" ] || { c_warn "пусто"; return; }
+      SKIP_XRAY=1 run_installer --update "$tag"
+      ;;
+    17)
+      read -r -p "Версия Xray (пусто = .bak, или тег v26.x.x): " xv
+      pyrun "$xv" <<'EOF'
+import sys
+sys.path.insert(0, "/opt/l2xpanel")
+import ops
+r = ops.rollback_xray(sys.argv[1] if len(sys.argv) > 1 else "")
+print(r.get("log") or "")
+print("OK" if r.get("ok") else "ERROR: " + str(r.get("error") or r))
+EOF
+      ;;
+    18) run_installer --uninstall; exit 0 ;;
     0|q) exit 0 ;;
     *) c_warn "Неизвестный пункт" ;;
   esac
@@ -238,8 +256,24 @@ case "${1:-}" in
   disable-2fa) disable_2fa ;;
   reset-path) reset_base_path ;;
   backup) backup ;;
-  update) run_installer --update ;;
+  update)
+    if [ -n "${2:-}" ]; then
+      SKIP_XRAY=1 run_installer --update "$2"
+    else
+      run_installer --update
+    fi
+    ;;
+  rollback-xray)
+    pyrun "${2:-}" <<'EOF'
+import sys
+sys.path.insert(0, "/opt/l2xpanel")
+import ops
+r = ops.rollback_xray(sys.argv[1] if len(sys.argv) > 1 else "")
+print(r.get("log") or "")
+raise SystemExit(0 if r.get("ok") else 1)
+EOF
+    ;;
   uninstall) run_installer --uninstall ;;
   "") while true; do menu; done ;;
-  *) echo "Использование: l2x [status|restart|url|reset-password|disable-2fa|reset-path|backup|update|uninstall]" ;;
+  *) echo "Использование: l2x [status|restart|url|reset-password|disable-2fa|reset-path|backup|update [TAG]|rollback-xray [TAG]|uninstall]" ;;
 esac

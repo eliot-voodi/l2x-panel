@@ -192,11 +192,15 @@
       <input type="hidden" name="action" value="update_xray"><button class="btn">Обновить до latest</button>
     </form>
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="restart_xray"><button class="btn ghost">Restart Xray</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"
+          onsubmit="return confirm('Откатить Xray на ноде {{ node.name }} на локальный .bak?')">
+      <input type="hidden" name="action" value="rollback_xray"><button class="btn ghost">Откат Xray (.bak)</button>
+    </form>
   </div>
   <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" class="mt" style="max-width:420px"
         onsubmit="return confirm('Установить выбранную версию Xray на {{ node.name }}?')">
     <input type="hidden" name="action" value="update_xray">
-    <label class="f">Или выбрать релиз</label>
+    <label class="f">Или выбрать релиз (установка / откат)</label>
     <div class="flex" style="gap:.5rem;align-items:end">
       <select name="version" style="flex:1">
         {% for v in xray_releases %}<option {% if (xr.version or node.xray_version) and v.lstrip('v') == (xr.version or node.xray_version) %}selected{% endif %}>{{ v }}</option>{% else %}<option value="">нет списка — укажите вручную ниже</option>{% endfor %}
@@ -220,7 +224,16 @@
       <input type="hidden" name="action" value="restart_panel"><button class="btn ghost">Restart l2xpanel</button>
     </form>
   </div>
-  <div class="hint mt">Update ставит релиз через встроенный updater ноды. Restore MASTER — аварийный возврат роли на удалённой панели.</div>
+  <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" class="mt" style="max-width:420px"
+        onsubmit="return confirm('Откатить панель на ноде {{ node.name }} на '+this.version.value+'?\nXray на ноде не меняется.')">
+    <input type="hidden" name="action" value="rollback_panel">
+    <label class="f">Откат панели на тег</label>
+    <div class="flex" style="gap:.5rem;align-items:end">
+      <input name="version" class="mono" placeholder="v1.9.72" required style="flex:1">
+      <button class="btn danger">Откатить панель</button>
+    </div>
+  </form>
+  <div class="hint mt">Update ставит latest; откат панели — любой GitHub-тег (SKIP_XRAY). Restore MASTER — аварийный возврат роли.</div>
 </div>
 
 {% elif tab == 'logs' and ok %}

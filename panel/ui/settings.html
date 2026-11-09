@@ -281,6 +281,7 @@
 {% elif tab == 'system' %}
 {% set pu = store.get('panel_update_state') if store is defined else {} %}
 {% set pu = pu or {} %}
+{% set prels = panel_releases if panel_releases is defined else [] %}
 <div class="card">
   <div class="card-head"><h3>Обновление панели</h3>
     <form method="post" action="{{ bp }}/panel/update/check"><button class="btn ghost sm">{{ ic.icon('refresh') }}Проверить</button></form></div>
@@ -300,6 +301,22 @@
   <div class="hint mt">Установлена актуальная версия.</div>
   {% endif %}
   <div class="hint">То же, что <code>l2x update</code>: код с GitHub, store и секреты не трогаются.</div>
+</div>
+<div class="card">
+  <h3>Откат / установка версии панели</h3>
+  <div class="hint">Выберите любой релиз GitHub. Данные и Xray не меняются. Сервис панели перезапустится.</div>
+  <form method="post" action="{{ bp }}/panel/update/rollback" class="mt"
+        onsubmit="return confirm('Установить панель '+this.version.value+'?\nТекущая: v{{ panel_version }}\nДанные сохранятся, Xray не трогаем.')">
+    <input type="hidden" name="confirm" value="yes">
+    <label class="f">Релиз</label>
+    <select name="version" required style="max-width:280px">
+      {% for r in prels %}
+      <option value="{{ r.tag }}" {% if r.tag.lstrip('v') == panel_version %}disabled{% endif %}>{{ r.tag }}{% if r.prerelease %} (pre){% endif %}</option>
+      {% else %}<option value="">нет списка релизов — проверьте GitHub</option>{% endfor %}
+    </select>
+    <div class="actions mt"><button class="btn danger" {% if not prels %}disabled{% endif %}>Откатить / установить выбранную</button></div>
+  </form>
+  <div class="hint">CLI: <code>l2x update v1.9.72</code> или <code>L2X_BRANCH=v1.9.72 SKIP_XRAY=1 bash install.sh --update</code></div>
 </div>
 {% include "_jobs.html" %}
 <div class="grid g2">

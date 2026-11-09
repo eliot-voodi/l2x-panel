@@ -4383,6 +4383,7 @@ def xray_page(request: Request):
         ctx["releases"] = ops.xray_releases()
         ctx["upd"] = store.get("xray_update_state") or {}
         ctx["upd_cfg"] = store["settings"].get("xray_update") or {}
+        ctx["xray_bak"] = ops.xray_backup_info()
     if tab == "template":
         ctx["final"] = json.dumps(xray.build_config(store), ensure_ascii=False, indent=2)
     if tab == "geo":
@@ -4469,6 +4470,36 @@ def xray_install(request: Request, version: str = Form(...)):
     return go("/xray?tab=core")
 
 
+@app.post("/xray/rollback")
+def xray_rollback(request: Request, version: str = Form(""), confirm: str = Form("")):
+    """Roll Xray back to local .bak (empty version) or a specific GitHub tag."""
+    if redir := _require(request):
+        return redir
+    if confirm != "yes":
+        flash(request, "Откат Xray не подтверждён", "error")
+        return go("/xray?tab=core")
+    running = XRAY_UPDATE_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Установка/откат Xray уже идёт", "info")
+        return go("/xray?tab=core")
+    target = (version or "").strip()
+
+    def do_rb(v: str) -> dict:
+        res = ops.rollback_xray(v)
+        try:
+            check_xray_update(force=True)
+        except Exception:
+            pass
+        return res
+
+    XRAY_UPDATE_JOB["id"] = ops.start_job("xray-rollback", do_rb, target)
+    if target:
+        flash(request, f"Откат Xray на {ops.normalize_tag(target)} запущен", "info")
+    else:
+        flash(request, "Откат Xray на предыдущий бинарник (.bak) запущен", "info")
+    return go("/xray?tab=core")
+
+
 def _next(request: Request, default: str = "/xray?tab=core") -> str:
     nxt = request.query_params.get("next") or default
     return nxt if nxt.startswith("/") and not nxt.startswith("//") else default
@@ -4511,6 +4542,41 @@ def panel_update_install(request: Request, version: str = Form(...), confirm: st
 
     PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update", do_update)
     flash(request, f"Обновление панели до {version} запущено. Сервис перезапустится; обновите страницу через минуту.", "info")
+    return go("/settings?tab=system")
+
+
+@app.post("/panel/update/rollback")
+def panel_update_rollback(request: Request, version: str = Form(...), confirm: str = Form("")):
+    """Install a specific panel release tag (rollback or pin). Keeps data; does not touch Xray."""
+    if redir := _require(request):
+        return redir
+    tag = ops.normalize_tag(version)
+    if confirm != "yes" or not tag:
+        flash(request, "Откат панели не подтверждён", "error")
+        return go("/settings?tab=system")
+    cur = ops.normalize_tag(panel_version())
+    if tag == cur:
+        flash(request, f"Уже установлена {tag}", "info")
+        return go("/settings?tab=system")
+    running = PANEL_UPDATE_JOB.get("id")
+    if running and ops.JOBS.get(running, {}).get("status") == "running":
+        flash(request, "Обновление/откат панели уже идёт", "info")
+        return go("/settings?tab=system")
+
+    def do_rollback():
+        res = ops.rollback_panel(tag)
+        try:
+            check_panel_update(force=True)
+        except Exception:
+            pass
+        return res
+
+    PANEL_UPDATE_JOB["id"] = ops.start_job("panel-rollback", do_rollback)
+    flash(
+        request,
+        f"Откат панели на {tag} запущен (Xray не меняется). Сервис перезапустится — обновите страницу через минуту.",
+        "info",
+    )
     return go("/settings?tab=system")
 
 
@@ -5061,6 +5127,7 @@ def settings_page(request: Request):
     if tab == "system":
         ctx["bbr"] = ops.bbr_status()
         ctx["store"] = store
+        ctx["panel_releases"] = ops.panel_releases(20)
     new_token = request.session.pop("new_api_token", None)
     return page(request, "settings.html", active="settings", tab=tab, s=s, admin=_admin(), new_token=new_token,
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5],
@@ -5964,7 +6031,8 @@ async def settings_node_action(node_id: str, request: Request):
         tab = "settings"
     elif action.startswith("l2tp") or action in ("refresh_l2tp", "select_best_l2tp"):
         tab = "l2tp"
-    elif action in ("update_panel", "restore_master", "restart_panel", "check_xray", "update_xray", "restart_xray"):
+    elif action in ("update_panel", "rollback_panel", "restore_master", "restart_panel",
+                    "check_xray", "update_xray", "rollback_xray", "restart_xray"):
         tab = "system"
 
     # NAT has no inbound manage HTTP — queue Xray update / local check from last pull
@@ -6970,6 +7038,24 @@ def _manage_action(action: str, payload: dict) -> dict:
             return {"ok": True, "started": False, "already": True, "current": panel_version()}
         PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-remote", ops.update_panel)
         return {"ok": True, "started": True, "current": panel_version()}
+
+    if action == "rollback_panel":
+        tag = ops.normalize_tag(str(payload.get("version") or ""))
+        if not tag:
+            return {"ok": False, "error": "version required (e.g. v1.9.72)"}
+        running = PANEL_UPDATE_JOB.get("id")
+        if running and ops.JOBS.get(running, {}).get("status") == "running":
+            return {"ok": True, "started": False, "already": True, "current": panel_version(), "version": tag}
+        PANEL_UPDATE_JOB["id"] = ops.start_job("panel-rollback-remote", ops.rollback_panel, tag)
+        return {"ok": True, "started": True, "current": panel_version(), "version": tag}
+
+    if action == "rollback_xray":
+        ver = str(payload.get("version") or "").strip()
+        running = XRAY_UPDATE_JOB.get("id")
+        if running and ops.JOBS.get(running, {}).get("status") == "running":
+            return {"ok": True, "started": False, "already": True}
+        XRAY_UPDATE_JOB["id"] = ops.start_job("xray-rollback-remote", ops.rollback_xray, ver)
+        return {"ok": True, "started": True, "version": ver or "bak"}
 
     if action == "restore_master":
         with mutate() as st:
