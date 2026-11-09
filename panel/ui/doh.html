@@ -106,7 +106,8 @@
       <div><label class="f">Timeout, с</label><input name="timeout_sec" type="number" min="1" step="0.5" value="{{ doh.timeout_sec or 4 }}"></div>
     </div>
     <label class="f">Пароль Pi-hole admin (пусто = не менять)</label>
-    <input name="pihole_password" type="password" autocomplete="new-password" placeholder="при сохранении — пересоздаёт контейнер с новым паролем">
+    <input name="pihole_password" type="password" autocomplete="new-password" placeholder="при сохранении — pihole setpassword + проверка входа">
+    <div class="hint">Пароль пишется в контейнер через <code>pihole setpassword</code> (без FTLCONF env — иначе спецсимволы/`$` ломают пароль).</div>
     <div class="hint">Публичный URL клиента: <code>https://{{ public_host or 'домен' }}/{{ doh.path_prefix or 'doh' }}/&lt;token&gt;</code> — только через nginx :443.</div>
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
   </form>

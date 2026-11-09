@@ -356,6 +356,8 @@ def _probe_query() -> bytes:
 
 COMPOSE_YML = """\
 # Managed by L2X Panel — Pi-hole + UDP DNS for DoH frontend
+# Admin password is applied with ``docker exec … pihole setpassword`` into the
+# volume — not via an FTLCONF env key (read-only + .env `$` interpolation bugs).
 services:
   pihole:
     image: pihole/pihole:latest
@@ -363,7 +365,6 @@ services:
     restart: unless-stopped
     environment:
       TZ: Europe/Moscow
-      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD}"
       FTLCONF_dns_listeningMode: ALL
     ports:
       - "127.0.0.1:53:53/tcp"
@@ -377,17 +378,79 @@ services:
 """
 
 
+def _env_quote(value: str) -> str:
+    """Quote a value for docker compose .env (safe with $, #, spaces, quotes)."""
+    s = str(value or "")
+    if re.fullmatch(r"[A-Za-z0-9_./:@%+=-]+", s):
+        return s
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
 def write_compose(*, password: str = "") -> Path:
     COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
     (COMPOSE_DIR / "docker-compose.yml").write_text(COMPOSE_YML, encoding="utf-8")
     env = COMPOSE_DIR / ".env"
     pwd = password or secrets.token_urlsafe(12)
-    env.write_text(f"PIHOLE_PASSWORD={pwd}\n", encoding="utf-8")
+    env.write_text(f"PIHOLE_PASSWORD={_env_quote(pwd)}\n", encoding="utf-8")
     try:
         os.chmod(env, 0o600)
     except OSError:
         pass
     return COMPOSE_DIR
+
+
+def _compose_base() -> list[str] | None:
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    if not yml.is_file():
+        return None
+    for cand in (
+        ["docker", "compose", "-f", str(yml)],
+        ["docker-compose", "-f", str(yml)],
+    ):
+        probe = _run([*cand, "version"], timeout=30, cwd=str(COMPOSE_DIR))
+        if probe["ok"]:
+            return cand
+    return None
+
+
+def _compose_has_env_password() -> bool:
+    """Old compose pinned password via FTLCONF — setpassword is ignored until removed."""
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    if not yml.is_file():
+        return False
+    try:
+        text = yml.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "FTLCONF_webserver_api_password" in text
+
+
+def wait_pihole_http(*, cfg: dict | None = None, timeout: float = 60) -> dict:
+    """Wait until local Pi-hole web/API answers (after up/recreate)."""
+    cfg = {**default_settings(), **(cfg or {})}
+    deadline = time.time() + max(5.0, float(timeout))
+    last = "timeout"
+    while time.time() < deadline:
+        r = _pihole_http("GET", "/api/auth", cfg=cfg, timeout=3)
+        if r.get("status") in (200, 401) or r.get("ok"):
+            return {"ok": True, "error": ""}
+        # Connection refused / empty while FTL boots
+        last = str(r.get("error") or f"HTTP {r.get('status') or '?'}")
+        time.sleep(1.5)
+    return {"ok": False, "error": last}
+
+
+def verify_pihole_password(password: str, *, cfg: dict | None = None) -> dict:
+    """Check that Pi-hole accepts this admin password via /api/auth."""
+    cfg = {**default_settings(), **(cfg or {}), "pihole_password": str(password or "")}
+    invalidate_pihole_session(cfg)
+    r = _pihole_http("POST", "/api/auth", cfg=cfg, body={"password": str(password or "")}, timeout=8)
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error") or f"HTTP {r.get('status') or '?'}"}
+    sess = (r.get("data") or {}).get("session") or {}
+    if sess.get("valid") or sess.get("sid"):
+        return {"ok": True, "error": ""}
+    return {"ok": False, "error": "Pi-hole отклонил пароль"}
 
 
 def pihole_ready() -> dict:
@@ -469,17 +532,16 @@ def install_pihole(*, password: str = "") -> dict:
         return {"ok": False, "error": dock.get("error") or "docker недоступен", "log": dock.get("log")}
     pwd = password or secrets.token_urlsafe(12)
     write_compose(password=pwd)
-    # Prefer docker compose v2
-    base = ["docker", "compose", "-f", str(COMPOSE_DIR / "docker-compose.yml")]
+    base = _compose_base()
+    if not base:
+        return {"ok": False, "error": "docker compose недоступен"}
     r = _run([*base, "pull"], timeout=300, cwd=str(COMPOSE_DIR))
     if not r["ok"]:
-        # try docker-compose
-        base = ["docker-compose", "-f", str(COMPOSE_DIR / "docker-compose.yml")]
-        r = _run([*base, "pull"], timeout=300, cwd=str(COMPOSE_DIR))
-    if not r["ok"]:
         return {"ok": False, "error": r["stderr"] or r["stdout"] or "pull failed", "log": r}
-    # Force recreate so FTLCONF_webserver_api_password from .env is applied
-    sp = set_pihole_password(pwd, update_env=False)
+    up = _run([*base, "up", "-d", "pihole"], timeout=180, cwd=str(COMPOSE_DIR))
+    if not up["ok"]:
+        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "up failed").strip(), "log": up}
+    sp = set_pihole_password(pwd, update_env=True)
     if not sp.get("ok"):
         return {**sp, "dir": str(COMPOSE_DIR), "docker_installed": bool(dock.get("installed"))}
     return {
@@ -489,11 +551,12 @@ def install_pihole(*, password: str = "") -> dict:
 
 
 def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
-    """Apply admin password.
+    """Apply admin password into the running Pi-hole volume.
 
-    Pi-hole v6 with FTLCONF_webserver_api_password ignores ``pihole setpassword``
-    («set by environment variable»). We update ``.env`` and recreate the container
-    so the new env value is picked up; DNS volumes are kept.
+    We deliberately do **not** use ``FTLCONF_webserver_api_password``:
+    docker-compose ``.env`` interpolation mangles ``$`` / special chars, and with
+    that env set ``pihole setpassword`` is ignored («set by environment variable»).
+    Password is applied via ``docker exec … pihole setpassword`` (argv, no shell).
     """
     pwd = str(password or "")
     if not pwd:
@@ -502,38 +565,57 @@ def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
         return {"ok": False, "error": "docker не установлен"}
     COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
     yml = COMPOSE_DIR / "docker-compose.yml"
-    if not yml.is_file():
+    need_rewrite = (not yml.is_file()) or _compose_has_env_password()
+    if need_rewrite:
         write_compose(password=pwd)
     elif update_env:
         env = COMPOSE_DIR / ".env"
-        env.write_text(f"PIHOLE_PASSWORD={pwd}\n", encoding="utf-8")
+        env.write_text(f"PIHOLE_PASSWORD={_env_quote(pwd)}\n", encoding="utf-8")
         try:
             os.chmod(env, 0o600)
         except OSError:
             pass
-    else:
-        # Still ensure .env matches even when caller said update_env=False after write_compose
-        env = COMPOSE_DIR / ".env"
-        if not env.is_file():
-            env.write_text(f"PIHOLE_PASSWORD={pwd}\n", encoding="utf-8")
 
-    base = None
-    for cand in (
-        ["docker", "compose", "-f", str(yml)],
-        ["docker-compose", "-f", str(yml)],
-    ):
-        probe = _run([*cand, "version"], timeout=30, cwd=str(COMPOSE_DIR))
-        if probe["ok"]:
-            base = cand
-            break
+    base = _compose_base()
     if not base:
         return {"ok": False, "error": "docker compose недоступен"}
 
-    # Recreate so FTLCONF_webserver_api_password is re-read from .env
-    up = _run([*base, "up", "-d", "--force-recreate", "pihole"], timeout=180, cwd=str(COMPOSE_DIR))
+    # Recreate only when migrating off FTLCONF env password (or first write)
+    up_args = [*base, "up", "-d"]
+    if need_rewrite:
+        up_args.append("--force-recreate")
+    up_args.append("pihole")
+    up = _run(up_args, timeout=180, cwd=str(COMPOSE_DIR))
     if not up["ok"]:
-        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "recreate failed").strip(), "log": up}
-    time.sleep(2)
+        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "up failed").strip(), "log": up}
+
+    ready = wait_pihole_http(timeout=75)
+    if not ready.get("ok"):
+        return {
+            "ok": False,
+            "error": f"Pi-hole не отвечает после запуска: {ready.get('error') or 'timeout'}",
+            "log": (up.get("stdout") or "").strip(),
+        }
+
+    # argv form — no shell, so $, quotes, spaces are safe
+    sp = _run(["docker", "exec", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
+    if not sp["ok"]:
+        # Older images / PATH: fall back to FTL config setter
+        sp2 = _run(
+            ["docker", "exec", "l2x-pihole", "pihole-FTL", "--config", "webserver.api.password", pwd],
+            timeout=60,
+        )
+        if not sp2["ok"]:
+            err = (sp.get("stderr") or sp.get("stdout") or sp2.get("stderr") or "setpassword failed").strip()
+            return {"ok": False, "error": err, "log": {"setpassword": sp, "ftl": sp2}}
+
+    check = verify_pihole_password(pwd)
+    if not check.get("ok"):
+        return {
+            "ok": False,
+            "error": f"пароль записан, но вход не проходит: {check.get('error') or 'auth failed'}",
+            "log": (up.get("stdout") or "").strip(),
+        }
     return {"ok": True, "log": (up.get("stdout") or "").strip()}
 
 
