@@ -2111,6 +2111,13 @@ def health():
         "agent": role == "agent",
         "time": datetime.now(timezone.utc).isoformat(),
     }
+    try:
+        xs = xray.xray_status()
+        out["xray_version"] = xs.get("version") or ""
+        out["xray_active"] = bool(xs.get("active"))
+    except Exception:
+        out["xray_version"] = ""
+        out["xray_active"] = False
     if role == "agent" and isinstance(ns.get("reverse_bridge"), dict):
         out["rv_conns"] = _reverse_conn_count(ns["reverse_bridge"])
     return out
@@ -5417,13 +5424,131 @@ def nodes_page(request: Request):
                     pass
     store = _load_store()
     running = NODES_JOB.get("id")
+    try:
+        master_xray = (xray.xray_status() or {}).get("version") or ""
+    except Exception:
+        master_xray = ""
     return page(request, "nodes.html", active="nodes", items=store["nodes"],
                 ns=store["settings"].get("nodes") or {},
                 is_master=nodes_mod.is_master(store),
                 master_version=panel_version(),
+                master_xray=master_xray,
                 sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
+
+
+def _node_xray_check_one(node: dict) -> dict:
+    """Check Xray version on one node (manage or NAT local+GitHub)."""
+    if node.get("nat"):
+        return _master_node_xray_nat(node["id"], "check_xray", {})
+    res = nodes_mod.manage_request(node, action="check_xray", timeout=60)
+    if res.get("ok"):
+        _persist_node_xray_info(node["id"], res)
+    return res
+
+
+def _node_xray_update_one(node: dict, version: str = "") -> dict:
+    params = {"version": version} if version else {}
+    if node.get("nat"):
+        res = _master_node_xray_nat(node["id"], "update_xray", params)
+    else:
+        res = nodes_mod.manage_request(node, action="update_xray", params=params, timeout=60)
+    if res.get("ok"):
+        _persist_node_xray_info(node["id"], res)
+    return res
+
+
+@app.post("/nodes/xray-check-all")
+def nodes_xray_check_all(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        flash(request, "Только master", "error")
+        return go("/nodes")
+    ok = fail = avail = 0
+    bits = []
+    for n in nodes_mod.ensure_list(store):
+        if not n.get("enabled", True):
+            continue
+        res = _node_xray_check_one(n)
+        name = n.get("name") or n.get("id")
+        if not res.get("ok"):
+            fail += 1
+            bits.append(f"{name}: {res.get('error') or 'fail'}")
+            continue
+        ok += 1
+        if res.get("available"):
+            avail += 1
+            bits.append(f"{name}: {res.get('current')} → {res.get('latest')}")
+        else:
+            bits.append(f"{name}: {res.get('current') or '?'}")
+    flash(
+        request,
+        f"Xray check: {ok} ok, {fail} err, обновлений {avail}"
+        + (f" — {'; '.join(bits[:8])}" if bits else ""),
+        "info" if fail == 0 else "error",
+    )
+    return go("/nodes")
+
+
+@app.post("/nodes/{node_id}/xray-check")
+def nodes_xray_check(node_id: str, request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        flash(request, "Только master", "error")
+        return go("/nodes")
+    node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
+    if not node:
+        flash(request, "Нода не найдена", "error")
+        return go("/nodes")
+    res = _node_xray_check_one(node)
+    name = node.get("name") or node_id
+    if res.get("ok"):
+        if res.get("available"):
+            flash(request, f"{name}: Xray {res.get('current')} → доступна {res.get('latest')}", "info")
+        else:
+            flash(request, f"{name}: Xray {res.get('current') or '?'} актуальна"
+                  + (f" ({res.get('error')})" if res.get("error") else ""), "info")
+    else:
+        flash(request, f"{name}: {res.get('error') or 'ошибка'}", "error")
+    return go("/nodes")
+
+
+@app.post("/nodes/{node_id}/xray-update")
+async def nodes_xray_update(node_id: str, request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        flash(request, "Только master", "error")
+        return go("/nodes")
+    node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
+    if not node:
+        flash(request, "Нода не найдена", "error")
+        return go("/nodes")
+    form = await request.form()
+    version = str(form.get("version") or "").strip()
+    res = _node_xray_update_one(node, version)
+    name = node.get("name") or node_id
+    if res.get("ok"):
+        ver = res.get("version") or version or "latest"
+        if res.get("queued"):
+            flash(request, f"{name}: Xray {ver} в очереди agent pull", "info")
+        elif res.get("already"):
+            flash(request, f"{name}: установка Xray уже идёт", "info")
+        else:
+            flash(request, f"{name}: обновление Xray → {ver} запущено", "info")
+        _tg_admin(
+            f"⬆️ Xray на ноде <b>{tgbot.escape(name)}</b> → <code>{tgbot.escape(str(ver))}</code>",
+            flag="notify_nodes",
+        )
+    else:
+        flash(request, f"{name}: {res.get('error') or 'ошибка'}", "error")
+    return go("/nodes")
 
 
 @app.get("/settings-node", response_class=HTMLResponse)
@@ -5463,20 +5588,97 @@ def settings_node_page(request: Request):
                 remote = {**snap, **remote, "ok": True}
         else:
             remote = nodes_mod.manage_request(node, timeout=30)
-            if remote.get("ok") and remote.get("version"):
+            if remote.get("ok"):
                 with mutate() as st:
                     for n in nodes_mod.ensure_list(st):
-                        if n.get("id") == node["id"]:
+                        if n.get("id") != node["id"]:
+                            continue
+                        if remote.get("version"):
                             n["panel_version"] = str(remote.get("version") or "")
-                            break
+                        xs = remote.get("xray") if isinstance(remote.get("xray"), dict) else {}
+                        if xs.get("version"):
+                            n["xray_version"] = str(xs.get("version") or "")
+                            n["xray_active"] = bool(xs.get("active"))
+                        break
                 node = dict(node)
-                node["panel_version"] = str(remote.get("version") or "")
+                if remote.get("version"):
+                    node["panel_version"] = str(remote.get("version") or "")
+                xs = remote.get("xray") if isinstance(remote.get("xray"), dict) else {}
+                if xs.get("version"):
+                    node["xray_version"] = str(xs.get("version") or "")
     return page(
         request, "settings_node.html", active="settings_node",
         items=items, node=node, remote=remote, is_master=is_master,
         tab=tab, login_url=login_url,
         log_text=log_text, log_src=log_src or "xray", log_n=log_n, log_q=log_q,
+        xray_releases=ops.xray_releases(12) if tab == "system" else [],
+        master_xray=(xray.xray_status() or {}).get("version") or "",
     )
+
+
+def _persist_node_xray_info(node_id: str, info: dict) -> None:
+    """Remember last known Xray version / update check on the node registry entry."""
+    if not isinstance(info, dict):
+        return
+    with mutate() as st:
+        for n in nodes_mod.ensure_list(st):
+            if n.get("id") != node_id:
+                continue
+            cur = str(info.get("current") or (info.get("xray") or {}).get("version") or "").strip()
+            if cur:
+                n["xray_version"] = cur.lstrip("vV")
+            if "active" in info:
+                n["xray_active"] = bool(info.get("active"))
+            elif isinstance(info.get("xray"), dict) and "active" in info["xray"]:
+                n["xray_active"] = bool(info["xray"].get("active"))
+            if info.get("latest"):
+                n["xray_latest"] = str(info.get("latest") or "")
+                n["xray_available"] = bool(info.get("available"))
+                n["xray_checked_at"] = nodes_mod.now_iso()
+            break
+
+
+def _master_node_xray_nat(node_id: str, action: str, params: dict) -> dict:
+    """NAT nodes are not reachable for /agent/manage — check locally / queue update via pull."""
+    store = _load_store()
+    node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
+    if not node:
+        return {"ok": False, "error": "нода не найдена"}
+    include_pre = str(params.get("include_prerelease") or "") in ("1", "true", "yes", "on")
+    if action == "check_xray":
+        current = str(node.get("xray_version") or "").strip()
+        latest = ops.xray_latest(include_pre)
+        tag = str(latest.get("tag") or "") if latest.get("ok") else ""
+        available = bool(tag and current) and ops.version_tuple(tag) > ops.version_tuple(current)
+        return {
+            "ok": True,
+            "error": "" if latest.get("ok") else (latest.get("error") or "github"),
+            "current": current or "?",
+            "latest": tag,
+            "available": available,
+            "url": latest.get("url") or "",
+            "prerelease": bool(latest.get("prerelease")),
+            "active": node.get("xray_active"),
+            "nat": True,
+        }
+    if action == "update_xray":
+        version = str(params.get("version") or "").strip()
+        if not version:
+            latest = ops.xray_latest(include_pre)
+            if not latest.get("ok") or not latest.get("tag"):
+                return {"ok": False, "error": latest.get("error") or "не удалось получить latest Xray"}
+            version = str(latest["tag"])
+        with mutate() as st:
+            for n in nodes_mod.ensure_list(st):
+                if n.get("id") != node_id:
+                    continue
+                n["xray_update_requested"] = version if version.startswith("v") else f"v{version}"
+                break
+        return {
+            "ok": True, "queued": True, "version": version,
+            "current": str(node.get("xray_version") or ""),
+        }
+    return {"ok": False, "error": f"unsupported nat action: {action}"}
 
 
 @app.post("/settings-node/{node_id}/action")
@@ -5502,9 +5704,15 @@ async def settings_node_action(node_id: str, request: Request):
         tab = "settings"
     elif action.startswith("l2tp") or action in ("refresh_l2tp", "select_best_l2tp"):
         tab = "l2tp"
-    elif action in ("update_panel", "restore_master", "restart_panel"):
+    elif action in ("update_panel", "restore_master", "restart_panel", "check_xray", "update_xray", "restart_xray"):
         tab = "system"
-    res = nodes_mod.manage_request(node, action=action, params=params, timeout=120)
+
+    # NAT has no inbound manage HTTP — queue Xray update / local check from last pull
+    if action in ("check_xray", "update_xray") and node.get("nat"):
+        res = _master_node_xray_nat(node_id, action, params)
+    else:
+        res = nodes_mod.manage_request(node, action=action, params=params, timeout=120)
+
     if res.get("ok"):
         msg = res.get("error") or f"{action}: ok"
         if action == "update_panel" and res.get("started"):
@@ -5513,6 +5721,26 @@ async def settings_node_action(node_id: str, request: Request):
             msg = "Select-best L2TP запущен на ноде"
         elif action == "set_admin_password":
             msg = "Пароль админа на ноде обновлён"
+        elif action == "check_xray":
+            cur = res.get("current") or "?"
+            latest = res.get("latest") or "?"
+            if res.get("available"):
+                msg = f"Xray {cur} → доступна {latest}"
+            elif res.get("error"):
+                msg = f"Xray {cur}; GitHub: {res.get('error')}"
+            else:
+                msg = f"Xray актуальна: {cur}"
+            _persist_node_xray_info(node_id, res)
+        elif action == "update_xray":
+            if res.get("queued"):
+                msg = f"Xray {res.get('version')}: в очереди agent pull (≤20 с)"
+            elif res.get("started"):
+                msg = f"Обновление Xray → {res.get('version')} запущено на ноде"
+            elif res.get("already"):
+                msg = f"Установка Xray уже идёт на ноде ({res.get('version')})"
+            else:
+                msg = f"Xray update: {res.get('version') or 'ok'}"
+            _persist_node_xray_info(node_id, res)
         elif action == "save_panel":
             msg = "Настройки панели на ноде сохранены"
             # keep local registry base_path in sync if changed
@@ -6327,6 +6555,50 @@ def _manage_action(action: str, payload: dict) -> dict:
         r = ops.xray_control("restart")
         return {"ok": bool(r.get("ok")), "error": "" if r.get("ok") else (r.get("stderr") or "restart failed"), "result": r}
 
+    if action == "check_xray":
+        xs = xray.xray_status()
+        current = str(xs.get("version") or "")
+        include_pre = str(payload.get("include_prerelease") or "") in ("1", "true", "yes", "on")
+        latest = ops.xray_latest(include_pre)
+        tag = str(latest.get("tag") or "") if latest.get("ok") else ""
+        available = bool(tag) and ops.version_tuple(tag) > ops.version_tuple(current)
+        return {
+            "ok": True,
+            "error": "" if latest.get("ok") else (latest.get("error") or "github"),
+            "xray": xs,
+            "current": current,
+            "latest": tag,
+            "available": available,
+            "url": latest.get("url") or "",
+            "prerelease": bool(latest.get("prerelease")),
+            "published": latest.get("published") or "",
+            "active": bool(xs.get("active")),
+        }
+
+    if action == "update_xray":
+        version = str(payload.get("version") or "").strip()
+        include_pre = str(payload.get("include_prerelease") or "") in ("1", "true", "yes", "on")
+        if not version:
+            latest = ops.xray_latest(include_pre)
+            if not latest.get("ok") or not latest.get("tag"):
+                return {"ok": False, "error": latest.get("error") or "не удалось получить latest Xray"}
+            version = str(latest["tag"])
+        current = str(xray.xray_status().get("version") or "")
+        running = XRAY_UPDATE_JOB.get("id")
+        if running and ops.JOBS.get(running, {}).get("status") == "running":
+            return {"ok": True, "started": False, "already": True, "version": version, "current": current}
+
+        def install_and_recheck(v: str) -> dict:
+            res = ops.install_xray(v)
+            try:
+                check_xray_update(force=True)
+            except Exception:
+                pass
+            return res
+
+        XRAY_UPDATE_JOB["id"] = ops.start_job("xray-update-remote", install_and_recheck, version)
+        return {"ok": True, "started": True, "version": version, "current": current}
+
     if action == "apply_xray":
         res = _apply_xray(_load_store())
         return {"ok": bool(res.get("ok")), "error": res.get("error") or ""}
@@ -6810,6 +7082,7 @@ async def agent_pull(request: Request):
     ver = ""
     want_update = False
     diag_req = None
+    xray_upd = ""
     agent_ver = str(body.get("version") or "")
     master_ver = panel_version()
     with mutate() as st:
@@ -6828,6 +7101,13 @@ async def agent_pull(request: Request):
                 node["agent_diag"] = diag_text[-60000:]
                 node["agent_diag_at"] = nodes_mod.now_iso()
             diag_req = node.pop("diag_requested", None)
+            xray_upd = str(node.pop("xray_update_requested", None) or "").strip()
+            # Remember Xray version reported by NAT agent pull status
+            xv = str(status.get("xray_version") or "").strip()
+            if xv:
+                node["xray_version"] = xv.lstrip("vV")
+            if "xray_active" in status:
+                node["xray_active"] = bool(status.get("xray_active"))
             nodes_mod.upsert_node_outbound(st, node)
             payload = nodes_mod.build_payload(st, node, xray.build_config)
             self_url = f"https://{public_host()}{base_path()}" if public_host() else ""
@@ -6847,6 +7127,10 @@ async def agent_pull(request: Request):
         extra["update"] = True
         if isinstance(payload, dict):
             payload = {**payload, "panel_update": True}
+    if xray_upd:
+        extra["xray_update"] = xray_upd if xray_upd.startswith("v") else f"v{xray_upd}"
+        if isinstance(payload, dict):
+            payload = {**payload, "xray_update": extra["xray_update"]}
     if have_ver and have_ver == ver:
         return {"ok": True, "unchanged": True, "version": ver, **extra}
     return {"ok": True, "unchanged": False, "version": ver, "payload": payload, **extra}
@@ -6953,6 +7237,10 @@ def _agent_pull_cycle() -> None:
     rv_conns = _reverse_conn_count(ns.get("reverse_bridge"))
     if ns.get("reverse_bridge") and rv_conns == 0:
         warnings.append("нет TCP-соединений reverse к мастеру")
+    try:
+        xs_local = xray.xray_status()
+    except Exception:
+        xs_local = {}
     body = {
         "node_id": pull["node_id"],
         "have": have,
@@ -6963,6 +7251,8 @@ def _agent_pull_cycle() -> None:
             "warnings": warnings,
             "reverse_ok": reverse_ok,
             "rv_conns": rv_conns,
+            "xray_version": str(xs_local.get("version") or ""),
+            "xray_active": bool(xs_local.get("active")),
         },
     }
     diag_ready = AGENT_DIAG.pop("text", None)
@@ -7020,6 +7310,21 @@ def _agent_pull_cycle() -> None:
             PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-pull", ops.update_panel)
         # Prefer finishing the panel update; skip apply on this cycle
         return
+    xray_upd = str(res.get("xray_update") or payload.get("xray_update") or "").strip()
+    if xray_upd:
+        running = XRAY_UPDATE_JOB.get("id")
+        if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
+            def install_and_recheck(v: str) -> dict:
+                r = ops.install_xray(v)
+                try:
+                    check_xray_update(force=True)
+                except Exception:
+                    pass
+                return r
+            XRAY_UPDATE_JOB["id"] = ops.start_job("xray-update-pull", install_and_recheck, xray_upd)
+        # Xray install restarts core — apply on next pull after job finishes
+        if res.get("unchanged") or not payload:
+            return
     if res.get("unchanged"):
         with mutate() as st:
             st.setdefault("settings", {}).setdefault("nodes", {})["pull_version"] = res.get("version") or have

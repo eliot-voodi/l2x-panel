@@ -47,6 +47,11 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("last_error", "")
         n.setdefault("last_ok", False)
         n.setdefault("panel_version", "")
+        n.setdefault("xray_version", "")
+        n.setdefault("xray_active", None)
+        n.setdefault("xray_latest", "")
+        n.setdefault("xray_available", False)
+        n.setdefault("xray_checked_at", "")
         n.setdefault("last_update", "")
         # Auto-sync interval in minutes; 0 = disabled
         n.setdefault("sync_interval_min", 0)
@@ -251,6 +256,13 @@ def apply_pull_seen(
         ))
     if node.get("update_requested"):
         warns.insert(0, "Обновление поставлено в очередь (agent pull ≤20 с)")
+    if node.get("xray_update_requested"):
+        warns.insert(0, f"Xray {node.get('xray_update_requested')}: в очереди agent pull")
+    xv = str(st.get("xray_version") or "").strip()
+    if xv:
+        node["xray_version"] = xv.lstrip("vV")
+    if "xray_active" in st:
+        node["xray_active"] = bool(st.get("xray_active"))
     if st.get("reverse_ok") is False and uses_reverse(node) and node.get("as_outbound"):
         warns.append("NAT reverse на ноде не поднят (нет rv-up/rv-direct)")
     elif st.get("reverse_ok") is True:
@@ -782,6 +794,11 @@ def probe_health(node: dict, timeout: int = 8) -> dict:
             ver = str(data.get("version") or "").strip()
             if ver:
                 node["panel_version"] = ver
+            xv = str(data.get("xray_version") or "").strip()
+            if xv:
+                node["xray_version"] = xv.lstrip("vV")
+            if "xray_active" in data:
+                node["xray_active"] = bool(data.get("xray_active"))
             return {"ok": True, "version": ver, "raw": data}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -871,6 +888,11 @@ def probe_all_health(nodes: list[dict], *, timeout: int = 5) -> list[dict]:
             n["rv_conns"] = raw["rv_conns"]
         elif not uses_reverse(n):
             n.pop("rv_conns", None)
+        xv = str(raw.get("xray_version") or "").strip()
+        if xv:
+            n["xray_version"] = xv.lstrip("vV")
+        if "xray_active" in raw:
+            n["xray_active"] = bool(raw.get("xray_active"))
     return events
 
 

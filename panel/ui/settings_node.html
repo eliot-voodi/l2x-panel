@@ -75,18 +75,25 @@
   {% endif %}
 </div>
 
-{% if ok %}
+{% if ok or node.nat %}
 <div class="tabs">
   {% for k, l in [('overview','Обзор'), ('l2tp','L2TP'), ('settings','Настройки'), ('system','Система'), ('logs','Логи')] %}
   <a href="{{ bp }}/settings-node?id={{ node.id }}&tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
   {% endfor %}
 </div>
 
-{% if tab == 'overview' %}
+{% if not ok and node.nat and tab != 'system' %}
+<div class="card"><div class="badge warn">NAT: manage HTTP недоступен — версия Xray из последнего pull; обновление через очередь agent pull (вкладка Система).</div></div>
+{% endif %}
+
+{% if tab == 'overview' and ok %}
 <div class="card">
   <h3>Быстрые действия</h3>
   <div class="actions" style="flex-wrap:wrap">
-    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="restart_xray"><button class="btn">Restart Xray</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="check_xray"><button class="btn ghost">Проверить Xray</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"
+          onsubmit="return confirm('Обновить Xray на ноде до latest?')"><input type="hidden" name="action" value="update_xray"><button class="btn">Обновить Xray</button></form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="restart_xray"><button class="btn ghost">Restart Xray</button></form>
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="apply_xray"><button class="btn ghost">Apply config</button></form>
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="refresh_l2tp"><button class="btn ghost">Refresh L2TP status</button></form>
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" onsubmit="return confirm('Запустить select-best L2TP на ноде?')"><input type="hidden" name="action" value="select_best_l2tp"><button class="btn ghost">Select best L2TP</button></form>
@@ -99,7 +106,7 @@
   <div class="mono small" style="white-space:pre-wrap">{{ snap.summary or '' }}</div>
 </div>
 
-{% elif tab == 'l2tp' %}
+{% elif tab == 'l2tp' and ok %}
 <div class="card" style="padding:0">
   <div class="table-wrap">
   <table>
@@ -134,7 +141,7 @@
   </div>
 </div>
 
-{% elif tab == 'settings' %}
+{% elif tab == 'settings' and ok %}
 {% set p = snap.panel or {} %}
 <form class="card" method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" style="max-width:820px">
   <input type="hidden" name="action" value="save_panel">
@@ -165,6 +172,41 @@
 </form>
 
 {% elif tab == 'system' %}
+{% set xr = snap.xray or {} %}
+<div class="card">
+  <h3>Xray на ноде</h3>
+  <table><tbody>
+    <tr><td class="dim">На ноде</td><td class="mono">{% if xr.active %}<span class="badge ok">up</span>{% else %}<span class="badge err">down</span>{% endif %} {{ xr.version or node.xray_version or '?' }}</td></tr>
+    <tr><td class="dim">На мастере</td><td class="mono">{{ master_xray or '?' }}</td></tr>
+    {% if node.xray_latest %}
+    <tr><td class="dim">GitHub latest</td><td class="mono">{{ node.xray_latest }}{% if node.xray_available %} <span class="badge warn">есть обновление</span>{% else %} <span class="badge ok">актуально</span>{% endif %}</td></tr>
+    {% endif %}
+    {% if node.xray_checked_at %}<tr><td class="dim">Проверено</td><td class="small">{{ fmt_dt(node.xray_checked_at) }}</td></tr>{% endif %}
+  </tbody></table>
+  <div class="actions mt" style="flex-wrap:wrap">
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action">
+      <input type="hidden" name="action" value="check_xray"><button class="btn ghost">Проверить версию</button>
+    </form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"
+          onsubmit="return confirm('Обновить Xray на ноде {{ node.name }} до latest с GitHub?\n{% if node.nat %}NAT: очередь через agent pull (≤20 с).{% else %}Ядро перезапустится; при ошибке — откат.{% endif %}')">
+      <input type="hidden" name="action" value="update_xray"><button class="btn">Обновить до latest</button>
+    </form>
+    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="restart_xray"><button class="btn ghost">Restart Xray</button></form>
+  </div>
+  <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" class="mt" style="max-width:420px"
+        onsubmit="return confirm('Установить выбранную версию Xray на {{ node.name }}?')">
+    <input type="hidden" name="action" value="update_xray">
+    <label class="f">Или выбрать релиз</label>
+    <div class="flex" style="gap:.5rem;align-items:end">
+      <select name="version" style="flex:1">
+        {% for v in xray_releases %}<option {% if (xr.version or node.xray_version) and v.lstrip('v') == (xr.version or node.xray_version) %}selected{% endif %}>{{ v }}</option>{% else %}<option value="">нет списка — укажите вручную ниже</option>{% endfor %}
+      </select>
+      <button class="btn ghost">Установить</button>
+    </div>
+    <div class="hint mt">{% if node.nat %}NAT: manage HTTP недоступен — проверка по последнему pull, обновление через очередь agent pull.{% else %}Проверка сравнивает с GitHub; установка качает бинарник на ноде и делает xray -test + restart с откатом.{% endif %}</div>
+  </form>
+</div>
+
 <div class="card">
   <h3>Система</h3>
   <div class="actions" style="flex-wrap:wrap">
@@ -181,7 +223,7 @@
   <div class="hint mt">Update ставит релиз через встроенный updater ноды. Restore MASTER — аварийный возврат роли на удалённой панели.</div>
 </div>
 
-{% elif tab == 'logs' %}
+{% elif tab == 'logs' and ok %}
 <div class="card">
   <form method="get" action="{{ bp }}/settings-node" class="row" style="align-items:end;max-width:640px">
     <input type="hidden" name="id" value="{{ node.id }}">
@@ -201,7 +243,7 @@
   <pre class="mono small mt" style="max-height:480px;overflow:auto;background:var(--bg);padding:1rem;border-radius:10px;border:1px solid var(--border)">{{ log_text or '(пусто)' }}</pre>
 </div>
 {% endif %}
-{% endif %}{# ok #}
+{% endif %}{# ok or nat #}
 {% endif %}{# node #}
 {% endif %}{# is_master #}
 {% endblock %}
