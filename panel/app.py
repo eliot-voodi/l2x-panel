@@ -143,6 +143,8 @@ def default_settings() -> dict:
             "hwid_required": False, "hwid_fallback": "device", "migrate_url": False, "happ_provider_id": "",
             # Hide disconnected / high-loss outbounds from subscription until healthy again
             "hide_unhealthy": True, "max_loss_pct": 20,
+            # PasarGuard/Marzban jwt.secret_key values — accept signed legacy sub tokens
+            "legacy_jwt_secrets": [],
         },
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
@@ -2026,7 +2028,42 @@ def _sub_new_url(request: Request, client: dict) -> str:
 
 
 def _find_by_token(store: dict, token: str) -> dict | None:
-    return next((c for c in store["clients"] if c.get("sub_token") and secrets.compare_digest(c["sub_token"], token)), None)
+    tok = str(token or "")
+    if not tok:
+        return None
+    hit = next(
+        (
+            c for c in store["clients"]
+            if c.get("sub_token") and secrets.compare_digest(str(c["sub_token"]), tok)
+        ),
+        None,
+    )
+    if hit:
+        return hit
+    # PasarGuard/Marzban: subscription URL token is HMAC/JWT signed, not stored as opaque id.
+    secrets_list = list((store.get("settings") or {}).get("sub", {}).get("legacy_jwt_secrets") or [])
+    if not secrets_list:
+        return None
+    payload = migrate_mod.parse_pasarguard_sub_token(tok, secrets_list)
+    if not payload:
+        return None
+    clients = store.get("clients") or []
+    username = str(payload.get("username") or "").strip()
+    if username:
+        email = username.lower()
+        found = next((c for c in clients if str(c.get("email") or "").lower() == email), None)
+        if found:
+            return found
+    uid = payload.get("user_id")
+    if uid is not None:
+        sid = str(uid)
+        found = next(
+            (c for c in clients if str(c.get("source_id") or "") == sid),
+            None,
+        )
+        if found:
+            return found
+    return None
 
 
 def _sub_response(request: Request, token: str) -> Response:
@@ -2986,7 +3023,10 @@ MIGRATE_CACHE = DATA / "migrate_preview.json"
 
 
 def _migrate_cache_save(users: list) -> None:
-    payload = [u.to_dict() if hasattr(u, "to_dict") else u for u in users]
+    payload = {
+        "users": [u.to_dict() if hasattr(u, "to_dict") else u for u in users],
+        "meta": dict(migrate_mod.LAST_SOURCE_META or {}),
+    }
     MIGRATE_CACHE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     try:
         os.chmod(MIGRATE_CACHE, 0o600)
@@ -3001,8 +3041,16 @@ def _migrate_cache_load() -> list:
         raw = json.loads(MIGRATE_CACHE.read_text(encoding="utf-8"))
     except ValueError:
         return []
+    # New format: {users, meta}; old format: bare list
+    if isinstance(raw, dict):
+        meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        if meta:
+            migrate_mod.LAST_SOURCE_META = dict(meta)
+        items = raw.get("users") or []
+    else:
+        items = raw or []
     out = []
-    for item in raw or []:
+    for item in items:
         if not isinstance(item, dict):
             continue
         out.append(migrate_mod.NormalizedUser(
@@ -3018,6 +3066,7 @@ def _migrate_cache_load() -> list:
             up=int(item.get("up") or 0),
             down=int(item.get("down") or 0),
             source=str(item.get("source") or ""),
+            source_id=str(item.get("source_id") or ""),
         ))
     return out
 
@@ -3139,13 +3188,29 @@ async def clients_migrate_run(request: Request):
             hint += f" · трафик в файле: {xray.format_traffic(tb)}"
         elif source == "3xui":
             hint += " · трафик в файле: 0 (нужен полный x-ui.db с таблицей client_traffics, не JSON export)"
+        jwt_n = len(meta.get("jwt_secrets") or [])
+        if source == "pasarguard":
+            if jwt_n:
+                hint += f" · JWT secret найден ({jwt_n}) — старые ссылки подписки сохранятся"
+            else:
+                hint += " · JWT secret не найден в файле — для тех же ссылок нужен API или бэкап с таблицей jwt"
         flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         return _migrate_page(request, preview=prev, **form_kw)
 
     with mutate() as st:
         report = migrate_mod.apply(st, users, selected, update_existing=update_existing)
+        sub = st["settings"].setdefault("sub", {})
+        # PasarGuard file import: keep jwt secrets so already-issued client sub URLs keep working
+        meta = migrate_mod.LAST_SOURCE_META or {}
+        jwt_secrets = [str(s).strip() for s in (meta.get("jwt_secrets") or []) if str(s).strip()]
+        if jwt_secrets:
+            existing = [str(s) for s in (sub.get("legacy_jwt_secrets") or []) if s]
+            for s in jwt_secrets:
+                if s not in existing:
+                    existing.append(s)
+            sub["legacy_jwt_secrets"] = existing
+            report["jwt_secrets"] = len(jwt_secrets)
         if apply_legacy and (legacy_path or legacy_port):
-            sub = st["settings"].setdefault("sub", {})
             if legacy_path:
                 aliases = list(sub.get("path_aliases") or [])
                 primary = (sub.get("path") or "sub").strip()
@@ -3167,6 +3232,8 @@ async def clients_migrate_run(request: Request):
     extra = ""
     if report.get("legacy"):
         extra = f" · legacy /{report['legacy'].get('path')}:{report['legacy'].get('port')}"
+    if report.get("jwt_secrets"):
+        extra += f" · JWT secrets {report['jwt_secrets']} (старые PG-ссылки активны)"
     tb = int(report.get("traffic_bytes") or 0)
     tf = int(report.get("traffic_fixed") or 0)
     traffic_hint = ""

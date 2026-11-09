@@ -50,6 +50,8 @@ class NormalizedUser:
     up: int = 0
     down: int = 0
     source: str = ""
+    # PasarGuard/Marzban numeric user id — needed to resolve signed v2/v3 sub tokens
+    source_id: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +97,183 @@ def token_from_url(url: str) -> str:
     path = urlsplit(raw).path if "://" in raw else raw
     parts = [p for p in path.split("/") if p]
     return parts[-1] if parts else ""
+
+
+# ---------------------------------------------------------------- PasarGuard / Marzban subscription tokens
+# Tokens are NOT stored in the users table — they are HMAC/JWT signed with jwt.secret_key.
+# File imports must recover the secret and either mint a stable token or accept any valid
+# signature at lookup time (see app._find_by_token).
+
+def _b64url_encode(raw: bytes) -> str:
+    from base64 import b64encode
+    return b64encode(raw, altchars=b"-_").decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(raw: str) -> bytes | None:
+    from base64 import b64decode
+    try:
+        s = raw.encode("utf-8")
+        return b64decode(s + b"=" * (-len(s) % 4), altchars=b"-_", validate=True)
+    except Exception:
+        return None
+
+
+def create_pasarguard_sub_token(user_id: int | str, secret: str, *, issued_at: int | None = None) -> str:
+    """Mint a modern PasarGuard v3 subscription token (HMAC-SHA256, full signature)."""
+    import hmac
+    import time
+    from hashlib import sha256
+    from math import ceil
+
+    uid = int(user_id)
+    ts = int(issued_at) if issued_at is not None else ceil(time.time())
+    data_b64 = _b64url_encode(f"v3,{uid},{ts}".encode("utf-8"))
+    sig = _b64url_encode(hmac.new(secret.encode("utf-8"), data_b64.encode("utf-8"), sha256).digest())
+    return f"{data_b64}.{sig}"
+
+
+def parse_pasarguard_sub_token(token: str, secrets: list[str]) -> dict[str, Any] | None:
+    """Decode Marzban/PasarGuard subscription token with any of the given jwt secrets.
+
+    Returns {"username": str} and/or {"user_id": int, "created_at": datetime}.
+    """
+    import hmac
+    from datetime import datetime, timezone
+    from hashlib import sha256
+
+    tok = str(token or "").strip()
+    if len(tok) < 15 or not secrets:
+        return None
+
+    def _parse_data(data_str: str) -> dict[str, Any] | None:
+        parts = data_str.split(",")
+        if len(parts) == 3 and parts[0] in ("v2", "v3"):
+            try:
+                uid = int(parts[1])
+                created = int(parts[2])
+            except ValueError:
+                return None
+            return {
+                "user_id": uid,
+                "created_at": datetime.fromtimestamp(created, tz=timezone.utc),
+            }
+        if len(parts) == 2:
+            try:
+                created = int(parts[1])
+            except ValueError:
+                return None
+            return {
+                "username": parts[0],
+                "created_at": datetime.fromtimestamp(created, tz=timezone.utc),
+            }
+        return None
+
+    # JWT form (older Marzban)
+    if tok.startswith("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."):
+        try:
+            import jwt as pyjwt  # PyJWT optional
+        except Exception:
+            pyjwt = None
+        if pyjwt is not None:
+            for secret in secrets:
+                if not secret:
+                    continue
+                try:
+                    payload = pyjwt.decode(tok, secret, algorithms=["HS256"], leeway=5)
+                except Exception:
+                    continue
+                if payload.get("access") != "subscription":
+                    continue
+                username = payload.get("sub")
+                if not username:
+                    continue
+                try:
+                    created = datetime.fromtimestamp(payload["iat"], tz=timezone.utc)
+                except Exception:
+                    created = None
+                return {"username": str(username), "created_at": created}
+
+    # New HMAC format: payload.signature ("." never appears in legacy tokens)
+    if "." in tok:
+        data_b64, _, signature = tok.rpartition(".")
+        for secret in secrets:
+            if not secret:
+                continue
+            expected = _b64url_encode(
+                hmac.new(secret.encode("utf-8"), data_b64.encode("utf-8"), sha256).digest()
+            )
+            if not hmac.compare_digest(signature.encode("utf-8"), expected.encode("utf-8")):
+                continue
+            decoded = _b64url_decode(data_b64)
+            if decoded is None:
+                return None
+            try:
+                return _parse_data(decoded.decode("utf-8"))
+            except Exception:
+                return None
+        return None
+
+    # Legacy truncated sha256(data+secret) signature (last 10 chars)
+    data_b64, signature = tok[:-10], tok[-10:]
+    decoded = _b64url_decode(data_b64)
+    if decoded is None:
+        return None
+    try:
+        data_str = decoded.decode("utf-8")
+    except Exception:
+        return None
+    for secret in secrets:
+        if not secret:
+            continue
+        resign_b64 = _b64url_encode(sha256((data_b64 + secret).encode("utf-8")).digest())[:10]
+        resign_hex = sha256((data_b64 + secret).encode("utf-8")).hexdigest()[:10]
+        sig = signature.encode("utf-8")
+        if hmac.compare_digest(sig, resign_b64.encode("utf-8")) or hmac.compare_digest(
+            sig, resign_hex.encode("utf-8")
+        ):
+            return _parse_data(data_str)
+    return None
+
+
+def _created_at_unix(raw: Any) -> int | None:
+    """Best-effort unix seconds from PasarGuard created_at / datetime / unix."""
+    from math import ceil
+
+    if raw in (None, "", 0, "0"):
+        return None
+    if isinstance(raw, datetime):
+        return ceil(raw.timestamp())
+    s = str(raw).strip()
+    if not s or s.upper() == "NULL":
+        return None
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        n = float(s)
+        if n > 1e12:
+            n /= 1000.0
+        return ceil(n) if n > 0 else None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return ceil(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _assign_pg_sub_tokens(users: list[NormalizedUser], secrets: list[str]) -> None:
+    """Fill missing sub_token from JWT secret (stable v3 mint using created_at)."""
+    secret = next((s for s in secrets if s), "")
+    if not secret:
+        return
+    for u in users:
+        if u.sub_token:
+            continue
+        sid = str(u.source_id or (u.extra or {}).get("id") or "").strip()
+        if not sid:
+            continue
+        issued = _created_at_unix((u.extra or {}).get("created_at"))
+        try:
+            u.sub_token = create_pasarguard_sub_token(sid, secret, issued_at=issued)
+        except Exception:
+            continue
 
 
 def expire_from_ms(ms: Any) -> str:
@@ -270,6 +449,7 @@ def apply(
         existing = by_email.get(email)
         up_i, down_i = int(u.up or 0), int(u.down or 0)
         if existing and not update_existing:
+            repaired = False
             # Re-run after a buggy import: fill traffic if panel still shows 0
             if (up_i or down_i) and xray.client_used_bytes(existing) <= 0:
                 try:
@@ -277,9 +457,28 @@ def apply(
                     _set_imported_traffic(existing, up_i, down_i)
                     traffic_fixed += 1
                     traffic_bytes += up_i + down_i
+                    repaired = True
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"{email}: {exc}")
-            else:
+            # Always attach PasarGuard source_id so legacy signed sub tokens resolve
+            if u.source_id and not existing.get("source_id"):
+                existing["source_id"] = str(u.source_id)
+                if u.source:
+                    existing["source"] = str(u.source)
+                repaired = True
+            # Replace username-fallback tokens with minted PasarGuard tokens when available
+            if (
+                u.sub_token
+                and ("." in u.sub_token or len(u.sub_token) > 40)
+                and (
+                    not existing.get("sub_token")
+                    or str(existing.get("sub_token")) == email
+                    or str(existing.get("sub_token")) == re.sub(r"[^A-Za-z0-9_-]", "", email)[:64]
+                )
+            ):
+                existing["sub_token"] = u.sub_token
+                repaired = True
+            if not repaired:
                 skipped += 1
             continue
         try:
@@ -300,6 +499,10 @@ def apply(
                     c["comment"] = u.comment
                 if u.tg_id:
                     c["tg_id"] = str(u.tg_id)
+                if u.source_id:
+                    c["source_id"] = str(u.source_id)
+                if u.source:
+                    c["source"] = str(u.source)
                 if tags:
                     c["inbounds"] = list(tags)
                 xray.ensure_client(c)
@@ -324,6 +527,10 @@ def apply(
                     payload["uuid"] = u.uuid
                 if u.password:
                     payload["password"] = u.password
+                if u.source_id:
+                    payload["source_id"] = str(u.source_id)
+                if u.source:
+                    payload["source"] = str(u.source)
                 c = xray.ensure_client(payload)
                 _set_imported_traffic(c, up_i, down_i)
                 traffic_bytes += up_i + down_i
@@ -800,11 +1007,11 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
     if "enabled" in u:
         enabled = bool(u["enabled"])
     uuid, password = _pg_uuid_password(u)
-    # File dumps often have no subscription_url (it is computed by PasarGuard).
-    # Fall back to a stable token from username so import still creates usable clients;
-    # for exact old links prefer API import.
-    if not sub:
-        sub = re.sub(r"[^A-Za-z0-9_-]", "", email)[:64] or email
+    source_id = str(u.get("id") if u.get("id") is not None else "").strip()
+    created_raw = u.get("created_at") or u.get("createdAt")
+    # File dumps have no subscription_url (signed URL is computed by PasarGuard).
+    # Leave sub_token empty here — parse_pasarguard_backup mints a v3 token from jwt secret.
+    # Username fallback only if minting is impossible (no secret / no id).
     return NormalizedUser(
         email=email,
         uuid=uuid,
@@ -818,7 +1025,8 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
         up=0,
         down=used,
         source=source,
-        extra={"status": status, "id": u.get("id")},
+        source_id=source_id,
+        extra={"status": status, "id": u.get("id"), "created_at": created_raw},
     )
 
 
@@ -922,14 +1130,98 @@ def _pg_rec_from_sql_cols(cols: list[str], fields: list[Any]) -> dict:
         "used_traffic": _sql_unquote(rec_raw.get("used_traffic")),
         "lifetime_used_traffic": _sql_unquote(rec_raw.get("lifetime_used_traffic")),
         "data_limit": _sql_unquote(rec_raw.get("data_limit")),
-        "expire": _sql_unquote(rec_raw.get("expire")),
+        "expire": _sql_unquote(rec_raw.get("expire") or rec_raw.get("expire_at")),
+        "expire_at": _sql_unquote(rec_raw.get("expire_at") or rec_raw.get("expire")),
+        "created_at": _sql_unquote(rec_raw.get("created_at")),
         "status": _sql_unquote(rec_raw.get("status")),
         "note": _sql_unquote(rec_raw.get("note")),
         "telegram_id": _sql_unquote(rec_raw.get("telegram_id")),
         "proxy_settings": _sql_unquote(rec_raw.get("proxy_settings")),
         "proxies": _sql_unquote(rec_raw.get("proxies")),
         "subscription_url": _sql_unquote(rec_raw.get("subscription_url") or ""),
+        "subscription_token": _sql_unquote(rec_raw.get("subscription_token") or ""),
     }
+
+
+_COPY_BLOCK_RE = re.compile(
+    r"COPY\s+(?:(?P<schema>[\"\w]+)\.)?(?P<table>[\"\w]+)\s*\((?P<cols>[^)]+)\)\s+FROM\s+stdin\s*;\r?\n"
+    r"(?P<body>.*?)(?<!\S)\\\.\s*(?:\r?\n|$)",
+    re.I | re.S,
+)
+
+
+def _iter_sql_copy_tables(text: str):
+    for block in _COPY_BLOCK_RE.finditer(text):
+        table = block.group("table").strip().strip('"')
+        cols = [c.strip().strip('"') for c in block.group("cols").split(",")]
+        body = block.group("body") or ""
+        yield table, cols, body
+
+
+def extract_pasarguard_meta_from_sql(text: str) -> dict[str, Any]:
+    """Pull jwt.secret_key (+ optional sub path hints) from a PasarGuard/Marzban SQL dump."""
+    secrets: list[str] = []
+    path = ""
+    for table, cols, body in _iter_sql_copy_tables(text):
+        low = table.lower()
+        if low == "jwt":
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                key = str(rec.get("secret_key") or "").strip()
+                if key and key not in secrets:
+                    secrets.append(key)
+        elif low == "settings" and not path:
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                blob = rec.get("subscription")
+                if isinstance(blob, str) and blob.strip().startswith("{"):
+                    try:
+                        sub = json.loads(blob)
+                    except Exception:
+                        sub = {}
+                elif isinstance(blob, dict):
+                    sub = blob
+                else:
+                    sub = {}
+                # url_prefix may be full URL; path segment after host is rarely useful.
+                # Default PasarGuard path is "sub" (same as L2X) — leave empty unless obvious.
+                prefix = str(sub.get("url_prefix") or "").strip()
+                if prefix and "://" not in prefix:
+                    path = re.sub(r"[^A-Za-z0-9_-]", "", prefix.strip("/").split("/")[0] or "")
+                break
+    return {"jwt_secrets": secrets, "path": path}
+
+
+def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
+    secrets: list[str] = []
+    conn = sqlite3.connect(str(path))
+    try:
+        tables = {
+            r[0].lower()
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "jwt" in tables:
+            cols = {r[1].lower() for r in conn.execute("PRAGMA table_info(jwt)").fetchall()}
+            if "secret_key" in cols:
+                for row in conn.execute("SELECT secret_key FROM jwt"):
+                    key = str(row[0] or "").strip()
+                    if key and key not in secrets:
+                        secrets.append(key)
+    finally:
+        conn.close()
+    return {"jwt_secrets": secrets}
 
 
 def _parse_users_sql_insert(text: str) -> list[NormalizedUser]:
@@ -974,16 +1266,9 @@ def _parse_pg_copy_field(raw: str) -> Any:
 def _parse_users_sql_copy(text: str) -> list[NormalizedUser]:
     """Parse Postgres/Timescale ``COPY ... users (...) FROM stdin;`` blocks from pg_dump."""
     out: list[NormalizedUser] = []
-    for block in re.finditer(
-        r"COPY\s+(?:(?P<schema>[\"\w]+)\.)?(?P<table>[\"\w]+)\s*\((?P<cols>[^)]+)\)\s+FROM\s+stdin\s*;\r?\n(?P<body>.*?)(?<!\S)\\\.\s*(?:\r?\n|$)",
-        text,
-        re.I | re.S,
-    ):
-        table = block.group("table").strip().strip('"')
+    for table, cols, body in _iter_sql_copy_tables(text):
         if table.lower() != "users":
             continue
-        cols = [c.strip().strip('"') for c in block.group("cols").split(",")]
-        body = block.group("body") or ""
         for line in body.splitlines():
             if not line or line == r"\.":
                 continue
@@ -1034,9 +1319,73 @@ def _pg_member_priority(name: str, content: bytes) -> int:
     return 100
 
 
+def _finalize_pasarguard_users(
+    users: list[NormalizedUser],
+    *,
+    jwt_secrets: list[str] | None = None,
+    path: str = "",
+    note: str = "",
+) -> list[NormalizedUser]:
+    global LAST_SOURCE_META
+    secrets = [s for s in (jwt_secrets or []) if s]
+    _assign_pg_sub_tokens(users, secrets)
+    # Last resort: username-shaped token so the client is still reachable somehow
+    for u in users:
+        if not u.sub_token:
+            u.sub_token = re.sub(r"[^A-Za-z0-9_-]", "", u.email)[:64] or u.email
+    LAST_SOURCE_META = {
+        **(LAST_SOURCE_META or {}),
+        "source": "pasarguard",
+        "clients": len(users),
+        "jwt_secrets": secrets,
+        "path": path or "",
+        "sub_tokens_minted": sum(1 for u in users if u.sub_token and "." in u.sub_token),
+        "note": note or (
+            "JWT secret imported — старые PasarGuard-ссылки принимаются панелью"
+            if secrets else
+            "JWT secret не найден в бэкапе — токены подписки не восстановить из файла; используйте API"
+        ),
+    }
+    return users
+
+
 def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
     members = _extract_archive_members(raw)
     ordered = sorted(members, key=lambda it: (_pg_member_priority(it[0], it[1]), it[0].lower()))
+    # Collect jwt secrets from any dump member (may live in a different file than users)
+    all_secrets: list[str] = []
+    path_hint = ""
+    for name, content in ordered:
+        low = name.lower()
+        try:
+            if content[:15] == b"SQLite format 3" or low.endswith((".db", ".sqlite", ".sqlite3")):
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                    tmp.write(content)
+                    path = Path(tmp.name)
+                try:
+                    meta = extract_pasarguard_meta_from_sqlite(path)
+                finally:
+                    path.unlink(missing_ok=True)
+                for s in meta.get("jwt_secrets") or []:
+                    if s not in all_secrets:
+                        all_secrets.append(s)
+            elif low.endswith(".sql") or _pg_looks_like_sql(content):
+                meta = extract_pasarguard_meta_from_sql(content.decode("utf-8", "replace"))
+                for s in meta.get("jwt_secrets") or []:
+                    if s not in all_secrets:
+                        all_secrets.append(s)
+                if not path_hint and meta.get("path"):
+                    path_hint = str(meta["path"])
+            elif low.endswith(".env") or low.rsplit("/", 1)[-1] == ".env":
+                # SUBSCRIPTION_PATH / XRAY_SUBSCRIPTION_PATH hints
+                text = content.decode("utf-8", "replace")
+                for key in ("XRAY_SUBSCRIPTION_PATH", "SUBSCRIPTION_PATH"):
+                    m = re.search(rf"(?m)^\s*{key}\s*=\s*[\"']?([^\"'\s#]+)", text)
+                    if m and not path_hint:
+                        path_hint = re.sub(r"[^A-Za-z0-9_-]", "", m.group(1).strip("/"))
+        except Exception:
+            continue
+
     errors: list[str] = []
     for name, content in ordered:
         if _pg_member_priority(name, content) >= 100:
@@ -1048,22 +1397,30 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                     tmp.write(content)
                     path = Path(tmp.name)
                 try:
+                    if not all_secrets:
+                        meta = extract_pasarguard_meta_from_sqlite(path)
+                        all_secrets.extend(meta.get("jwt_secrets") or [])
                     users = _parse_pg_sqlite(path)
                 finally:
                     path.unlink(missing_ok=True)
                 if users:
-                    return users
+                    return _finalize_pasarguard_users(users, jwt_secrets=all_secrets, path=path_hint)
                 continue
             if low.endswith(".sql") or _pg_looks_like_sql(content):
                 text = content.decode("utf-8", "replace")
+                if not all_secrets:
+                    meta = extract_pasarguard_meta_from_sql(text)
+                    all_secrets.extend(meta.get("jwt_secrets") or [])
+                    if not path_hint and meta.get("path"):
+                        path_hint = str(meta["path"])
                 users = _parse_users_sql_dump(text)
                 if users:
-                    return users
+                    return _finalize_pasarguard_users(users, jwt_secrets=all_secrets, path=path_hint)
                 continue
             if low.endswith(".json") or b'"username"' in content[:4000]:
                 users = parse_pasarguard_json(content)
                 if users:
-                    return users
+                    return _finalize_pasarguard_users(users, jwt_secrets=all_secrets, path=path_hint)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")
             continue
@@ -1072,7 +1429,7 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
         "PasarGuard: не удалось разобрать бэкап. "
         f"{hint}"
         "Нужен zip/tar.gz с db.sqlite3 или SQL dump (pg_dump/mysqldump), "
-        "либо JSON users. Для сохранения старых ссылок подписки лучше API."
+        "либо JSON users."
     )
 
 

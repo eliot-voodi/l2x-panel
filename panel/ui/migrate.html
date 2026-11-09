@@ -69,7 +69,7 @@
     <div class="hint">
       <b>3x-ui:</b> SQLite <code>.db</code> (getDb) или JSON export клиентов.<br>
       <b>PasarGuard:</b> backup <code>.zip</code>/<code>.tar.gz</code> (<code>db.sqlite3</code>, <code>db_dump/</code>, <code>pg_dump/db-*.sql</code>), SQL dump или JSON users.
-      Для <b>тех же</b> ссылок подписки лучше режим API — в файле токен часто не хранится.<br>
+      Токен подписки в БД не хранится (подписан JWT) — панель берёт <code>jwt.secret_key</code> из бэкапа и принимает уже выданные клиентам ссылки.<br>
       <b>Remnawave:</b> JSON массив/ответ API с users.
     </div>
   </div>
