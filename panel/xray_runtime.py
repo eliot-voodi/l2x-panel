@@ -1538,8 +1538,15 @@ def _xray_active() -> bool:
     return (_run(["systemctl", "is-active", "xray"])["stdout"] or "").strip() == "active"
 
 
+_XRAY_ENABLED_ONCE = False
+
+
 def _restart_xray() -> dict:
-    _run(["systemctl", "enable", "xray"])
+    # systemctl enable on every apply is pure overhead once the unit is already enabled
+    global _XRAY_ENABLED_ONCE
+    if not _XRAY_ENABLED_ONCE:
+        _run(["systemctl", "enable", "xray"])
+        _XRAY_ENABLED_ONCE = True
     return _run(["systemctl", "restart", "xray"], timeout=30)
 
 
@@ -1558,7 +1565,7 @@ def _restore_prev_config() -> str:
     return restart["stderr"] or restart["stdout"] or "xray still inactive after rollback"
 
 
-def apply_config(store: dict, *, clients_only: bool = False) -> dict:
+def apply_config(store: dict, *, xray_only: bool = False, clients_only: bool = False) -> dict:
     """Build, verify, then atomically install Xray config. Never skips verification.
 
     Flow (hardcoded, not configurable):
@@ -1568,11 +1575,12 @@ def apply_config(store: dict, *, clients_only: bool = False) -> dict:
       4. replace live config + restart
       5. if Xray is not active — restore previous config and restart again
 
-    clients_only: skip traffic harvest and iptables port-ban refresh (inbound ports /
-    nginx front are unchanged when only clients are added/edited). Still builds,
-    tests, and restarts Xray so the new client is live.
+    xray_only / clients_only: skip traffic harvest and iptables port-ban refresh
+    (inbound ports / nginx front are unchanged). Still builds, tests, and restarts
+    Xray so routing/clients/outbounds go live.
     """
-    if not clients_only:
+    xray_only = bool(xray_only or clients_only)
+    if not xray_only:
         try:
             harvest_traffic(store)
             enforce_quotas(store)
@@ -1600,6 +1608,22 @@ def apply_config(store: dict, *, clients_only: bool = False) -> dict:
                 pass
         return {"ok": False, "error": t["error"] or "xray config test failed", "verified": False}
 
+    # Identical live config + already running → skip restart (common for no-op apply)
+    try:
+        new_text = t["tmp"].read_text(encoding="utf-8")
+        live_text = XRAY_CONFIG.read_text(encoding="utf-8") if XRAY_CONFIG.is_file() else None
+    except OSError:
+        new_text = None
+        live_text = object()
+    if new_text is not None and live_text == new_text and _xray_active():
+        try:
+            t["tmp"].unlink()
+        except OSError:
+            pass
+        if not xray_only:
+            ban_inbound_ports(store)
+        return {"ok": True, "error": "", "config": cfg, "verified": True, "unchanged": True}
+
     # Snapshot the currently running config before we touch it.
     if XRAY_CONFIG.is_file():
         try:
@@ -1619,7 +1643,7 @@ def apply_config(store: dict, *, clients_only: bool = False) -> dict:
 
     restart = _restart_xray()
     if _xray_active():
-        if not clients_only:
+        if not xray_only:
             ban_inbound_ports(store)
         return {"ok": True, "error": "", "config": cfg, "verified": True}
 

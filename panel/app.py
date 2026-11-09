@@ -266,6 +266,7 @@ def _apply_xray(
     persist: bool = True,
     defer_front_reload: float = 0,
     hold_front_commit: bool = False,
+    xray_only: bool = False,
     clients_only: bool = False,
 ) -> dict:
     """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails.
@@ -276,16 +277,18 @@ def _apply_xray(
     hold_front_commit: stage+test nginx but leave reload to the caller (BackgroundTasks on
     /agent/apply) so the sync HTTP response is not cut by reloading the proxying nginx.
     defer_front_reload: legacy Timer-based delay inside commit (prefer hold_front_commit).
-    clients_only: client add/edit/delete — skip nginx stage/reload, cert jobs, and iptables
-    port refresh (those only change with inbounds/front). Still rebuilds+tests+restarts Xray.
+    xray_only: clients / outbounds / routing / L2TP / Xray DNS — skip nginx stage/reload,
+    cert jobs, and iptables (front unchanged). Still rebuilds+tests+restarts Xray.
+    clients_only: alias of xray_only (kept for older call sites).
     """
+    xray_only = bool(xray_only or clients_only)
     ns = (store.get("settings") or {}).get("nodes") or {}
     is_agent = bool(ns.get("agent_enabled") and (ns.get("role") or "") == "agent")
     runtime = nodes_mod.agent_runtime_store(store) if is_agent else store
     with STORE_LOCK:
         xray.ensure_inbounds(runtime)
         staged = {"ok": True, "skipped": True, "changed": False, "problems": [], "error": ""}
-        if not clients_only:
+        if not xray_only:
             # Register rv-in Path in store before nginx stage (otherwise first reverse
             # enable ships nginx without the location and agents dial into a 404).
             if not is_agent:
@@ -297,14 +300,14 @@ def _apply_xray(
             staged = front.stage(store)
             if not staged["ok"]:
                 return {"ok": False, "error": staged["error"], "verified": False}
-        result = xray.apply_config(runtime, clients_only=clients_only)
+        result = xray.apply_config(runtime, xray_only=xray_only)
         if not result.get("ok"):
-            if not clients_only:
+            if not xray_only:
                 front.rollback(staged)
             if persist:
                 _save_store(store)
             return result
-        if clients_only:
+        if xray_only:
             pass
         elif hold_front_commit:
             result = {**result, "_front_staged": staged}
@@ -318,7 +321,7 @@ def _apply_xray(
                 result = {**result, "warning": "; ".join(staged["problems"])}
         if persist:
             _save_store(store)
-    if result.get("ok") and not clients_only:
+    if result.get("ok") and not xray_only:
         direct_ports = [
             int(ib.get("port") or 0) for ib in runtime.get("inbounds") or []
             if ib.get("enabled", True) and P.is_direct(ib)
@@ -328,7 +331,7 @@ def _apply_xray(
                 ops.ensure_ports_open(direct_ports)
             except Exception:
                 pass
-    if not clients_only and not hold_front_commit:
+    if not xray_only and not hold_front_commit:
         _issue_front_certs(store)
     return result
 
@@ -1109,13 +1112,21 @@ def _tg_admin(text: str, *, flag: str = "notify_changes", actor: str | None = No
 
 
 def _tg_change(summary: str, *details: str) -> None:
-    """notify_changes with a clear «what changed» body + actor footer via _tg_admin."""
+    """notify_changes with a clear «what changed» body + actor footer via _tg_admin.
+
+    Runs off the request thread so Telegram latency does not block panel actions.
+    Actor footer is captured on the caller thread (ContextVar).
+    """
     lines = [summary]
     for d in details:
         d = str(d or "").strip()
         if d:
             lines.append(d)
-    _tg_admin("\n".join(lines), flag="notify_changes")
+    text = "\n".join(lines)
+    actor = tgbot.get_actor()
+    threading.Thread(
+        target=_tg_admin, kwargs={"text": text, "flag": "notify_changes", "actor": actor}, daemon=True,
+    ).start()
 
 
 def _tg_node_events(events: list[dict]) -> None:
@@ -1322,7 +1333,7 @@ def _watchdog_cycle() -> None:
             events.append({"type": "ip_ban", **b})
         _save_store(store)
         if need_apply:
-            _apply_xray(store)
+            _apply_xray(store, xray_only=True)
     _expiry_warnings(store)
     _notify_events(events)
 
@@ -1664,7 +1675,7 @@ def select_best_l2tp(*, force: bool = False) -> dict:
             _persist_l2tp_item(t["name"], t, connected=False)
             log.append(f"  disconnect {t['name']}")
 
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     log.append(f"xray ok={xr.get('ok')} {xr.get('error') or xr.get('warning') or ''}".strip())
     summary = {
         "ok": bool(winners),
@@ -3031,7 +3042,7 @@ async def client_save(request: Request):
         if not original:
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
-    result = _apply_xray(_load_store(), clients_only=True)
+    result = _apply_xray(_load_store(), xray_only=True)
     act = "создан" if not original else "обновлён"
     bits = []
     if c.get("limit_gb"):
@@ -3043,9 +3054,10 @@ async def client_save(request: Request):
     ibs = c.get("inbounds") or []
     if ibs:
         bits.append("inbounds: " + ", ".join(f"<code>{tgbot.escape(str(x))}</code>" for x in ibs[:8]))
-    summary = f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}"
-    detail = " · ".join(bits)
-    threading.Thread(target=_tg_change, args=(summary, detail), daemon=True).start()
+    _tg_change(
+        f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}",
+        " · ".join(bits),
+    )
     flash(request, *_ok_msg(f"Клиент {c['email']} сохранён", result))
     return go(f"/clients/{c['email']}/edit")
 
@@ -3107,10 +3119,8 @@ async def clients_bulk(request: Request):
         else:
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
-    result = _apply_xray(_load_store(), clients_only=True)
-    threading.Thread(
-        target=_tg_change, args=(f"👤 Клиенты (bulk): {tgbot.escape(msg)}",), daemon=True,
-    ).start()
+    result = _apply_xray(_load_store(), xray_only=True)
+    _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
 
@@ -3155,12 +3165,8 @@ def client_action(email: str, action: str, request: Request):
             flash(request, "Неизвестное действие", "error")
             return go("/clients")
     need_xray = action not in ("regen_sub", "clear_ips", "clear_hwids")
-    result = _apply_xray(_load_store(), clients_only=True) if need_xray else {"ok": True}
-    threading.Thread(
-        target=_tg_change,
-        args=(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}",),
-        daemon=True,
-    ).start()
+    result = _apply_xray(_load_store(), xray_only=True) if need_xray else {"ok": True}
+    _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
         return go("/clients")
@@ -3352,7 +3358,7 @@ def l2tp_connect(name: str, request: Request):
         else:
             it["status"], it["last_error"] = "disconnected", result.get("error", "connect failed")
     if result["ok"]:
-        xr = _apply_xray(_load_store())
+        xr = _apply_xray(_load_store(), xray_only=True)
         flash(request, *_ok_msg(f"{name}: connected, egress {item.get('public_ip') or '?'}", xr))
     else:
         flash(request, f"{name}: {result.get('error')}", "error")
@@ -3373,7 +3379,7 @@ def l2tp_disconnect(name: str, request: Request):
         for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
             item[key] = ""
         item["last_error"] = "" if result["ok"] else result.get("error", "")
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     flash(request, *_ok_msg(f"{name}: disconnected", xr))
     return go("/l2tp")
 
@@ -3394,7 +3400,7 @@ def l2tp_delete(name: str, request: Request):
         l2tp.delete_tunnel(item, store_l2tp=store["l2tp"])
         _delete_l2tp_secrets(name)
         store["l2tp"] = [x for x in store["l2tp"] if x["name"] != name]
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     flash(request, *_ok_msg(f"L2TP {name} удалён", xr))
     return go("/l2tp")
 
@@ -3578,7 +3584,7 @@ def _pia_reconnect_one(tag: str, *, token: str | None = None) -> dict:
         o["kind"] = "pia"
         o["pia_reconnected_at"] = datetime.now(timezone.utc).isoformat()
         o.pop("last_test", None)
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     if not xr.get("ok"):
         with mutate() as store:
             o = next((x for x in store.get("outbounds_custom") or [] if x.get("tag") == tag), None)
@@ -3586,7 +3592,7 @@ def _pia_reconnect_one(tag: str, *, token: str | None = None) -> dict:
                 o["config"] = prev
                 o.pop("pia_reconnected_at", None)
             _pia_settings(store)["last_error"] = f"{tag}: Xray {xr.get('error')}"
-        _apply_xray(_load_store())
+        _apply_xray(_load_store(), xray_only=True)
         return {"ok": False, "error": f"{tag}: Xray отклонил конфиг — откат", "token": use_token}
     # brief settle so this peer is up before rotating the next one
     time.sleep(2)
@@ -3874,7 +3880,7 @@ async def outbound_add(request: Request):
     if err:
         flash(request, err, "error")
         return go("/outbounds")
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     if not xr.get("ok"):
         with mutate() as store:
             store["outbounds_custom"] = previous
@@ -4012,7 +4018,7 @@ def outbound_action(tag: str, action: str, request: Request):
                     flash(request, f"{tag} используется клиентами: {', '.join(used)}", "error")
                     return go("/outbounds")
                 store["outbounds_custom"].remove(o)
-    xr = _apply_xray(_load_store()) if action != "reset" else {"ok": True}
+    xr = _apply_xray(_load_store(), xray_only=True) if action != "reset" else {"ok": True}
     labels = {
         "delete": "удалён", "toggle": "вкл/выкл", "sub": "в подписке вкл/выкл",
         "reset": "сброс трафика",
@@ -4065,7 +4071,7 @@ async def balancers_save(key: str, request: Request):
             b["expected"] = max(1, _int(form.get("expected"), 1))
             b["max_rtt"] = str(form.get("max_rtt") or "1s")
             b["tolerance"] = _float(form.get("tolerance"), 0.15)
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     with_state = "вкл" if form.get("enabled") == "1" else "выкл"
     _tg_change(
         f"⚖ Balancer <b>{tgbot.escape(key)}</b> сохранён ({with_state})",
@@ -4114,7 +4120,7 @@ async def routing_add(request: Request):
             flash(request, "Нужно хотя бы одно условие", "error")
             return go("/routing")
         store["routes"].append(rule)
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(
         f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> добавлено",
         f"→ <code>{tgbot.escape(str(form.get('outbound') or 'direct'))}</code>",
@@ -4135,7 +4141,7 @@ def routing_preset(key: str, request: Request):
             flash(request, f"{preset['name']} уже есть", "error")
             return go("/routing")
         store["routes"].insert(0, {"enabled": True, **json.loads(json.dumps(preset))})
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(f"🗺 Routing: preset <b>{tgbot.escape(preset['name'])}</b> добавлен")
     flash(request, *_ok_msg(f"Добавлено {preset['name']}", xr))
     return go("/routing")
@@ -4163,7 +4169,7 @@ def routing_action(name: str, action: str, request: Request):
         elif action == "down" and idx < len(routes) - 1:
             routes[idx + 1], routes[idx] = routes[idx], routes[idx + 1]
             what = "ниже"
-    xr = _apply_xray(_load_store())
+    xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(f"🗺 Routing: <b>{tgbot.escape(name)}</b> — {tgbot.escape(what)}")
     flash(request, *_ok_msg(f"{name}: {action}", xr))
     return go("/routing")
@@ -4249,7 +4255,7 @@ async def xray_settings_save(request: Request):
             return go(f"/xray?tab={section}")
     if section != "geo_custom":
         # apply_config always runs xray -test + live restart check; rejects/rolls back on failure
-        xr = _apply_xray(_load_store())
+        xr = _apply_xray(_load_store(), xray_only=True)
         flash(request, *_ok_msg("Настройки Xray применены", xr))
     else:
         flash(request, "Сохранено", "info")
@@ -5266,7 +5272,7 @@ async def rest_api(path: str, request: Request):
                 return _api_err(err)
             st["clients"].append(c)
             xray.ensure_wg_peer(st, c)
-        res = _apply_xray(_load_store(), clients_only=True)
+        res = _apply_xray(_load_store(), xray_only=True)
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if len(parts) == 3 and parts[:2] == ["clients", "update"] and request.method == "POST":
         with mutate() as st:
@@ -5276,7 +5282,7 @@ async def rest_api(path: str, request: Request):
             err = _api_apply_client(st, c, data)
             if err:
                 return _api_err(err)
-        res = _apply_xray(_load_store(), clients_only=True)
+        res = _apply_xray(_load_store(), xray_only=True)
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if len(parts) == 3 and parts[0] == "clients" and parts[1] in ("delete", "reset") and request.method in ("POST", "DELETE"):
         with mutate() as st:
@@ -5287,13 +5293,13 @@ async def rest_api(path: str, request: Request):
                 st["clients"].remove(c)
             else:
                 xray.reset_client_traffic(c)
-        _apply_xray(_load_store(), clients_only=True)
+        _apply_xray(_load_store(), xray_only=True)
         return _api_ok(None, f"{parts[1]} ok")
     if parts == ["clients", "resetAll"] and request.method == "POST":
         with mutate() as st:
             for c in st["clients"]:
                 xray.reset_client_traffic(c)
-        _apply_xray(_load_store(), clients_only=True)
+        _apply_xray(_load_store(), xray_only=True)
         return _api_ok(None, "reset all")
     if parts == ["l2tp", "list"]:
         return _api_ok([{k: v for k, v in x.items() if k not in ("password",)} for x in store["l2tp"]])
@@ -6346,7 +6352,7 @@ def _manage_action(action: str, payload: dict) -> dict:
                 else:
                     it["status"], it["last_error"] = "disconnected", result.get("error", "connect failed")
         if result.get("ok"):
-            _apply_xray(_load_store())
+            _apply_xray(_load_store(), xray_only=True)
         return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "name": name}
 
     if action == "l2tp_disconnect":
@@ -6360,7 +6366,7 @@ def _manage_action(action: str, payload: dict) -> dict:
             for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
                 item[key] = ""
             item["last_error"] = "" if result.get("ok") else result.get("error", "")
-        _apply_xray(_load_store())
+        _apply_xray(_load_store(), xray_only=True)
         return {"ok": True, "error": "", "name": name}
 
     if action == "select_best_l2tp":

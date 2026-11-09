@@ -627,6 +627,27 @@ def _restore(snapshot: dict[Path, str | None]) -> None:
             pass
 
 
+def _includes_already_ready() -> bool:
+    """True when nginx main/includes/FD drop-in already match what _ensure_includes would write."""
+    try:
+        main = NGINX_CONF.read_text(encoding="utf-8")
+        if STREAM_INCLUDE_LINE not in main:
+            return False
+        if _patch_nginx_fd_limits(main)[0] != main:
+            return False
+        want = f"{MARK}\ninclude {HTTP_CONF};\n"
+        cur = HTTP_INCLUDE.read_text(encoding="utf-8") if HTTP_INCLUDE.is_file() else None
+        if cur != want:
+            return False
+        if not NGINX_SYSTEMD_DROPIN.is_file():
+            return False
+        if NGINX_SYSTEMD_DROPIN.read_text(encoding="utf-8").strip() != NGINX_SYSTEMD_DROPIN_BODY.strip():
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def stage(store: dict) -> dict:
     """Write candidate config and run `nginx -t`. Nginx keeps serving the old config until commit()."""
     if not available():
@@ -634,6 +655,21 @@ def stage(store: dict) -> dict:
     # Inbounds with routing problems are left out of nginx (and reported); they never block the others.
     stream, http, problems = render(store)
     FRONT_DIR.mkdir(parents=True, exist_ok=True)
+    # Fast path: generated front configs + includes already match → skip write/nginx -t
+    try:
+        cur_stream = STREAM_CONF.read_text(encoding="utf-8") if STREAM_CONF.is_file() else None
+        cur_http = HTTP_CONF.read_text(encoding="utf-8") if HTTP_CONF.is_file() else None
+    except OSError:
+        cur_stream = cur_http = None
+    if cur_stream == stream and cur_http == http and _includes_already_ready():
+        return {
+            "ok": True,
+            "snapshot": {},
+            "changed": False,
+            "problems": problems,
+            "error": "",
+            "restart": False,
+        }
     snapshot: dict[Path, str | None] = {}
     need_restart = False
     for path in (STREAM_CONF, HTTP_CONF):
