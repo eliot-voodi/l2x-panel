@@ -284,6 +284,26 @@ def pull_wants_update(node: dict, agent_version: str, master_version: str) -> bo
     return manual
 
 
+def pull_xray_update_tag(node: dict, status: dict | None = None) -> str:
+    """NAT Xray update command for /agent/pull.
+
+    Unlike panel update, this must NOT be one-shot: keep re-sending until the agent
+    reports an installed version >= requested (missed pull / panel-update early-return
+    / failed download must not drop the queue forever).
+    """
+    requested = str(node.get("xray_update_requested") or "").strip()
+    if not requested:
+        return ""
+    st = status if isinstance(status, dict) else {}
+    reported = str(st.get("xray_version") or node.get("xray_version") or "").strip()
+    if reported and version_tuple(reported) >= version_tuple(requested):
+        node.pop("xray_update_requested", None)
+        return ""
+    tag = requested if requested.startswith("v") or requested.startswith("V") else f"v{requested}"
+    node["xray_update_requested"] = tag
+    return tag
+
+
 def pull_request(master_url: str, token: str, body: dict, timeout: int = 30) -> dict:
     """Agent side: POST /agent/pull on master (plain HTTPS, outbound only)."""
     url = master_url.rstrip("/") + "/agent/pull"

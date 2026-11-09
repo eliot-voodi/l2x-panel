@@ -6051,8 +6051,9 @@ def nodes_page(request: Request):
 def _node_xray_check_one(node: dict) -> dict:
     """Check Xray version on one node (manage or NAT local+GitHub)."""
     if node.get("nat"):
-        return _master_node_xray_nat(node["id"], "check_xray", {})
-    res = nodes_mod.manage_request(node, action="check_xray", timeout=60)
+        res = _master_node_xray_nat(node["id"], "check_xray", {})
+    else:
+        res = nodes_mod.manage_request(node, action="check_xray", timeout=60)
     if res.get("ok"):
         _persist_node_xray_info(node["id"], res)
     return res
@@ -7764,13 +7765,14 @@ async def agent_pull(request: Request):
                 node["agent_diag"] = diag_text[-60000:]
                 node["agent_diag_at"] = nodes_mod.now_iso()
             diag_req = node.pop("diag_requested", None)
-            xray_upd = str(node.pop("xray_update_requested", None) or "").strip()
             # Remember Xray version reported by NAT agent pull status
             xv = str(status.get("xray_version") or "").strip()
             if xv:
                 node["xray_version"] = xv.lstrip("vV")
             if "xray_active" in status:
                 node["xray_active"] = bool(status.get("xray_active"))
+            # Keep re-sending until agent reports matching/newer Xray (not one-shot pop)
+            xray_upd = nodes_mod.pull_xray_update_tag(node, status)
             nodes_mod.upsert_node_outbound(st, node)
             payload = nodes_mod.build_payload(st, node, xray.build_config)
             self_url = f"https://{public_host()}{base_path()}" if public_host() else ""
@@ -7966,6 +7968,31 @@ def _agent_pull_cycle() -> None:
         with mutate() as st:
             st.setdefault("settings", {}).setdefault("nodes", {})["pull_fail_streak"] = 0
     payload = res.get("payload") if isinstance(res.get("payload"), dict) else {}
+    # Xray update via pull MUST run even if panel update is also requested: master keeps
+    # re-sending the tag until our reported xray_version catches up. Handle Xray first so a
+    # panel-update early-return cannot starve the core upgrade forever.
+    xray_upd = str(res.get("xray_update") or payload.get("xray_update") or "").strip()
+    xray_job_started = False
+    if xray_upd:
+        cur = ""
+        try:
+            cur = str(xray.xray_status().get("version") or "")
+        except Exception:
+            cur = ""
+        if cur and nodes_mod.version_tuple(cur) >= nodes_mod.version_tuple(xray_upd):
+            xray_upd = ""  # already there — master clears on next status report
+        else:
+            running = XRAY_UPDATE_JOB.get("id")
+            if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
+                def install_and_recheck(v: str) -> dict:
+                    r = ops.install_xray(v)
+                    try:
+                        check_xray_update(force=True)
+                    except Exception:
+                        pass
+                    return r
+                XRAY_UPDATE_JOB["id"] = ops.start_job("xray-update-pull", install_and_recheck, xray_upd)
+                xray_job_started = True
     want_update = bool(res.get("update") or payload.get("panel_update"))
     if want_update:
         running = PANEL_UPDATE_JOB.get("id")
@@ -7973,18 +8000,7 @@ def _agent_pull_cycle() -> None:
             PANEL_UPDATE_JOB["id"] = ops.start_job("panel-update-pull", ops.update_panel)
         # Prefer finishing the panel update; skip apply on this cycle
         return
-    xray_upd = str(res.get("xray_update") or payload.get("xray_update") or "").strip()
-    if xray_upd:
-        running = XRAY_UPDATE_JOB.get("id")
-        if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
-            def install_and_recheck(v: str) -> dict:
-                r = ops.install_xray(v)
-                try:
-                    check_xray_update(force=True)
-                except Exception:
-                    pass
-                return r
-            XRAY_UPDATE_JOB["id"] = ops.start_job("xray-update-pull", install_and_recheck, xray_upd)
+    if xray_upd or xray_job_started:
         # Xray install restarts core — apply on next pull after job finishes
         if res.get("unchanged") or not payload:
             return
