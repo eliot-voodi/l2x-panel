@@ -214,6 +214,7 @@
     <a class="nav-link {% if active=='dashboard' %}active{% endif %}" href="{{ bp }}/">{{ ic.icon('grid') }}{{ t('Дашборд') }}</a>
     <div class="nav-group">{{ t('Пользователи') }}</div>
     <a class="nav-link {% if active=='clients' %}active{% endif %}" href="{{ bp }}/clients">{{ ic.icon('users') }}{{ t('Клиенты') }}</a>
+    <a class="nav-link {% if active=='groups' %}active{% endif %}" href="{{ bp }}/groups">{{ ic.icon('layers') }}Группы</a>
     <a class="nav-link {% if active=='migrate' %}active{% endif %}" href="{{ bp }}/clients/migrate">{{ ic.icon('inbox') }}Миграция</a>
     <a class="nav-link {% if active=='inbounds' %}active{% endif %}" href="{{ bp }}/inbounds">{{ ic.icon('inbox') }}{{ t('Inbounds') }}</a>
     <a class="nav-link {% if active=='bans' %}active{% endif %}" href="{{ bp }}/bans">{{ ic.icon('shield') }}Баны IP</a>

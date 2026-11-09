@@ -63,8 +63,17 @@
       <label class="f">Доп. HTTP-порты (через запятую)</label>
       <input name="legacy_ports" value="{{ (sb.legacy_ports or [])|join(', ') }}" placeholder="2096">
     </div>
+    <div style="max-width:280px">
+      <label class="f">Доп. HTTPS-порты (через запятую)</label>
+      <input name="legacy_tls_ports" value="{{ (sb.legacy_tls_ports or [])|join(', ') }}" placeholder="8000">
+    </div>
   </div>
-  <div class="hint">nginx слушает эти порты <b>без TLS</b> (как 3x-ui sub) и отдаёт те же подписки. iptables не блокирует их. Нельзя завернуть 2096→443 через REDIRECT: на 443 — TLS stream.</div>
+  <div class="hint">HTTP — <b>без TLS</b> (как 3x-ui sub, <code>http://host:2096/…</code>). HTTPS — с сертификатом публичного домена (PasarGuard <code>https://host:8000/sub/…</code>). iptables не блокирует эти порты.</div>
+
+  <label class="f">PasarGuard / Marzban JWT secret (по одному в строке)</label>
+  <textarea name="legacy_jwt_secrets" class="mono" rows="2" placeholder="значение jwt.secret_key из БД PasarGuard">{% for k in (sb.legacy_jwt_secrets or []) %}{{ k }}
+{% endfor %}</textarea>
+  <div class="hint">Токены подписки PasarGuard подписаны этим ключом — с ним панель принимает <b>любые</b> ранее выданные ссылки клиентов (поиск по id пользователя PasarGuard). Заполняется автоматически при импорте бэкапа.</div>
 
   <h3 class="mt">Здоровье outbound в подписке</h3>
   {{ m.check('hide_unhealthy', sb.hide_unhealthy if sb.hide_unhealthy is defined else true, 'Скрывать disconnected / high-loss outbound из подписки') }}

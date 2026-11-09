@@ -137,6 +137,8 @@ def default_settings() -> dict:
             "path_aliases": [],
             # Extra HTTP ports nginx listens on for old clients (e.g. 2096); not TLS :443
             "legacy_ports": [],
+            # Extra HTTPS ports (e.g. PasarGuard https://host:8000/sub/…), cert of public domain
+            "legacy_tls_ports": [],
             "domain": "", "cert_file": "", "key_file": "", "update_hours": 1, "title": "",
             "support_url": "", "announce": "", "show_page": True,
             "json_fragment": "", "json_noise": "", "json_mux": "",
@@ -206,11 +208,12 @@ def _load_store() -> dict:
             data = {}
     for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
                          ("ip_ban_stats", {}), ("xray_update_state", {}), ("l2tp_auto_state", {}),
-                         ("panel_update_state", {}), ("nodes", [])):
+                         ("panel_update_state", {}), ("nodes", []), ("groups", [])):
         data.setdefault(key, default)
     data.setdefault("reverse", {"bridges": [], "portals": []})
     xray.ensure_balancers(data)
     xray.ensure_inbounds(data)
+    xray.ensure_groups(data)
     xray._ensure_section(data, "xray_settings", xray.default_xray_settings())
     xray._ensure_section(data, "dns", xray.default_dns())
     _ensure_settings(data)
@@ -2891,12 +2894,15 @@ def _client_row(store: dict, c: dict) -> dict:
     limit = xray.gb_to_bytes(c.get("limit_gb"))
     daily_used = xray.client_daily_used_bytes(c)
     daily_limit = xray.gb_to_bytes(c.get("daily_limit_gb"))
+    grp = xray.client_group(store, c)
     return {
         **c, "used": used, "limit_bytes": limit, "pct": min(100, int(100 * used / limit)) if limit else 0,
         "daily_used": daily_used, "daily_limit_bytes": daily_limit,
         "daily_pct": min(100, int(100 * daily_used / daily_limit)) if daily_limit else 0,
         "status": xray.client_status(c), "online_ips": ONLINE.get(c["email"], []), "sub_url": sub_url(c),
         "inbound_tags": [i["tag"] for i in xray.client_inbounds(store, c)], "days_left": xray.days_left(c),
+        "group_name": (grp or {}).get("name") or "",
+        "effective_outbound": xray.client_default_outbound(store, c),
     }
 
 
@@ -2918,7 +2924,7 @@ def clients_page(request: Request):
             continue
         rows.append(row)
     return page(request, "clients.html", active="clients", items=rows, q=q, status=status, store=store,
-                total=len(store["clients"]))
+                total=len(store["clients"]), groups=xray.ensure_groups(store))
 
 
 def _client_form(form, store: dict, client: dict) -> str | None:
@@ -2980,12 +2986,19 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         client["doh_token"] = doh_mod.new_token()
     if client["doh_in_tunnel"] and not client["doh_enabled"]:
         client["doh_enabled"] = True
+    gid = str(form.get("group_id") or "").strip()
+    if gid and not xray.get_group(store, gid):
+        return "Неизвестная группа"
+    client["group_id"] = gid
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
-    client["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
+    # Personal inbounds/tags apply only when no group is assigned
+    if not gid:
+        client["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
     known = {t_["tag"] for t_ in xray.selectable_outbound_tags(store)}
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
-    client["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
+    if not gid:
+        client["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
     limits = {}
     daily_limits = {}
     for tag in known:
@@ -3015,6 +3028,8 @@ def client_new(request: Request):
     doh_mod.ensure_client_doh(c)
     return page(request, "client_edit.html", active="clients", c=c, row=None, is_new=True, store=store,
                 tags=xray.selectable_outbound_tags(store), inbounds=xray.client_capable_inbounds(store),
+                groups=xray.ensure_groups(store), group=None,
+                eff_tags=[], eff_inbounds=[],
                 hwids=[], bans=[], links=[], wg_confs=[], doh_url="",
                 doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
 
@@ -3194,6 +3209,8 @@ async def clients_migrate_run(request: Request):
                 hint += f" · JWT secret найден ({jwt_n}) — старые ссылки подписки сохранятся"
             else:
                 hint += " · JWT secret не найден в файле — для тех же ссылок нужен API или бэкап с таблицей jwt"
+            if meta.get("port"):
+                hint += f" · порт PasarGuard {meta['port']} ({'HTTPS' if meta.get('tls') else 'HTTP'})"
         flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         return _migrate_page(request, preview=prev, **form_kw)
 
@@ -3218,11 +3235,17 @@ async def clients_migrate_run(request: Request):
                     aliases.append(legacy_path)
                 sub["path_aliases"] = aliases
             if legacy_port and 1 <= legacy_port <= 65535 and legacy_port not in (80, 443):
-                ports = list(sub.get("legacy_ports") or [])
+                # PasarGuard served subscriptions over HTTPS (uvicorn SSL) — keep the scheme
+                use_tls = bool(meta.get("tls")) and int(meta.get("port") or 0) == legacy_port
+                key = "legacy_tls_ports" if use_tls else "legacy_ports"
+                other = "legacy_ports" if use_tls else "legacy_tls_ports"
+                ports = list(sub.get(key) or [])
                 if legacy_port not in ports:
                     ports.append(legacy_port)
-                sub["legacy_ports"] = ports
-            report["legacy"] = {"path": legacy_path, "port": legacy_port}
+                sub[key] = ports
+                sub[other] = [p for p in (sub.get(other) or []) if int(p) != legacy_port]
+            report["legacy"] = {"path": legacy_path, "port": legacy_port,
+                                "tls": bool(meta.get("tls")) and int(meta.get("port") or 0) == legacy_port}
     result = _apply_xray(_load_store())
     _tg_change(
         f"📦 Миграция <b>{migrate_mod.SOURCE_LABELS.get(source, source)}</b>: "
@@ -3231,7 +3254,8 @@ async def clients_migrate_run(request: Request):
     )
     extra = ""
     if report.get("legacy"):
-        extra = f" · legacy /{report['legacy'].get('path')}:{report['legacy'].get('port')}"
+        extra = (f" · legacy /{report['legacy'].get('path')}:{report['legacy'].get('port')}"
+                 f"{' https' if report['legacy'].get('tls') else ''}")
     if report.get("jwt_secrets"):
         extra += f" · JWT secrets {report['jwt_secrets']} (старые PG-ссылки активны)"
     tb = int(report.get("traffic_bytes") or 0)
@@ -3274,8 +3298,12 @@ def client_edit(email: str, request: Request):
     links = [(e, P.endpoint_to_link(e)) for e in eps]
     wg_confs = [(e, P.wireguard_conf(e)) for e in eps if e["protocol"] == "wireguard"]
     doh_mod.ensure_client_doh(c)
+    grp = xray.client_group(store, c)
     return page(request, "client_edit.html", active="clients", c=c, row=_client_row(store, c), is_new=False,
                 store=store, tags=tags, inbounds=xray.client_capable_inbounds(store), bans=bans, links=links,
+                groups=xray.ensure_groups(store), group=grp,
+                eff_tags=xray.client_effective_allowed_tags(store, c),
+                eff_inbounds=xray.client_effective_inbounds(store, c),
                 wg_confs=wg_confs, hwids=hwid.public_list(c),
                 doh_url=doh_mod.public_url(store, c),
                 doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
@@ -3343,9 +3371,13 @@ async def clients_bulk(request: Request):
                 n += 1
                 if email in existing:
                     continue
+                bulk_gid = str(form.get("group_id") or "").strip()
+                if bulk_gid and not xray.get_group(store, bulk_gid):
+                    bulk_gid = ""
                 c = xray.ensure_client({"email": email, "sub_token": secrets.token_urlsafe(18),
                                         "limit_gb": _float(form.get("limit_gb")),
-                                        "outbound": str(form.get("outbound") or "direct")})
+                                        "outbound": str(form.get("outbound") or "direct"),
+                                        "group_id": bulk_gid})
                 days = _int(form.get("days"))
                 if days and form.get("first_use") == "1":
                     c["start_on_first_use"], c["duration_days"] = True, days
@@ -3363,6 +3395,16 @@ async def clients_bulk(request: Request):
             before = len(store["clients"])
             store["clients"] = [c for c in store["clients"] if xray.client_status(c) not in ("expired", "limited")]
             msg = f"Удалено исчерпанных: {before - len(store['clients'])}"
+        elif action == "set_group" and selected:
+            gid = str(form.get("group_id") or "").strip()
+            if gid and not xray.get_group(store, gid):
+                flash(request, "Неизвестная группа", "error")
+                return go("/clients")
+            for c in store["clients"]:
+                if c["email"] in selected:
+                    c["group_id"] = gid
+            gname = (xray.get_group(store, gid) or {}).get("name") if gid else "без группы"
+            msg = f"группа «{gname}»: {len(selected)}"
         elif action in ("enable", "disable", "delete", "reset") and selected:
             for c in list(store["clients"]):
                 if c["email"] not in selected:
@@ -3383,6 +3425,124 @@ async def clients_bulk(request: Request):
     _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
+
+
+# ================================================================ client groups
+
+def _group_form(form, store: dict, group: dict) -> str | None:
+    name = str(form.get("name") or "").strip()
+    if not name:
+        return "Укажите название группы"
+    group["name"] = name
+    group["comment"] = str(form.get("comment") or "").strip()
+    known = {t["tag"] for t in xray.selectable_outbound_tags(store)}
+    selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
+    group["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
+    known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
+    sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
+    group["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
+    outbound = str(form.get("outbound") or "").strip()
+    if outbound and outbound != "direct" and outbound not in known:
+        return f"Неизвестный outbound {outbound}"
+    group["outbound"] = outbound
+    return None
+
+
+@app.get("/groups", response_class=HTMLResponse)
+def groups_page(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    groups = xray.ensure_groups(store)
+    counts: dict[str, int] = {}
+    for c in store.get("clients") or []:
+        gid = str(c.get("group_id") or "")
+        if gid:
+            counts[gid] = counts.get(gid, 0) + 1
+    rows = [{**g, "clients": counts.get(str(g.get("id") or ""), 0)} for g in groups]
+    return page(
+        request, "groups.html", active="groups", items=rows, store=store,
+        tags=xray.selectable_outbound_tags(store),
+        inbounds=xray.client_capable_inbounds(store),
+    )
+
+
+@app.get("/groups/new", response_class=HTMLResponse)
+def groups_new(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    g = xray.new_group()
+    return page(
+        request, "group_edit.html", active="groups", g=g, is_new=True, store=store,
+        tags=xray.selectable_outbound_tags(store),
+        inbounds=xray.client_capable_inbounds(store),
+        clients_count=0,
+    )
+
+
+@app.get("/groups/{gid}/edit", response_class=HTMLResponse)
+def groups_edit(gid: str, request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    g = xray.get_group(store, gid)
+    if not g:
+        flash(request, "Группа не найдена", "error")
+        return go("/groups")
+    n = sum(1 for c in store.get("clients") or [] if str(c.get("group_id") or "") == gid)
+    return page(
+        request, "group_edit.html", active="groups", g=g, is_new=False, store=store,
+        tags=xray.selectable_outbound_tags(store),
+        inbounds=xray.client_capable_inbounds(store),
+        clients_count=n,
+    )
+
+
+@app.post("/groups/save")
+async def groups_save(request: Request):
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    gid = str(form.get("id") or "").strip()
+    with mutate(history_section="groups") as store:
+        xray.ensure_groups(store)
+        if gid:
+            g = xray.get_group(store, gid)
+            if not g:
+                flash(request, "Группа не найдена", "error")
+                return go("/groups")
+        else:
+            g = xray.new_group()
+            store.setdefault("groups", []).append(g)
+        err = _group_form(form, store, g)
+        if err:
+            flash(request, err, "error")
+            return go(f"/groups/{g['id']}/edit" if gid else "/groups/new")
+    result = _apply_xray(_load_store(), xray_only=True)
+    _tg_change(f"👥 Группа <b>{tgbot.escape(g['name'])}</b> сохранена")
+    flash(request, *_ok_msg(f"Группа «{g['name']}» сохранена", result))
+    return go(f"/groups/{g['id']}/edit")
+
+
+@app.post("/groups/{gid}/delete")
+def groups_delete(gid: str, request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate(history_section="groups") as store:
+        g = xray.get_group(store, gid)
+        if not g:
+            flash(request, "Группа не найдена", "error")
+            return go("/groups")
+        name = g.get("name") or gid
+        store["groups"] = [x for x in store.get("groups") or [] if str(x.get("id")) != gid]
+        for c in store.get("clients") or []:
+            if str(c.get("group_id") or "") == gid:
+                c["group_id"] = ""
+    result = _apply_xray(_load_store(), xray_only=True)
+    _tg_change(f"👥 Группа <b>{tgbot.escape(str(name))}</b> удалена")
+    flash(request, *_ok_msg(f"Группа «{name}» удалена", result))
+    return go("/groups")
 
 
 @app.post("/clients/{email}/{action}")
@@ -5294,12 +5454,27 @@ async def settings_save(request: Request):
                 pnum = _int(part, 0)
                 if 1 <= pnum <= 65535 and pnum not in (80, 443) and pnum not in leg_ports:
                     leg_ports.append(pnum)
+            leg_tls: list[int] = []
+            for part in re.split(r"[\s,;]+", str(form.get("legacy_tls_ports") or "")):
+                if not part.strip():
+                    continue
+                pnum = _int(part, 0)
+                if 1 <= pnum <= 65535 and pnum not in (80, 443) and pnum not in leg_tls:
+                    leg_tls.append(pnum)
+            leg_ports = [x for x in leg_ports if x not in leg_tls]
+            jwt_list: list[str] = []
+            for line in _split_lines(str(form.get("legacy_jwt_secrets") or "")):
+                key = line.strip()
+                if re.fullmatch(r"[A-Za-z0-9_\-]{16,128}", key) and key not in jwt_list:
+                    jwt_list.append(key)
             sub.update({
                 "enabled": form.get("enabled") == "1", "server_enabled": False,
                 "listen": "127.0.0.1", "port": 2096,
                 "path": primary,
                 "path_aliases": aliases,
                 "legacy_ports": leg_ports,
+                "legacy_tls_ports": leg_tls,
+                "legacy_jwt_secrets": jwt_list,
                 "domain": front.public_domain({"settings": s}) or front.normalize_host(str(form.get("domain") or "")),
                 "cert_file": "", "key_file": "", "update_hours": _int(form.get("update_hours"), 1),
                 "title": str(form.get("title") or ""), "support_url": str(form.get("support_url") or ""),
@@ -5680,13 +5855,14 @@ def _public_client(store: dict, c: dict) -> dict:
         "daily_outbound_limits": c.get("daily_outbound_limits"),
         "on_expire": c.get("on_expire"), "on_quota": c.get("on_quota"),
         "allowed_tags": c.get("allowed_tags"),
+        "group_id": c.get("group_id") or "",
     }
 
 
 API_CLIENT_FIELDS = (
     "outbound", "enabled", "limit_gb", "daily_limit_gb", "expire_at", "limit_ip", "limit_hwid", "comment", "tg_id",
     "inbounds", "reset_period", "renew_on_reset", "start_on_first_use", "duration_days", "allowed_tags",
-    "outbound_limits", "daily_outbound_limits", "on_expire", "on_quota", "sub_enabled",
+    "outbound_limits", "daily_outbound_limits", "on_expire", "on_quota", "sub_enabled", "group_id",
 )
 
 
@@ -5696,6 +5872,8 @@ def _api_apply_client(store: dict, c: dict, data: dict) -> str | None:
             c[key] = data[key]
     if c.get("outbound") not in _allowed_outbounds(store):
         return f"unknown outbound {c.get('outbound')}"
+    if c.get("group_id") and not xray.get_group(store, c.get("group_id")):
+        return f"unknown group_id {c.get('group_id')}"
     if c.get("expire_at") and not xray.parse_expire_at(c["expire_at"]):
         return "bad expire_at"
     if c.get("on_expire") not in xray.LIMIT_ACTIONS:

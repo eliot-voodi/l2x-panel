@@ -71,11 +71,9 @@ def sub_uri_paths(store: dict | None = None) -> list[str]:
     return out
 
 
-def legacy_sub_ports(store: dict | None = None) -> list[int]:
-    """Extra HTTP ports nginx should listen on for old panel subscription URLs (e.g. 2096)."""
-    sub = (((store or {}).get("settings") or {}).get("sub") or {})
+def _legacy_port_list(sub: dict, key: str) -> list[int]:
     ports: list[int] = []
-    for raw in sub.get("legacy_ports") or []:
+    for raw in sub.get(key) or []:
         try:
             p = int(raw)
         except (TypeError, ValueError):
@@ -83,6 +81,26 @@ def legacy_sub_ports(store: dict | None = None) -> list[int]:
         if 1 <= p <= 65535 and p not in (80, 443, P.FRONT_PORT, P.FRONT_INTERNAL_PORT) and p not in ports:
             ports.append(p)
     return ports
+
+
+def legacy_sub_tls_ports(store: dict | None = None) -> list[int]:
+    """Extra HTTPS ports for old subscription URLs (e.g. PasarGuard https://host:8000/sub/…)."""
+    sub = (((store or {}).get("settings") or {}).get("sub") or {})
+    return _legacy_port_list(sub, "legacy_tls_ports")
+
+
+def legacy_sub_ports(store: dict | None = None) -> list[int]:
+    """All extra ports nginx listens on for old subscription URLs (HTTP + HTTPS)."""
+    sub = (((store or {}).get("settings") or {}).get("sub") or {})
+    tls = set(_legacy_port_list(sub, "legacy_tls_ports"))
+    plain = [p for p in _legacy_port_list(sub, "legacy_ports") if p not in tls]
+    return plain + sorted(tls)
+
+
+def legacy_sub_plain_ports(store: dict | None = None) -> list[int]:
+    sub = (((store or {}).get("settings") or {}).get("sub") or {})
+    tls = set(_legacy_port_list(sub, "legacy_tls_ports"))
+    return [p for p in _legacy_port_list(sub, "legacy_ports") if p not in tls]
 
 
 def _run(cmd: list[str], timeout: int = 60) -> dict:
@@ -446,8 +464,9 @@ def render(store: dict) -> tuple[str, str, list[str]]:
             blocks.append("server {\n" + "\n".join([*h2, *content]) + "\n}")
     # Legacy subscription ports (HTTP): 3x-ui style http://host:2096/<path>/<token>
     # Cannot iptables-REDIRECT to :443 (TLS stream) — dedicated plain-HTTP listeners.
-    leg_ports = legacy_sub_ports(store)
-    if leg_ports and pub:
+    plain_ports = legacy_sub_plain_ports(store)
+    tls_ports = legacy_sub_tls_ports(store)
+    if (plain_ports or tls_ports) and pub:
         common = (
             "        proxy_http_version 1.1;\n"
             "        proxy_set_header Host $host;\n"
@@ -460,7 +479,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         proxy = f"        proxy_pass http://{PANEL_UPSTREAM};\n{common}"
         sub_locs = "\n".join(_sub_location(sp, proxy) for sp in sub_uri_paths(store))
         sub_locs += f"\n    location ^~ /api/sub/ {{\n{proxy}    }}"
-        for port in leg_ports:
+        for port in plain_ports:
             listen_lines = f"    listen {port};\n"
             if _ipv6():
                 listen_lines += f"    listen [::]:{port};\n"
@@ -473,6 +492,26 @@ def render(store: dict) -> tuple[str, str, list[str]]:
                 "    location / { return 404; }\n"
                 "}"
             )
+        if tls_ports:
+            crt, key, _ = cert_for(pub)
+            for port in tls_ports:
+                listen_lines = f"    listen {port} ssl;\n"
+                if _ipv6():
+                    listen_lines += f"    listen [::]:{port} ssl;\n"
+                blocks.append(
+                    "server {\n"
+                    f"{listen_lines}"
+                    f"    server_name {pub} _;\n"
+                    "    server_tokens off;\n"
+                    f"    ssl_certificate {crt};\n"
+                    f"    ssl_certificate_key {key};\n"
+                    "    ssl_protocols TLSv1.2 TLSv1.3;\n"
+                    # Plain HTTP on the TLS port → redirect to https on same port
+                    "    error_page 497 =301 https://$host:$server_port$request_uri;\n"
+                    f"{sub_locs}\n"
+                    "    location / { return 404; }\n"
+                    "}"
+                )
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
 
 

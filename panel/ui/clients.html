@@ -73,6 +73,13 @@
     <button class="btn ghost sm" name="action" value="enable">Включить</button>
     <button class="btn ghost sm" name="action" value="disable">Выключить</button>
     <button class="btn ghost sm" name="action" value="reset" onclick="return confirm('Сбросить трафик выбранных?')">Сбросить трафик</button>
+    <span class="flex" style="gap:.35rem;align-items:center">
+      <select name="group_id" style="width:auto;min-width:160px;padding:.3rem .5rem;font-size:.82rem">
+        <option value="">— без группы —</option>
+        {% for g in groups or [] %}<option value="{{ g.id }}">{{ g.name }}</option>{% endfor %}
+      </select>
+      <button class="btn ghost sm" name="action" value="set_group">Назначить группу</button>
+    </span>
     <button class="btn danger sm" name="action" value="delete" onclick="return confirm('Удалить выбранных клиентов?')">Удалить</button>
   </div>
 
@@ -114,8 +121,9 @@
           {% else %}∞{% endif %}
         </td>
         <td class="small">
-          <div>{% if c.inbounds %}{{ c.inbound_tags|join(', ') }}{% else %}<span class="dim">все ({{ c.inbound_tags|length }})</span>{% endif %}</div>
-          <div class="dim">{{ outbound_label(store, c.outbound) }}</div>
+          {% if c.group_name %}<div><span class="badge accent">{{ c.group_name }}</span></div>{% endif %}
+          <div>{% if c.group_name or c.inbounds %}{{ c.inbound_tags|join(', ') }}{% else %}<span class="dim">все ({{ c.inbound_tags|length }})</span>{% endif %}</div>
+          <div class="dim">{{ outbound_label(store, c.effective_outbound) }}</div>
         </td>
         <td>
           <div class="actions" style="justify-content:flex-end">
@@ -159,8 +167,9 @@
             <div><span class="lbl">Трафик</span><span class="val">{{ format_traffic(c.used) }} / {{ (c.limit_gb|string ~ ' GB') if c.limit_gb else '∞' }}</span></div>
             <div><span class="lbl">Срок</span><span class="val">{% if c.expire_at %}{{ fmt_dt(c.expire_at, False) }}{% if c.days_left is not none %} · {% if c.days_left > 0 %}{{ '%.0f'|format(c.days_left) }} дн{% else %}истёк{% endif %}{% endif %}{% elif c.start_on_first_use %}{{ c.duration_days }} дн с 1-го подкл.{% else %}∞{% endif %}</span></div>
             <div><span class="lbl">Устройства</span><span class="val">{% if devs %}{{ devs|length }}{% if c.limit_hwid %} / {{ c.limit_hwid }}{% endif %} · {{ by_hwid|length }} HWID{% else %}—{% if c.limit_hwid %} / {{ c.limit_hwid }}{% endif %}{% endif %}</span></div>
-            <div><span class="lbl">Inbounds</span><span class="val">{% if c.inbounds %}{{ c.inbound_tags|join(', ') }}{% else %}все ({{ c.inbound_tags|length }}){% endif %}</span></div>
-            <div><span class="lbl">Outbound</span><span class="val">{{ outbound_label(store, c.outbound) }}</span></div>
+            {% if c.group_name %}<div><span class="lbl">Группа</span><span class="val">{{ c.group_name }}</span></div>{% endif %}
+            <div><span class="lbl">Inbounds</span><span class="val">{% if c.group_name or c.inbounds %}{{ c.inbound_tags|join(', ') }}{% else %}все ({{ c.inbound_tags|length }}){% endif %}</span></div>
+            <div><span class="lbl">Outbound</span><span class="val">{{ outbound_label(store, c.effective_outbound) }}</span></div>
             {% if c.tg_id %}<div><span class="lbl">Telegram</span><span class="val">{% if c.tg_username %}@{{ c.tg_username }}{% else %}{{ c.tg_id }}{% endif %}{% if c.tg_fio %} · {{ c.tg_fio }}{% endif %}</span></div>{% endif %}
           </div>
           <input type="hidden" id="sub-m-{{ loop.index }}" value="{{ c.sub_url }}">
@@ -208,6 +217,11 @@
       <div><label class="f">Срок, дней</label><input name="days" type="number" min="0" placeholder="∞"></div>
     </div>
     {{ m.check('first_use', False, 'Отсчёт срока с первого подключения') }}
+    <label class="f">Группа</label>
+    <select name="group_id">
+      <option value="">— без группы —</option>
+      {% for g in groups or [] %}<option value="{{ g.id }}">{{ g.name }}</option>{% endfor %}
+    </select>
     <label class="f">Outbound</label>
     <select name="outbound">
       <option value="direct">🏠 Direct</option>

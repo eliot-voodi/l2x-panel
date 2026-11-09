@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ g.name if not is_new else 'Новая группа' }} · {{ app_name }}{% endblock %}
+{% block page_title %}{% if is_new %}Новая группа{% else %}{{ g.name }}{% endif %}{% endblock %}
+{% block page_sub %}<a href="{{ bp }}/groups">← все группы</a>{% if not is_new %} · клиентов: {{ clients_count }}{% endif %}{% endblock %}
+{% block top_actions %}
+{% if not is_new %}
+<form method="post" action="{{ bp }}/groups/{{ g.id }}/delete" onsubmit="return confirm('Удалить группу?')">
+  <button class="btn danger sm">{{ t('Удалить') }}</button>
+</form>
+{% endif %}
+{% endblock %}
+{% block content %}
+<form method="post" action="{{ bp }}/groups/save">
+  <input type="hidden" name="id" value="{{ '' if is_new else g.id }}">
+  <div class="card">
+    <h3>Профиль</h3>
+    <div class="row">
+      <div><label class="f">Название</label><input name="name" value="{{ g.name }}" required autofocus placeholder="Free / Premium / …"></div>
+      <div><label class="f">Комментарий</label><input name="comment" value="{{ g.comment or '' }}" placeholder="для себя"></div>
+    </div>
+    <label class="f">Outbound по умолчанию (основная ссылка клиента)</label>
+    <select name="outbound">
+      <option value="" {% if not g.outbound %}selected{% endif %}>— не менять (как у клиента) —</option>
+      <option value="direct" {% if g.outbound == 'direct' %}selected{% endif %}>🏠 Direct</option>
+      {% for tg in tags %}<option value="{{ tg.tag }}" {% if g.outbound == tg.tag %}selected{% endif %}>{{ tg.label }}</option>{% endfor %}
+    </select>
+    <div class="hint">Если задан — перекрывает «Outbound по умолчанию» в карточке клиента.</div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Inbounds</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if not g.inbounds %}checked{% endif %}> все</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="select" {% if g.inbounds %}checked{% endif %}> выбранные</label></div>
+    </div>
+    <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
+      <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
+      <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
+    </div>
+    {% for ib in inbounds %}
+      <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if not g.inbounds or ib.tag in g.inbounds %}checked{% endif %}>
+        <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }} <span class="dim small">:{{ ib.port }}</span></label><br>
+    {% else %}<div class="dim">Нет inbounds</div>{% endfor %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Подключения в подписке</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if not g.allowed_tags %}checked{% endif %}> все</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if g.allowed_tags %}checked{% endif %}> выбранные</label></div>
+    </div>
+    <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
+      <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
+      <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.15rem .5rem">
+      {% for tg in tags %}
+      <label class="check"><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if not g.allowed_tags or tg.tag in g.allowed_tags %}checked{% endif %}>
+        {{ tg.label }}{% if tg.kind == 'balancer' %} <span class="badge">авто</span>{% endif %}</label>
+      {% endfor %}
+    </div>
+    <div class="hint mt">Клиенты этой группы получат в подписке только отмеченные подключения (с учётом health/лимитов).</div>
+  </div>
+
+  <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/groups">{{ t('Отмена') }}</a></div>
+</form>
+<script>
+(function () {
+  function setMode(name, mode) {
+    var radios = document.querySelectorAll('input[name="' + mode + '"]');
+    radios.forEach(function (r) { if (r.value === 'select') r.checked = true; });
+  }
+  document.querySelectorAll('[data-check-all]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var name = btn.getAttribute('data-check-all');
+      var mode = btn.getAttribute('data-mode');
+      document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) { c.checked = true; });
+      if (mode) setMode(name, mode);
+    });
+  });
+  document.querySelectorAll('[data-uncheck-all]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var name = btn.getAttribute('data-uncheck-all');
+      var mode = btn.getAttribute('data-mode');
+      document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) { c.checked = false; });
+      if (mode) setMode(name, mode);
+    });
+  });
+})();
+</script>
+{% endblock %}

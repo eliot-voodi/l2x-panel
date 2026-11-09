@@ -995,11 +995,86 @@ def client_capable_inbounds(store: dict) -> list[dict]:
 
 
 def client_inbounds(store: dict, client: dict) -> list[dict]:
-    wanted = client.get("inbounds") or []
+    wanted = client_effective_inbounds(store, client)
     capable = client_capable_inbounds(store)
     if not wanted:
         return capable
     return [i for i in capable if i["tag"] in wanted]
+
+
+# ---------------------------------------------------------------- client groups
+# Groups define which outbounds (subscription connections) and inbounds a client gets.
+# Empty allowed_tags / inbounds on a group = all. Client without group_id keeps personal lists.
+
+def ensure_groups(store: dict) -> list[dict]:
+    groups = store.setdefault("groups", [])
+    if not isinstance(groups, list):
+        groups = []
+        store["groups"] = groups
+    cleaned: list[dict] = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        if not g.get("id"):
+            g["id"] = "g_" + secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+        g.setdefault("name", str(g.get("id") or "group"))
+        g.setdefault("comment", "")
+        if not isinstance(g.get("allowed_tags"), list):
+            g["allowed_tags"] = []
+        if not isinstance(g.get("inbounds"), list):
+            g["inbounds"] = []
+        g.setdefault("outbound", "")
+        cleaned.append(g)
+    store["groups"] = cleaned
+    return cleaned
+
+
+def get_group(store: dict, group_id: str | None) -> dict | None:
+    gid = str(group_id or "").strip()
+    if not gid:
+        return None
+    for g in ensure_groups(store):
+        if str(g.get("id") or "") == gid:
+            return g
+    return None
+
+
+def client_group(store: dict, client: dict) -> dict | None:
+    return get_group(store, client.get("group_id"))
+
+
+def client_effective_allowed_tags(store: dict, client: dict) -> list[str]:
+    """Outbound tags allowed in subscription. Empty list = all."""
+    g = client_group(store, client)
+    if g is not None:
+        return list(g.get("allowed_tags") or [])
+    return list(client.get("allowed_tags") or [])
+
+
+def client_effective_inbounds(store: dict, client: dict) -> list[str]:
+    """Inbound tags for the client. Empty list = all capable."""
+    g = client_group(store, client)
+    if g is not None:
+        return list(g.get("inbounds") or [])
+    return list(client.get("inbounds") or [])
+
+
+def client_default_outbound(store: dict, client: dict) -> str:
+    g = client_group(store, client)
+    if g is not None and g.get("outbound"):
+        return str(g["outbound"])
+    return str(client.get("outbound") or "direct")
+
+
+def new_group(*, name: str = "", comment: str = "") -> dict:
+    return {
+        "id": "g_" + secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12],
+        "name": (name or "Группа").strip() or "Группа",
+        "comment": (comment or "").strip(),
+        "allowed_tags": [],
+        "inbounds": [],
+        "outbound": "",
+    }
 
 
 # ---------------------------------------------------------------- clients
@@ -1044,6 +1119,7 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("tg_last_name", "")
     client.setdefault("tg_fio", "")
     client.setdefault("allowed_tags", [])
+    client.setdefault("group_id", "")
     client.setdefault("outbound_limits", {})
     client.setdefault("daily_outbound_limits", {})
     client.setdefault("sub_enabled", True)
@@ -1188,8 +1264,8 @@ def client_access_ok(client: dict) -> bool:
     )
 
 
-def tag_allowed_for_client(client: dict, tag: str) -> bool:
-    allowed = client.get("allowed_tags") or []
+def tag_allowed_for_client(store: dict, client: dict, tag: str) -> bool:
+    allowed = client_effective_allowed_tags(store, client)
     if allowed and tag not in allowed:
         return False
     if client_tag_exceeded(client, tag):
@@ -1266,7 +1342,7 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
     tags += [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
     entries = []
     for tag in tags:
-        if not ignore_quota and not tag_allowed_for_client(client, tag):
+        if not ignore_quota and not tag_allowed_for_client(store, client, tag):
             continue
         if not outbound_ok_for_sub(store, tag):
             continue
@@ -1325,8 +1401,8 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
         prefix = f"[{ib.get('remark') or ib['tag']}] " if multi else ""
         for ident in client_identities(store, client, ib):
             if ident["main"]:
-                ob = client.get("outbound") or "direct"
-                if ob != "direct" and not tag_allowed_for_client(client, ob):
+                ob = client_default_outbound(store, client)
+                if ob != "direct" and not tag_allowed_for_client(store, client, ob):
                     continue
                 if ob != "direct" and not outbound_ok_for_sub(store, ob):
                     continue
@@ -1542,8 +1618,8 @@ def build_config(store: dict) -> dict:
                 "type": "field", "user": [e["email"]],
                 **_route_target(store, e["tag"], known_outbounds=known_outbounds),
             })
-        ob = c.get("outbound") or "direct"
-        if ob != "direct" and not tag_allowed_for_client(c, ob):
+        ob = client_default_outbound(store, c)
+        if ob != "direct" and not tag_allowed_for_client(store, c, ob):
             rules.append({"type": "field", "user": [c["email"]], "outboundTag": "block"})
         elif ob != "direct":
             rules.append({
@@ -2172,7 +2248,11 @@ def enforce_quotas(store: dict) -> bool:
                 events.append({"type": "daily_exceeded", "email": client["email"]})
 
         flags = client.setdefault("tag_exceeded", {})
-        for tag in set((client.get("outbound_limits") or {}).keys()) | set(client.get("allowed_tags") or []):
+        watch_tags = (
+            set((client.get("outbound_limits") or {}).keys())
+            | set(client_effective_allowed_tags(store, client))
+        )
+        for tag in watch_tags:
             hit = client_tag_exceeded(client, tag)
             if bool(flags.get(tag)) != hit:
                 flags[tag] = hit
@@ -2181,7 +2261,11 @@ def enforce_quotas(store: dict) -> bool:
                     events.append({"type": "tag_exceeded", "email": client["email"], "tag": tag})
 
         dflags = client.setdefault("daily_tag_exceeded", {})
-        for tag in set((client.get("daily_outbound_limits") or {}).keys()) | set(client.get("allowed_tags") or []):
+        dwatch = (
+            set((client.get("daily_outbound_limits") or {}).keys())
+            | set(client_effective_allowed_tags(store, client))
+        )
+        for tag in dwatch:
             hit = client_daily_tag_exceeded(client, tag)
             if bool(dflags.get(tag)) != hit:
                 dflags[tag] = hit

@@ -1,4 +1,4 @@
-"""Import users from 3x-ui, PasarGuard, or Remnawave (API or backup file).
+﻿"""Import users from 3x-ui, PasarGuard, or Remnawave (API or backup file).
 
 Preserves subscription tokens, traffic counters, limits, and expiry so clients
 can keep their existing subscription URLs after DNS points at L2X.
@@ -1325,6 +1325,8 @@ def _finalize_pasarguard_users(
     jwt_secrets: list[str] | None = None,
     path: str = "",
     note: str = "",
+    port: int = 0,
+    tls: bool = False,
 ) -> list[NormalizedUser]:
     global LAST_SOURCE_META
     secrets = [s for s in (jwt_secrets or []) if s]
@@ -1339,6 +1341,8 @@ def _finalize_pasarguard_users(
         "clients": len(users),
         "jwt_secrets": secrets,
         "path": path or "",
+        "port": int(port or 0) or None,
+        "tls": bool(tls),
         "sub_tokens_minted": sum(1 for u in users if u.sub_token and "." in u.sub_token),
         "note": note or (
             "JWT secret imported — старые PasarGuard-ссылки принимаются панелью"
@@ -1355,6 +1359,8 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
     # Collect jwt secrets from any dump member (may live in a different file than users)
     all_secrets: list[str] = []
     path_hint = ""
+    port_hint = 0
+    tls_hint = False
     for name, content in ordered:
         low = name.lower()
         try:
@@ -1383,6 +1389,11 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                     m = re.search(rf"(?m)^\s*{key}\s*=\s*[\"']?([^\"'\s#]+)", text)
                     if m and not path_hint:
                         path_hint = re.sub(r"[^A-Za-z0-9_-]", "", m.group(1).strip("/"))
+                if not port_hint:
+                    m = re.search(r"(?m)^\s*UVICORN_PORT\s*=\s*[\"']?(\d+)", text)
+                    if m:
+                        port_hint = int(m.group(1))
+                        tls_hint = bool(re.search(r"(?m)^\s*UVICORN_SSL_CERTFILE\s*=\s*[\"']?\S", text))
         except Exception:
             continue
 
@@ -1404,7 +1415,9 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                 finally:
                     path.unlink(missing_ok=True)
                 if users:
-                    return _finalize_pasarguard_users(users, jwt_secrets=all_secrets, path=path_hint)
+                    return _finalize_pasarguard_users(
+                        users, jwt_secrets=all_secrets, path=path_hint, port=port_hint, tls=tls_hint
+                    )
                 continue
             if low.endswith(".sql") or _pg_looks_like_sql(content):
                 text = content.decode("utf-8", "replace")
@@ -1415,12 +1428,16 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                         path_hint = str(meta["path"])
                 users = _parse_users_sql_dump(text)
                 if users:
-                    return _finalize_pasarguard_users(users, jwt_secrets=all_secrets, path=path_hint)
+                    return _finalize_pasarguard_users(
+                        users, jwt_secrets=all_secrets, path=path_hint, port=port_hint, tls=tls_hint
+                    )
                 continue
             if low.endswith(".json") or b'"username"' in content[:4000]:
                 users = parse_pasarguard_json(content)
                 if users:
-                    return _finalize_pasarguard_users(users, jwt_secrets=all_secrets, path=path_hint)
+                    return _finalize_pasarguard_users(
+                        users, jwt_secrets=all_secrets, path=path_hint, port=port_hint, tls=tls_hint
+                    )
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")
             continue

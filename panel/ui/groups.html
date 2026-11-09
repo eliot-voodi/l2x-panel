@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Группы · {{ app_name }}{% endblock %}
+{% block page_title %}Группы клиентов{% endblock %}
+{% block page_sub %}Набор подключений (outbound) и inbounds для подписки{% endblock %}
+{% block top_actions %}
+<div class="actions">
+  <a class="btn" href="{{ bp }}/groups/new">{{ ic.icon('plus') }}Новая группа</a>
+</div>
+{% endblock %}
+{% block content %}
+<div class="hint" style="margin-bottom:1rem">
+  Группа задаёт, какие <b>подключения</b> попадут в подписку клиента и какие inbounds ему доступны.
+  Назначьте группу в карточке клиента или массово на странице Клиенты — личные галочки подключений при этом не используются.
+</div>
+<div class="card" style="padding:0">
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>Группа</th>
+      <th>Клиентов</th>
+      <th>Подключения</th>
+      <th>Inbounds</th>
+      <th>Outbound по умолч.</th>
+      <th class="right">{{ t('Действия') }}</th>
+    </tr></thead>
+    <tbody>
+    {% for g in items %}
+      <tr>
+        <td>
+          <a href="{{ bp }}/groups/{{ g.id }}/edit"><b>{{ g.name }}</b></a>
+          {% if g.comment %}<div class="dim small">{{ g.comment }}</div>{% endif %}
+          <div class="dim small mono">{{ g.id }}</div>
+        </td>
+        <td>{% if g.clients %}<span class="badge accent">{{ g.clients }}</span>{% else %}<span class="dim">0</span>{% endif %}</td>
+        <td class="small">
+          {% if g.allowed_tags %}
+            {% for tg in g.allowed_tags %}<span class="badge" style="margin:0 .2rem .2rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}
+          {% else %}<span class="dim">все</span>{% endif %}
+        </td>
+        <td class="small">
+          {% if g.inbounds %}{{ g.inbounds|join(', ') }}{% else %}<span class="dim">все</span>{% endif %}
+        </td>
+        <td class="small">{% if g.outbound %}{{ outbound_label(store, g.outbound) }}{% else %}<span class="dim">как у клиента</span>{% endif %}</td>
+        <td>
+          <div class="actions" style="justify-content:flex-end">
+            <a class="btn ghost icon" href="{{ bp }}/groups/{{ g.id }}/edit" title="{{ t('Изменить') }}">{{ ic.icon('edit') }}</a>
+            <form method="post" action="{{ bp }}/groups/{{ g.id }}/delete" onsubmit="return confirm('Удалить группу «{{ g.name }}»? Клиенты останутся без группы.')">
+              <button class="btn danger icon" title="{{ t('Удалить') }}">{{ ic.icon('trash') }}</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="empty">Групп пока нет — создайте, чтобы назначать наборы подключений клиентам</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endblock %}
