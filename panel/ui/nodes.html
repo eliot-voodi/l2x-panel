@@ -185,6 +185,7 @@
         <td>
           <div class="actions" style="justify-content:flex-end;flex-wrap:wrap">
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
+            <a class="btn ghost sm" href="{{ bp }}/settings-node?id={{ n.id }}&tab=system" title="iperf3: замер скорости master ↔ нода">iperf{% if n.iperf3_last and n.iperf3_last.down_mbps is not none %} {{ n.iperf3_last.down_mbps }}↓{% endif %}</a>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-check"><button class="btn ghost sm" title="Проверить версию Xray на ноде">Xray?</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-update"
                   onsubmit="return confirm('Обновить Xray на {{ n.name }} до latest?\n{% if n.nat %}NAT: очередь agent pull ≤20 с{% else %}Ядро перезапустится, при ошибке — откат{% endif %}')">
@@ -273,6 +274,7 @@
           </form>
           <div class="actions">
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
+            <a class="btn ghost sm" href="{{ bp }}/settings-node?id={{ n.id }}&tab=system" title="iperf3">iperf{% if n.iperf3_last and n.iperf3_last.down_mbps is not none %} {{ n.iperf3_last.down_mbps }}↓{% endif %}</a>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-check"><button class="btn ghost sm">Xray?</button></form>
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-update"
                   onsubmit="return confirm('Обновить Xray на {{ n.name }}?')">

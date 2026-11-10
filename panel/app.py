@@ -6711,8 +6711,85 @@ async def settings_node_action(node_id: str, request: Request):
     elif action.startswith("l2tp") or action in ("refresh_l2tp", "select_best_l2tp"):
         tab = "l2tp"
     elif action in ("update_panel", "rollback_panel", "restore_master", "restart_panel",
-                    "check_xray", "update_xray", "rollback_xray", "restart_xray"):
+                    "check_xray", "update_xray", "rollback_xray", "restart_xray",
+                    "iperf3_bench", "ensure_network_perf"):
         tab = "system"
+
+    # iperf3 master↔node — background job (NAT wait can take ~40–55 s).
+    if action == "iperf3_bench":
+        seconds = max(3, min(20, _int(params.get("seconds"), 8)))
+        name = str(node.get("name") or node_id)
+
+        def _reload():
+            with STORE_LOCK:
+                return _load_store()
+
+        def _save_node_fields(fields: dict) -> None:
+            with mutate() as st:
+                for n in nodes_mod.ensure_list(st):
+                    if n.get("id") != node_id:
+                        continue
+                    for k, v in fields.items():
+                        if v is None:
+                            n.pop(k, None)
+                        else:
+                            n[k] = v
+                    break
+
+        def _job() -> dict:
+            _save_node_fields({"iperf3_running": True, "iperf3_last": {
+                "ok": None, "at": nodes_mod.now_iso(), "error": "running…",
+            }})
+            try:
+                res = nodes_mod.iperf3_bench(
+                    _reload(), node_id,
+                    master_host=public_host(),
+                    seconds=seconds,
+                    reload_store=_reload,
+                    persist=_save_node_fields,
+                )
+            except Exception as exc:  # noqa: BLE001
+                res = {"ok": False, "error": str(exc)[:300], "at": nodes_mod.now_iso()}
+            last = res.get("iperf3_last") or {
+                k: res.get(k)
+                for k in ("ok", "mode", "up_mbps", "down_mbps", "seconds", "host", "port", "error", "at")
+            }
+            _save_node_fields({
+                "iperf3_last": last,
+                "iperf3_requested": None,
+                "iperf3_result": None,
+                "iperf3_running": False,
+            })
+            if res.get("ok"):
+                _tg_admin(
+                    f"🖥 iperf3 <b>{tgbot.escape(name)}</b>: "
+                    f"↓ <code>{res.get('down_mbps')}</code> · ↑ <code>{res.get('up_mbps')}</code> Mbps",
+                    flag="notify_nodes",
+                )
+            else:
+                _tg_admin(
+                    f"🖥 iperf3 <b>{tgbot.escape(name)}</b>: ошибка — "
+                    f"{tgbot.escape(str(res.get('error') or '')[:200])}",
+                    flag="notify_nodes",
+                )
+            return res
+
+        running = None
+        for jid, meta in list(ops.JOBS.items()):
+            if meta.get("name") == f"iperf3-{node_id[:8]}" and meta.get("status") == "running":
+                running = jid
+                break
+        if running:
+            flash(request, f"{name}: iperf3 уже выполняется", "info")
+        else:
+            ops.start_job(f"iperf3-{node_id[:8]}", _job)
+            flash(
+                request,
+                f"{name}: iperf3 запущен (↓ master→node / ↑ node→master). "
+                f"Обновите страницу через ~20–50 с.",
+                "info",
+            )
+        return go(f"/settings-node?id={node_id}&tab={tab}")
 
     # Panel update on a node → serial queue (never parallel with other nodes)
     if action == "update_panel":
@@ -7836,6 +7913,21 @@ def _manage_action(action: str, payload: dict) -> dict:
     if action == "ensure_network_perf":
         return ops.ensure_network_perf()
 
+    if action == "iperf3_ensure":
+        return ops.ensure_iperf3()
+
+    if action == "iperf3_serve":
+        port = max(1024, min(65535, _int(payload.get("port"), 5201)))
+        one_off = str(payload.get("one_off") or "1") not in ("0", "false", "no")
+        return ops.iperf3_server_start(port, one_off=one_off)
+
+    if action == "iperf3_client":
+        host = str(payload.get("host") or "").strip()
+        port = max(1024, min(65535, _int(payload.get("port"), 5201)))
+        seconds = max(3, min(30, _int(payload.get("seconds"), 8)))
+        reverse = str(payload.get("reverse") or "") in ("1", "true", "yes", "on")
+        return ops.iperf3_client(host, port, seconds=seconds, reverse=reverse)
+
     if action == "restart_panel":
         # Delayed restart so the HTTP response can leave
         def _restart():
@@ -8247,6 +8339,7 @@ async def agent_pull(request: Request):
     ver = ""
     want_update = False
     diag_req = None
+    iperf_req = None
     xray_upd = ""
     agent_ver = str(body.get("version") or "")
     master_ver = panel_version()
@@ -8266,6 +8359,20 @@ async def agent_pull(request: Request):
                 node["agent_diag"] = diag_text[-60000:]
                 node["agent_diag_at"] = nodes_mod.now_iso()
             diag_req = node.pop("diag_requested", None)
+            # iperf3 result from NAT agent (after master queued iperf3_requested)
+            iperf_body = body.get("iperf3") if isinstance(body.get("iperf3"), dict) else None
+            if not iperf_body and isinstance(status.get("iperf3"), dict):
+                iperf_body = status.get("iperf3")
+            if isinstance(iperf_body, dict) and iperf_body.get("nonce"):
+                node["iperf3_result"] = iperf_body
+                if node.get("iperf3_requested") and (
+                    (node["iperf3_requested"] or {}).get("nonce") == iperf_body.get("nonce")
+                ):
+                    node.pop("iperf3_requested", None)
+            # Hand out pending bench request (do not pop until result arrives — re-send)
+            pending_iperf = node.get("iperf3_requested")
+            if isinstance(pending_iperf, dict) and pending_iperf.get("host"):
+                iperf_req = dict(pending_iperf)
             # Remember Xray version reported by NAT agent pull status
             xv = str(status.get("xray_version") or "").strip()
             if xv:
@@ -8289,6 +8396,8 @@ async def agent_pull(request: Request):
     extra: dict = {}
     if isinstance(diag_req, dict):
         extra["diag"] = diag_req
+    if isinstance(iperf_req, dict):
+        extra["iperf3"] = iperf_req
     if want_update:
         extra["update"] = True
         if isinstance(payload, dict):
@@ -8303,6 +8412,35 @@ async def agent_pull(request: Request):
 
 
 AGENT_DIAG: dict = {}
+AGENT_IPERF: dict = {}  # {"running": bool, "result": dict|None}
+
+
+def _run_agent_iperf3(req: dict) -> dict:
+    """NAT agent: install iperf3 and measure both directions to master's server."""
+    host = str(req.get("host") or "").strip()
+    port = max(1024, min(65535, _int(req.get("port"), 5201)))
+    seconds = max(3, min(20, _int(req.get("seconds"), 8)))
+    nonce = str(req.get("nonce") or "")
+    ens = ops.ensure_iperf3()
+    if not ens.get("ok"):
+        return {"ok": False, "nonce": nonce, "error": ens.get("error") or "iperf3 install failed"}
+    up = ops.iperf3_client(host, port, seconds=seconds, reverse=False)
+    down = ops.iperf3_client(host, port, seconds=seconds, reverse=True)
+    ok = bool(up.get("ok") and down.get("ok"))
+    return {
+        "ok": ok,
+        "nonce": nonce,
+        "up_mbps": up.get("up_mbps") if up.get("ok") else None,
+        "down_mbps": down.get("down_mbps") if down.get("ok") else None,
+        "seconds": seconds,
+        "host": host,
+        "port": port,
+        "error": "" if ok else (
+            ("" if up.get("ok") else f"↑ {up.get('error')}; ")
+            + ("" if down.get("ok") else f"↓ {down.get('error')}")
+        ).strip("; "),
+        "at": nodes_mod.now_iso(),
+    }
 
 
 def _reverse_conn_count(rb) -> int:
@@ -8424,12 +8562,35 @@ def _agent_pull_cycle() -> None:
     diag_ready = AGENT_DIAG.pop("text", None)
     if diag_ready:
         body["diag"] = diag_ready
+    iperf_ready = AGENT_IPERF.pop("result", None)
+    if isinstance(iperf_ready, dict):
+        body["iperf3"] = iperf_ready
+        body["status"]["iperf3"] = iperf_ready
     current = str(pull["master_url"]).rstrip("/")
     res = nodes_mod.pull_request(current, token, body, timeout=45)
     if diag_ready and not res.get("ok"):
         AGENT_DIAG.setdefault("text", diag_ready)
+    if isinstance(iperf_ready, dict) and not res.get("ok"):
+        AGENT_IPERF.setdefault("result", iperf_ready)
     if isinstance(res.get("diag"), dict) and not AGENT_DIAG.get("running"):
         _start_agent_diag(res["diag"])
+    if isinstance(res.get("iperf3"), dict) and not AGENT_IPERF.get("running"):
+        def _iperf_job(req: dict) -> None:
+            AGENT_IPERF["running"] = True
+            try:
+                AGENT_IPERF["result"] = _run_agent_iperf3(req)
+            except Exception as exc:  # noqa: BLE001
+                AGENT_IPERF["result"] = {
+                    "ok": False,
+                    "nonce": str(req.get("nonce") or ""),
+                    "error": str(exc)[:300],
+                }
+            finally:
+                AGENT_IPERF["running"] = False
+
+        threading.Thread(
+            target=_iperf_job, args=(res["iperf3"],), daemon=True, name="agent-iperf3",
+        ).start()
     if res.get("moved") and res.get("master_url"):
         res = {**res, "ok": False}
     if not res.get("ok"):

@@ -212,6 +212,33 @@
 </div>
 
 <div class="card">
+  <h3>Скорость до ноды (iperf3)</h3>
+  {% set ip = node.iperf3_last or {} %}
+  {% if node.iperf3_running or ip.error == 'running…' %}
+  <div class="badge warn">идёт замер… обновите страницу</div>
+  {% elif ip.at %}
+  <table class="mt"><tbody>
+    <tr><td class="dim">↓ master → node</td><td class="mono">{% if ip.down_mbps is not none %}{{ ip.down_mbps }} Mbps{% else %}—{% endif %}</td></tr>
+    <tr><td class="dim">↑ node → master</td><td class="mono">{% if ip.up_mbps is not none %}{{ ip.up_mbps }} Mbps{% else %}—{% endif %}</td></tr>
+    <tr><td class="dim">Когда</td><td class="small">{{ fmt_dt(ip.at) }}{% if ip.mode %} · {{ ip.mode }}{% endif %}{% if ip.seconds %} · {{ ip.seconds }}s{% endif %}</td></tr>
+    {% if ip.error %}<tr><td class="dim">Ошибка</td><td class="small">{{ ip.error }}</td></tr>{% endif %}
+  </tbody></table>
+  {% else %}
+  <div class="hint">Ещё не измеряли. Master поднимает iperf3-сервер, нода подключается клиентом (NAT — через agent pull).</div>
+  {% endif %}
+  <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" class="mt" style="max-width:420px"
+        onsubmit="return confirm('Замерить скорость master ↔ {{ node.name }} через iperf3?\nЗаймёт ~20–50 с.')">
+    <input type="hidden" name="action" value="iperf3_bench">
+    <label class="f">Длительность одного направления, сек</label>
+    <div class="flex" style="gap:.5rem;align-items:end">
+      <input name="seconds" type="number" min="3" max="20" value="8" style="max-width:100px">
+      <button class="btn">Замерить iperf3</button>
+    </div>
+  </form>
+  <div class="hint mt">Нужен <code>public_host</code> мастера и открытый входящий TCP 5201–5299 на время теста. На ноде iperf3 ставится автоматически.</div>
+</div>
+
+<div class="card">
   <h3>Система</h3>
   <div class="actions" style="flex-wrap:wrap">
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" onsubmit="return confirm('Обновить панель на ноде до последнего релиза?')">

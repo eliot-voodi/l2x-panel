@@ -1311,3 +1311,198 @@ def speedtest(bytes_: int = 25_000_000) -> dict:
     if len(parts) < 2:
         return {"ok": False, "error": r["stderr"]}
     return {"ok": True, "mbps": round(float(parts[0]) * 8 / 1e6, 1), "seconds": float(parts[1])}
+
+
+# ---------------------------------------------------------------- iperf3 (master ↔ node)
+
+_IPERF_LOCK = threading.Lock()
+_IPERF_SERVER_PROC: subprocess.Popen | None = None
+
+
+def ensure_iperf3() -> dict:
+    """Install iperf3 if missing (apt/yum). Idempotent."""
+    which = _run(["bash", "-lc", "command -v iperf3"], 10)
+    path = (which.get("stdout") or "").strip()
+    if path:
+        ver = _run([path, "-v"], 5)
+        return {"ok": True, "path": path, "version": (ver.get("stdout") or ver.get("stderr") or "").splitlines()[:1]}
+    install = _run(
+        ["bash", "-lc",
+         "export DEBIAN_FRONTEND=noninteractive; "
+         "(command -v apt-get >/dev/null && apt-get install -y -qq iperf3) || "
+         "(command -v dnf >/dev/null && dnf install -y -q iperf3) || "
+         "(command -v yum >/dev/null && yum install -y -q iperf3) || exit 1"],
+        180,
+    )
+    which2 = _run(["bash", "-lc", "command -v iperf3"], 10)
+    path2 = (which2.get("stdout") or "").strip()
+    if not path2:
+        return {"ok": False, "error": install.get("stderr") or "iperf3 install failed"}
+    return {"ok": True, "path": path2, "installed": True}
+
+
+def _iperf3_bin() -> str:
+    r = _run(["bash", "-lc", "command -v iperf3"], 5)
+    return (r.get("stdout") or "").strip() or "iperf3"
+
+
+def _iperf3_parse(raw: str) -> dict:
+    """Extract mbps from iperf3 --json client output."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {"ok": False, "error": "bad iperf3 json", "raw": (raw or "")[:400]}
+    end = data.get("end") if isinstance(data, dict) else None
+    if not isinstance(end, dict):
+        err = ""
+        if isinstance(data, dict):
+            err = str((data.get("error") or ""))
+        return {"ok": False, "error": err or "no end block"}
+    sent = end.get("sum_sent") if isinstance(end.get("sum_sent"), dict) else {}
+    recv = end.get("sum_received") if isinstance(end.get("sum_received"), dict) else {}
+    # bidir nests under streams — also check sum
+    if not sent and isinstance(end.get("sum"), dict):
+        sent = end["sum"]
+    def _mbps(block: dict) -> float | None:
+        try:
+            bps = float(block.get("bits_per_second") or 0)
+        except (TypeError, ValueError):
+            return None
+        return round(bps / 1e6, 2)
+    return {
+        "ok": True,
+        "send_mbps": _mbps(sent),
+        "recv_mbps": _mbps(recv),
+        "seconds": float((sent or recv).get("seconds") or 0) or None,
+    }
+
+
+def iperf3_firewall(port: int, *, open_: bool) -> None:
+    """Best-effort temporary allow of TCP port (ufw / iptables / nft)."""
+    port = int(port)
+    if open_:
+        _run(["bash", "-lc",
+              f"command -v ufw >/dev/null && ufw allow {port}/tcp comment l2x-iperf3 || true; "
+              f"iptables -C INPUT -p tcp --dport {port} -j ACCEPT 2>/dev/null || "
+              f"iptables -I INPUT -p tcp --dport {port} -j ACCEPT 2>/dev/null || true"], 15)
+    else:
+        _run(["bash", "-lc",
+              f"command -v ufw >/dev/null && ufw delete allow {port}/tcp >/dev/null 2>&1 || true; "
+              f"iptables -D INPUT -p tcp --dport {port} -j ACCEPT 2>/dev/null || true"], 15)
+
+
+def iperf3_server_stop() -> None:
+    global _IPERF_SERVER_PROC
+    with _IPERF_LOCK:
+        proc = _IPERF_SERVER_PROC
+        _IPERF_SERVER_PROC = None
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _run(["bash", "-lc", "pkill -f 'iperf3 -s' 2>/dev/null || true"], 5)
+
+
+def iperf3_server_start(port: int = 5201, *, one_off: bool = True) -> dict:
+    """Start iperf3 server in background. one_off=True → exit after a single test."""
+    ens = ensure_iperf3()
+    if not ens.get("ok"):
+        return ens
+    bin_ = ens.get("path") or _iperf3_bin()
+    iperf3_server_stop()
+    port = max(1024, min(65535, int(port or 5201)))
+    cmd = [bin_, "-s", "-p", str(port)]
+    if one_off:
+        cmd.append("-1")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    global _IPERF_SERVER_PROC
+    with _IPERF_LOCK:
+        _IPERF_SERVER_PROC = proc
+    time.sleep(0.25)
+    if proc.poll() is not None:
+        return {"ok": False, "error": f"iperf3 server exited code {proc.returncode}"}
+    iperf3_firewall(port, open_=True)
+    return {"ok": True, "port": port, "pid": proc.pid, "one_off": one_off}
+
+
+def iperf3_client(
+    host: str,
+    port: int = 5201,
+    *,
+    seconds: int = 8,
+    reverse: bool = False,
+    bidir: bool = False,
+) -> dict:
+    """Run iperf3 client; return send/recv mbps. reverse=True → server sends (master→node when master is server)."""
+    ens = ensure_iperf3()
+    if not ens.get("ok"):
+        return ens
+    host = (host or "").strip()
+    if not host:
+        return {"ok": False, "error": "host required"}
+    port = max(1024, min(65535, int(port or 5201)))
+    seconds = max(3, min(30, int(seconds or 8)))
+    bin_ = ens.get("path") or _iperf3_bin()
+    cmd = [bin_, "-c", host, "-p", str(port), "-t", str(seconds), "-J", "--connect-timeout", "5000"]
+    if bidir:
+        cmd.append("--bidir")
+    elif reverse:
+        cmd.append("-R")
+    r = _run(cmd, seconds + 25)
+    parsed = _iperf3_parse(r.get("stdout") or "")
+    if not parsed.get("ok"):
+        err = parsed.get("error") or r.get("stderr") or "iperf3 failed"
+        if r.get("stderr") and err == "iperf3 failed":
+            err = (r["stderr"] or "")[:300]
+        return {"ok": False, "error": err, "code": r.get("code")}
+    # When master is server and node is client:
+    #  normal: send=node→master (↑ from node), recv=master→node is empty on client sum_received often equals download from server side
+    #  -R:    server pushes → client's recv = master→node (↓ to node)
+    out = {
+        "ok": True,
+        "host": host,
+        "port": port,
+        "seconds": seconds,
+        "reverse": bool(reverse),
+        "bidir": bool(bidir),
+        "send_mbps": parsed.get("send_mbps"),
+        "recv_mbps": parsed.get("recv_mbps"),
+    }
+    if reverse:
+        out["down_mbps"] = parsed.get("recv_mbps")  # master → node
+        out["up_mbps"] = parsed.get("send_mbps")
+    else:
+        out["up_mbps"] = parsed.get("send_mbps")    # node → master
+        out["down_mbps"] = parsed.get("recv_mbps")
+    return out
+
+
+def iperf3_run_pair(host: str, port: int = 5201, *, seconds: int = 8) -> dict:
+    """Two one-shot tests: ↑ node→master then ↓ master→node (caller must restart server between, or use persistent server)."""
+    up = iperf3_client(host, port, seconds=seconds, reverse=False)
+    if not up.get("ok"):
+        return {"ok": False, "error": up.get("error") or "up failed", "up": up}
+    down = iperf3_client(host, port, seconds=seconds, reverse=True)
+    if not down.get("ok"):
+        return {"ok": False, "error": down.get("error") or "down failed", "up": up, "down": down}
+    return {
+        "ok": True,
+        "up_mbps": up.get("up_mbps"),
+        "down_mbps": down.get("down_mbps"),
+        "seconds": seconds,
+        "host": host,
+        "port": port,
+        "up": up,
+        "down": down,
+    }

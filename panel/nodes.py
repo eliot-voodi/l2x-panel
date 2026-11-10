@@ -1179,6 +1179,161 @@ def manage_request(node: dict, *, action: str = "", params: dict | None = None, 
         return {"ok": False, "error": str(exc)}
 
 
+def iperf3_pick_port() -> int:
+    """Ephemeral high port for a one-shot iperf3 server."""
+    import random
+    return random.randint(5201, 5299)
+
+
+def iperf3_bench(
+    store: dict,
+    node_id: str,
+    *,
+    master_host: str,
+    seconds: int = 8,
+    port: int = 0,
+    wait_nat_sec: int = 55,
+    reload_store=None,
+    persist=None,
+) -> dict:
+    """Measure master↔node throughput with iperf3.
+
+    Master runs the server; the node connects as client (works for NAT via agent pull).
+    Reports down_mbps (master→node) and up_mbps (node→master).
+    ``reload_store`` — callable → fresh store (NAT wait).
+    ``persist`` — callable(fields) to write node fields without a long lock hold.
+    """
+    import ops
+
+    node = next((n for n in ensure_list(store) if n.get("id") == node_id), None)
+    if not node:
+        return {"ok": False, "error": "нода не найдена"}
+    if is_tunnel_only_node(node):
+        return {"ok": False, "error": "tunnel-only нода: нет панели/agent manage для iperf3"}
+    host = (master_host or "").strip()
+    if not host:
+        return {"ok": False, "error": "не задан public_host мастера (Настройки → Панель)"}
+    host = host.removeprefix("https://").removeprefix("http://").split("/")[0].split(":")[0]
+    seconds = max(3, min(20, int(seconds or 8)))
+    port = int(port or 0) or iperf3_pick_port()
+
+    ens = ops.ensure_iperf3()
+    if not ens.get("ok"):
+        return {"ok": False, "error": f"master iperf3: {ens.get('error') or 'install failed'}"}
+
+    nat = bool(node.get("nat"))
+    use_manage = not nat
+
+    def _serve(*, one_off: bool) -> dict:
+        return ops.iperf3_server_start(port, one_off=one_off)
+
+    def _client_via_manage(*, reverse: bool) -> dict:
+        return manage_request(
+            node,
+            action="iperf3_client",
+            params={
+                "host": host,
+                "port": port,
+                "seconds": seconds,
+                "reverse": "1" if reverse else "0",
+            },
+            timeout=seconds + 40,
+        )
+
+    def _finish(result: dict) -> dict:
+        last = {
+            k: result.get(k)
+            for k in ("ok", "mode", "up_mbps", "down_mbps", "seconds", "host", "port", "error", "at")
+        }
+        result["iperf3_last"] = last
+        node["iperf3_last"] = last
+        return result
+
+    try:
+        if use_manage:
+            rem = manage_request(node, action="iperf3_ensure", timeout=120)
+            if not rem.get("ok"):
+                return _finish({
+                    "ok": False,
+                    "error": f"manage iperf3_ensure: {rem.get('error') or 'fail'} "
+                             f"(для NAT-нод замер идёт через agent pull)",
+                    "at": now_iso(),
+                })
+
+        if use_manage:
+            s1 = _serve(one_off=True)
+            if not s1.get("ok"):
+                return _finish({"ok": False, "error": s1.get("error") or "server start failed", "at": now_iso()})
+            up = _client_via_manage(reverse=False)
+            s2 = _serve(one_off=True)
+            if not s2.get("ok"):
+                return _finish({
+                    "ok": False, "error": s2.get("error") or "server restart failed",
+                    "up": up, "at": now_iso(),
+                })
+            down = _client_via_manage(reverse=True)
+            return _finish({
+                "ok": bool(up.get("ok") and down.get("ok")),
+                "mode": "manage",
+                "host": host,
+                "port": port,
+                "seconds": seconds,
+                "up_mbps": up.get("up_mbps") if up.get("ok") else None,
+                "down_mbps": down.get("down_mbps") if down.get("ok") else None,
+                "up": up,
+                "down": down,
+                "error": "" if (up.get("ok") and down.get("ok")) else (
+                    ("" if up.get("ok") else f"↑ {up.get('error')}; ")
+                    + ("" if down.get("ok") else f"↓ {down.get('error')}")
+                ).strip("; "),
+                "at": now_iso(),
+            })
+
+        # NAT / manage-down: persistent server; agent runs both directions on pull
+        s = _serve(one_off=False)
+        if not s.get("ok"):
+            return _finish({"ok": False, "error": s.get("error") or "server start failed", "at": now_iso()})
+        req = {
+            "host": host,
+            "port": port,
+            "seconds": seconds,
+            "nonce": secrets.token_hex(8),
+            "at": now_iso(),
+        }
+        if callable(persist):
+            persist({"iperf3_requested": req, "iperf3_result": None})
+        else:
+            node["iperf3_requested"] = req
+            node.pop("iperf3_result", None)
+        deadline = time.time() + max(25, int(wait_nat_sec or 55))
+        got = None
+        while time.time() < deadline:
+            st = reload_store() if callable(reload_store) else store
+            n2 = next((n for n in ensure_list(st) if n.get("id") == node_id), None)
+            got = (n2 or {}).get("iperf3_result") if n2 else None
+            if isinstance(got, dict) and got.get("nonce") == req["nonce"]:
+                break
+            time.sleep(1.5)
+        return _finish({
+            "ok": bool(isinstance(got, dict) and got.get("ok")),
+            "mode": "pull",
+            "host": host,
+            "port": port,
+            "seconds": seconds,
+            "up_mbps": (got or {}).get("up_mbps"),
+            "down_mbps": (got or {}).get("down_mbps"),
+            "error": "" if (got or {}).get("ok") else (
+                (got or {}).get("error")
+                or "NAT: нода не ответила за отведённое время (нужен agent pull ≤20 с)"
+            ),
+            "at": now_iso(),
+            "raw": got,
+        })
+    finally:
+        ops.iperf3_server_stop()
+        ops.iperf3_firewall(port, open_=False)
+
+
 def health_url(node: dict) -> str:
     """Public /health is outside the secret base_path."""
     base = (node.get("url") or "").rstrip("/")
