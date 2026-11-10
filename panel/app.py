@@ -7889,8 +7889,12 @@ async def agent_promote(request: Request):
 
     Role flips only after Xray apply succeeds; otherwise rolls back to agent.
     Heavy DoH docker recreate runs in background so the HTTP call does not time out.
+
+    Auth is token-only (``_agent_manage_auth``): promote must work even when
+    ``agent_enabled`` was flipped off by a bad sync/update — otherwise handoff
+    dead-ends with ``agent disabled``.
     """
-    store, err = _agent_auth(request)
+    store, err = _agent_manage_auth(request)
     if err:
         return err
     try:

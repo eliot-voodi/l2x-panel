@@ -2337,6 +2337,12 @@ def remap_inbound_share_hosts(store: dict, *, new_host: str, old_hosts: list[str
 
 def promote_via_api(node: dict, payload: dict, timeout: int = 180) -> dict:
     """Promote a mirrored agent to master over HTTP (no SSH). Uses already-synced store + final delta."""
+    # Best-effort: re-enable agent API if a previous sync left agent_enabled=false.
+    # New panels accept promote via manage-auth anyway; this helps older nodes.
+    heal = manage_request(node, action="enable_agent", timeout=20)
+    if heal.get("manual_off"):
+        return {"ok": False, "error": "agent выключен вручную на ноде — включите в Settings → Nodes", "manual_off": True}
+
     url = agent_endpoint(node, "agent/promote")
     token = node.get("token") or ""
     data = json.dumps(payload, ensure_ascii=False).encode()
@@ -2366,6 +2372,19 @@ def promote_via_api(node: dict, payload: dict, timeout: int = 180) -> dict:
         except json.JSONDecodeError:
             parsed = {}
         err = str(parsed.get("error") or "")
+        # Retry once after force-enable if still on old panel that gates promote on agent_enabled
+        if "agent disabled" in err.lower() and not heal.get("ok"):
+            heal2 = manage_request(node, action="enable_agent", timeout=20)
+            if heal2.get("ok"):
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        body2 = resp.read().decode("utf-8", "replace")
+                        parsed2 = json.loads(body2)
+                        return parsed2 if isinstance(parsed2, dict) else {"ok": True, "raw": body2[:500]}
+                except Exception as retry_exc:  # noqa: BLE001
+                    err = f"agent disabled; retry after enable_agent: {retry_exc}"
+            elif heal2.get("manual_off"):
+                return {"ok": False, "error": "agent выключен вручную на ноде", "manual_off": True}
         if not err:
             low = body.lower()
             if "413" in str(exc.code) or "request entity too large" in low:
