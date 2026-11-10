@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -711,8 +712,100 @@ def bbr_set(enable: bool) -> dict:
     return {"ok": r["ok"], **bbr_status(), "error": r["stderr"]}
 
 
+def _physical_ifaces() -> list[str]:
+    """Non-loopback NICs that have a backing device (skip veth/bridge/docker)."""
+    root = Path("/sys/class/net")
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in sorted(root.iterdir()):
+        name = p.name
+        if name == "lo" or not (p / "device").exists():
+            continue
+        out.append(name)
+    return out
+
+
+def ensure_iface_fq() -> dict:
+    """Apply `tc qdisc … fq` on physical NICs.
+
+    ``net.core.default_qdisc=fq`` only affects *new* interfaces / after reboot —
+    existing eth0 often stays on fq_codel until replaced explicitly (needed for BBR).
+    """
+    changed: list[str] = []
+    errors: list[str] = []
+    for iface in _physical_ifaces():
+        cur = _run(["tc", "qdisc", "show", "dev", iface])
+        text = (cur.get("stdout") or "").strip()
+        root = ""
+        for line in text.splitlines():
+            if " root" in line:
+                root = line
+                break
+        if not root and text:
+            root = text.splitlines()[0]
+        # Already fq (but not fq_codel)
+        if re.search(r"\bqdisc\s+fq\s", root) and "fq_codel" not in root:
+            continue
+        r = _run(["tc", "qdisc", "replace", "dev", iface, "root", "fq"])
+        if r.get("ok"):
+            changed.append(iface)
+        else:
+            err = (r.get("stderr") or r.get("stdout") or "tc failed").strip()
+            errors.append(f"{iface}: {err}")
+    return {"ok": not errors, "changed": changed, "errors": errors}
+
+
+def ensure_low_ram_swap(min_ram_mb: int = 1800, size_gb: int = 2) -> dict:
+    """On small VMs without swap, add a swapfile so peaks don't OOM-kill Xray/panel."""
+    mem = _mem_total_mb()
+    swap_total = 0
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("SwapTotal:"):
+                swap_total = int(line.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    if mem >= min_ram_mb or swap_total > 0:
+        return {"ok": True, "skipped": True, "mem_mb": mem, "swap_kb": swap_total}
+    path = Path("/swapfile")
+    created = False
+    if not path.exists():
+        # Prefer fallocate; fall back to dd
+        r = _run(["fallocate", "-l", f"{size_gb}G", str(path)])
+        if not r.get("ok"):
+            r = _run(["dd", "if=/dev/zero", f"of={path}", "bs=1M", f"count={size_gb * 1024}", "status=none"])
+            if not r.get("ok"):
+                return {"ok": False, "error": r.get("stderr") or "create swapfile failed", "mem_mb": mem}
+        created = True
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        _run(["chmod", "600", str(path)])
+    _run(["mkswap", str(path)])
+    r = _run(["swapon", str(path)])
+    if not r.get("ok") and "Device or resource busy" not in (r.get("stderr") or ""):
+        return {"ok": False, "error": r.get("stderr") or "swapon failed", "mem_mb": mem, "created": created}
+    fstab = Path("/etc/fstab")
+    try:
+        fst = fstab.read_text(encoding="utf-8") if fstab.is_file() else ""
+        if "/swapfile" not in fst:
+            with fstab.open("a", encoding="utf-8") as fh:
+                fh.write("\n/swapfile none swap sw 0 0\n")
+    except OSError as exc:
+        return {"ok": False, "error": f"fstab: {exc}", "mem_mb": mem, "created": created}
+    swap_conf = Path("/etc/sysctl.d/99-l2xpanel-swap.conf")
+    try:
+        swap_conf.write_text("vm.swappiness = 10\n", encoding="utf-8")
+        _run(["sysctl", "-e", "-p", str(swap_conf)])
+    except OSError:
+        _run(["sysctl", "-w", "vm.swappiness=10"])
+    return {"ok": True, "created": created, "mem_mb": mem, "size_gb": size_gb, "path": str(path)}
+
+
 def ensure_network_perf() -> dict:
-    """Idempotent: BBR, buffers, backlog and ephemeral-port sysctls sized by RAM."""
+    """Idempotent: BBR, buffers, backlog, iface fq qdisc, and low-RAM swapfile."""
     body = perf_sysctl_body()
     try:
         cur = (PERF_SYSCTL_PATH.read_text(encoding="utf-8") if PERF_SYSCTL_PATH.is_file() else "")
@@ -733,8 +826,24 @@ def ensure_network_perf() -> dict:
         pass
     _run(["modprobe", "tcp_bbr"])
     r = _run(["sysctl", "-e", "-p", str(PERF_SYSCTL_PATH)])
+    fq = ensure_iface_fq()
+    swap = ensure_low_ram_swap()
     st = bbr_status()
-    return {"ok": r["ok"] and st.get("enabled"), "wrote": wrote, "error": "" if r["ok"] else (r["stderr"] or "sysctl"), **st}
+    err_parts = []
+    if not r["ok"]:
+        err_parts.append(r["stderr"] or "sysctl")
+    if not fq.get("ok") and fq.get("errors"):
+        err_parts.append("fq: " + "; ".join(fq["errors"][:3]))
+    if not swap.get("ok") and swap.get("error"):
+        err_parts.append("swap: " + str(swap["error"]))
+    return {
+        "ok": r["ok"] and st.get("enabled") and fq.get("ok", True) and swap.get("ok", True),
+        "wrote": wrote,
+        "fq": fq,
+        "swap": swap,
+        "error": "; ".join(err_parts),
+        **st,
+    }
 
 
 # ---------------------------------------------------------------- ACME

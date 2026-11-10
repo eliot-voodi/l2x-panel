@@ -497,6 +497,33 @@ install_system() {
   printf 'tcp_bbr\n' > /etc/modules-load.d/l2x-perf.conf
   while read -r mod; do modprobe "$mod" 2>/dev/null || true; done < "$SRC/deploy/modules.conf"
   modprobe tcp_bbr 2>/dev/null || true
+  # default_qdisc=fq alone leaves existing NICs on fq_codel — force fq for BBR
+  if command -v tc >/dev/null 2>&1; then
+    for iface in /sys/class/net/*/device; do
+      [ -e "$iface" ] || continue
+      name=$(basename "$(dirname "$iface")")
+      [ "$name" = lo ] && continue
+      root=$(tc qdisc show dev "$name" 2>/dev/null | awk '/ root/{print; exit}')
+      case "$root" in
+        *"qdisc fq "* ) case "$root" in *fq_codel*) ;; *) continue ;; esac ;;
+      esac
+      tc qdisc replace dev "$name" root fq 2>/dev/null || true
+    done
+  fi
+  # low-RAM VMs: add swapfile so peak traffic does not OOM-kill Xray/panel
+  mem_kb=$(awk '/MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  swap_kb=$(awk '/SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "${mem_kb:-0}" -gt 0 ] && [ "$((mem_kb / 1024))" -lt 1800 ] && [ "${swap_kb:-0}" -eq 0 ]; then
+    if [ ! -f /swapfile ]; then
+      fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile 2>/dev/null || true
+    grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    printf 'vm.swappiness = 10\n' > /etc/sysctl.d/99-l2xpanel-swap.conf
+    sysctl -e -p /etc/sysctl.d/99-l2xpanel-swap.conf >/dev/null || true
+  fi
 
   backup_unmanaged /etc/ipsec.conf
   install -m 644 "$SRC/deploy/ipsec.conf" /etc/ipsec.conf
