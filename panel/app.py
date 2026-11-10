@@ -4147,6 +4147,10 @@ def _pia_reconnect_one(tag: str, *, token: str | None = None) -> dict:
             return {"ok": False, "error": f"{tag}: {res.get('error')}", "token": use_token}
         cfg_ob = res["config"]
         cfg_ob.pop("tag", None)
+        # Keep dialerProxy chain across peer rotation
+        via_prev = _outbound_via(prev)
+        if via_prev:
+            _apply_outbound_wrap(cfg_ob, wrap_on=True, wrap_via=via_prev, self_tag=tag)
         o["config"] = cfg_ob
         o["info"] = res.get("info") or o.get("info")
         o["pia_hostname"] = res.get("hostname") or host
@@ -4287,11 +4291,13 @@ def outbounds_page(request: Request):
         status = xray.custom_outbound_status(o)
         in_sub = bool(o.get("in_sub", True))
         live = status == "connected" or not hide_unhealthy
+        cfg = o.get("config") or {}
         rows.append({
             "tag": o["tag"], "kind": o.get("kind") or "custom",
             "label": xray.outbound_label(store, o["tag"]),
             "enabled": o.get("enabled", True), "status": status,
-            "info": o.get("info") or (o.get("config") or {}).get("protocol"),
+            "info": o.get("info") or cfg.get("protocol"),
+            "via": _outbound_via(cfg),
             "in_sub": in_sub,
             "sub_live": in_sub and live,
             "custom": True, "last_test": o.get("last_test"),
@@ -4299,6 +4305,7 @@ def outbounds_page(request: Request):
     for r in rows:
         tr = ot.get(r["tag"]) or {}
         r["up"], r["down"] = int(tr.get("up") or 0), int(tr.get("down") or 0)
+        r.setdefault("via", "")
     custom = {o["tag"]: {"config": o.get("config") or {}, "remark": o.get("remark") or "", "country": o.get("country") or ""}
               for o in store["outbounds_custom"]}
     return page(request, "outbounds.html", active="outbounds", items=rows, nord_countries=[], custom=custom,
@@ -4332,6 +4339,45 @@ def _outbound_info(config: dict) -> str:
     if isinstance(peer, dict) and peer.get("endpoint"):
         return f"{proto} {peer['endpoint']}"
     return proto
+
+
+def _outbound_via(config: dict | None) -> str:
+    """Return dialerProxy tag if this outbound is chained through another."""
+    if not isinstance(config, dict):
+        return ""
+    so = ((config.get("streamSettings") or {}).get("sockopt") or {})
+    return str(so.get("dialerProxy") or "").strip()
+
+
+def _apply_outbound_wrap(config: dict, *, wrap_on: bool, wrap_via: str, self_tag: str = "") -> str | None:
+    """Set or clear streamSettings.sockopt.dialerProxy. Returns error or None."""
+    via = (wrap_via or "").strip()
+    self_tag = (self_tag or "").strip()
+    if wrap_on:
+        if not via:
+            return "Выберите outbound для заворачивания трафика"
+        if self_tag and via == self_tag:
+            return "Нельзя заворачивать outbound через самого себя"
+        ss = config.setdefault("streamSettings", {})
+        if not isinstance(ss, dict):
+            return "streamSettings повреждён"
+        so = ss.setdefault("sockopt", {})
+        if not isinstance(so, dict):
+            return "sockopt повреждён"
+        so["dialerProxy"] = via
+        return None
+    # Wrap off → drop dialerProxy only (keep other sockopt keys)
+    ss = config.get("streamSettings")
+    if not isinstance(ss, dict):
+        return None
+    so = ss.get("sockopt")
+    if isinstance(so, dict) and "dialerProxy" in so:
+        so.pop("dialerProxy", None)
+        if not so:
+            ss.pop("sockopt", None)
+        if not ss:
+            config.pop("streamSettings", None)
+    return None
 
 
 def _add_custom_outbound(store: dict, tag: str, remark: str, config: dict, kind: str, info: str = "", country: str = "") -> str | None:
@@ -4428,6 +4474,19 @@ async def outbound_add(request: Request):
             raise ValueError("неизвестный режим")
     except Exception as exc:  # noqa: BLE001
         flash(request, f"Outbound: {exc}", "error")
+        return go("/outbounds")
+    wrap_on = form.get("wrap_on") == "1"
+    wrap_via = str(form.get("wrap_via") or "").strip()
+    if wrap_on and wrap_via:
+        known = set(xray.all_outbound_tags(_load_store()))
+        if wrap_via not in known:
+            flash(request, f"Outbound: неизвестный via «{wrap_via}»", "error")
+            return go("/outbounds")
+    wrap_err = _apply_outbound_wrap(
+        config, wrap_on=wrap_on, wrap_via=wrap_via, self_tag=edit_tag or tag,
+    )
+    if wrap_err:
+        flash(request, f"Outbound: {wrap_err}", "error")
         return go("/outbounds")
     with mutate() as store:
         previous = json.loads(json.dumps(store["outbounds_custom"]))

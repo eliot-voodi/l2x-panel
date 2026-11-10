@@ -66,7 +66,7 @@
         <td><b>{{ o.label }}</b><div class="dim small mono">{{ o.tag }}</div></td>
         <td><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.sub_live %} <span class="badge ok" title="доступен в подписках">в подписке</span>{% elif o.custom and o.in_sub %}<span class="badge" title="вкл. в подписку, но disconnected — скрыт">скрыт</span>{% endif %}</td>
         <td>{{ m.status_badge(o.status if o.status else 'active') }}</td>
-        <td class="small mono">{{ o.info or '' }}</td>
+        <td class="small mono">{{ o.info or '' }}{% if o.via %}<div class="dim">via {{ o.via }}</div>{% endif %}</td>
         <td class="small nowrap">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</td>
         <td class="small">{% if o.last_test %}{% if o.last_test.ok %}<span class="badge ok">{{ o.last_test.ms }} мс</span>{% else %}<span class="badge err">ошибка</span>{% endif %}<div class="dim">{{ ago(o.last_test.at) }}</div>{% endif %}</td>
         <td>
@@ -108,6 +108,7 @@
           <div class="kv">
             <div><span class="lbl">Тип</span><span class="val"><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.sub_live %} · в подписке{% elif o.custom and o.in_sub %} · скрыт (нет пинга){% endif %}</span></div>
             {% if o.info %}<div><span class="lbl">Инфо</span><span class="val mono">{{ o.info }}</span></div>{% endif %}
+            {% if o.via %}<div><span class="lbl">Via</span><span class="val mono">{{ o.via }}</span></div>{% endif %}
             <div><span class="lbl">Трафик</span><span class="val">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</span></div>
             <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
           </div>
@@ -151,6 +152,23 @@
       <div><label class="f">Tag</label><input name="tag" id="f-tag" pattern="[A-Za-z0-9._-]*" placeholder="my-proxy (для WARP/Nord — авто)"></div>
       <div><label class="f">Название</label><input name="remark" id="f-remark"></div>
       <div style="max-width:100px"><label class="f">Страна</label><input name="country" id="f-country" maxlength="2" style="text-transform:uppercase" placeholder="DE"></div>
+    </div>
+
+    {# Shared for form / JSON / WARP / Nord / PIA: dialerProxy through another outbound #}
+    <div class="sec" id="wrap-sec">
+      <div class="sec-h">
+        <span>Заворачивать трафик</span>
+        <label class="check" style="margin:0"><input type="checkbox" name="wrap_on" id="wrap_on" value="1"> включить</label>
+      </div>
+      <div data-show="wrap_on:on">
+        <label class="f">Через outbound</label>
+        <select name="wrap_via" id="wrap_via">
+          <option value="">— выберите —</option>
+          {% for tg in dialer_tags %}<option value="{{ tg }}">{{ tg }}</option>{% endfor %}
+        </select>
+        <div class="hint mt">Соединение с сервером этого outbound пойдёт через выбранный выход (Xray <code>sockopt.dialerProxy</code>).
+          Так новый прокси / WARP / Nord / PIA может ходить через уже созданный outbound (L2TP, VLESS, node…).</div>
+      </div>
     </div>
 
     <div data-m="form">
@@ -301,7 +319,7 @@
         <div class="sec-h"><span>Sockopt</span><label class="check" style="margin:0"><input type="checkbox" id="so_on"> включить</label></div>
         <div data-show="so_on:on">
           <div class="row">
-            <div><label class="f">Dialer proxy (цепочка)</label>
+            <div><label class="f">Dialer proxy (доп., = «Заворачивать»)</label>
               <select id="so_dialer"><option value="">нет</option>{% for tg in dialer_tags %}<option>{{ tg }}</option>{% endfor %}</select></div>
             <div><label class="f">Interface</label><input id="so_iface" placeholder="eth0 / l2x-..."></div>
             <div><label class="f">Mark</label><input id="so_mark" type="number" min="0"></div>
@@ -487,16 +505,17 @@
     }
     o.settings = s;
     var st = STREAM.indexOf(p) >= 0 ? buildStream() : {};
+    var so = {};
+    var wrapVia = (v('wrap_on') && v('wrap_via')) ? v('wrap_via') : '';
+    if (wrapVia) so.dialerProxy = wrapVia;
     if (v('so_on')) {
-      var so = {};
-      if (v('so_dialer')) so.dialerProxy = v('so_dialer');
       if (v('so_iface')) so.interface = v('so_iface');
       if (num('so_mark')) so.mark = num('so_mark');
       if (v('so_ds')) so.domainStrategy = v('so_ds');
       if (num('so_keepalive')) so.tcpKeepAliveInterval = num('so_keepalive');
       if (v('so_tfo')) so.tcpFastOpen = true;
-      st.sockopt = so;
     }
+    if (Object.keys(so).length) st.sockopt = so;
     if (Object.keys(st).length) o.streamSettings = st;
     if (STREAM.indexOf(p) >= 0 && v('mux_on')) {
       o.mux = { enabled: true, concurrency: num('mux_conc') == null ? 8 : num('mux_conc'),
@@ -569,6 +588,9 @@
       sv('so_dialer', so.dialerProxy || ''); sv('so_iface', so.interface || ''); sv('so_mark', so.mark || '');
       sv('so_ds', so.domainStrategy || ''); sv('so_keepalive', so.tcpKeepAliveInterval || ''); sv('so_tfo', so.tcpFastOpen);
     }
+    var via = (so && so.dialerProxy) || '';
+    sv('wrap_on', !!via);
+    sv('wrap_via', via);
     var mx = o.mux;
     sv('mux_on', !!(mx && mx.enabled));
     if (mx) { sv('mux_conc', mx.concurrency); sv('mux_xudp', mx.xudpConcurrency); sv('mux_udp443', mx.xudpProxyUDP443 || 'reject'); }
@@ -638,15 +660,28 @@
   }
   $('pia_region').addEventListener('change', piaFillServers);
 
+  function filterWrapOptions(selfTag) {
+    var sel = $('wrap_via');
+    if (!sel) return;
+    Array.prototype.forEach.call(sel.options, function (op) {
+      if (!op.value) return;
+      op.hidden = !!(selfTag && op.value === selfTag);
+      op.disabled = op.hidden;
+    });
+    if (selfTag && sel.value === selfTag) sel.value = '';
+  }
+
   window.obOpen = function (tag) {
     var item = tag ? CUSTOM[tag] : null;
     showErr('');
     sv('f-tag', tag || ''); sv('f-remark', item ? item.remark : ''); sv('f-country', item ? item.country : ''); sv('f-link', '');
+    sv('wrap_on', false); sv('wrap_via', '');
     $('f-tag').readOnly = !!tag;
     $('edit_tag').value = tag || '';
     $('ob-title').textContent = tag ? 'Редактировать ' + tag : 'Новый outbound';
     $('ob-submit').textContent = tag ? 'Сохранить' : 'Добавить';
     document.querySelectorAll('#otabs [data-new]').forEach(function (a) { a.hidden = !!tag; });
+    filterWrapOptions(tag || '');
     curMode = 'form';
     loadOb(item ? item.config : { protocol: 'vless' });
     setMode('form');
@@ -698,11 +733,26 @@
   form.addEventListener('submit', function (e) {
     showErr('');
     try {
+      if (v('wrap_on') && !v('wrap_via')) {
+        e.preventDefault(); showErr('Выберите outbound для заворачивания трафика'); return;
+      }
       if (curMode === 'form') {
         $('ob-json-out').value = JSON.stringify(buildOb());
       } else if (curMode === 'json') {
-        try { JSON.parse($('ob-json').value); } catch (err) { e.preventDefault(); showErr('JSON с ошибкой: ' + err.message); return; }
-        $('ob-json-out').value = $('ob-json').value;
+        try {
+          var jo = JSON.parse($('ob-json').value || '{}');
+          if (v('wrap_on') && v('wrap_via')) {
+            jo.streamSettings = jo.streamSettings || {};
+            jo.streamSettings.sockopt = jo.streamSettings.sockopt || {};
+            jo.streamSettings.sockopt.dialerProxy = v('wrap_via');
+          } else if (jo.streamSettings && jo.streamSettings.sockopt) {
+            delete jo.streamSettings.sockopt.dialerProxy;
+            if (!Object.keys(jo.streamSettings.sockopt).length) delete jo.streamSettings.sockopt;
+            if (!Object.keys(jo.streamSettings).length) delete jo.streamSettings;
+          }
+          $('ob-json').value = JSON.stringify(jo, null, 2);
+          $('ob-json-out').value = JSON.stringify(jo);
+        } catch (err) { e.preventDefault(); showErr('JSON с ошибкой: ' + err.message); return; }
       }
       if ((curMode === 'form' || curMode === 'json') && !v('f-tag')) { e.preventDefault(); showErr('Укажите Tag'); return; }
       if (curMode === 'pia') {
@@ -716,6 +766,21 @@
       e.preventDefault();
       showErr(String(err && err.message || err));
     }
+  });
+  // Keep advanced sockopt dialer in sync with wrap checkbox (and reverse)
+  $('wrap_on').addEventListener('change', function () {
+    if (v('wrap_on') && v('wrap_via')) { sv('so_on', true); sv('so_dialer', v('wrap_via')); }
+    else sv('so_dialer', '');
+    refresh();
+  });
+  $('wrap_via').addEventListener('change', function () {
+    if (v('wrap_on') && v('wrap_via')) { sv('so_on', true); sv('so_dialer', v('wrap_via')); }
+    else if (!v('wrap_on')) sv('so_dialer', '');
+  });
+  $('so_dialer').addEventListener('change', function () {
+    if (v('so_dialer')) { sv('wrap_on', true); sv('wrap_via', v('so_dialer')); }
+    else { sv('wrap_on', false); sv('wrap_via', ''); }
+    refresh();
   });
   refresh();
 </script>
