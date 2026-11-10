@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 PANEL = ROOT / "panel"
@@ -53,10 +54,54 @@ def test_source_uses_docker_exec_setpassword():
     text = (PANEL / "doh.py").read_text(encoding="utf-8")
     assert '"pihole", "setpassword"' in text
     assert '"-u", "0"' in text
+    assert "def _pihole_setpassword_cli" in text
     assert "def verify_pihole_password" not in text
     assert "def _ftlconf_password_yaml" not in text
     ast.parse(text)
     ok("docker exec -u 0 setpassword")
+
+
+def test_live_container_skips_compose_up():
+    import doh as d
+
+    d.write_compose(password="abc")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        joined = " ".join(str(x) for x in cmd)
+        if "inspect" in joined:
+            return {"ok": True, "stdout": "true\n", "stderr": ""}
+        if "setpassword" in joined:
+            return {"ok": True, "stdout": "Password set\n", "stderr": ""}
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    with mock.patch.object(d, "_run", side_effect=fake_run), \
+            mock.patch.object(d, "shutil") as sh:
+        sh.which.return_value = "/usr/bin/docker"
+        res = d.set_pihole_password("new-secret")
+    if not res.get("ok"):
+        fail("live-cli", res)
+    if res.get("via") != "pihole setpassword":
+        fail("via", res)
+    if any("compose" in " ".join(c) or c[:1] == ["docker-compose"] for c in calls
+           if "up" in c):
+        # compose up should not run when container already running and no FTLCONF pin
+        ups = [c for c in calls if "up" in c]
+        if ups:
+            fail("compose-up", ups)
+    if not any("setpassword" in c for c in calls):
+        fail("setpassword", calls)
+    ok("live container -> setpassword only")
+
+
+def test_tg_admin_mentions_node():
+    text = (PANEL / "app.py").read_text(encoding="utf-8")
+    if "def _local_node_label" not in text:
+        fail("tg-node", "missing _local_node_label")
+    if "🖥" not in text:
+        fail("tg-node", "missing node footer marker")
+    ok("tg admin node footer")
 
 
 def main():
@@ -64,6 +109,8 @@ def main():
     test_compose_no_ftlconf_assignment()
     test_detect_old_pin()
     test_source_uses_docker_exec_setpassword()
+    test_live_container_skips_compose_up()
+    test_tg_admin_mentions_node()
     print("ALL PASSED")
 
 

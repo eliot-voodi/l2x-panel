@@ -131,15 +131,15 @@
 {% elif tab == 'nodes' %}{% set ns = s.nodes %}
 <form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
   <input type="hidden" name="section" value="nodes">
-  {{ m.check('agent_enabled', ns.agent_enabled, 'Режим агента: принимать конфиг с мастер-панели') }}
+  {{ m.check('agent_enabled', ns.agent_enabled, 'Agent API включён (Bearer /agent/*) — должен быть на всех нодах, включая master') }}
   {{ m.check('allow_master_manage', ns.allow_master_manage, 'Разрешить remote /agent/manage на этом хосте, даже если role=master (опасно)') }}
   <label class="f">Agent token</label>
   <input value="{{ ns.agent_token }}" class="mono" readonly>
   {{ m.check('regen_token', False, 'Сгенерировать новый token') }}
   <div class="hint">
-    Агент остаётся включённым после обновлений и перезапусков. Выключить можно только сняв эту галочку.
-    На мастер-панели: Nodes → добавить ноду с URL <code>https://{{ public_host }}</code> и этим token (<code>POST /agent/apply</code>).
-    По умолчанию на master опасные manage-действия (пароль, update, restart) запрещены — включайте только если другой сервер должен удалённо управлять этим хостом.
+    Agent API всегда онлайн после обновлений, перезапусков и promote (панель от root).
+    Снять галочку = выключить вручную. На master config-push (<code>/agent/apply</code>) отклоняется; promote/manage работают по token.
+    Опасные manage-действия на master по умолчанию запрещены — включайте allow_master_manage только если нужно удалённое управление.
   </div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>

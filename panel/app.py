@@ -151,7 +151,7 @@ def default_settings() -> dict:
         "tg": tgbot.default_settings(),
         "webhooks": webhooks.default_settings(),
         "nodes": {
-            "agent_enabled": False, "agent_token": "", "role": "master", "agent_manual_off": False,
+            "agent_enabled": True, "agent_token": "", "role": "master", "agent_manual_off": False,
             # When True, /agent/manage may mutate this host even if role=master (default off).
             "allow_master_manage": False,
         },
@@ -1217,16 +1217,32 @@ BOT = tgbot.Bot(_bot_settings, {
 TG_LOW_GB = 5.0
 
 
+def _local_node_label() -> str:
+    """Public host + role for admin Telegram footers (which panel ran the action)."""
+    host = (public_host() or "").strip()
+    try:
+        role = "master" if nodes_mod.is_master(_load_store()) else "agent"
+    except Exception:
+        role = ""
+    if host and role:
+        return f"{host} · {role}"
+    return host or role or ""
+
+
 def _tg_admin(text: str, *, flag: str = "notify_changes", actor: str | None = None) -> None:
     """Send HTML message to Telegram admins if the given notify flag is on.
 
-    For notify_changes / notify_nodes always append who (login) and from which IP
+    Always append which local node (host · role) executed the action.
+    For notify_changes / notify_nodes also append who (login) and from which IP
     when the action came from a panel session (or an inherited background job).
     """
     try:
         s = _bot_settings()
         if not s.get("enabled") or not s.get(flag, True):
             return
+        node = _local_node_label()
+        if node:
+            text = f"{text}\n🖥 <code>{tgbot.escape(node)}</code>"
         if flag in ("notify_changes", "notify_nodes"):
             suffix = tgbot.get_actor() if actor is None else (actor or "")
             if suffix:
@@ -1956,15 +1972,17 @@ def _sync_xray_config() -> None:
 
 
 def _ensure_agent_sticky() -> None:
-    """Keep agent mode on after restarts/updates unless the admin turned it off manually."""
+    """Keep Agent API on after restarts/updates/promote unless admin turned it off.
+
+    Role (master|agent) is independent: master also keeps agent_enabled so
+    /agent/manage, promote and health never hit «agent disabled».
+    """
     try:
         with mutate() as store:
             ns = store.setdefault("settings", {}).setdefault("nodes", {})
             ns.setdefault("agent_manual_off", False)
-            role = (ns.get("role") or "master").strip() or "master"
-            if role == "agent" and not ns.get("agent_manual_off"):
-                if not ns.get("agent_enabled"):
-                    ns["agent_enabled"] = True
+            if not ns.get("agent_manual_off") and not ns.get("agent_enabled"):
+                ns["agent_enabled"] = True
             # Token must exist for manage/apply even before first provision push
             if not ns.get("agent_token"):
                 ns["agent_token"] = secrets.token_urlsafe(32)
@@ -5541,11 +5559,13 @@ async def settings_save(request: Request):
             ns["allow_master_manage"] = form.get("allow_master_manage") == "1"
             want_agent = form.get("agent_enabled") == "1"
             ns["agent_enabled"] = want_agent
-            # Manual off is sticky: only an explicit uncheck turns agent off permanently.
-            # Sync/update/restart must not demote an agent unless this flag is set.
+            # Manual off is sticky: only an explicit uncheck turns Agent API off.
+            # Enabling API must NEVER demote a master to agent (role stays).
             if want_agent:
-                ns["role"] = "agent"
                 ns["agent_manual_off"] = False
+                role = (ns.get("role") or "master").strip() or "master"
+                if role != "master":
+                    ns["role"] = "agent"
             else:
                 ns["agent_manual_off"] = True
                 if (ns.get("role") or "") == "agent":
@@ -7368,7 +7388,8 @@ def nodes_restore_master(request: Request):
         return redir
     with mutate() as store:
         ns = store.setdefault("settings", {}).setdefault("nodes", {})
-        ns["agent_enabled"] = False
+        if not ns.get("agent_manual_off"):
+            ns["agent_enabled"] = True
         ns["role"] = "master"
         ns["runtime_preserve"] = False
         ns["mirror"] = False
@@ -7484,12 +7505,11 @@ def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
         return None, err
     store = _load_store()
     ns = store["settings"].get("nodes") or {}
-    # Auto-heal: role=agent and not manually disabled → keep accepting pushes
-    if (ns.get("role") or "") == "agent" and not ns.get("agent_manual_off") and not ns.get("agent_enabled"):
+    # Auto-heal on any role: Agent API stays on unless admin unchecked it
+    if not ns.get("agent_manual_off") and not ns.get("agent_enabled"):
         with mutate() as st:
             n2 = st.setdefault("settings", {}).setdefault("nodes", {})
             n2["agent_enabled"] = True
-            n2["role"] = "agent"
         store = _load_store()
         ns = store["settings"].get("nodes") or {}
     if not ns.get("agent_enabled"):
@@ -7783,7 +7803,9 @@ def _manage_action(action: str, payload: dict) -> dict:
     if action == "restore_master":
         with mutate() as st:
             ns = st.setdefault("settings", {}).setdefault("nodes", {})
-            ns["agent_enabled"] = False
+            # Keep Agent API online on master (unless admin set agent_manual_off)
+            if not ns.get("agent_manual_off"):
+                ns["agent_enabled"] = True
             ns["role"] = "master"
             ns["runtime_preserve"] = False
             ns["mirror"] = False
@@ -7949,7 +7971,9 @@ async def agent_promote(request: Request):
                 old_hosts.append(str(inc_host))
             nodes_mod.remap_inbound_share_hosts(st, new_host=str(new_host or ""), old_hosts=old_hosts)
             ns = st.setdefault("settings", {}).setdefault("nodes", {})
-            ns["agent_enabled"] = False
+            # Master keeps Agent API online so handoff/manage never hit «agent disabled»
+            if not ns.get("agent_manual_off"):
+                ns["agent_enabled"] = True
             ns["role"] = "master"
             ns["mirror"] = False
             ns["runtime_preserve"] = False
@@ -8124,6 +8148,12 @@ async def agent_apply(request: Request, background_tasks: BackgroundTasks):
     store, err = _agent_auth(request)
     if err:
         return err
+    # Master keeps Agent API online, but must not accept config pushes (use promote)
+    if nodes_mod.is_master(store):
+        return JSONResponse(
+            {"ok": False, "error": "master rejects apply (Agent API online; use /agent/promote)"},
+            status_code=403,
+        )
     try:
         payload = await request.json()
     except ValueError:

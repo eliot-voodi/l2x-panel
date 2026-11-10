@@ -521,11 +521,25 @@ def install_pihole(*, password: str = "") -> dict:
     }
 
 
-def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
-    """Set Pi-hole admin password via ``docker exec … pihole setpassword`` (root).
+def _pihole_running() -> bool:
+    st = _run(["docker", "inspect", "-f", "{{.State.Running}}", "l2x-pihole"], timeout=15)
+    return bool(st.get("ok") and "true" in (st.get("stdout") or "").lower())
 
-    No FTLCONF env password — that makes setpassword ignored. If an old compose
-    still pins FTLCONF_webserver_api_password, strip it and recreate once.
+
+def _pihole_setpassword_cli(pwd: str) -> dict:
+    """Run ``pihole setpassword`` inside the container (root first, then default user)."""
+    sp = _run(["docker", "exec", "-u", "0", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
+    if sp.get("ok"):
+        return sp
+    return _run(["docker", "exec", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
+
+
+def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
+    """Set Pi-hole admin password via CLI: ``docker exec … pihole setpassword``.
+
+    Prefer a live container + setpassword only (no recreate). If an old compose
+    still pins FTLCONF_webserver_api_password, strip it and recreate once —
+    otherwise setpassword is ignored by FTL.
     """
     pwd = str(password or "").replace("\r", "").replace("\n", "")
     if not pwd:
@@ -536,12 +550,15 @@ def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
     COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
     yml = COMPOSE_DIR / "docker-compose.yml"
     need_recreate = (not yml.is_file()) or _compose_pins_ftlconf_password()
+    up: dict = {"ok": True, "stdout": "", "stderr": ""}
+
     if need_recreate:
         # Drop FTLCONF password pin so setpassword is not ignored
         write_compose(password=pwd)
     elif update_env:
         if not yml.is_file():
             write_compose(password=pwd)
+            need_recreate = True
         else:
             env = COMPOSE_DIR / ".env"
             env.write_text(f"PIHOLE_PASSWORD={_env_quote(pwd)}\n", encoding="utf-8")
@@ -550,32 +567,28 @@ def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
             except OSError:
                 pass
 
-    base = _compose_base()
-    if not base:
-        return {"ok": False, "error": "docker compose недоступен"}
+    # Start/recreate only when needed; password change on a live box is CLI-only
+    if need_recreate or not _pihole_running():
+        base = _compose_base()
+        if not base:
+            return {"ok": False, "error": "docker compose недоступен"}
+        up_cmd = [*base, "up", "-d"]
+        if need_recreate:
+            up_cmd.append("--force-recreate")
+        up_cmd.append("pihole")
+        up = _run(up_cmd, timeout=180, cwd=str(COMPOSE_DIR))
+        if not up.get("ok"):
+            return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "up failed").strip(), "log": up}
+        for _ in range(30):
+            if _pihole_running():
+                break
+            time.sleep(1)
+        else:
+            return {"ok": False, "error": "контейнер l2x-pihole не запущен", "log": up}
+        time.sleep(2)
 
-    up_cmd = [*base, "up", "-d"]
-    if need_recreate:
-        up_cmd.append("--force-recreate")
-    up_cmd.append("pihole")
-    up = _run(up_cmd, timeout=180, cwd=str(COMPOSE_DIR))
-    if not up["ok"]:
-        return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "up failed").strip(), "log": up}
-
-    # Wait until container is running, then setpassword as root via docker exec
-    for _ in range(30):
-        st = _run(["docker", "inspect", "-f", "{{.State.Running}}", "l2x-pihole"], timeout=15)
-        if st.get("ok") and "true" in (st.get("stdout") or "").lower():
-            break
-        time.sleep(1)
-    else:
-        return {"ok": False, "error": "контейнер l2x-pihole не запущен", "log": up}
-
-    time.sleep(2)
     # argv — no shell; panel service is root so docker.sock works
-    sp = _run(["docker", "exec", "-u", "0", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
-    if not sp.get("ok"):
-        sp = _run(["docker", "exec", "l2x-pihole", "pihole", "setpassword", pwd], timeout=60)
+    sp = _pihole_setpassword_cli(pwd)
     if not sp.get("ok"):
         err = (sp.get("stderr") or sp.get("stdout") or "setpassword failed").strip()
         return {"ok": False, "error": err, "log": sp}
@@ -585,7 +598,7 @@ def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
     except Exception:
         pass
     log = ((up.get("stdout") or "") + "\n" + (sp.get("stdout") or "") + (sp.get("stderr") or "")).strip()
-    return {"ok": True, "log": log[-2000:]}
+    return {"ok": True, "log": log[-2000:], "via": "pihole setpassword"}
 
 
 def stop_pihole() -> dict:

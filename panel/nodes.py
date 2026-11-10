@@ -129,7 +129,7 @@ def agent_token(store: dict) -> str:
     s = store.setdefault("settings", {}).setdefault("nodes", {})
     if not s.get("agent_token"):
         s["agent_token"] = secrets.token_urlsafe(32)
-    s.setdefault("agent_enabled", False)
+    s.setdefault("agent_enabled", True)  # Agent API on all nodes (incl. master)
     s.setdefault("role", "master")  # master | agent
     s.setdefault("agent_manual_off", False)
     return s["agent_token"]
@@ -1061,6 +1061,9 @@ def agent_endpoint(node: dict, path: str) -> str:
     bp = (node.get("base_path") or "").strip().strip("/")
     path = (path or "").lstrip("/")
     if bp:
+        # url may already include /base_path — do not double it
+        if base.endswith("/" + bp) or base.rstrip("/").endswith("/" + bp):
+            return f"{base}/{path}"
         return f"{base}/{bp}/{path}"
     return f"{base}/{path}"
 
@@ -2527,7 +2530,9 @@ if nh:
         if (not sh) or (sh != nh and (not old_hosts or sh in old_hosts)):
             ib['share_host'] = nh
 ns = store.setdefault('settings', {}).setdefault('nodes', {})
-ns['agent_enabled'] = False
+# Keep Agent API online on the new master (role alone defines master)
+if not ns.get('agent_manual_off'):
+    ns['agent_enabled'] = True
 ns['role'] = 'master'
 ns['mirror'] = False
 ns['runtime_preserve'] = False

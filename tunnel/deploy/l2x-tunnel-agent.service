@@ -5,11 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
+Group=root
 ExecStart=/usr/local/bin/l2x-tunnel-agent -config /etc/l2x-tunnel/agent.yaml
-Restart=on-failure
+Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
