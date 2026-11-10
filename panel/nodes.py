@@ -987,6 +987,10 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         # Mirror keeps a copy of master settings (DoH/Pi-hole, TG, sub, …) for fast promote
         settings_out = json.loads(json.dumps(store.get("settings") or {}))
         settings_out.pop("nodes", None)
+        # Never ship master public_host/base_path — agent nginx SNI breaks if overwritten
+        if isinstance(settings_out.get("panel"), dict):
+            settings_out["panel"].pop("public_host", None)
+            settings_out["panel"].pop("base_path", None)
 
     reverse_bridge = None
     if rv_on and node.get("as_outbound") and node.get("enabled", True):
@@ -2203,6 +2207,11 @@ def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
     keep_host = local_panel.get("public_host")
     merged = json.loads(json.dumps(incoming))
     merged.pop("nodes", None)  # role forced by caller
+    # Incoming panel must never clobber this host's identity (mirror sync / promote)
+    if isinstance(merged.get("panel"), dict):
+        merged["panel"] = dict(merged["panel"])
+        merged["panel"].pop("public_host", None)
+        merged["panel"].pop("base_path", None)
     # Deep-ish replace of known sections
     for key, val in merged.items():
         if isinstance(val, dict) and isinstance(local.get(key), dict):
