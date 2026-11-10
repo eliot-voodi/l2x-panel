@@ -7248,12 +7248,26 @@ async def nodes_action(node_id: str, action: str, request: Request):
                                                master_store_snapshot=snap, old_master_node=old)
             log_lines.append(res.get("log") or "")
             if not res.get("ok"):
-                _tg_admin(
-                    f"❌ Promote → <b>{tgbot.escape(name)}</b>: {tgbot.escape(res.get('error') or 'fail')}",
-                    flag="notify_nodes",
-                )
-                return {"ok": False, "error": res.get("error") or "promote failed",
-                        "log": "\n".join(x for x in log_lines if x)}
+                # API body may be lost after remote already flipped (nginx/uvicorn close).
+                soft = False
+                for i in range(4):
+                    _time.sleep(1 if i else 0)
+                    probe0 = nodes_mod.probe_role(node_copy, timeout=10)
+                    log_lines.append(
+                        f"soft-probe[{i}]: ok={probe0.get('ok')} role={probe0.get('role')} "
+                        f"after err={res.get('error')}"
+                    )
+                    if probe0.get("ok") and probe0.get("is_master"):
+                        soft = True
+                        res = {**res, "ok": True, "soft": True, "error": ""}
+                        break
+                if not soft:
+                    _tg_admin(
+                        f"❌ Promote → <b>{tgbot.escape(name)}</b>: {tgbot.escape(res.get('error') or 'fail')}",
+                        flag="notify_nodes",
+                    )
+                    return {"ok": False, "error": res.get("error") or "promote failed",
+                            "log": "\n".join(x for x in log_lines if x)}
 
             # 2) Verify new master is healthy and reports master role
             verified = False

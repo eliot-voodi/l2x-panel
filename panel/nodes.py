@@ -2401,9 +2401,34 @@ def promote_via_api(node: dict, payload: dict, timeout: int = 180) -> dict:
                 err = f"HTTP {exc.code}: {(body or '')[:300]}"
         if exc.code == 404:
             err = "агент без /agent/promote — обновите ноду или укажите SSH-пароль"
+        # Connection may die after remote already flipped — verify by /health role.
+        soft = _promote_verify_remote_master(node, reason=err)
+        if soft:
+            return soft
         return {"ok": False, "error": err, "log": body, "status": exc.code}
     except Exception as exc:  # noqa: BLE001
+        soft = _promote_verify_remote_master(node, reason=str(exc))
+        if soft:
+            return soft
         return {"ok": False, "error": str(exc), "log": ""}
+
+
+def _promote_verify_remote_master(node: dict, *, reason: str = "") -> dict | None:
+    """If promote HTTP dies mid-flight but the peer already reports role=master, treat as OK."""
+    try:
+        probe = probe_role(node, timeout=12)
+    except Exception:
+        return None
+    if probe.get("ok") and probe.get("is_master"):
+        return {
+            "ok": True,
+            "soft": True,
+            "error": "",
+            "role": "master",
+            "version": probe.get("version") or "",
+            "log": f"promote response lost ({reason[:160]}); verified role=master via /health",
+        }
+    return None
 
 
 def promote_via_ssh(
