@@ -373,12 +373,21 @@ def _reverse_portal_member_ok(store: dict, outbound: dict) -> bool:
         return False
     try:
         import nodes as nodes_mod
-        if node.get("nat") or nodes_mod.uses_reverse(node):
+        if node.get("nat"):
+            # NAT reverse/L2X: live while pull is fresh
             if not nodes_mod.pull_fresh(node):
                 return False
             if node.get("reverse_ok") is False:
                 return False
             conns = node.get("rv_conns")
+            if isinstance(conns, int) and conns <= 0:
+                return False
+        elif nodes_mod.uses_reverse(node):
+            # Reachable reverse: push-synced — do not require last_pull
+            if node.get("reverse_ok") is False:
+                return False
+            conns = node.get("rv_conns")
+            # Missing rv_conns = unknown (probe will refresh); only fail on explicit 0
             if isinstance(conns, int) and conns <= 0:
                 return False
     except Exception:
@@ -2642,7 +2651,8 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
     path.write_text(json.dumps(cfg), encoding="utf-8")
     proc = subprocess.Popen([XRAY_BIN, "run", "-c", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        time.sleep(0.8)
+        # Xray socks inbound is usually ready in <300ms; 0.8s stacked serially across tags
+        time.sleep(0.35)
         r = _run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "--max-time", str(timeout),
                   "--socks5-hostname", f"127.0.0.1:{port}", url], timeout=timeout + 5)
         parts = (r["stdout"] or "").split()

@@ -404,16 +404,14 @@ def tunnel_agent_online(health: dict, node: dict) -> bool:
         return False
     agents = health.get("agents")
     aid = tunnel_agent_id(node)
-    if isinstance(agents, dict) and aid in agents:
+    if isinstance(agents, dict):
         return bool(agents.get(aid))
-    # Legacy single-peer portal: online means the only agent is up.
-    if bool(health.get("online")) and not agents:
-        return True
+    # No agents map → unknown (do not mark every L2X node online)
     return False
 
 
 def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> None:
-    """Mark tunnel-only nodes online from local l2x-tunneld /health."""
+    """Mark tunnel-only (no panel token) nodes online from local l2x-tunneld /health."""
     try:
         import json
         import urllib.request
@@ -422,7 +420,8 @@ def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> 
     except Exception:
         return
     for n in nodes if nodes is not None else ensure_list(store):
-        if not uses_l2x_tunnel(n):
+        # Panel NAT agents keep online from /agent/pull — do not overwrite from tunneld
+        if not is_tunnel_only_node(n):
             continue
         online = tunnel_agent_online(data, n)
         n["online"] = online
@@ -1252,7 +1251,10 @@ def apply_health_probe(node: dict, probe: dict) -> list[dict]:
 
 def probe_all_health(nodes: list[dict], *, timeout: int = 5, store: dict | None = None) -> list[dict]:
     """Probe enabled nodes; mutate each in place; return combined events."""
+    from concurrent.futures import ThreadPoolExecutor
+
     events: list[dict] = []
+    http_targets: list[dict] = []
     for n in nodes or []:
         if not n.get("enabled", True):
             continue
@@ -1268,21 +1270,29 @@ def probe_all_health(nodes: list[dict], *, timeout: int = 5, store: dict | None 
             continue
         if not (n.get("url") or n.get("domain")):
             continue
+        http_targets.append(n)
+
+    def _probe_one(n: dict) -> tuple[dict, dict]:
         try:
-            probe = probe_health(n, timeout=timeout)
+            return n, probe_health(n, timeout=timeout)
         except Exception as exc:  # noqa: BLE001
-            probe = {"ok": False, "error": str(exc)}
-        events.extend(apply_health_probe(n, probe))
-        raw = probe.get("raw") if isinstance(probe.get("raw"), dict) else {}
-        if isinstance(raw.get("rv_conns"), int):
-            n["rv_conns"] = raw["rv_conns"]
-        elif not uses_reverse(n):
-            n.pop("rv_conns", None)
-        xv = str(raw.get("xray_version") or "").strip()
-        if xv:
-            n["xray_version"] = xv.lstrip("vV")
-        if "xray_active" in raw:
-            n["xray_active"] = bool(raw.get("xray_active"))
+            return n, {"ok": False, "error": str(exc)}
+
+    if http_targets:
+        workers = max(1, min(8, len(http_targets)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for n, probe in pool.map(lambda node: _probe_one(node), http_targets):
+                events.extend(apply_health_probe(n, probe))
+                raw = probe.get("raw") if isinstance(probe.get("raw"), dict) else {}
+                if isinstance(raw.get("rv_conns"), int):
+                    n["rv_conns"] = raw["rv_conns"]
+                elif not uses_reverse(n):
+                    n.pop("rv_conns", None)
+                xv = str(raw.get("xray_version") or "").strip()
+                if xv:
+                    n["xray_version"] = xv.lstrip("vV")
+                if "xray_active" in raw:
+                    n["xray_active"] = bool(raw.get("xray_active"))
     if store is not None:
         refresh_tunnel_only_health(store, nodes)
     return events

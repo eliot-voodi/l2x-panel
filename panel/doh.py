@@ -579,13 +579,13 @@ def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
         up = _run(up_cmd, timeout=180, cwd=str(COMPOSE_DIR))
         if not up.get("ok"):
             return {"ok": False, "error": (up.get("stderr") or up.get("stdout") or "up failed").strip(), "log": up}
-        for _ in range(30):
+        for _ in range(12):
             if _pihole_running():
                 break
             time.sleep(1)
         else:
             return {"ok": False, "error": "контейнер l2x-pihole не запущен", "log": up}
-        time.sleep(2)
+        time.sleep(1)
 
     # argv — no shell; panel service is root so docker.sock works
     sp = _pihole_setpassword_cli(pwd)

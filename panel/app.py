@@ -11,6 +11,7 @@ import secrets
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1501,11 +1502,18 @@ def _outbounds_probe_cycle() -> None:
     if not tags:
         return
     results: dict[str, dict] = {}
-    for tag in tags:
+
+    def _one(tag: str) -> tuple[str, dict]:
         try:
-            results[tag] = xray.test_outbound(store, tag)
+            return tag, xray.test_outbound(store, tag)
         except Exception as exc:  # noqa: BLE001
-            results[tag] = {"ok": False, "error": str(exc), "ms": 0}
+            return tag, {"ok": False, "error": str(exc), "ms": 0}
+
+    # Parallel probes (cap workers) — serial Xray spawn was the slow path
+    workers = max(1, min(6, len(tags)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for tag, res in pool.map(lambda t: _one(t), tags):
+            results[tag] = res
     now = xray.now_utc().isoformat()
     with mutate() as st:
         for o in st.get("outbounds_custom") or []:
@@ -1522,8 +1530,8 @@ def _outbounds_probe_cycle() -> None:
 
 
 def _outbounds_probe_loop() -> None:
-    # First pass after a short delay so startup apply finishes
-    if _stop.wait(90):
+    # First pass soon after startup apply finishes
+    if _stop.wait(25):
         return
     while True:
         try:
@@ -2316,12 +2324,14 @@ def health(request: Request):
         return out
     store = _load_store()
     ns = (store.get("settings") or {}).get("nodes") or {}
-    role = "agent" if (ns.get("agent_enabled") and (ns.get("role") or "") == "agent") else "master"
+    # Role is independent of agent_enabled (API may stay on for masters)
+    role = "agent" if (ns.get("role") or "master") == "agent" else "master"
     out.update({
         "app": app_title(),
         "version": panel_version(),
         "role": role,
         "agent": role == "agent",
+        "agent_enabled": bool(ns.get("agent_enabled")),
         "time": datetime.now(timezone.utc).isoformat(),
     })
     try:
@@ -6318,8 +6328,8 @@ def _nodes_health_cycle() -> None:
     snapshot = [dict(n) for n in nodes_mod.ensure_list(store) if n.get("enabled", True)]
     if not snapshot:
         return
+    # probe_all_health already refreshes tunnel-only peers once
     events = nodes_mod.probe_all_health(snapshot, timeout=5, store=store)
-    nodes_mod.refresh_tunnel_only_health(store, snapshot)
     by_id = {n.get("id"): n for n in snapshot if n.get("id")}
     with mutate() as st:
         for n in nodes_mod.ensure_list(st):
@@ -6360,16 +6370,18 @@ def _nodes_sync_loop() -> None:
                 ]
                 running = NODES_JOB.get("id")
                 busy = bool(running and ops.JOBS.get(running, {}).get("status") == "running")
+                # One due node per tick — avoid stacking multi-minute syncs in the health loop
                 if due_ids and not busy and NODES_SCHED_LOCK.acquire(blocking=False):
                     try:
-                        for nid in due_ids:
-                            # re-check due under fresh store (previous push may have updated last_sync)
-                            st = _load_store()
-                            node = next((x for x in nodes_mod.ensure_list(st) if x.get("id") == nid), None)
-                            if not node or not nodes_mod.node_sync_due(node):
-                                continue
-                            name = node.get("name") or nid[:8]
-                            _node_push_job(nid, f"{name}: schedule", host)
+                        st = _load_store()
+                        node = next(
+                            (x for x in nodes_mod.ensure_list(st)
+                             if x.get("id") in due_ids and nodes_mod.node_sync_due(x)),
+                            None,
+                        )
+                        if node:
+                            name = node.get("name") or str(node.get("id") or "")[:8]
+                            _node_push_job(node["id"], f"{name}: schedule", host)
                     finally:
                         NODES_SCHED_LOCK.release()
         except Exception:
@@ -7109,16 +7121,21 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 node.pop("reverse_ok", None)
                 if node["rv_mode"]:
                     node["as_outbound"] = True
-                    node["tunnel_mode"] = "l2x_udp"
+                    node["tunnel_mode"] = "xray_reverse"
+                    nodes_mod.ensure_reverse(node)
                 else:
                     node["tunnel_mode"] = ""
                     nodes_mod.ensure_bridge(node)
-                label = f"reverse outbound {'вкл' if node['rv_mode'] else 'выкл'} (l2x_udp)"
+                label = f"reverse outbound {'вкл' if node['rv_mode'] else 'выкл'}"
             elif action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")
                 if node["as_outbound"]:
                     if node.get("nat") or node.get("rv_mode"):
-                        node["tunnel_mode"] = node.get("tunnel_mode") or "l2x_udp"
+                        # Preserve explicit mode; default reverse when rv identity exists
+                        if not str(node.get("tunnel_mode") or "").strip():
+                            node["tunnel_mode"] = (
+                                "xray_reverse" if (node.get("rv_uuid") or node.get("rv_mode")) else "l2x_udp"
+                            )
                     elif not nodes_mod.uses_l2x_tunnel(node):
                         nodes_mod.ensure_bridge(node)
                 label = f"outbound {'вкл' if node['as_outbound'] else 'выкл'}"
@@ -7624,18 +7641,21 @@ def _manage_action(action: str, payload: dict) -> dict:
         return _manage_snapshot(store0)
 
     if action == "enable_agent":
-        # Master re-enables a node that lost agent mode. Never overrides Settings → uncheck
+        # Re-enable Agent API. Never demote a master; never overrides Settings → uncheck
         # (agent_manual_off): only the local admin can clear that flag by enabling the checkbox.
         with mutate() as st:
             ns = st.setdefault("settings", {}).setdefault("nodes", {})
             if ns.get("agent_manual_off"):
                 return {"ok": False, "error": "agent выключен вручную на этой ноде", "manual_off": True}
             ns["agent_enabled"] = True
-            ns["role"] = "agent"
             ns["agent_manual_off"] = False
+            # Keep master role; only force agent when already demoted / unset
+            if (ns.get("role") or "master") != "master":
+                ns["role"] = "agent"
             if not ns.get("agent_token"):
                 ns["agent_token"] = secrets.token_urlsafe(32)
-        return {"ok": True, "error": "", "agent_enabled": True, "role": "agent"}
+            role_out = ns.get("role") or "agent"
+        return {"ok": True, "error": "", "agent_enabled": True, "role": role_out}
 
     if action == "restart_xray":
         r = ops.xray_control("restart")
