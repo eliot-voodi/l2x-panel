@@ -72,7 +72,12 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("tunnel_mode", "")
         n.setdefault("last_pull", "")
         if not str(n.get("tunnel_mode") or "").strip() and (n.get("nat") or n.get("rv_mode")):
-            n["tunnel_mode"] = "l2x_udp"
+            # Keep Xray reverse when the node already has reverse identity (promote/sync
+            # must not silently flip am/root to l2x_udp and break egress).
+            if n.get("rv_uuid") or n.get("rv_mode"):
+                n["tunnel_mode"] = "xray_reverse"
+            else:
+                n["tunnel_mode"] = "l2x_udp"
     return nodes
 
 
@@ -151,12 +156,16 @@ def uses_l2x_tunnel(node: dict) -> bool:
         return True
     if mode == "xray_reverse":
         return False
+    # Prefer reverse when reverse identity exists (do not steal am/root after promote).
+    if node.get("rv_uuid") or node.get("rv_mode"):
+        node["tunnel_mode"] = "xray_reverse"
+        return False
     # Sticky: once a Go agent id is assigned, keep L2X even if mode was cleared.
     if str(node.get("tunnel_node_id") or "").strip():
         node["tunnel_mode"] = "l2x_udp"
         return True
-    # Default for NAT: prefer l2x_udp when explicitly unset after migration
-    return bool(node.get("nat") or node.get("rv_mode")) and mode != "xray_reverse"
+    # Default for NAT without reverse: l2x_udp
+    return bool(node.get("nat"))
 
 
 def is_tunnel_only_node(node: dict) -> bool:
