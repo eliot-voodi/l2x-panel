@@ -24,13 +24,14 @@ type Stats struct {
 }
 
 type stream struct {
-	id     uint32
-	conn   net.Conn
-	pathID uint8
-	closed atomic.Bool
-	ready  chan struct{}
-	buf    [][]byte
-	bufMu  sync.Mutex
+	id      uint32
+	conn    net.Conn
+	pathID  uint8
+	agentID string // portal: which agent owns this stream
+	closed  atomic.Bool
+	ready   chan struct{}
+	buf     [][]byte
+	bufMu   sync.Mutex
 }
 
 type Engine struct {
@@ -52,6 +53,24 @@ type Engine struct {
 	bufPool sync.Pool
 
 	onAgentHello func(addr *net.UDPAddr)
+
+	// Agent-side single WSS link (HTTPS camouflage).
+	wsMu      sync.RWMutex
+	wsWriteMu sync.Mutex
+	ws        wsConn
+
+	// Portal: many agents keyed by node_id (WSS).
+	agentsMu sync.RWMutex
+	agents   map[string]*agentLink
+}
+
+// wsConn is satisfied by *websocket.Conn (binary messages).
+type wsConn interface {
+	WriteMessage(messageType int, data []byte) error
+	ReadMessage() (messageType int, p []byte, err error)
+	Close() error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
 }
 
 func New(role string, ciph crypto.Cipher, p *pool.Pool, token, nodeID, defDial string, maxStreams int) *Engine {
@@ -153,6 +172,10 @@ func (e *Engine) readLoop(ctx context.Context, path *pool.Path) {
 func (e *Engine) handlePacket(path *pool.Path, addr *net.UDPAddr, packet []byte) {
 	e.Stats.PacketsIn.Add(1)
 	_ = path
+	e.handleCipherPacket(packet, addr)
+}
+
+func (e *Engine) handleCipherPacket(packet []byte, addr *net.UDPAddr) {
 	if len(packet) < proto.HeaderSize+e.Cipher.Overhead() {
 		return
 	}
@@ -172,25 +195,44 @@ func (e *Engine) handlePacket(path *pool.Path, addr *net.UDPAddr, packet []byte)
 		return
 	}
 	e.Stats.BytesIn.Add(uint64(len(plain)))
+	e.dispatchFrame(fr, pathID, addr)
+}
 
+func (e *Engine) dispatchFrame(fr proto.Frame, pathID uint8, addr *net.UDPAddr) {
 	switch fr.Type {
 	case proto.TypeHELLO:
 		if e.Role == "portal" {
-			e.SetPeer(addr)
-			_ = e.sendTo(addr, proto.Frame{Type: proto.TypeHELLOOK, Payload: []byte("ok")}, pathID)
-			log.Printf("agent hello from %s node=%s", addr, string(fr.Payload))
+			if addr != nil {
+				e.SetPeer(addr)
+			} else {
+				e.online.Store(true)
+				e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+			}
+			nodeID, _ := parseHelloPayload(fr.Payload, e.Token)
+			if nodeID == "" {
+				// legacy: payload may be raw "token|node" already logged
+				nodeID = string(fr.Payload)
+			}
+			_ = e.sendForAgent(nodeID, proto.Frame{Type: proto.TypeHELLOOK, Payload: []byte("ok")}, pathID)
+			log.Printf("agent hello via %s node=%s", linkKind(addr), string(fr.Payload))
 		}
 	case proto.TypeHELLOOK:
-		e.SetPeer(addr)
-		log.Printf("portal hello-ok from %s", addr)
+		if addr != nil {
+			e.SetPeer(addr)
+		} else {
+			e.online.Store(true)
+		}
+		log.Printf("portal hello-ok via %s", linkKind(addr))
 	case proto.TypeKA:
-		if e.Role == "portal" && e.GetPeer() == nil {
+		if e.Role == "portal" && e.GetPeer() == nil && addr != nil {
 			e.SetPeer(addr)
 		}
 	case proto.TypePUNCH:
-		e.SetPeer(addr)
+		if addr != nil {
+			e.SetPeer(addr)
+		}
 		if fr.Flags&0x80 == 0 {
-			_ = e.sendTo(addr, proto.Frame{Type: proto.TypePUNCH, Flags: 0x80, Payload: []byte("pong")}, pathID)
+			_ = e.send(proto.Frame{Type: proto.TypePUNCH, Flags: 0x80, Payload: []byte("pong")}, pathID)
 		}
 	case proto.TypeOPEN:
 		if e.Role == "agent" {
@@ -214,28 +256,58 @@ func (e *Engine) handlePacket(path *pool.Path, addr *net.UDPAddr, packet []byte)
 	}
 }
 
+func linkKind(addr *net.UDPAddr) string {
+	if addr == nil {
+		return "wss"
+	}
+	return addr.String()
+}
+
 func (e *Engine) send(fr proto.Frame, pathHint uint8) error {
+	return e.sendForAgent("", fr, pathHint)
+}
+
+func (e *Engine) sendForAgent(agentID string, fr proto.Frame, pathHint uint8) error {
+	if agentID == "" && fr.StreamID != 0 {
+		e.mu.RLock()
+		if st := e.streams[fr.StreamID]; st != nil {
+			agentID = st.agentID
+		}
+		e.mu.RUnlock()
+	}
 	peer := e.GetPeer()
-	if peer == nil && e.Role == "agent" {
-		// agent always has configured peer
+	if peer == nil && e.Role == "agent" && e.getWS() == nil {
 		return errNoPeer
 	}
-	if peer == nil {
-		return errNoPeer
+	if peer == nil && e.Role == "portal" && agentID == "" && e.getWS() == nil {
+		// allow if any agent online (control frames)
+		if len(e.AgentsStatus()) == 0 {
+			return errNoPeer
+		}
 	}
-	return e.sendTo(peer, fr, pathHint)
+	return e.sendToAgent(peer, agentID, fr, pathHint)
 }
 
 var errNoPeer = errors.New("no peer")
 
 func (e *Engine) sendTo(addr *net.UDPAddr, fr proto.Frame, pathHint uint8) error {
-	path := e.Pool.ByID(pathHint)
-	if path == nil {
-		path = e.Pool.Next()
-	}
+	return e.sendToAgent(addr, "", fr, pathHint)
+}
+
+func (e *Engine) sendToAgent(addr *net.UDPAddr, agentID string, fr proto.Frame, pathHint uint8) error {
 	seq := e.seq.Add(1)
 	fr.Seq = seq
-	fr.Flags = (fr.Flags & 0xf0) | (path.ID & 0x0f)
+	pathID := uint8(0)
+	if e.Pool != nil {
+		path := e.Pool.ByID(pathHint)
+		if path == nil {
+			path = e.Pool.Next()
+		}
+		if path != nil {
+			pathID = path.ID
+		}
+	}
+	fr.Flags = (fr.Flags & 0xf0) | (pathID & 0x0f)
 	raw := make([]byte, proto.HeaderSize+len(fr.Payload)+e.Cipher.Overhead()+16)
 	n, err := proto.Encode(raw, fr)
 	if err != nil {
@@ -243,9 +315,36 @@ func (e *Engine) sendTo(addr *net.UDPAddr, fr proto.Frame, pathHint uint8) error
 	}
 	hdr := raw[:proto.HeaderSize]
 	plain := raw[proto.HeaderSize:n]
-	nonce := crypto.Nonce12(path.ID, seq)
+	nonce := crypto.Nonce12(pathID, seq)
 	ct := e.Cipher.Seal(nil, nonce, plain, hdr)
 	out := append(append([]byte{}, hdr...), ct...)
+
+	// Portal → specific agent WSS
+	if e.Role == "portal" && agentID != "" {
+		if err := e.writeAgentWS(agentID, out); err != nil {
+			return err
+		}
+		e.Stats.BytesOut.Add(uint64(len(plain)))
+		return nil
+	}
+	// Agent (or legacy single-link portal) WSS
+	if e.getWS() != nil {
+		if err := e.writeWS(out); err != nil {
+			return err
+		}
+		e.Stats.BytesOut.Add(uint64(len(plain)))
+		return nil
+	}
+	if e.Pool == nil || addr == nil {
+		return errNoPeer
+	}
+	path := e.Pool.ByID(pathID)
+	if path == nil {
+		path = e.Pool.Next()
+	}
+	if path == nil {
+		return errNoPeer
+	}
 	_, err = path.Conn.WriteToUDP(out, addr)
 	if err == nil {
 		e.Stats.PacketsOut.Add(1)

@@ -67,7 +67,11 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("nat", False)
         # Reverse outbound on a reachable node: node dials master instead of master → node
         n.setdefault("rv_mode", False)
+        # Egress datapath for NAT/reverse: xray_reverse | l2x_udp
+        n.setdefault("tunnel_mode", "")
         n.setdefault("last_pull", "")
+        if not str(n.get("tunnel_mode") or "").strip() and (n.get("nat") or n.get("rv_mode")):
+            n["tunnel_mode"] = "l2x_udp"
     return nodes
 
 
@@ -137,9 +141,130 @@ def is_master(store: dict) -> bool:
     return (ns.get("role") or "master") != "agent"
 
 
+def uses_l2x_tunnel(node: dict) -> bool:
+    """Egress via l2x-tunneld SOCKS (WSS agent), not Xray VLESS reverse."""
+    if not node.get("as_outbound") or not node.get("enabled", True):
+        return False
+    mode = str(node.get("tunnel_mode") or "").strip()
+    if mode == "l2x_udp":
+        return True
+    if mode == "xray_reverse":
+        return False
+    # Sticky: once a Go agent id is assigned, keep L2X even if mode was cleared.
+    if str(node.get("tunnel_node_id") or "").strip():
+        node["tunnel_mode"] = "l2x_udp"
+        return True
+    # Default for NAT: prefer l2x_udp when explicitly unset after migration
+    return bool(node.get("nat") or node.get("rv_mode")) and mode != "xray_reverse"
+
+
+def is_tunnel_only_node(node: dict) -> bool:
+    """Pure Go tunnel agent: no panel /agent/pull, health = l2x-tunneld peer."""
+    if str(node.get("tunnel_mode") or "").strip() != "l2x_udp":
+        return False
+    return not (node.get("token") or "").strip()
+
+
 def uses_reverse(node: dict) -> bool:
     """Master egress via this node goes through the VLESS reverse tunnel (node dials master)."""
+    if uses_l2x_tunnel(node):
+        return False
     return bool(node.get("nat") or node.get("rv_mode"))
+
+
+def ensure_tunnel_settings(store: dict) -> dict:
+    """Master settings for l2x-tunneld SOCKS + WSS camouflage path on :443."""
+    ns = store.setdefault("settings", {}).setdefault("nodes", {})
+    tun = ns.setdefault("tunnel", {})
+    tun.setdefault("enabled", True)
+    tun.setdefault("transport", "wss")
+    tun.setdefault("socks_host", "127.0.0.1")
+    tun.setdefault("socks_port", 11080)
+    tun.setdefault("ws_listen", "127.0.0.1:11081")
+    if not str(tun.get("ws_path") or "").strip():
+        alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        tun["ws_path"] = "/ws-" + "".join(secrets.choice(alphabet) for _ in range(10))
+    return tun
+
+
+def tunnel_socks_addr(store: dict) -> tuple[str, int]:
+    """Local SOCKS5 published by l2x-tunneld on the master."""
+    tun = ensure_tunnel_settings(store)
+    host = str(tun.get("socks_host") or "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(tun.get("socks_port") or 11080)
+    except (TypeError, ValueError):
+        port = 11080
+    return host, port
+
+
+def tunnel_agent_id(node: dict) -> str:
+    """Stable agent node_id used in HELLO + SOCKS username."""
+    tid = str(node.get("tunnel_node_id") or "").strip()
+    if tid:
+        return tid
+    name = slugify(str(node.get("name") or node.get("id") or "node"))
+    node["tunnel_node_id"] = name
+    return name
+
+
+def tunnel_agent_online(health: dict, node: dict) -> bool:
+    """Whether l2x-tunneld reports this node's agent connected."""
+    if not isinstance(health, dict):
+        return False
+    agents = health.get("agents")
+    aid = tunnel_agent_id(node)
+    if isinstance(agents, dict) and aid in agents:
+        return bool(agents.get(aid))
+    # Legacy single-peer portal: online means the only agent is up.
+    if bool(health.get("online")) and not agents:
+        return True
+    return False
+
+
+def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> None:
+    """Mark tunnel-only nodes online from local l2x-tunneld /health."""
+    try:
+        import json
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:9109/health", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+    except Exception:
+        return
+    for n in nodes if nodes is not None else ensure_list(store):
+        if not uses_l2x_tunnel(n):
+            continue
+        online = tunnel_agent_online(data, n)
+        n["online"] = online
+        n["last_probe"] = now_iso()
+        n["last_probe_error"] = "" if online else "tunneld peer offline"
+        if online:
+            n["last_seen"] = now_iso()
+            n["last_warning"] = ""
+            n["last_ok"] = True
+            n["fail_streak"] = 0
+        n["tunnel_transport"] = "wss"
+        n["panel_version"] = n.get("panel_version") or "l2x-tunnel-agent"
+        tunnel_agent_id(n)
+
+
+def tunnel_node_outbound_config(store: dict, node: dict) -> dict:
+    """Xray socks outbound → l2x-tunneld → agent freedom (SOCKS user = agent node_id)."""
+    host, port = tunnel_socks_addr(store)
+    aid = tunnel_agent_id(node)
+    return {
+        "protocol": "socks",
+        "settings": {
+            "servers": [{
+                "address": host,
+                "port": port,
+                "users": [{"user": aid, "pass": "l2x"}],
+            }],
+        },
+        "streamSettings": {
+            "sockopt": {"tcpCongestion": "bbr", "tcpNoDelay": True, "tcpFastOpen": True},
+        },
+    }
 
 
 def ensure_bridge(node: dict) -> dict:
@@ -418,6 +543,7 @@ def node_outbound_config(node: dict) -> dict:
             "wsSettings": {"path": node["bridge_path"], "headers": {}},
             "tlsSettings": {"serverName": domain, "allowInsecure": False, "fingerprint": "firefox",
                             "alpn": ["http/1.1"]},
+            "sockopt": {"tcpCongestion": "bbr", "tcpNoDelay": True, "tcpFastOpen": True},
         },
     }
 
@@ -431,6 +557,29 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         if existing:
             customs.remove(existing)
         return
+    if uses_l2x_tunnel(node):
+        entry = {
+            "tag": tag,
+            "remark": f"{node.get('name')} (L2X tunnel)",
+            "kind": "node",
+            "reverse": False,
+            "tunnel": True,
+            "node_id": node.get("id"),
+            "enabled": True,
+            "in_sub": True,
+            "country": (node.get("country") or "")[:2].upper(),
+            "config": tunnel_node_outbound_config(store, node),
+        }
+        if existing:
+            keep = existing.get("last_test")
+            existing.clear()
+            existing.update(entry)
+            # Keep only a successful probe; drop stale reverse-pull failures.
+            if isinstance(keep, dict) and keep.get("ok") is True:
+                existing["last_test"] = keep
+        else:
+            customs.append(entry)
+        return
     if uses_reverse(node):
         # Portal tag on master = outbound; master never dials the node
         ensure_reverse_master(store)
@@ -440,6 +589,7 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
             "remark": f"{node.get('name')} ({'NAT' if node.get('nat') else 'reverse'})",
             "kind": "node",
             "reverse": True,
+            "tunnel": False,
             "node_id": node.get("id"),
             "enabled": True,
             "in_sub": True,
@@ -603,12 +753,12 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     mirror = bool(node.get("mirror"))
     nat = bool(node.get("nat"))
     rv_on = uses_reverse(node)
+    tunnel_on = uses_l2x_tunnel(node)
     if mirror:
         node["sync_clients"] = True
         node["sync_inbounds"] = True
-    # NAT node: no inbound ports → no client inbounds / bridge inbound; only reverse egress.
-    # Reverse mode: the node dials master, so the bridge inbound is not needed either.
-    bridge_on = bool(node.get("as_outbound")) and not rv_on
+    # NAT/reverse/l2x tunnel: no bridge inbound — egress is reverse portal or SOCKS tunnel.
+    bridge_on = bool(node.get("as_outbound")) and not rv_on and not tunnel_on
     inbounds = list(store.get("inbounds") or []) if not nat else []
     # Path/TLS share domains must be the node hostname, not the master
     node_dom = node_public_domain(node)
@@ -699,8 +849,8 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         "bridge": {
             "uuid": node.get("bridge_uuid"),
             "path": node.get("bridge_path"),
-            "enabled": bool(node.get("as_outbound")),
-        } if node.get("as_outbound") else None,
+            "enabled": bool(bridge_on),
+        } if bridge_on else None,
     }
     # Include reverse_bridge only when we have a full bridge, or when reverse is off
     # (explicit null clears it). If rv_on but build failed, omit the key so the agent
@@ -709,6 +859,8 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         out["reverse_bridge"] = reverse_bridge
     elif not rv_on:
         out["reverse_bridge"] = None
+    if tunnel_on:
+        out["tunnel_mode"] = "l2x_udp"
     return out
 
 
@@ -891,12 +1043,14 @@ def apply_health_probe(node: dict, probe: dict) -> list[dict]:
     return events
 
 
-def probe_all_health(nodes: list[dict], *, timeout: int = 5) -> list[dict]:
+def probe_all_health(nodes: list[dict], *, timeout: int = 5, store: dict | None = None) -> list[dict]:
     """Probe enabled nodes; mutate each in place; return combined events."""
     events: list[dict] = []
     for n in nodes or []:
         if not n.get("enabled", True):
             continue
+        if is_tunnel_only_node(n):
+            continue  # health from refresh_tunnel_only_health / tunneld
         if n.get("nat"):
             # Unreachable from master by design — online = recent /agent/pull
             if pull_fresh(n):
@@ -922,6 +1076,8 @@ def probe_all_health(nodes: list[dict], *, timeout: int = 5) -> list[dict]:
             n["xray_version"] = xv.lstrip("vV")
         if "xray_active" in raw:
             n["xray_active"] = bool(raw.get("xray_active"))
+    if store is not None:
+        refresh_tunnel_only_health(store, nodes)
     return events
 
 
@@ -1089,6 +1245,9 @@ def _push_once(node: dict, payload: dict, timeout: int = 60) -> dict:
 
 
 def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") -> dict:
+    if is_tunnel_only_node(node):
+        # Go tunnel-agent has no panel HTTP API — master only wires SOCKS outbound.
+        return {"ok": True, "queued": False, "tunnel_only": True, "warnings": [], "error": ""}
     if node.get("nat"):
         # Node has no open ports — it pulls /agent/pull every ~20s; config is already queued.
         return {"ok": True, "queued": True, "warnings": [], "error": ""}
@@ -1390,12 +1549,13 @@ def provision_via_ssh(
         "as_outbound": bool(as_outbound), "mirror": mirror, "base_path": panel_path, "role": "agent",
         "url": f"https://{domain}", "last_sync": "", "last_error": "", "last_ok": False,
         "nat": bool(nat),
+        "tunnel_mode": "l2x_udp" if nat else "",
     }
     if nat:
-        ensure_reverse(node)
+        pass  # egress via l2x-tunneld SOCKS (tunnel_mode=l2x_udp); no Xray reverse
     else:
         ensure_bridge(node)
-    log: list[str] = [f"provision {name} @ {domain}" + (" [NAT/reverse]" if nat else "")]
+    log: list[str] = [f"provision {name} @ {domain}" + (" [NAT/l2x_udp]" if nat else "")]
 
     try:
         client, fp = _ssh_connect(domain, ssh_user, ssh_password, int(ssh_port or 22))

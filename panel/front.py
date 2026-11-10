@@ -377,6 +377,35 @@ def _panel_locations(store: dict | None = None) -> list[str]:
     else:
         # No secret path yet: only bare / is camouflaged; /login and the rest still reach the panel
         out.append(f"    location / {{\n{proxy}    }}")
+    # L2X Go tunnel camouflage: WSS over :443 (looks like normal web, not VPN UDP)
+    try:
+        import nodes as nodes_mod
+        tun = nodes_mod.ensure_tunnel_settings(store or {})
+        ws_path = str(tun.get("ws_path") or "").strip()
+        ws_listen = str(tun.get("ws_listen") or "127.0.0.1:11081").strip()
+        if ws_path.startswith("/") and ":" in ws_listen:
+            ws_port = ws_listen.rsplit(":", 1)[-1]
+            out.insert(
+                -1 if out else 0,
+                (
+                    f"    location = {ws_path} {{\n"
+                    f"        proxy_pass http://127.0.0.1:{ws_port};\n"
+                    "        proxy_http_version 1.1;\n"
+                    "        proxy_set_header Upgrade $http_upgrade;\n"
+                    "        proxy_set_header Connection $l2x_connection_upgrade;\n"
+                    "        proxy_set_header Host $host;\n"
+                    "        proxy_set_header X-Real-IP $remote_addr;\n"
+                    "        proxy_set_header X-Forwarded-For $remote_addr;\n"
+                    "        proxy_read_timeout 1d;\n"
+                    "        proxy_send_timeout 1d;\n"
+                    "        proxy_buffering off;\n"
+                    "        proxy_request_buffering off;\n"
+                    "        tcp_nodelay on;\n"
+                    "    }"
+                ),
+            )
+    except Exception:
+        pass
     # The only camouflage redirect in the whole config; kept as the last block of the server
     out.append(f"    location = / {{\n        return 302 {CAMOUFLAGE_URL};\n    }}")
     return out
@@ -494,6 +523,44 @@ def render(store: dict) -> tuple[str, str, list[str]]:
             )
         if tls_ports:
             crt, key, _ = cert_for(pub)
+            tunnel_ws = ""
+            try:
+                import nodes as nodes_mod
+                tun = nodes_mod.ensure_tunnel_settings(store)
+                ws_path = str(tun.get("ws_path") or "").strip()
+                ws_listen = str(tun.get("ws_listen") or "127.0.0.1:11081").strip()
+                if ws_path.startswith("/") and ":" in ws_listen:
+                    ws_port = ws_listen.rsplit(":", 1)[-1]
+                    # Prefer these ports for Go tunnel WSS: nginx terminates TLS directly
+                    # (public :443 is Xray RAW + fallbacks — WS upgrade is unreliable there).
+                    # No nginx `if` on Upgrade — it breaks intermittent WSS handshakes.
+                    tunnel_ws = (
+                        f"    location = {ws_path} {{\n"
+                        f"        proxy_pass http://127.0.0.1:{ws_port};\n"
+                        "        proxy_http_version 1.1;\n"
+                        "        proxy_set_header Upgrade $http_upgrade;\n"
+                        "        proxy_set_header Connection $l2x_connection_upgrade;\n"
+                        "        proxy_set_header Host $host;\n"
+                        "        proxy_set_header X-Real-IP $remote_addr;\n"
+                        "        proxy_set_header X-Forwarded-For $remote_addr;\n"
+                        "        proxy_read_timeout 1d;\n"
+                        "        proxy_send_timeout 1d;\n"
+                        "        proxy_buffering off;\n"
+                        "        proxy_request_buffering off;\n"
+                        "        tcp_nodelay on;\n"
+                        "    }\n"
+                        "    location = /l2x-tunnel-agent {\n"
+                        "        default_type application/octet-stream;\n"
+                        "        alias /var/www/l2x-public/l2x-tunnel-agent;\n"
+                        "    }\n"
+                        "    location = /install-l2x-agent.sh {\n"
+                        "        default_type application/octet-stream;\n"
+                        "        alias /var/www/l2x-public/install-l2x-agent.sh;\n"
+                        "    }\n"
+                    )
+                    tun["ws_public_port"] = int(tls_ports[0])
+            except Exception:
+                tunnel_ws = ""
             for port in tls_ports:
                 listen_lines = f"    listen {port} ssl;\n"
                 if _ipv6():
@@ -509,6 +576,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
                     # Plain HTTP on the TLS port → redirect to https on same port
                     "    error_page 497 =301 https://$host:$server_port$request_uri;\n"
                     f"{sub_locs}\n"
+                    f"{tunnel_ws}"
                     "    location / { return 404; }\n"
                     "}"
                 )

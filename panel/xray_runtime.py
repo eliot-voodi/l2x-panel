@@ -416,10 +416,69 @@ def outbound_member_ok(store: dict, tag: str) -> bool:
             continue
         if not o.get("enabled", True):
             return False
+        if o.get("tunnel") or (
+            o.get("kind") == "node" and (o.get("config") or {}).get("protocol") == "socks"
+        ):
+            return _tunnel_outbound_member_ok(store, o)
         if o.get("reverse") or (o.get("kind") == "node" and not (o.get("config") or {})):
             return _reverse_portal_member_ok(store, o)
         return True
     return True
+
+
+def _tunnel_outbound_member_ok(store: dict, outbound: dict) -> bool:
+    """l2x_udp node: live while tunneld reports an online peer.
+
+    Panel pull freshness applies only when the node has an agent token (pull cycle).
+    Tunnel-only agents (SOCKS egress, no panel pull) are gated by tunneld /health.
+    """
+    try:
+        import nodes as nodes_mod
+
+        node = next(
+            (n for n in nodes_mod.ensure_list(store) if n.get("id") == outbound.get("node_id")),
+            None,
+        )
+    except Exception:
+        node = None
+    tunnel_only = False
+    if node:
+        # Pure L2X tunnel agent: no panel token/pull — health is tunneld peer only.
+        try:
+            import nodes as nodes_mod
+            tunnel_only = nodes_mod.is_tunnel_only_node(node)
+        except Exception:
+            tunnel_only = bool(str(node.get("tunnel_mode") or "") == "l2x_udp" and not (node.get("token") or "").strip())
+        if not tunnel_only:
+            if node.get("online") is False:
+                return False
+            try:
+                import nodes as nodes_mod
+                if node.get("nat") and not nodes_mod.pull_fresh(node):
+                    return False
+            except Exception:
+                pass
+    # Best-effort: local tunneld /health (per-agent when multi-peer)
+    try:
+        import json
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:9109/health", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+            if node is not None:
+                try:
+                    import nodes as nodes_mod
+                    ok = nodes_mod.tunnel_agent_online(data, node)
+                except Exception:
+                    ok = bool(data.get("online"))
+            else:
+                ok = bool(data.get("online"))
+            if ok and node is not None and tunnel_only:
+                node["online"] = True
+                node["last_seen"] = node.get("last_seen") or ""
+            return ok
+    except Exception:
+        # If metrics unreachable, keep in pool (avoid emptying balancer on panel restart)
+        return True
 
 
 def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None) -> bool:
@@ -517,8 +576,10 @@ def _custom_outbounds(store: dict) -> list[dict]:
     for o in store.get("outbounds_custom") or []:
         if not o.get("enabled", True):
             continue
-        # Reverse/NAT node outbounds are Xray portals (no dial config)
-        if o.get("reverse") or (o.get("kind") == "node" and not (o.get("config") or {})):
+        # Xray VLESS reverse portals have no dial config (traffic via reverse.tag)
+        if o.get("reverse") and not (o.get("config") or {}):
+            continue
+        if o.get("kind") == "node" and not (o.get("config") or {}) and not o.get("tunnel"):
             continue
         cfg = copy.deepcopy(o.get("config") or {})
         if not cfg:
@@ -531,7 +592,10 @@ def _custom_outbounds(store: dict) -> list[dict]:
 
 
 def reverse_nat_nodes(store: dict) -> list[dict]:
-    """Enabled NAT nodes used as reverse outbounds (portal tags)."""
+    """Enabled NAT nodes used as Xray VLESS reverse outbounds (portal tags).
+
+    Nodes with tunnel_mode=l2x_udp use l2x-tunneld SOCKS instead — excluded here.
+    """
     try:
         import nodes as nodes_mod
         nodes = nodes_mod.ensure_list(store)
@@ -543,6 +607,10 @@ def reverse_nat_nodes(store: dict) -> list[dict]:
             continue
         try:
             import nodes as nodes_mod
+            if nodes_mod.uses_l2x_tunnel(n):
+                continue
+            if not nodes_mod.uses_reverse(n):
+                continue
             nodes_mod.ensure_reverse(n)
         except Exception:
             continue
@@ -720,6 +788,9 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
     # --- Master: shared reverse inbound behind nginx Path ---
     nat_nodes = reverse_nat_nodes(store)
     if not nat_nodes:
+        # Drop stale VLESS reverse inbound when all NAT nodes use l2x_udp / are gone
+        cfg["inbounds"] = [i for i in cfg.get("inbounds") or [] if i.get("tag") != "rv-in"]
+        clear_reverse_front_inbound(store)
         return
     rv = nodes_mod.ensure_reverse_master(store)
     path = rv.get("path") or "/xh-rv"
@@ -773,6 +844,12 @@ def _inject_reverse(store: dict, cfg: dict) -> None:
         pass
 
 
+def clear_reverse_front_inbound(store: dict) -> None:
+    """Remove panel-shaped rv-in when no Xray reverse NAT nodes remain."""
+    panel_ibs = store.get("inbounds") or []
+    store["inbounds"] = [i for i in panel_ibs if i.get("tag") != "rv-in"]
+
+
 def ensure_reverse_front_inbound(store: dict) -> dict | None:
     """Register/update the panel-shaped rv-in inbound so nginx publishes its Path on :443.
 
@@ -784,6 +861,7 @@ def ensure_reverse_front_inbound(store: dict) -> dict | None:
     except Exception:
         return None
     if not reverse_nat_nodes(store):
+        clear_reverse_front_inbound(store)
         return None
     rv = nodes_mod.ensure_reverse_master(store)
     path = rv.get("path") or "/xh-rv"
@@ -1628,18 +1706,18 @@ def build_config(store: dict) -> dict:
         },
         {"tag": "block", "protocol": "blackhole", "settings": {}},
     ]
-    outbounds.extend(_l2tp_outbounds(store))
-    outbounds.extend(_custom_outbounds(store))
-    if fake.get("enabled"):
-        outbounds.append({"tag": "dns-out", "protocol": "dns"})
-
-    # Sync NAT reverse stubs into outbounds_custom before balancer/subscription logic
+    # Sync node_* outbounds (reverse portals / l2x SOCKS) before they enter the config
     try:
         import nodes as nodes_mod
         if nodes_mod.is_master(store):
             nodes_mod.sync_all_node_outbounds(store)
     except Exception:
         pass
+
+    outbounds.extend(_l2tp_outbounds(store))
+    outbounds.extend(_custom_outbounds(store))
+    if fake.get("enabled"):
+        outbounds.append({"tag": "dns-out", "protocol": "dns"})
 
     # Build balancers before rules so we know which tags actually exist on this host
     bals_cfg, observatory, burst = _balancers_cfg(store)
@@ -2000,11 +2078,18 @@ PORTBAN_CHAIN = "L2X_PORTBAN"
 def ban_inbound_ports(store: dict) -> None:
     """Drop incoming non-loopback traffic to every inbound port: clients reach Xray only via nginx :443.
 
+    Direct inbounds (ib.direct) listen publicly on their own port and must stay reachable.
     Ports listed in settings.sub.legacy_ports (e.g. 2096 for old 3x-ui subscription links)
     stay open so nginx can serve plain-HTTP subscription aliases there.
     """
     import front as front_mod
     keep = set(front_mod.legacy_sub_ports(store))
+    # Public direct inbounds (Reality Vision etc.) are not behind nginx — do not DROP them.
+    keep |= {
+        int(ib["port"])
+        for ib in ensure_inbounds(store)
+        if ib.get("enabled", True) and P.is_direct(ib) and int(ib.get("port") or 0) > 0
+    }
     # 2053 always banned; 2096 banned only when not declared as a legacy sub port
     forced = {2053} | ({2096} - keep)
     ports = sorted(({int(ib["port"]) for ib in ensure_inbounds(store)} | forced) - P.RESERVED_PORTS - keep)
@@ -2470,10 +2555,42 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
     import socket
     import time
 
-    # Reverse portal: live only while the NAT node keeps the tunnel up (tracked via pull)
     for o in store.get("outbounds_custom") or []:
         if o.get("tag") != tag:
             continue
+        # L2X Go tunnel: probe via local SOCKS published by l2x-tunneld (not reverse pull).
+        if o.get("tunnel") or (
+            o.get("kind") == "node" and (o.get("config") or {}).get("protocol") == "socks"
+        ):
+            if not _tunnel_outbound_member_ok(store, o):
+                return {"ok": False, "error": "L2X tunnel offline (tunneld peer)", "ms": 0}
+            t0 = time.time()
+            cfg = o.get("config") or {}
+            servers = ((cfg.get("settings") or {}).get("servers") or [{}])
+            host = str((servers[0] or {}).get("address") or "127.0.0.1")
+            try:
+                port = int((servers[0] or {}).get("port") or 11080)
+            except (TypeError, ValueError):
+                port = 11080
+            r = _run(
+                [
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
+                    "--max-time", str(timeout),
+                    "--socks5-hostname", f"{host}:{port}", url,
+                ],
+                timeout=timeout + 5,
+            )
+            parts = (r.get("stdout") or "").strip().split()
+            code = parts[0] if parts else "000"
+            ms = int(float(parts[1]) * 1000) if len(parts) > 1 else int((time.time() - t0) * 1000)
+            ok = code.startswith("2") or code.startswith("3")
+            return {
+                "ok": ok,
+                "code": code,
+                "ms": ms,
+                "error": "" if ok else (r.get("stderr") or f"socks probe http={code}"),
+            }
+        # Reverse portal: live only while the NAT node keeps the tunnel up (tracked via pull)
         if o.get("reverse") or (o.get("kind") == "node" and not (o.get("config") or {})):
             try:
                 import nodes as nodes_mod

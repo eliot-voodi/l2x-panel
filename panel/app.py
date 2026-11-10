@@ -6256,7 +6256,8 @@ def _nodes_health_cycle() -> None:
     snapshot = [dict(n) for n in nodes_mod.ensure_list(store) if n.get("enabled", True)]
     if not snapshot:
         return
-    events = nodes_mod.probe_all_health(snapshot, timeout=5)
+    events = nodes_mod.probe_all_health(snapshot, timeout=5, store=store)
+    nodes_mod.refresh_tunnel_only_health(store, snapshot)
     by_id = {n.get("id"): n for n in snapshot if n.get("id")}
     with mutate() as st:
         for n in nodes_mod.ensure_list(st):
@@ -6266,7 +6267,8 @@ def _nodes_health_cycle() -> None:
             for key in (
                 "online", "fail_streak", "last_seen", "last_probe",
                 "last_probe_error", "panel_version",
-                "xray_version", "xray_active",
+                "xray_version", "xray_active", "last_warning", "last_ok",
+                "tunnel_transport",
             ):
                 if key in src:
                     n[key] = src[key]
@@ -6758,8 +6760,7 @@ async def nodes_add(request: Request):
             node["mirror"] = False
             node["sync_clients"] = False
             node["sync_inbounds"] = False
-            nodes_mod.ensure_reverse_master(store)
-            nodes_mod.ensure_reverse(node)
+            node["tunnel_mode"] = "l2x_udp"
         elif node["as_outbound"]:
             nodes_mod.ensure_bridge(node)
         nodes_mod.ensure_list(store).append(node)
@@ -6840,8 +6841,7 @@ async def nodes_provision(request: Request):
             # replace same domain if re-provisioning
             nodes[:] = [n for n in nodes if (n.get("domain") or "") != node["domain"] and n.get("url") != node["url"]]
             if nat:
-                nodes_mod.ensure_reverse_master(store)
-                nodes_mod.ensure_reverse(node)
+                node["tunnel_mode"] = node.get("tunnel_mode") or "l2x_udp"
             nodes.append(node)
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
@@ -6849,7 +6849,7 @@ async def nodes_provision(request: Request):
             xr = _apply_xray(store)
         log = (res.get("log") or "") + f"\npanel: {res.get('panel_url')}\nadmin pass: {res.get('admin_password')}\n"
         if nat:
-            log += "mode: NAT reverse (нода сама заберёт конфиг с мастера)\n"
+            log += "mode: NAT + l2x_udp (egress через l2x-tunneld SOCKS; нода pull с мастера)\n"
             log += f"queued: {push.get('queued')} xray: {xr.get('ok')}"
         else:
             log += f"sync: {push.get('ok')} {push.get('error') or ''}\nxray: {xr.get('ok')}"
@@ -6867,7 +6867,25 @@ def _node_push_job(node_id: str, label: str, host: str):
         node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
         if not node:
             return {"ok": False, "error": "нода не найдена", "log": ""}
+        nodes_mod.ensure_tunnel_settings(store)
         nodes_mod.upsert_node_outbound(store, node)
+        # Pure Go tunnel agent: no panel pull — just refresh SOCKS outbound + health
+        if nodes_mod.is_tunnel_only_node(node):
+            nodes_mod.refresh_tunnel_only_health(store, [node])
+            name = node.get("name") or node_id
+            online = bool(node.get("online"))
+            node["last_ok"] = online
+            node["last_error"] = "" if online else "tunneld peer offline"
+            node["last_warning"] = ""
+            node["last_sync"] = nodes_mod.now_iso()
+            xr = _apply_xray(store)
+            return {
+                "ok": online and bool(xr.get("ok")),
+                "log": (
+                    f"{label}: L2X WSS tunnel {'online' if online else 'offline'}; "
+                    f"xray={'ok' if xr.get('ok') else xr.get('error')}"
+                ),
+            }
         payload = nodes_mod.build_payload(store, node, xray.build_config)
         node_snap = dict(node)
         name = node.get("name") or node_id
@@ -6899,7 +6917,11 @@ def _node_push_job(node_id: str, label: str, host: str):
             if res.get("queued"):
                 n["last_ok"] = True
                 n["last_error"] = ""
-                n["last_warning"] = "NAT: конфиг в очереди — нода заберёт через /agent/pull"
+                if nodes_mod.is_tunnel_only_node(n):
+                    n["last_warning"] = ""
+                    nodes_mod.refresh_tunnel_only_health(store, [n])
+                else:
+                    n["last_warning"] = "NAT: конфиг в очереди — нода заберёт через /agent/pull"
             else:
                 n["last_ok"] = bool(node_snap.get("last_ok"))
                 n["last_error"] = node_snap.get("last_error") or ""
@@ -7015,7 +7037,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 return go("/nodes")
             if action == "reverse":
                 if node.get("nat"):
-                    flash(request, "Нода за NAT всегда работает через reverse", "info")
+                    flash(request, "Нода за NAT: egress через l2x_udp (не Xray reverse)", "info")
                     return go("/nodes")
                 if not nodes_mod.is_master(store):
                     flash(request, "Только мастер может менять режим outbound", "error")
@@ -7025,18 +7047,17 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 node.pop("reverse_ok", None)
                 if node["rv_mode"]:
                     node["as_outbound"] = True
-                    nodes_mod.ensure_reverse_master(store)
-                    nodes_mod.ensure_reverse(node)
+                    node["tunnel_mode"] = "l2x_udp"
                 else:
+                    node["tunnel_mode"] = ""
                     nodes_mod.ensure_bridge(node)
-                label = f"reverse outbound {'вкл' if node['rv_mode'] else 'выкл'}"
+                label = f"reverse outbound {'вкл' if node['rv_mode'] else 'выкл'} (l2x_udp)"
             elif action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")
                 if node["as_outbound"]:
-                    if nodes_mod.uses_reverse(node):
-                        nodes_mod.ensure_reverse_master(store)
-                        nodes_mod.ensure_reverse(node)
-                    else:
+                    if node.get("nat") or node.get("rv_mode"):
+                        node["tunnel_mode"] = node.get("tunnel_mode") or "l2x_udp"
+                    elif not nodes_mod.uses_l2x_tunnel(node):
                         nodes_mod.ensure_bridge(node)
                 label = f"outbound {'вкл' if node['as_outbound'] else 'выкл'}"
             elif action == "mirror":
