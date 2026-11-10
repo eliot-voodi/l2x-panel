@@ -75,6 +75,8 @@ def default_settings() -> dict:
         "cpu_threshold": 85,
         "report_hours": 24,
         "backup_hours": 24,
+        # unix ts of last successful scheduled TG backup (persisted in store)
+        "last_backup_at": 0,
         # All Bot API traffic (notify + long-poll) via proxy.
         # type: http | socks5 | socks4 | outbound
         # outbound = route through an existing panel outbound (VLESS/Trojan/…) via local Xray SOCKS.
@@ -329,10 +331,12 @@ class Bot:
                 log.warning("sendMessage failed chat=%s: %s", cid, res.get("error") or res.get("description"))
         return ok_any
 
-    def send_document(self, filename: str, blob: bytes, caption: str = "", chat_id: str | int | None = None) -> None:
+    def send_document(self, filename: str, blob: bytes, caption: str = "", chat_id: str | int | None = None) -> bool:
+        """Send a document to admin chat(s). Returns True if at least one delivery succeeded."""
         s = self.get_settings()
         if not s.get("enabled") or not s.get("token"):
-            return
+            return False
+        ok_any = False
         for cid in ([chat_id] if chat_id is not None else (s.get("admin_ids") or [])):
             if cid is None or cid == "":
                 continue
@@ -351,9 +355,21 @@ class Bot:
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             )
             try:
-                self._opener().open(req, timeout=60).read()
+                raw = self._opener().open(req, timeout=120).read()
+                try:
+                    parsed = json.loads(raw.decode("utf-8", "replace") or "{}")
+                except json.JSONDecodeError:
+                    parsed = {}
+                if parsed.get("ok"):
+                    ok_any = True
+                else:
+                    log.warning(
+                        "sendDocument failed chat=%s: %s",
+                        cid, parsed.get("description") or parsed.get("error") or raw[:200],
+                    )
             except Exception as exc:  # noqa: BLE001
-                log.warning("sendDocument failed: %s", exc)
+                log.warning("sendDocument failed chat=%s: %s", cid, exc)
+        return ok_any
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -401,8 +417,13 @@ class Bot:
             if not s.get("enabled") or not s.get("token"):
                 self._stop.wait(5)
                 continue
+            # Scheduled report/CPU still run on master even when command long-poll is off.
+            # (Backup schedule lives in the panel backup loop — write → TG → delete file.)
             if not self.should_poll() or s.get("receive_commands", True) is False:
-                # Standby / agent / explicitly disabled: do not steal getUpdates
+                try:
+                    self._periodic(include_backup=False)
+                except Exception:
+                    log.exception("periodic failed")
                 self._stop.wait(10)
                 continue
             self._ensure_polling_mode()
@@ -426,7 +447,7 @@ class Bot:
                         log.exception("handle failed")
                         self.send(f"Ошибка: {escape(exc)}", chat_id)
             try:
-                self._periodic()
+                self._periodic(include_backup=False)
             except Exception:
                 log.exception("periodic failed")
             if not res.get("ok"):
@@ -438,7 +459,7 @@ class Bot:
                 # Tiny yield so a tight timeout=0 style loop cannot spin CPU
                 self._stop.wait(0.2)
 
-    def _periodic(self) -> None:
+    def _periodic(self, *, include_backup: bool = False) -> None:
         if not self.should_poll():
             return
         s = self.get_settings()
@@ -446,10 +467,16 @@ class Bot:
         if s.get("report_hours") and now - self._last_report >= float(s["report_hours"]) * 3600:
             self._last_report = now
             self.send(self.hooks["report"]())
-        if s.get("backup_hours") and now - self._last_backup >= float(s["backup_hours"]) * 3600:
+        # Scheduled backups are handled by panel `_tg_backup_loop` (disk → TG → delete).
+        # Optional legacy path kept for hooks/tests when include_backup=True.
+        if include_backup and s.get("backup_hours") and now - self._last_backup >= float(s["backup_hours"]) * 3600:
             self._last_backup = now
-            name, blob = self.hooks["backup"]()
-            self.send_document(name, blob, "Автоматический бэкап L2X Panel")
+            hook = self.hooks.get("backup_send") or self.hooks.get("backup")
+            if callable(hook):
+                try:
+                    hook()
+                except Exception:
+                    log.exception("scheduled backup hook failed")
         cpu = self.hooks["cpu"]()
         if s.get("cpu_threshold") and cpu >= float(s["cpu_threshold"]) and now - self._last_cpu_alert > 1800:
             self._last_cpu_alert = now
@@ -558,9 +585,21 @@ class Bot:
         elif cmd == "/tunnels":
             self.send(self.hooks["tunnels"](), chat_id)
         elif cmd == "/backup":
-            name, blob = self.hooks["backup"]()
-            self.send_document(name, blob, "Бэкап L2X Panel", chat_id)
-            self.send("Бэкап отправлен.", chat_id)
+            hook = self.hooks.get("backup_send")
+            if callable(hook):
+                res = hook()
+                if isinstance(res, dict) and res.get("ok"):
+                    self.send(
+                        f"Бэкап отправлен ({escape(res.get('name') or '')}) и удалён с сервера.",
+                        chat_id,
+                    )
+                else:
+                    err = (res or {}).get("error") if isinstance(res, dict) else "ошибка"
+                    self.send(f"Бэкап: {escape(err)}", chat_id)
+            else:
+                name, blob = self.hooks["backup"]()
+                ok = self.send_document(name, blob, "Бэкап L2X Panel", chat_id)
+                self.send("Бэкап отправлен." if ok else "Не удалось отправить бэкап.", chat_id)
         elif cmd == "/restart_xray":
             self.send(self.hooks["restart_xray"](), chat_id)
         else:

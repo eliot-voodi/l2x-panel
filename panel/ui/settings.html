@@ -169,6 +169,7 @@
     <div><label class="f">Отчёт каждые, ч (0 — нет)</label><input name="report_hours" type="number" step="0.5" value="{{ tg.report_hours }}"></div>
     <div><label class="f">Бэкап каждые, ч (0 — нет)</label><input name="backup_hours" type="number" step="0.5" value="{{ tg.backup_hours }}"></div>
   </div>
+  <div class="hint">Автобэкап: zip → Telegram → файл удаляется с сервера. То же расписание на вкладке «Бэкап».</div>
 
   {% set px = tg.proxy if tg.proxy is defined else {} %}
   <h3 class="mt">Прокси для Telegram</h3>
@@ -360,22 +361,50 @@
 {% include "_jobs.html" %}
 
 {% elif tab == 'backup' %}
+{% set tg = s.tg or {} %}
 <div class="grid g2">
   <div class="card">
     <h3>Создать бэкап</h3>
     <div class="small muted">Полный архив: store.json (клиенты, inbounds, outbounds, DNS, DoH/Pi-hole настройки, Telegram…), admin, secret_key, L2TP secrets, TLS-сертификаты (<code>/etc/l2xpanel/certs</code>), каталог DoH/Pi-hole (<code>/opt/l2xpanel/doh</code> — compose, .env, gravity/lists).</div>
     <div class="actions mt">
       <a class="btn" href="{{ bp }}/backup/download">{{ ic.icon('download') }}Скачать .zip</a>
-      <form method="post" action="{{ bp }}/backup/telegram"><button class="btn ghost" {% if not s.tg.enabled %}disabled title="Telegram-бот выключен"{% endif %}>Отправить в Telegram</button></form>
+      <form method="post" action="{{ bp }}/backup/telegram"><button class="btn ghost" {% if not tg.enabled %}disabled title="Telegram-бот выключен"{% endif %}>Отправить в Telegram</button></form>
     </div>
+    <div class="hint mt">При отправке в Telegram файл сначала пишется в <code>/var/lib/l2xpanel/backups/</code>, после успешной доставки — <b>удаляется с сервера</b>.</div>
   </div>
   <form class="card" method="post" action="{{ bp }}/backup/restore" enctype="multipart/form-data" onsubmit="return confirm('Восстановить из бэкапа? Текущие данные будут заменены (копия сохранится).')">
     <h3>Восстановить</h3>
     <input type="file" name="file" accept=".zip" required>
-    <div class="hint">Перед восстановлением создаётся страховочная копия pre-restore-*.zip в каталоге данных.</div>
+    <div class="hint">Перед восстановлением создаётся страховочная копия pre-restore-*.zip в каталоге данных (хранится только последняя).</div>
     <div class="actions mt"><button class="btn danger">Восстановить</button></div>
   </form>
 </div>
+
+<form class="card mt" method="post" action="{{ bp }}/settings/save" style="max-width:640px">
+  <input type="hidden" name="section" value="backup">
+  <h3>Расписание в Telegram</h3>
+  <div class="hint">Только на master. Нужны включённый бот и admin chat id (вкладка Telegram). После каждой успешной отправки zip удаляется с диска.</div>
+  <div class="row" style="align-items:end">
+    <div>
+      <label class="f">Автобэкап каждые, ч (0 — выкл)</label>
+      <input name="backup_hours" type="number" step="0.5" min="0" max="720" value="{{ tg.backup_hours if tg.backup_hours is defined else 24 }}">
+    </div>
+    <div class="actions"><button class="btn">Сохранить</button></div>
+  </div>
+  {% if tg.last_backup_at %}
+  <table class="mt"><tbody>
+    <tr>
+      <td class="dim">Последняя отправка</td>
+      <td class="small">{{ fmt_ts(tg.last_backup_at) }}{% if tg.last_backup_name %} · <code>{{ tg.last_backup_name }}</code>{% endif %}
+        {% if tg.last_backup_ok %}<span class="badge ok">ok</span>{% elif tg.last_backup_ok is sameas false %}<span class="badge err">ошибка</span>{% endif %}
+      </td>
+    </tr>
+    {% if tg.last_backup_error %}<tr><td class="dim">Ошибка</td><td class="small">{{ tg.last_backup_error }}</td></tr>{% endif %}
+  </tbody></table>
+  {% else %}
+  <div class="hint mt">Ещё не отправляли по расписанию.</div>
+  {% endif %}
+</form>
 
 {% elif tab == 'system' %}
 {% set pu = store.get('panel_update_state') if store is defined else {} %}

@@ -850,18 +850,36 @@ def _add_tree_to_zip(z: zipfile.ZipFile, root: Path, prefix: str) -> int:
     return n
 
 
+def backups_dir(data_dir: Path) -> Path:
+    """On-disk staging for Telegram / scheduled backups (deleted after successful send)."""
+    d = Path(data_dir) / "backups"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
 def make_backup(data_dir: Path) -> bytes:
     """Full system backup: panel data + TLS certs + DoH/Pi-hole compose volumes."""
     buf = io.BytesIO()
     counts = {"data": 0, "certs": 0, "doh": 0}
+    staged = Path(data_dir) / "backups"
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(data_dir.rglob("*")):
             if not p.is_file():
                 continue
+            # Skip staged TG backups and restore safety copies (avoid zip-in-zip bloat)
             if p.name in BACKUP_EXCLUDE or p.name.startswith("pre-restore-"):
                 continue
+            try:
+                if staged in p.parents or p.parent == staged:
+                    continue
+            except Exception:
+                pass
             rel = p.relative_to(data_dir).as_posix()
-            if not _safe_zip_name(rel):
+            if not _safe_zip_name(rel) or rel.startswith("backups/"):
                 continue
             z.write(p, rel)
             counts["data"] += 1
@@ -874,6 +892,76 @@ def make_backup(data_dir: Path) -> bytes:
     return buf.getvalue()
 
 
+def write_backup(data_dir: Path, *, name: str = "") -> dict:
+    """Write backup zip under data_dir/backups/. Caller should delete after TG send."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    fname = (name or f"l2xpanel-{stamp}.zip").strip()
+    if not fname.endswith(".zip"):
+        fname += ".zip"
+    fname = Path(fname).name  # no path traversal
+    path = backups_dir(data_dir) / fname
+    try:
+        blob = make_backup(data_dir)
+        path.write_bytes(blob)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return {"ok": True, "path": str(path), "name": fname, "size": len(blob), "bytes": blob}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def delete_backup_file(path: str | Path) -> bool:
+    try:
+        p = Path(path)
+        if p.is_file():
+            p.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def cleanup_staged_backups(data_dir: Path, *, keep_newest: int = 0) -> int:
+    """Remove staged zip files in backups/. keep_newest=0 deletes all."""
+    d = backups_dir(data_dir)
+    files = sorted(
+        (p for p in d.glob("*.zip") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    removed = 0
+    for i, p in enumerate(files):
+        if i < max(0, int(keep_newest or 0)):
+            continue
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def cleanup_pre_restore(data_dir: Path, *, keep_newest: int = 1) -> int:
+    """Drop old pre-restore-*.zip safety copies in the data dir."""
+    files = sorted(
+        (p for p in Path(data_dir).glob("pre-restore-*.zip") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    removed = 0
+    for i, p in enumerate(files):
+        if i < max(0, int(keep_newest or 0)):
+            continue
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def restore_backup(data_dir: Path, blob: bytes) -> dict:
     try:
         z = zipfile.ZipFile(io.BytesIO(blob))
@@ -884,6 +972,7 @@ def restore_backup(data_dir: Path, blob: bytes) -> dict:
         return {"ok": False, "error": "в архиве нет store.json"}
     safety = data_dir / f"pre-restore-{int(time.time())}.zip"
     safety.write_bytes(make_backup(data_dir))
+    cleanup_pre_restore(data_dir, keep_newest=1)
     restored = {"data": 0, "certs": 0, "doh": 0}
     ddir = doh_dir()
     for name in names:

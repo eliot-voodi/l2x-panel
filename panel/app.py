@@ -1194,6 +1194,35 @@ def _tg_backup() -> tuple[str, bytes]:
     return f"l2xpanel-{datetime.now().strftime('%Y%m%d-%H%M')}.zip", ops.make_backup(DATA)
 
 
+def _send_backup_to_telegram(*, caption: str = "Бэкап L2X Panel", scheduled: bool = False) -> dict:
+    """Write backup to disk → send to Telegram admins → delete the file on success."""
+    written = ops.write_backup(DATA)
+    if not written.get("ok"):
+        return {"ok": False, "error": written.get("error") or "write failed"}
+    path = written["path"]
+    name = written["name"]
+    blob = written.get("bytes") or Path(path).read_bytes()
+    try:
+        sent = BOT.send_document(name, blob, caption)
+    except Exception as exc:  # noqa: BLE001
+        ops.delete_backup_file(path)
+        return {"ok": False, "error": str(exc)[:300], "deleted": True}
+    if sent:
+        ops.delete_backup_file(path)
+        ops.cleanup_staged_backups(DATA, keep_newest=0)
+        ops.cleanup_pre_restore(DATA, keep_newest=1)
+        return {
+            "ok": True, "name": name, "size": written.get("size") or len(blob),
+            "deleted": True, "scheduled": scheduled,
+        }
+    # Keep file briefly on failure so admin can download / retry; still prune older leftovers
+    ops.cleanup_staged_backups(DATA, keep_newest=1)
+    return {
+        "ok": False, "error": "Telegram sendDocument failed",
+        "path": path, "name": name, "deleted": False,
+    }
+
+
 def _tg_restart_xray() -> str:
     r = ops.xray_control("restart")
     return "Xray перезапущен" if r["ok"] else f"Ошибка: {r['stderr']}"
@@ -1209,7 +1238,11 @@ def _bot_should_poll() -> bool:
 
 BOT = tgbot.Bot(_bot_settings, {
     "report": _tg_report, "usage": _tg_usage, "online": _tg_online, "clients": _tg_clients,
-    "tunnels": _tg_tunnels, "backup": _tg_backup, "restart_xray": _tg_restart_xray,
+    "tunnels": _tg_tunnels, "backup": _tg_backup,
+    "backup_send": lambda: _send_backup_to_telegram(
+        caption="Автоматический бэкап L2X Panel", scheduled=True,
+    ),
+    "restart_xray": _tg_restart_xray,
     "cpu": sysmon.cpu_percent, "client_by_tg": _tg_client_by_tg,
     "bind_tg": _tg_bind, "unlink_tg": _tg_unlink, "touch_tg_profile": _tg_touch_profile,
 }, should_poll=_bot_should_poll)
@@ -1539,6 +1572,62 @@ def _outbounds_probe_loop() -> None:
         except Exception:
             pass
         if _stop.wait(max(60, OUTBOUND_PROBE_INTERVAL)):
+            return
+
+
+def _tg_backup_cycle() -> None:
+    """Scheduled Telegram backup: write zip → sendDocument → delete from disk."""
+    try:
+        if not nodes_mod.is_master(_load_store()):
+            return
+    except Exception:
+        return
+    s = _bot_settings()
+    try:
+        hours = float(s.get("backup_hours") or 0)
+    except (TypeError, ValueError):
+        hours = 0
+    if hours <= 0 or not s.get("enabled") or not s.get("token"):
+        return
+    if not (s.get("admin_ids") or []):
+        return
+    try:
+        last = float(s.get("last_backup_at") or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if last and time.time() - last < hours * 3600:
+        return
+    res = _send_backup_to_telegram(
+        caption="Автоматический бэкап L2X Panel", scheduled=True,
+    )
+    if res.get("ok"):
+        with mutate() as st:
+            tg = st.setdefault("settings", {}).setdefault("tg", {})
+            tg["last_backup_at"] = time.time()
+            tg["last_backup_name"] = res.get("name") or ""
+            tg["last_backup_ok"] = True
+            tg["last_backup_error"] = ""
+        _refresh_settings_cache()
+    else:
+        with mutate() as st:
+            tg = st.setdefault("settings", {}).setdefault("tg", {})
+            tg["last_backup_ok"] = False
+            tg["last_backup_error"] = str(res.get("error") or "")[:300]
+            # Soft bump so we don't hammer Telegram every minute on persistent failure
+            if not last:
+                tg["last_backup_at"] = time.time() - hours * 3600 + 600
+        _refresh_settings_cache()
+
+
+def _tg_backup_loop() -> None:
+    if _stop.wait(45):
+        return
+    while True:
+        try:
+            _tg_backup_cycle()
+        except Exception:
+            pass
+        if _stop.wait(60):
             return
 
 
@@ -2011,7 +2100,7 @@ def _startup():
         pass
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
                    _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
-                   _agent_pull_loop):
+                   _agent_pull_loop, _tg_backup_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -5639,6 +5728,10 @@ async def settings_save(request: Request):
                 "backup_hours": _float(form.get("backup_hours"), 24),
                 "proxy": proxy,
             })
+        elif section == "backup":
+            # Schedule lives under settings.tg (same field as Telegram tab)
+            tg = s.setdefault("tg", {})
+            tg["backup_hours"] = _float(form.get("backup_hours"), float(tg.get("backup_hours") or 24))
         elif section == "iplimit":
             s["iplimit"]["ban_minutes"] = _int(form.get("ban_minutes"), 30)
     _refresh_settings_cache()
@@ -5834,9 +5927,18 @@ def backup_download(request: Request):
 def backup_telegram(request: Request):
     if redir := _require(request):
         return redir
-    name, blob = _tg_backup()
-    BOT.send_document(name, blob, "Бэкап L2X Panel")
-    flash(request, "Бэкап отправлен в Telegram", "info")
+    res = _send_backup_to_telegram(caption="Бэкап L2X Panel", scheduled=False)
+    if res.get("ok"):
+        with mutate() as st:
+            tg = st.setdefault("settings", {}).setdefault("tg", {})
+            tg["last_backup_at"] = time.time()
+            tg["last_backup_name"] = res.get("name") or ""
+            tg["last_backup_ok"] = True
+            tg["last_backup_error"] = ""
+        _refresh_settings_cache()
+        flash(request, f"Бэкап отправлен в Telegram и удалён с сервера ({res.get('name')})", "info")
+    else:
+        flash(request, f"Бэкап в Telegram: {res.get('error') or 'ошибка'}", "error")
     return go("/settings?tab=backup")
 
 
