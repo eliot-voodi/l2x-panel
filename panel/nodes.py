@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import time
@@ -181,10 +182,190 @@ def ensure_tunnel_settings(store: dict) -> dict:
     tun.setdefault("socks_host", "127.0.0.1")
     tun.setdefault("socks_port", 11080)
     tun.setdefault("ws_listen", "127.0.0.1:11081")
+    tun.setdefault("ws_public_port", 8000)
     if not str(tun.get("ws_path") or "").strip():
         alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         tun["ws_path"] = "/ws-" + "".join(secrets.choice(alphabet) for _ in range(10))
     return tun
+
+
+def tunnel_public_ws_url(store: dict, master_host: str = "") -> str:
+    """Public WSS URL Go tunnel-agents dial (nginx terminates TLS)."""
+    tun = ensure_tunnel_settings(store)
+    host = _normalize_domain(master_host) or next(iter(sorted(master_public_domains(store))), "")
+    if not host:
+        return ""
+    path = str(tun.get("ws_path") or "/ws-l2x-tunnel").strip() or "/ws-l2x-tunnel"
+    if not path.startswith("/"):
+        path = "/" + path
+    try:
+        port = int(tun.get("ws_public_port") or 8000)
+    except (TypeError, ValueError):
+        port = 8000
+    if port in (443, 0):
+        return f"wss://{host}{path}"
+    return f"wss://{host}:{port}{path}"
+
+
+def export_tunnel_bundle() -> dict:
+    """PSK/token (+ listen bits) from local l2x-tunneld config for promote handoff."""
+    out: dict = {}
+    path = Path("/etc/l2x-tunnel/tunneld.yaml")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    import re as _re
+    for key in ("psk", "token", "cipher"):
+        m = _re.search(rf"(?:^|\n)\s*{key}:\s*\"([^\"]+)\"", text)
+        if not m:
+            m = _re.search(rf"(?:^|\n)\s*{key}:\s*'([^']+)'", text)
+        if not m:
+            m = _re.search(rf"(?:^|\n)\s*{key}:\s*(\S+)", text)
+        if m:
+            out[key] = m.group(1).strip()
+    for key in ("socks_listen", "ws_listen", "proxy_listen", "ws_path"):
+        m = _re.search(rf"(?:^|\n)\s*{key}:\s*\"([^\"]+)\"", text)
+        if not m:
+            m = _re.search(rf"(?:^|\n)\s*{key}:\s*'([^']+)'", text)
+        if not m:
+            m = _re.search(rf"(?:^|\n)\s*{key}:\s*(\S+)", text)
+        if m:
+            out[key] = m.group(1).strip().strip('"')
+    return out
+
+
+def render_tunnel_yaml(bundle: dict | None, tun_settings: dict | None = None) -> str:
+    """Render l2x-tunneld.yaml from promote tunnel bundle + settings."""
+    bundle = dict(bundle or {})
+    tun_settings = dict(tun_settings or {})
+    psk = str(bundle.get("psk") or "").strip()
+    token = str(bundle.get("token") or "").strip()
+    if not psk or not token:
+        return ""
+    path = str(tun_settings.get("ws_path") or bundle.get("ws_path") or "/ws-l2x-tunnel").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    socks = str(tun_settings.get("socks_host") or "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        socks_port = int(tun_settings.get("socks_port") or 11080)
+    except (TypeError, ValueError):
+        socks_port = 11080
+    ws_listen = str(tun_settings.get("ws_listen") or bundle.get("ws_listen") or "127.0.0.1:11081").strip()
+    cipher = str(bundle.get("cipher") or "chacha20poly1305").strip() or "chacha20poly1305"
+    return (
+        "role: portal\n"
+        "transport: wss\n"
+        "tunnel:\n"
+        f"  psk: {json.dumps(psk)}\n"
+        f"  token: {json.dumps(token)}\n"
+        "  listen_udp: \"127.0.0.1:0\"\n"
+        "  path_count: 1\n"
+        f"  cipher: {cipher}\n"
+        "  max_streams: 4000\n"
+        f"proxy_listen: {json.dumps(str(bundle.get('proxy_listen') or '127.0.0.1:18080'))}\n"
+        f"socks_listen: {json.dumps(f'{socks}:{socks_port}')}\n"
+        f"ws_listen: {json.dumps(ws_listen)}\n"
+        f"ws_path: {json.dumps(path)}\n"
+        "metrics:\n"
+        "  listen: \"127.0.0.1:9109\"\n"
+    )
+
+
+def apply_tunnel_bundle(bundle: dict | None, tun_settings: dict | None = None) -> dict:
+    """Write /etc/l2x-tunnel/tunneld.yaml essentials on a newly promoted master."""
+    body = render_tunnel_yaml(bundle, tun_settings)
+    if not body:
+        return {"ok": False, "error": "tunnel bundle missing psk/token"}
+    try:
+        Path("/etc/l2x-tunnel").mkdir(parents=True, exist_ok=True)
+        Path("/etc/l2x-tunnel/tunneld.yaml").write_text(body, encoding="utf-8")
+        os.chmod("/etc/l2x-tunnel/tunneld.yaml", 0o600)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        import subprocess
+        subprocess.run(["systemctl", "restart", "l2x-tunneld"], capture_output=True, timeout=30, check=False)
+    except Exception:
+        pass
+    path = str((tun_settings or {}).get("ws_path") or (bundle or {}).get("ws_path") or "")
+    return {"ok": True, "ws_path": path}
+
+
+def retarget_tunnel_agent_ssh(
+    node: dict,
+    *,
+    ws_url: str,
+    psk: str = "",
+    token: str = "",
+    ssh_password: str = "",
+    timeout: int = 60,
+) -> dict:
+    """Point a Go tunnel-only agent at the new master's WSS URL (after promote)."""
+    if not uses_l2x_tunnel(node) or not is_tunnel_only_node(node):
+        return {"ok": False, "error": "not a tunnel-only node", "skipped": True}
+    if not ws_url:
+        return {"ok": False, "error": "ws_url required"}
+    domain = node.get("domain") or ""
+    user = node.get("ssh_user") or "root"
+    port = int(node.get("ssh_port") or 22)
+    if not domain or not ssh_password:
+        return {"ok": False, "error": "нужны domain и SSH-пароль для retarget L2X agent"}
+    aid = tunnel_agent_id(node)
+    try:
+        client, fp = _ssh_connect(
+            domain, user, ssh_password, port,
+            expected_fp=str(node.get("ssh_hostkey_fp") or ""),
+        )
+        if fp:
+            node["ssh_hostkey_fp"] = fp
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"SSH: {exc}"}
+    try:
+        remote = (
+            "import json,re\n"
+            "from pathlib import Path\n"
+            f"ws={ws_url!r}; psk={psk!r}; tok={token!r}; nid={aid!r}\n"
+            "p=Path('/etc/l2x-tunnel/agent.yaml')\n"
+            "text=p.read_text() if p.exists() else ''\n"
+            "if not text.strip():\n"
+            "  text='role: agent\\ntransport: wss\\nws_url: %s\\ntunnel:\\n'"
+            "  '  psk: %s\\n  token: %s\\n  node_id: %s\\n  cipher: chacha20poly1305\\n'"
+            "  '  max_streams: 4000\\nmetrics:\\n  listen: 127.0.0.1:9110\\n' % ("
+            "ws, json.dumps(psk), json.dumps(tok), json.dumps(nid))\n"
+            "else:\n"
+            "  if re.search(r'(?m)^ws_url:\\s*', text):\n"
+            "    text=re.sub(r'(?m)^ws_url:\\s*.*$', 'ws_url: '+ws, text, count=1)\n"
+            "  else:\n"
+            "    text=text.rstrip()+'\\nws_url: '+ws+'\\n'\n"
+            "  if psk and re.search(r'(?m)^\\s*psk:\\s*', text):\n"
+            "    text=re.sub(r'(?m)^(\\s*psk:\\s*).*$', lambda m: m.group(1)+json.dumps(psk), text, count=1)\n"
+            "  if tok and re.search(r'(?m)^\\s*token:\\s*', text):\n"
+            "    text=re.sub(r'(?m)^(\\s*token:\\s*).*$', lambda m: m.group(1)+json.dumps(tok), text, count=1)\n"
+            "p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text); print('retargeted', ws)\n"
+        )
+        sftp = client.open_sftp()
+        with sftp.file("/tmp/l2x_retarget_agent.py", "w") as f:
+            f.write(remote)
+        sftp.close()
+        r = _ssh_run(
+            client,
+            "python3 /tmp/l2x_retarget_agent.py && "
+            "systemctl restart l2x-tunnel-agent 2>/dev/null || true; "
+            "rm -f /tmp/l2x_retarget_agent.py; "
+            "curl -sS --max-time 2 http://127.0.0.1:9110/health || true",
+            timeout=timeout,
+        )
+        out = (r.get("stdout") or "") + (r.get("stderr") or "")
+        ok = "retargeted" in out and bool(r.get("ok", True))
+        return {"ok": ok, "log": out[-800:], "error": "" if ok else (r.get("stderr") or "retarget failed")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def tunnel_socks_addr(store: dict) -> tuple[str, int]:
@@ -832,9 +1013,19 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
                 "dials": int(rv.get("dials") or REVERSE_DIALS_DEFAULT),
             }
 
+    master_url = ""
+    try:
+        import front as front_mod
+        pub = _normalize_domain(front_mod.public_domain(store) or "")
+        if pub:
+            bp = str((((store.get("settings") or {}).get("panel") or {}).get("base_path") or "")).strip().strip("/")
+            master_url = f"https://{pub}/{bp}" if bp else f"https://{pub}"
+    except Exception:
+        pass
     out = {
         "mirror": mirror,
         "nat": nat,
+        "master_url": master_url,
         "clients": (clients if node.get("sync_clients", True) and not nat else []) + bridge_clients,
         "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on else [],
         "outbounds_custom": customs,
@@ -1885,8 +2076,13 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
             "psk": str(sec.get("psk") or ""),
         }
     settings = json.loads(json.dumps(store.get("settings") or {}))
-    # Receiving node will force role=master; don't ship old agent flags as truth
-    settings.pop("nodes", None)
+    # Receiving node will force role=master; don't ship old agent flags as truth.
+    # Keep tunnel block so L2X WSS portal survives promote.
+    nodes_in = settings.pop("nodes", None) or {}
+    tunnel_settings = {}
+    if isinstance(nodes_in, dict) and isinstance(nodes_in.get("tunnel"), dict):
+        tunnel_settings = json.loads(json.dumps(nodes_in.get("tunnel") or {}))
+    tunnel_bundle = export_tunnel_bundle()
     certs = ops_mod.export_certs_bundle()
     doh_bundle = ops_mod.export_doh_bundle()
     return {
@@ -1898,6 +2094,8 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
         "dns": json.loads(json.dumps(store.get("dns") or {})),
         "xray_settings": json.loads(json.dumps(store.get("xray_settings") or {})),
         "settings": settings,
+        "tunnel_settings": tunnel_settings,
+        "tunnel_bundle": tunnel_bundle,
         "ip_bans": json.loads(json.dumps(store.get("ip_bans") or [])),
         "l2tp": l2tp,
         "l2tp_secrets": secrets,
@@ -1908,6 +2106,7 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
         "transferred_l2tp": len(l2tp),
         "transferred_certs": len(certs),
         "transferred_doh_files": len(doh_bundle),
+        "transferred_tunnel": bool(tunnel_bundle.get("psk") and tunnel_bundle.get("token")),
     }
 
 
@@ -1979,6 +2178,8 @@ def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_no
         "dns": snap.get("dns") or {},
         "xray_settings": snap.get("xray_settings") or {},
         "settings": snap.get("settings") or {},
+        "tunnel_settings": snap.get("tunnel_settings") or {},
+        "tunnel_bundle": snap.get("tunnel_bundle") or {},
         "ip_bans": snap.get("ip_bans") or [],
         "certs": snap.get("certs") or [],
         "doh_bundle": snap.get("doh_bundle") or [],
@@ -2226,11 +2427,20 @@ def promote_via_ssh(
             "doh_bundle": master_store_snapshot.get("doh_bundle") or [],
             "l2tp": master_store_snapshot.get("l2tp") or [],
             "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
+            "tunnel_settings": master_store_snapshot.get("tunnel_settings") or {},
             "nodes": [old_master_node],
+            "old_master_domain": old_master_node.get("domain") or "",
         }
         sftp = client.open_sftp()
         with sftp.file("/tmp/l2x_promote.json", "w") as f:
             f.write(json.dumps(snap, ensure_ascii=False))
+        tun_yaml = render_tunnel_yaml(
+            master_store_snapshot.get("tunnel_bundle"),
+            master_store_snapshot.get("tunnel_settings"),
+        )
+        if tun_yaml:
+            with sftp.file("/tmp/l2x_tunneld.yaml", "w") as f:
+                f.write(tun_yaml)
         promote_py = """
 import base64, hashlib, json, os, subprocess
 from pathlib import Path
@@ -2277,9 +2487,26 @@ ns['agent_enabled'] = False
 ns['role'] = 'master'
 ns['mirror'] = False
 ns['runtime_preserve'] = False
+ns.pop('master_pull_url', None)
+ns.pop('pull', None)
+ns.pop('reverse_bridge', None)
+ns.pop('upstream_master_url', None)
+tun = snap.get('tunnel_settings') or {}
+if isinstance(tun, dict) and tun:
+    ns['tunnel'] = tun
 tmp = store_path.with_suffix('.tmp')
 tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2))
 tmp.replace(store_path)
+# Tunnel yaml is uploaded separately to /tmp/l2x_tunneld.yaml by promote_via_ssh
+_ty = Path('/tmp/l2x_tunneld.yaml')
+if _ty.exists():
+    Path('/etc/l2x-tunnel').mkdir(parents=True, exist_ok=True)
+    Path('/etc/l2x-tunnel/tunneld.yaml').write_text(_ty.read_text())
+    try:
+        os.chmod('/etc/l2x-tunnel/tunneld.yaml', 0o600)
+    except OSError:
+        pass
+    print('tunnel_yaml_installed')
 secrets = snap.get('l2tp_secrets') or {}
 if secrets:
     sk = (os.environ.get('SECRET_KEY') or '').strip()

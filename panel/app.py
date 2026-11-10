@@ -2313,8 +2313,28 @@ def health(request: Request):
     except Exception:
         out["xray_version"] = ""
         out["xray_active"] = False
-    if role == "agent" and isinstance(ns.get("reverse_bridge"), dict):
-        out["rv_conns"] = _reverse_conn_count(ns["reverse_bridge"])
+    if role == "agent":
+        # Who this node treats as master (pull / promote redirect / reverse / last push)
+        pull = ns.get("pull") if isinstance(ns.get("pull"), dict) else {}
+        master_url = (
+            str(pull.get("master_url") or "").rstrip("/")
+            or str(ns.get("master_pull_url") or "").rstrip("/")
+            or str(ns.get("upstream_master_url") or "").rstrip("/")
+        )
+        rb = ns.get("reverse_bridge") if isinstance(ns.get("reverse_bridge"), dict) else {}
+        master_host = str(rb.get("master_host") or "")
+        if not master_host and master_url:
+            try:
+                from urllib.parse import urlparse
+                master_host = (urlparse(master_url).hostname or "") or ""
+            except Exception:
+                master_host = ""
+        if master_url:
+            out["master_url"] = master_url
+        if master_host:
+            out["master_host"] = master_host
+        if rb:
+            out["rv_conns"] = _reverse_conn_count(rb)
     return out
 
 
@@ -7224,8 +7244,35 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 ns["runtime_preserve"] = True
                 # NAT agents still poll us — /agent/pull forwards them here
                 ns["master_pull_url"] = nodes_mod.node_pull_base(node_copy)
+                ns["upstream_master_url"] = nodes_mod.node_pull_base(node_copy)
                 nodes_mod.agent_token(st)
-                st["nodes"] = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
+                remaining = [n for n in nodes_mod.ensure_list(st) if n.get("id") != node_copy.get("id")]
+                st["nodes"] = remaining
+            # 4) L2X Go agents do not use /agent/pull — they keep dialing the old WSS until
+            # agent.yaml ws_url is updated (retarget_tunnel_agent_ssh with THAT node's SSH).
+            new_host = nodes_mod.node_public_domain(node_copy) or str(node_copy.get("domain") or "")
+            ws_url = ""
+            try:
+                fake = {
+                    "settings": {
+                        "nodes": {"tunnel": snap.get("tunnel_settings") or {}},
+                        "panel": {"public_host": new_host},
+                    }
+                }
+                ws_url = nodes_mod.tunnel_public_ws_url(fake, new_host)
+            except Exception:
+                ws_url = ""
+            retarget_logs = []
+            for n in remaining:
+                if not (nodes_mod.uses_l2x_tunnel(n) and nodes_mod.is_tunnel_only_node(n)):
+                    continue
+                tip = ws_url or f"wss://{new_host}:8000/…"
+                msg = (
+                    f"l2x-retarget REQUIRED for {n.get('name')}: "
+                    f"set ws_url={tip} in /etc/l2x-tunnel/agent.yaml and restart l2x-tunnel-agent"
+                )
+                retarget_logs.append(msg)
+                log_lines.append(msg)
             via = "API" if use_api else "SSH"
             _tg_admin(
                 f"✅ Promote → <b>{tgbot.escape(name)}</b> OK ({via}). "
@@ -7242,8 +7289,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 + f" перенесено custom={n_custom}, l2tp={n_l2tp}"
                 + f", certs={int(snap.get('transferred_certs') or 0)}"
                 + f", doh_files={int(snap.get('transferred_doh_files') or 0)}"
+                + f", tunnel={bool(snap.get('transferred_tunnel'))}"
                 + " (туннели disconnected — Connect на новом master; settings/DoH/Pi-hole включены)."
-                + "\nСтарый master стал agent с runtime_preserve (трафик не срезается).",
+                + "\nСтарый master стал agent с runtime_preserve (трафик не срезается)."
+                + ("\n" + "\n".join(retarget_logs) if retarget_logs else ""),
             }
 
         NODES_JOB["id"] = ops.start_job("node-promote", job)
@@ -7849,11 +7898,20 @@ async def agent_promote(request: Request):
             ns.pop("master_pull_url", None)
             ns.pop("pull", None)
             ns.pop("reverse_bridge", None)
+            ns.pop("upstream_master_url", None)
+            tun = payload.get("tunnel_settings")
+            if isinstance(tun, dict) and tun:
+                ns["tunnel"] = tun
         # Re-encrypt L2TP secrets with this host's SECRET_KEY (plaintext over agent TLS + Bearer)
         for tname, sec in (payload.get("l2tp_secrets") or {}).items():
             if not tname or not isinstance(sec, dict):
                 continue
             _save_l2tp_secrets(str(tname), str(sec.get("password") or ""), str(sec.get("psk") or ""))
+        if payload.get("tunnel_bundle"):
+            try:
+                nodes_mod.apply_tunnel_bundle(payload.get("tunnel_bundle"), payload.get("tunnel_settings"))
+            except Exception:
+                pass
         n_certs = ops.import_certs_bundle(payload.get("certs") or [])
         # Write DoH files now; recreate container in background (docker pull/up can exceed proxy timeouts)
         doh_res = ops.import_doh_bundle(payload.get("doh_bundle") or [], recreate=False)
@@ -7955,6 +8013,12 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
             ns["role"] = "agent"
         ns["mirror"] = mirror
         ns["runtime_preserve"] = False
+        master_url = str(payload.get("master_url") or "").rstrip("/")
+        if master_url:
+            ns["upstream_master_url"] = master_url
+            # Mirror/public agents keep an explicit pointer even without NAT pull cycle
+            if not isinstance(ns.get("pull"), dict):
+                ns["master_pull_url"] = master_url
         masters = payload.get("masters")
         if isinstance(masters, list) and isinstance(ns.get("pull"), dict):
             ns["pull"]["fallbacks"] = [str(m).rstrip("/") for m in masters if m][:8]
