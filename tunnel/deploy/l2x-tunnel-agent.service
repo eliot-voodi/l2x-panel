@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
+# Belt-and-suspenders: apply even if an older agent binary lacks netperf.Apply()
+ExecStartPre=-/sbin/modprobe tcp_bbr
+ExecStartPre=-/bin/bash -c 'command -v sysctl >/dev/null && sysctl -e -p /etc/sysctl.d/99-l2xpanel-perf.conf || true'
 ExecStart=/usr/local/bin/l2x-tunnel-agent -config /etc/l2x-tunnel/agent.yaml
 Restart=always
 RestartSec=2

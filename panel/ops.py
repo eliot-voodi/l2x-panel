@@ -610,18 +610,83 @@ def tail(path: str, lines: int = 300) -> str:
 # ---------------------------------------------------------------- BBR
 
 PERF_SYSCTL_PATH = Path("/etc/sysctl.d/99-l2xpanel-perf.conf")
-PERF_SYSCTL_BODY = (
-    "# managed by l2x-panel — TCP throughput (BBR + larger buffers)\n"
-    "net.core.default_qdisc = fq\n"
-    "net.ipv4.tcp_congestion_control = bbr\n"
-    "net.core.rmem_max = 16777216\n"
-    "net.core.wmem_max = 16777216\n"
-    "net.ipv4.tcp_rmem = 4096 87380 16777216\n"
-    "net.ipv4.tcp_wmem = 4096 65536 16777216\n"
-    "net.ipv4.tcp_fastopen = 3\n"
-    "net.ipv4.tcp_slow_start_after_idle = 0\n"
-    "net.ipv4.tcp_mtu_probing = 1\n"
-)
+PERF_MODULES_PATH = Path("/etc/modules-load.d/l2x-perf.conf")
+PERF_EPHEMERAL_LOW = 10240
+# Keep in sync with tunnel/internal/netperf (Go agents on hosts without the panel).
+PERF_FIXED_RESERVED = (11080, 11081, 18080, 19100)
+
+
+def _mem_total_mb() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 1024
+
+
+def _listening_ports(min_port: int) -> set[int]:
+    ports: set[int] = set()
+    for name, listen_state in (("tcp", "0A"), ("tcp6", "0A"), ("udp", "07"), ("udp6", "07")):
+        try:
+            lines = Path(f"/proc/net/{name}").read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4 or parts[3] != listen_state:
+                continue
+            try:
+                port = int(parts[1].rsplit(":", 1)[1], 16)
+            except (ValueError, IndexError):
+                continue
+            if port >= min_port:
+                ports.add(port)
+    return ports
+
+
+def perf_sysctl_body(mem_mb: int | None = None, reserved: set[int] | None = None) -> str:
+    mem = _mem_total_mb() if mem_mb is None else mem_mb
+    if mem >= 3500:
+        buf, ct = 67108864, 1048576
+    elif mem >= 1800:
+        buf, ct = 33554432, 524288
+    else:
+        buf, ct = 16777216, 262144
+    if reserved is None:
+        reserved = set(PERF_FIXED_RESERVED) | _listening_ports(PERF_EPHEMERAL_LOW)
+    res = ",".join(str(p) for p in sorted(reserved))
+    lines = [
+        f"# managed by l2x-panel — network perf (RAM {mem} MB)",
+        "net.core.default_qdisc = fq",
+        "net.ipv4.tcp_congestion_control = bbr",
+        f"net.core.rmem_max = {buf}",
+        f"net.core.wmem_max = {buf}",
+        "net.core.rmem_default = 1048576",
+        "net.core.wmem_default = 1048576",
+        f"net.ipv4.tcp_rmem = 4096 131072 {buf}",
+        f"net.ipv4.tcp_wmem = 4096 65536 {buf}",
+        "net.ipv4.udp_rmem_min = 16384",
+        "net.ipv4.udp_wmem_min = 16384",
+        "net.core.netdev_max_backlog = 16384",
+        "net.core.somaxconn = 65535",
+        "net.ipv4.tcp_max_syn_backlog = 65535",
+        f"net.ipv4.ip_local_port_range = {PERF_EPHEMERAL_LOW} 65535",
+    ]
+    if res:
+        lines.append(f"net.ipv4.ip_local_reserved_ports = {res}")
+    lines += [
+        "net.ipv4.tcp_notsent_lowat = 16384",
+        "net.ipv4.tcp_fastopen = 3",
+        "net.ipv4.tcp_slow_start_after_idle = 0",
+        "net.ipv4.tcp_mtu_probing = 1",
+        f"-net.netfilter.nf_conntrack_max = {ct}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+PERF_SYSCTL_BODY = perf_sysctl_body(mem_mb=1024, reserved=set(PERF_FIXED_RESERVED))
 
 
 def bbr_status() -> dict:
@@ -635,31 +700,39 @@ def bbr_set(enable: bool) -> dict:
     if enable:
         conf.write_text("net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n")
         try:
-            PERF_SYSCTL_PATH.write_text(PERF_SYSCTL_BODY, encoding="utf-8")
+            PERF_SYSCTL_PATH.write_text(perf_sysctl_body(), encoding="utf-8")
         except OSError:
             pass
     else:
         conf.write_text("net.core.default_qdisc=fq_codel\nnet.ipv4.tcp_congestion_control=cubic\n")
     r = _run(["sysctl", "-p", str(conf)])
     if enable and PERF_SYSCTL_PATH.is_file():
-        _run(["sysctl", "-p", str(PERF_SYSCTL_PATH)])
+        _run(["sysctl", "-e", "-p", str(PERF_SYSCTL_PATH)])
     return {"ok": r["ok"], **bbr_status(), "error": r["stderr"]}
 
 
 def ensure_network_perf() -> dict:
-    """Idempotent: enable BBR + TCP buffer sysctls (fixes slow upload on high-RTT paths)."""
+    """Idempotent: BBR, buffers, backlog and ephemeral-port sysctls sized by RAM."""
+    body = perf_sysctl_body()
     try:
         cur = (PERF_SYSCTL_PATH.read_text(encoding="utf-8") if PERF_SYSCTL_PATH.is_file() else "")
     except OSError:
         cur = ""
     wrote = False
-    if cur.strip() != PERF_SYSCTL_BODY.strip():
+    if cur.strip() != body.strip():
         try:
-            PERF_SYSCTL_PATH.write_text(PERF_SYSCTL_BODY, encoding="utf-8")
+            PERF_SYSCTL_PATH.write_text(body, encoding="utf-8")
             wrote = True
         except OSError as exc:
             return {"ok": False, "error": str(exc), **bbr_status()}
-    r = _run(["sysctl", "-p", str(PERF_SYSCTL_PATH)])
+    try:
+        if not PERF_MODULES_PATH.is_file():
+            PERF_MODULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PERF_MODULES_PATH.write_text("tcp_bbr\n", encoding="utf-8")
+    except OSError:
+        pass
+    _run(["modprobe", "tcp_bbr"])
+    r = _run(["sysctl", "-e", "-p", str(PERF_SYSCTL_PATH)])
     st = bbr_status()
     return {"ok": r["ok"] and st.get("enabled"), "wrote": wrote, "error": "" if r["ok"] else (r["stderr"] or "sysctl"), **st}
 

@@ -332,7 +332,7 @@ def retarget_tunnel_agent_ssh(
         return {"ok": False, "error": f"SSH: {exc}"}
     try:
         remote = (
-            "import json,re\n"
+            "import json,re,subprocess\n"
             "from pathlib import Path\n"
             f"ws={ws_url!r}; psk={psk!r}; tok={token!r}; nid={aid!r}\n"
             "p=Path('/etc/l2x-tunnel/agent.yaml')\n"
@@ -352,6 +352,34 @@ def retarget_tunnel_agent_ssh(
             "  if tok and re.search(r'(?m)^\\s*token:\\s*', text):\n"
             "    text=re.sub(r'(?m)^(\\s*token:\\s*).*$', lambda m: m.group(1)+json.dumps(tok), text, count=1)\n"
             "p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text); print('retargeted', ws)\n"
+            "# network perf even when agent binary is older than netperf.Apply()\n"
+            "mem=1024\n"
+            "try:\n"
+            "  for line in Path('/proc/meminfo').read_text().splitlines():\n"
+            "    if line.startswith('MemTotal:'): mem=int(line.split()[1])//1024; break\n"
+            "except Exception: pass\n"
+            "buf,ct=(67108864,1048576) if mem>=3500 else ((33554432,524288) if mem>=1800 else (16777216,262144))\n"
+            "body=('\\n'.join([\n"
+            "  f'# managed by l2x-panel retarget — network perf (RAM {mem} MB)',\n"
+            "  'net.core.default_qdisc = fq','net.ipv4.tcp_congestion_control = bbr',\n"
+            "  f'net.core.rmem_max = {buf}',f'net.core.wmem_max = {buf}',\n"
+            "  'net.core.rmem_default = 1048576','net.core.wmem_default = 1048576',\n"
+            "  f'net.ipv4.tcp_rmem = 4096 131072 {buf}',f'net.ipv4.tcp_wmem = 4096 65536 {buf}',\n"
+            "  'net.ipv4.udp_rmem_min = 16384','net.ipv4.udp_wmem_min = 16384',\n"
+            "  'net.core.netdev_max_backlog = 16384','net.core.somaxconn = 65535',\n"
+            "  'net.ipv4.tcp_max_syn_backlog = 65535','net.ipv4.ip_local_port_range = 10240 65535',\n"
+            "  'net.ipv4.ip_local_reserved_ports = 11080,11081,18080,19100',\n"
+            "  'net.ipv4.tcp_notsent_lowat = 16384','net.ipv4.tcp_fastopen = 3',\n"
+            "  'net.ipv4.tcp_slow_start_after_idle = 0','net.ipv4.tcp_mtu_probing = 1',\n"
+            "  f'-net.netfilter.nf_conntrack_max = {ct}',\n"
+            "])+ '\\n')\n"
+            "Path('/etc/sysctl.d').mkdir(parents=True, exist_ok=True)\n"
+            "Path('/etc/sysctl.d/99-l2xpanel-perf.conf').write_text(body)\n"
+            "Path('/etc/modules-load.d').mkdir(parents=True, exist_ok=True)\n"
+            "Path('/etc/modules-load.d/l2x-perf.conf').write_text('tcp_bbr\\n')\n"
+            "subprocess.run(['modprobe','tcp_bbr'], capture_output=True)\n"
+            "subprocess.run(['sysctl','-e','-p','/etc/sysctl.d/99-l2xpanel-perf.conf'], capture_output=True)\n"
+            "print('netperf applied', mem)\n"
         )
         sftp = client.open_sftp()
         with sftp.file("/tmp/l2x_retarget_agent.py", "w") as f:

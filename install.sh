@@ -491,9 +491,12 @@ backup_unmanaged() {
 install_system() {
   step "Системная настройка"
   install -m 644 "$SRC/deploy/sysctl.conf" /etc/sysctl.d/99-l2xpanel.conf
-  sysctl -q -p /etc/sysctl.d/99-l2xpanel.conf >/dev/null || true
+  # -e: skip unknown keys (e.g. nf_conntrack when module not loaded yet)
+  sysctl -e -p /etc/sysctl.d/99-l2xpanel.conf >/dev/null || true
   install -m 644 "$SRC/deploy/modules.conf" /etc/modules-load.d/l2xpanel.conf
+  printf 'tcp_bbr\n' > /etc/modules-load.d/l2x-perf.conf
   while read -r mod; do modprobe "$mod" 2>/dev/null || true; done < "$SRC/deploy/modules.conf"
+  modprobe tcp_bbr 2>/dev/null || true
 
   backup_unmanaged /etc/ipsec.conf
   install -m 644 "$SRC/deploy/ipsec.conf" /etc/ipsec.conf

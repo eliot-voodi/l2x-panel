@@ -28,5 +28,10 @@ if [[ ! -f "$CFG_DIR/agent.yaml" ]]; then
 fi
 cp deploy/l2x-tunneld.service /etc/systemd/system/
 cp deploy/l2x-tunnel-agent.service /etc/systemd/system/
+install -m 644 deploy/sysctl-perf.conf /etc/sysctl.d/99-l2xpanel-perf.conf
+install -d /etc/modules-load.d
+printf 'tcp_bbr\n' > /etc/modules-load.d/l2x-perf.conf
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -e -p /etc/sysctl.d/99-l2xpanel-perf.conf >/dev/null || true
 systemctl daemon-reload
 echo "[l2x-tunnel] binaries in $PREFIX/bin — edit $CFG_DIR then: systemctl enable --now l2x-tunneld l2x-tunnel-agent"

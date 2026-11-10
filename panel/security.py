@@ -187,7 +187,7 @@ MANAGE_READ = frozenset({
 # Mutating ops OK on agents; blocked on master unless allow_master_manage
 MANAGE_WRITE = frozenset({
     "restart_xray", "update_xray", "rollback_xray", "apply_xray", "l2tp_connect", "l2tp_disconnect",
-    "select_best_l2tp", "save_panel", "enable_agent", "node_diag",
+    "select_best_l2tp", "save_panel", "enable_agent", "node_diag", "ensure_network_perf",
 })
 # High-impact: need confirm + blocked on master by default
 MANAGE_ADMIN = frozenset({

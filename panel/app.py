@@ -7833,6 +7833,9 @@ def _manage_action(action: str, payload: dict) -> dict:
         xr = _apply_xray(_load_store())
         return {"ok": bool(xr.get("ok")), "error": xr.get("error") or "", "role": "master"}
 
+    if action == "ensure_network_perf":
+        return ops.ensure_network_perf()
+
     if action == "restart_panel":
         # Delayed restart so the HTTP response can leave
         def _restart():

@@ -95,9 +95,16 @@ metrics:
         (r"C:\temp\l2x-panel\tunnel\deploy\l2x-tunnel-agent.service", "l2x-tunnel-agent.service"),
     ):
         sftp.put(unit, f"/etc/systemd/system/{name}")
+    sftp.put(
+        r"C:\temp\l2x-panel\tunnel\deploy\sysctl-perf.conf",
+        "/etc/sysctl.d/99-l2xpanel-perf.conf",
+    )
 
     # firewall UDP 4443 if ufw exists
     run(c, "command -v ufw >/dev/null && ufw allow 4443/udp || true", check=False)
+    run(c, "mkdir -p /etc/modules-load.d && printf 'tcp_bbr\\n' > /etc/modules-load.d/l2x-perf.conf")
+    run(c, "modprobe tcp_bbr 2>/dev/null || true", check=False)
+    run(c, "sysctl -e -p /etc/sysctl.d/99-l2xpanel-perf.conf >/dev/null || true", check=False)
     run(c, "systemctl daemon-reload")
     run(c, "systemctl enable --now l2x-tunneld l2x-tunnel-agent")
     time.sleep(2)

@@ -14,12 +14,17 @@ import (
 	"github.com/eliot-voodi/l2x-panel/tunnel/internal/config"
 	"github.com/eliot-voodi/l2x-panel/tunnel/internal/crypto"
 	"github.com/eliot-voodi/l2x-panel/tunnel/internal/engine"
+	"github.com/eliot-voodi/l2x-panel/tunnel/internal/netperf"
 	"github.com/eliot-voodi/l2x-panel/tunnel/internal/pool"
 )
 
 func main() {
 	cfgPath := flag.String("config", "/etc/l2x-tunnel/agent.yaml", "config path")
 	flag.Parse()
+
+	if err := netperf.Apply(); err != nil {
+		log.Printf("netperf: %v", err)
+	}
 
 	cfg, err := config.Load(*cfgPath, "agent")
 	if err != nil {
