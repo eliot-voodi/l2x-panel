@@ -970,16 +970,18 @@ def outbound_label(store: dict, tag: str) -> str:
 def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = None) -> dict:
     """Map a logical tag to a routing target.
 
-    Balancers are only referenced when they have live members (and thus appear in
-    the config with observatory). Otherwise use the balancer's fallback outbound
-    (``direct`` by default, ``block`` when fallback is ``none``).
+    Balancers are only referenced when they have *healthy* members (same gate as
+    ``_balancers_cfg`` / observatory). Using the unfiltered member list here caused
+    ``balancer lb_* not found`` on mirrors/agents where every member failed health.
+    Otherwise use the balancer's fallback outbound (``direct`` by default, ``block``
+    when fallback is ``none``).
     """
     tag = (tag or "direct").strip() or "direct"
     if _is_balancer_target(store, tag):
         for b in ensure_balancers(store).values():
             if b.get("tag") != tag or not b.get("enabled", True):
                 continue
-            if balancer_member_tags(store, b):
+            if balancer_member_tags(store, b, healthy_only=True):
                 return {"balancerTag": tag}
             return {"outboundTag": balancer_fallback_tag(b)}
         return {"outboundTag": "direct"}

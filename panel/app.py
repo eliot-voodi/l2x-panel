@@ -6096,6 +6096,10 @@ def enqueue_outdated_nodes(*, master_ver: str) -> dict:
     for n in nodes_mod.ensure_list(store):
         if not n.get("enabled", True):
             continue
+        # Go tunnel-only agents have no panel /agent/pull — skip NAT update queue.
+        if nodes_mod.is_tunnel_only_node(n):
+            skipped += 1
+            continue
         nv = str(n.get("panel_version") or "").lstrip("vV")
         if nv and mv and nv == mv:
             skipped += 1
@@ -6120,6 +6124,24 @@ def _run_one_node_update(item: dict) -> dict:
     name = node.get("name") or item.get("name") or node_id[:8]
     node_copy = dict(node)
     before = str(node_copy.get("panel_version") or "")
+
+    # Pure Go L2X agent: no panel binary / no /agent/pull — cannot NAT-update.
+    if nodes_mod.is_tunnel_only_node(node_copy):
+        with mutate() as st:
+            for n in nodes_mod.ensure_list(st):
+                if n.get("id") != node_id:
+                    continue
+                n.pop("update_requested", None)
+                n["update_queue_status"] = "ok"
+                n["last_error"] = ""
+                n["last_warning"] = "L2X tunnel-agent: панель не обновляется через NAT pull (бинарь отдельно)"
+                n["panel_version"] = n.get("panel_version") or "l2x-tunnel-agent"
+                nodes_mod.refresh_tunnel_only_health(st, [n])
+                break
+        return {
+            "ok": True, "error": "", "version": before or "l2x-tunnel-agent",
+            "name": name, "before": before, "skipped": True, "tunnel_only": True,
+        }
 
     if node_copy.get("nat"):
         with mutate() as st:
@@ -7126,6 +7148,24 @@ async def nodes_action(node_id: str, action: str, request: Request):
         node = next((n for n in nodes_mod.ensure_list(store) if n["id"] == node_id), None)
         if not node:
             flash(request, "Нода не найдена", "error")
+            return go("/nodes")
+        if nodes_mod.is_tunnel_only_node(node):
+            with mutate() as st:
+                for n in nodes_mod.ensure_list(st):
+                    if n.get("id") != node_id:
+                        continue
+                    n.pop("update_requested", None)
+                    n["update_queue_status"] = "ok"
+                    n["last_error"] = ""
+                    n["last_warning"] = "L2X tunnel-agent обновляется бинарём, не через NAT pull"
+                    nodes_mod.refresh_tunnel_only_health(st, [n])
+                    break
+            flash(
+                request,
+                f"{node.get('name')}: это Go L2X agent — нет panel pull. "
+                "Обновите l2x-tunnel-agent с GitHub release, не кнопкой «Обновить».",
+                "info",
+            )
             return go("/nodes")
         ssh_password = str(form.get("password") or "")
         via = "NAT-pull" if node.get("nat") else ("SSH" if ssh_password else "agent")
