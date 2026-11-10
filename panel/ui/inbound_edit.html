@@ -53,6 +53,11 @@
     </select>
     <div class="hint">Для vless/vmess/trojan/ss — только если у клиента не задан свой outbound. Для socks/http/dokodemo/wireguard — весь трафик inbound.</div>
     <div class="mt">{{ m.check('enabled', ib.enabled, t('Включён')) }}</div>
+    <div class="mt flex gap" style="flex-wrap:wrap;align-items:center">
+      <button type="button" class="btn sm" id="btn_max_speed">Профиль: макс. скорость</button>
+      {% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}
+    </div>
+    <div class="hint">VLESS + raw/TCP + REALITY + Vision, порт напрямую, TFO + BBR, без Mux/XHTTP. Это максимальная скорость клиента (как inbound <code>speed</code>).</div>
   </div>
 
   <div class="card">
@@ -471,6 +476,23 @@
     else if (dec !== 'none' || enc !== 'none') sel.value = (dec.indexOf('x25519') >= 0 || enc.length > 20) ? 'x25519' : 'custom';
   }
   ['protocol', 'network', 'security'].forEach(function (id) { document.getElementById(id).addEventListener('change', sync); });
+  document.getElementById('btn_max_speed').addEventListener('click', function () {
+    document.getElementById('protocol').value = 'vless';
+    document.getElementById('ib_direct').checked = true;
+    var net = document.getElementById('network'); if (net) net.value = 'raw';
+    var sec = document.getElementById('security'); if (sec) sec.value = 'reality';
+    var flow = document.querySelector('select[name="flow"]'); if (flow) flow.value = 'xtls-rprx-vision';
+    var dec = document.getElementById('vless_decryption'); if (dec) dec.value = 'none';
+    var enc = document.getElementById('vless_encryption'); if (enc) enc.value = 'none';
+    var auth = document.getElementById('vless_auth'); if (auth) auth.value = 'none';
+    var sockOn = document.querySelector('input[name="sockopt_on"]'); if (sockOn) sockOn.checked = true;
+    var tfo = document.querySelector('input[name="so_tfo"]'); if (tfo) tfo.checked = true;
+    var nd = document.querySelector('input[name="so_nodelay"]'); if (nd) nd.checked = true;
+    var cong = document.querySelector('select[name="so_cong"]'); if (cong) cong.value = 'bbr';
+    var rawH = document.querySelector('select[name="raw_header"]'); if (rawH) rawH.value = 'none';
+    var out = document.querySelector('select[name="outbound"]'); if (out) out.value = 'direct';
+    sync();
+  });
   sync();
 
   function getJson(url) {

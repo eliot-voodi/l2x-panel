@@ -169,12 +169,13 @@ def default_stream(security: str = "reality") -> dict:
             "read_buffer": 2, "write_buffer": 2,
         },
         "sockopt": {
-            "enabled": False,
-            "tcp_fast_open": False,
+            # Reality/raw defaults lean toward line-rate (TFO + BBR + nodelay)
+            "enabled": security == "reality",
+            "tcp_fast_open": security == "reality",
             "tcp_keep_alive_interval": 0,
             "tcp_keep_alive_idle": 0,
             "tcp_user_timeout": 0,
-            "tcp_congestion": "",
+            "tcp_congestion": "bbr" if security == "reality" else "",
             "tcp_window_clamp": 0,
             "tcp_max_seg": 0,
             "mark": 0,
@@ -184,10 +185,59 @@ def default_stream(security: str = "reality") -> dict:
             "interface": "",
             "penetrate": False,
             "tcp_mptcp": False,
-            "tcp_no_delay": False,
+            "tcp_no_delay": security == "reality",
             "v6only": False,
         },
     }
+
+
+def is_max_speed_inbound(ib: dict | None) -> bool:
+    """True when inbound matches the line-rate recipe: VLESS + raw + Reality + Vision."""
+    if not isinstance(ib, dict) or (ib.get("protocol") or "") != "vless":
+        return False
+    st = ib.get("stream") or {}
+    s = ib.get("settings") or {}
+    so = st.get("sockopt") or {}
+    if (st.get("network") or "raw") != "raw":
+        return False
+    if (st.get("security") or "") != "reality":
+        return False
+    if (s.get("flow") or "") != "xtls-rprx-vision":
+        return False
+    enc = (s.get("encryption") or "none").strip() or "none"
+    if enc != "none":
+        return False
+    return True
+
+
+def apply_max_speed_profile(ib: dict) -> dict:
+    """Mutate inbound to the max-throughput profile (does not touch Reality keys)."""
+    ensure_inbound_shape(ib)
+    ib["protocol"] = "vless"
+    ib["direct"] = True
+    ib["listen"] = inbound_listen(ib)
+    s = ib.setdefault("settings", {})
+    s["flow"] = "xtls-rprx-vision"
+    s["decryption"] = "none"
+    s["encryption"] = "none"
+    st = ib.setdefault("stream", {})
+    st["network"] = "raw"
+    st["security"] = "reality"
+    st["fingerprint"] = st.get("fingerprint") or "firefox"
+    raw = st.setdefault("raw", {})
+    raw["header"] = "none"
+    so = st.setdefault("sockopt", {})
+    so.update({
+        "enabled": True,
+        "tcp_fast_open": True,
+        "tcp_congestion": "bbr",
+        "tcp_no_delay": True,
+    })
+    sniff = ib.setdefault("sniffing", {})
+    sniff.setdefault("enabled", True)
+    sniff.setdefault("dest", ["http", "tls", "quic"])
+    ib.setdefault("outbound", "direct")
+    return ib
 
 
 def default_settings(protocol: str) -> dict:
