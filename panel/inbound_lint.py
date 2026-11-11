@@ -104,6 +104,13 @@ def inbound_issues(store: dict, ib: dict) -> list[dict]:
         dec, enc = str(s.get("decryption") or "none"), str(s.get("encryption") or "none")
         if (dec == "none") != (enc == "none"):
             _issue(out, "vless_encryption", ERROR, "decryption и encryption должны быть заданы парой (или обе none).")
+        # Xray: fallbacks cannot be used together with decryption != none
+        if ib.get("fallbacks") and P._vless_enc_on(s):
+            msg = ('Fallbacks нельзя вместе с VLESS encryption (decryption ≠ none) — '
+                   'Xray не стартует. Очистите Fallbacks или поставьте Authentication = None.')
+            _issue(out, "fallbacks", ERROR, msg)
+            _issue(out, "vless_decryption", ERROR, msg)
+            _issue(out, "vless_auth", ERROR, msg)
 
     # --- Reality
     if sec == "reality":
@@ -182,7 +189,7 @@ def inbound_issues(store: dict, ib: dict) -> list[dict]:
                 except ValueError:
                     _issue(out, "xh_extra", ERROR, "Extra JSON: нужен JSON-объект {…}.")
         if ib.get("fallbacks") and not (net == "raw" and sec in ("tls", "none")):
-            _issue(out, "fallbacks", WARN, "Fallbacks работают только с raw + TLS.")
+            _issue(out, "fallbacks", WARN, "Fallbacks работают только с raw + TLS (или raw без security).")
 
     # --- routing
     so = st.get("sockopt") or {}
@@ -219,6 +226,58 @@ def summarize(issues: list[dict]) -> dict:
         "warnings": len(warns),
         "title": "\n".join(f"{'✖' if i['level'] == ERROR else '⚠'} {i['msg']}" for i in [*errs, *warns])[:1500],
     }
+
+
+def map_xray_error_fields(ib: dict, error: str) -> list[dict]:
+    """Turn a dry-test / apply Xray error into form-field highlights for the edit UI."""
+    err = (error or "").strip()
+    if not err:
+        return []
+    low = err.lower()
+    out: list[dict] = []
+    proto = ib.get("protocol") or ""
+    st = ib.get("stream") or {}
+    sec = st.get("security") or "none"
+
+    if "fallback" in low and "decrypt" in low:
+        msg = ("Xray: fallbacks нельзя вместе с decryption ≠ none. "
+               "Очистите Fallbacks или Authentication = None.")
+        _issue(out, "fallbacks", ERROR, msg)
+        _issue(out, "vless_decryption", ERROR, msg)
+        _issue(out, "vless_auth", ERROR, msg)
+        return out
+
+    if "fallback" in low:
+        _issue(out, "fallbacks", ERROR, f"Xray: {err}")
+        return out
+
+    if "reality" in low and ("private" in low or "public" in low or "key" in low):
+        _issue(out, "r_priv", ERROR, f"Xray: {err}")
+        return out
+
+    if "shortid" in low or "short id" in low or "short_id" in low:
+        _issue(out, "r_sids", ERROR, f"Xray: {err}")
+        return out
+
+    if "certificate" in low or "cert file" in low or ("tls" in low and ("fail" in low or "error" in low)):
+        _issue(out, "tls_cert" if sec == "tls" or proto == "hysteria" else "security", ERROR, f"Xray: {err}")
+        return out
+
+    if "port" in low and ("already" in low or "bind" in low or "address already" in low):
+        _issue(out, "port", ERROR, f"Xray: {err}")
+        return out
+
+    if "flow" in low or "vision" in low:
+        _issue(out, "flow", ERROR, f"Xray: {err}")
+        return out
+
+    if "decrypt" in low or "encryption" in low:
+        _issue(out, "vless_decryption", ERROR, f"Xray: {err}")
+        return out
+
+    # Unknown — still surface under tag so the form isn't "all green"
+    _issue(out, "tag", ERROR, f"Xray: {err}")
+    return out
 
 
 _DRY_CACHE: dict[str, dict] = {}

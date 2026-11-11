@@ -86,12 +86,37 @@ def test_summarize():
     ok("summarize counts")
 
 
+def test_fallbacks_with_decryption():
+    store = _store()
+    ib = P.default_inbound("vless", 10004, "vless")
+    ib["direct"] = False
+    ib["stream"]["network"] = "raw"
+    ib["stream"]["security"] = "none"
+    ib["settings"]["flow"] = "xtls-rprx-vision"
+    ib["settings"]["decryption"] = "mlkem768x25519plus.500s..."
+    ib["settings"]["encryption"] = "mlkem768x25519plus.500s..."
+    ib["fallbacks"] = [{"name": "", "alpn": "", "path": "//ms", "dest": "127.0.0.1:8881", "xver": 0}]
+    issues = L.inbound_issues(store, ib)
+    fields = {i["field"] for i in issues if i["level"] == L.ERROR}
+    if "fallbacks" not in fields or "vless_decryption" not in fields:
+        fail("fb+dec", f"expected fallbacks+decryption highlights, got {issues}")
+    mapped = L.map_xray_error_fields(
+        ib,
+        'VLESS settings: "fallbacks" can not be used together with "decryption"',
+    )
+    mfields = {i["field"] for i in mapped}
+    if "fallbacks" not in mfields:
+        fail("map-xray", str(mapped))
+    ok("fallbacks + decryption -> highlight")
+
+
 def main():
     print("== inbound_lint offline ==")
     test_vision_on_ws()
     test_reality_pub_domain()
     test_none_outbound_ok()
     test_summarize()
+    test_fallbacks_with_decryption()
     print("ALL PASSED")
 
 

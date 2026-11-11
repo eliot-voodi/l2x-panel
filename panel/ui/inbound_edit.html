@@ -615,12 +615,14 @@
       panel.style.display = '';
       if (errs) title.innerHTML = '<span style="color:var(--danger)">✖ ' + errs + ' ошибк' + (errs === 1 ? 'а' : 'и') + '</span>' +
         (warns ? ' · <span style="color:var(--warn)">' + warns + ' предупр.</span>' : '');
+      else if (xt.ok === false) title.innerHTML = '<span style="color:var(--danger)">✖ Xray отклонил конфиг</span>' +
+        (warns ? ' · <span style="color:var(--warn)">' + warns + ' предупр.</span>' : '');
       else if (warns) title.innerHTML = '<span style="color:var(--warn)">⚠ ' + warns + ' предупрежден' + (warns === 1 ? 'ие' : 'ий') + '</span>';
       else title.innerHTML = '<span style="color:var(--ok)">✓ Параметры в порядке</span>';
       list.innerHTML = issues.map(function (i) {
         return '<div class="lint-item"><span class="badge ' + (i.level === 'error' ? 'err' : 'warn') + '">' +
           i.level + '</span> ' + (i.msg || '').replace(/</g, '&lt;') + '</div>';
-      }).join('') || '<div class="dim small">Замечаний нет</div>';
+      }).join('') || (xt.ok === false ? '' : '<div class="dim small">Замечаний нет</div>');
       if (xt.skipped) {
         badge.className = 'badge warn';
         badge.textContent = 'Xray: skip';
@@ -633,15 +635,19 @@
         badge.className = 'badge err';
         badge.textContent = 'Xray FAIL';
         badge.title = xt.error || '';
-        list.innerHTML += '<div class="lint-item"><span class="badge err">xray</span> ' +
-          (xt.error || 'конфиг не проходит -test').replace(/</g, '&lt;') + '</div>';
+        // Avoid duplicating if already mapped into issues
+        var already = issues.some(function (i) { return (i.msg || '').indexOf('Xray:') === 0 || (i.msg || '').indexOf('Fallbacks нельзя') === 0; });
+        if (!already) {
+          list.innerHTML += '<div class="lint-item"><span class="badge err">xray</span> ' +
+            (xt.error || 'конфиг не проходит -test').replace(/</g, '&lt;') + '</div>';
+        }
       } else {
         badge.className = 'badge';
         badge.textContent = 'Xray…';
       }
       if (saveBtn) {
-        saveBtn.disabled = errs > 0;
-        saveBtn.title = errs > 0 ? 'Сначала исправьте ошибки' : '';
+        saveBtn.disabled = errs > 0 || xt.ok === false;
+        saveBtn.title = (errs > 0 || xt.ok === false) ? 'Сначала исправьте ошибки' : '';
       }
     }
     function runCheck() {

@@ -2928,6 +2928,14 @@ async def inbound_check(request: Request):
         ib, issues = _inbound_check_model(store, form)
         store["inbounds"] = [i for i in store.get("inbounds") or [] if i.get("id") != ib.get("id")] + [ib]
         xt = inbound_lint.xray_dry_test(store) if ib.get("enabled", True) else {"ok": None, "skipped": True, "error": "inbound выключен"}
+        # Map Xray dry-test failure onto form fields so they highlight (not just a badge)
+        if xt.get("ok") is False and xt.get("error"):
+            known = {(i.get("field"), i.get("msg")) for i in issues}
+            for mapped in inbound_lint.map_xray_error_fields(ib, str(xt.get("error") or "")):
+                key = (mapped.get("field"), mapped.get("msg"))
+                if key not in known:
+                    issues.append(mapped)
+                    known.add(key)
         return {"ok": True, "issues": issues, "summary": inbound_lint.summarize(issues), "xray": xt}
 
     return await run_in_threadpool(_run)
@@ -3322,7 +3330,7 @@ def _migrate_page(request: Request, *, preview=None, report=None, **form_kw):
         legacy_path=form_kw.get("legacy_path") or "",
         legacy_port=form_kw.get("legacy_port") or "",
         apply_legacy=bool(form_kw.get("apply_legacy")),
-        restore_structure=bool(form_kw.get("restore_structure", True)),
+        migrate_what=str(form_kw.get("migrate_what") or "all"),
         source_meta=meta,
     )
 
@@ -3349,7 +3357,13 @@ async def clients_migrate_run(request: Request):
     web_base = str(form.get("web_base") or "").strip()
     insecure = form.get("insecure") == "1"
     update_existing = form.get("update_existing") == "1"
-    restore_structure = form.get("restore_structure") == "1"
+    migrate_what = str(form.get("migrate_what") or "all").strip().lower()
+    if migrate_what not in ("clients", "outbounds", "routes", "all"):
+        migrate_what = "all"
+    want_clients = migrate_what in ("clients", "all")
+    want_inbounds = migrate_what == "all"
+    want_outbounds = migrate_what in ("outbounds", "all")
+    want_routes = migrate_what in ("routes", "all")
     selected = [str(x) for x in form.getlist("inbounds")]
     legacy_path = re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("legacy_path") or ""))
     legacy_port = _int(form.get("legacy_port"), 0)
@@ -3360,7 +3374,7 @@ async def clients_migrate_run(request: Request):
         "selected_inbounds": selected,
         "legacy_path": legacy_path, "legacy_port": legacy_port or "",
         "apply_legacy": apply_legacy,
-        "restore_structure": restore_structure,
+        "migrate_what": migrate_what,
     }
 
     users: list = []
@@ -3375,7 +3389,8 @@ async def clients_migrate_run(request: Request):
                 filename = getattr(up, "filename", "") or ""
             if not raw and action == "import":
                 users = _migrate_cache_load()
-                if not users:
+                meta_cached = migrate_mod.LAST_SOURCE_META or {}
+                if not users and not meta_cached.get("structure"):
                     err = "Нет кэша preview — сначала нажмите «Проверить» с файлом"
             elif not raw:
                 err = "Выберите файл бэкапа / экспорта"
@@ -3408,21 +3423,31 @@ async def clients_migrate_run(request: Request):
         flash(request, err, "error")
         return _migrate_page(request, **form_kw)
 
-    if not users:
+    has_structure = bool(meta.get("structure")) and source == "3xui"
+    need_structure = want_inbounds or want_outbounds or want_routes
+    if want_clients and not users and not need_structure:
+        flash(request, "Пользователи не найдены", "error")
+        return _migrate_page(request, **form_kw)
+    if need_structure and not has_structure and not (want_clients and users):
+        flash(request, "В файле нет структуры 3x-ui (нужен полный x-ui.db / getDb)", "error")
+        return _migrate_page(request, **form_kw)
+    if not users and not has_structure:
         flash(request, "Пользователи не найдены", "error")
         return _migrate_page(request, **form_kw)
 
     store = _load_store()
     if action != "import":
-        prev = migrate_mod.preview(store, users)
+        prev = migrate_mod.preview(store, users) if users else {
+            "total": 0, "create": 0, "skip": 0, "conflicts": [], "sample": [],
+        }
         hint = ""
         if legacy_path or legacy_port:
             hint = f" · старый path/port: /{legacy_path or '?'} :{legacy_port or '?'}"
         meta = migrate_mod.LAST_SOURCE_META or {}
         tb = int(meta.get("traffic_bytes") or 0)
-        if tb > 0:
+        if want_clients and tb > 0:
             hint += f" · трафик в файле: {xray.format_traffic(tb)}"
-        elif source == "3xui":
+        elif want_clients and source == "3xui":
             hint += " · трафик в файле: 0 (нужен полный x-ui.db с таблицей client_traffics, не JSON export)"
         if source == "3xui" and (meta.get("inbounds") or meta.get("outbounds") or meta.get("routes")):
             hint += (
@@ -3430,6 +3455,9 @@ async def clients_migrate_run(request: Request):
                 f" / out {meta.get('outbounds', 0)}"
                 f" / route {meta.get('routes', 0)}"
             )
+        scope = {"clients": "только клиенты", "outbounds": "только outbound",
+                 "routes": "только маршруты", "all": "всё"}.get(migrate_what, migrate_what)
+        hint += f" · перенос: {scope}"
         jwt_n = len(meta.get("jwt_secrets") or [])
         if source == "pasarguard":
             if jwt_n:
@@ -3438,33 +3466,42 @@ async def clients_migrate_run(request: Request):
                 hint += " · JWT secret не найден в файле — для тех же ссылок нужен API или бэкап с таблицей jwt"
             if meta.get("port"):
                 hint += f" · порт PasarGuard {meta['port']} ({'HTTPS' if meta.get('tls') else 'HTTP'})"
-        flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
+        if want_clients:
+            flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
+        else:
+            flash(request, f"Готово к импорту структуры{hint}", "info")
         return _migrate_page(request, preview=prev, **form_kw)
 
     with mutate() as st:
         meta = migrate_mod.LAST_SOURCE_META or {}
-        # Restore 3x-ui inbounds / outbounds / routes before attaching clients
-        if restore_structure and source == "3xui" and meta.get("structure"):
-            struct_rep = migrate_mod.apply_3xui_structure(st, meta.get("structure"))
-            # Prefer restored inbound tags when the form had no selection
-            if not selected and struct_rep.get("inbound_tags"):
+        struct_rep = {}
+        if source == "3xui" and meta.get("structure") and (want_inbounds or want_outbounds or want_routes):
+            struct_rep = migrate_mod.apply_3xui_structure(
+                st, meta.get("structure"),
+                restore_inbounds=want_inbounds,
+                restore_outbounds=want_outbounds,
+                restore_routes=want_routes,
+            )
+            if want_clients and not selected and struct_rep.get("inbound_tags"):
                 selected = list(struct_rep["inbound_tags"])
+        if want_clients:
+            report = migrate_mod.apply(st, users, selected, update_existing=update_existing)
         else:
-            struct_rep = {}
-        report = migrate_mod.apply(st, users, selected, update_existing=update_existing)
+            report = {"created": 0, "updated": 0, "skipped": 0, "errors": [], "traffic_bytes": 0, "traffic_fixed": 0}
         if struct_rep:
             report["structure"] = struct_rep
+        report["migrate_what"] = migrate_what
         sub = st["settings"].setdefault("sub", {})
         # PasarGuard file import: keep jwt secrets so already-issued client sub URLs keep working
         jwt_secrets = [str(s).strip() for s in (meta.get("jwt_secrets") or []) if str(s).strip()]
-        if jwt_secrets:
+        if jwt_secrets and want_clients:
             existing = [str(s) for s in (sub.get("legacy_jwt_secrets") or []) if s]
             for s in jwt_secrets:
                 if s not in existing:
                     existing.append(s)
             sub["legacy_jwt_secrets"] = existing
             report["jwt_secrets"] = len(jwt_secrets)
-        if apply_legacy and (legacy_path or legacy_port):
+        if apply_legacy and want_clients and (legacy_path or legacy_port):
             if legacy_path:
                 aliases = list(sub.get("path_aliases") or [])
                 primary = (sub.get("path") or "sub").strip()
