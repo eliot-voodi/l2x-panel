@@ -54,6 +54,24 @@
 </style>
 {% endblock %}
 {% block content %}
+{% if xtest is defined and xtest %}
+  {% if xtest.ok %}
+  <div class="card" style="border-color:var(--ok);background:var(--ok-soft);padding:.7rem 1rem;margin-bottom:.85rem">
+    <b style="color:var(--ok)">✓ Xray config OK</b>
+    <span class="dim small"> — <code>xray run -test</code> прошёл</span>
+  </div>
+  {% elif xtest.skipped %}
+  <div class="card" style="padding:.7rem 1rem;margin-bottom:.85rem">
+    <span class="badge warn">Xray -test</span>
+    <span class="small muted">{{ xtest.error or 'пропущен' }}</span>
+  </div>
+  {% else %}
+  <div class="card" style="border-color:var(--danger);background:var(--danger-soft);padding:.7rem 1rem;margin-bottom:.85rem">
+    <b style="color:var(--danger)">✖ Xray config FAIL</b>
+    <div class="mono small mt" style="white-space:pre-wrap;color:var(--danger)">{{ xtest.error or 'ошибка' }}</div>
+  </div>
+  {% endif %}
+{% endif %}
 <div class="card" style="padding:0">
   {# —— Desktop —— #}
   <div class="table-wrap inbounds-desktop" style="padding:0">
@@ -65,7 +83,7 @@
     {% for ib in items %}
       <tr>
         <td><span class="dot {% if ib.enabled and ib.ok %}on{% endif %}" title="{{ 'включён' if ib.enabled else 'выключен' }}"></span></td>
-        <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit"><b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div>{% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}</td>
+        <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit"><b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div>{% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}{% if ib.lint and ib.lint.errors %}<span class="badge err" title="{{ ib.lint.title }}">{{ ib.lint.errors }} err</span>{% elif ib.lint and ib.lint.warnings %}<span class="badge warn" title="{{ ib.lint.title }}">{{ ib.lint.warnings }} warn</span>{% endif %}</td>
         <td><span class="badge accent">{{ ib.protocol }}</span></td>
         {% set fm = P.front_mode(ib) %}
         <td class="mono" title="{% if P.is_direct(ib) %}напрямую 0.0.0.0:{{ ib.port }} (без nginx){% elif fm %}nginx :443 → 127.0.0.1:{{ ib.port }}{% else %}только 127.0.0.1{% endif %}">{% if fm %}443 → {% endif %}{{ ib.port }}{% if P.is_direct(ib) %} <span class="badge warn">direct</span>{% endif %}{% if fm == 'http' and ib.share_host %}<div class="hint">{{ ib.share_host }}{{ P.front_http_path(ib) }}</div>{% endif %}</td>
@@ -112,7 +130,7 @@
             <b>{{ ib.remark or ib.tag }}</b>
             <span class="dim small mono">{{ ib.tag }} · {{ ib.protocol }}{% if ib.protocol in P.USER_PROTOCOLS %} / {{ ib.stream.network }}{% endif %}</span>
           </span>
-          {% if P.is_max_speed_inbound(ib) %}<span class="badge ok">скорость</span>{% else %}<span class="badge accent">{{ ib.protocol }}</span>{% endif %}
+          {% if ib.lint and ib.lint.errors %}<span class="badge err" title="{{ ib.lint.title }}">err</span>{% elif ib.lint and ib.lint.warnings %}<span class="badge warn" title="{{ ib.lint.title }}">warn</span>{% elif P.is_max_speed_inbound(ib) %}<span class="badge ok">скорость</span>{% else %}<span class="badge accent">{{ ib.protocol }}</span>{% endif %}
           <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
         </button>
         <div class="ib-detail" hidden>

@@ -32,6 +32,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import admins
 import front
 import hwid
+import inbound_lint
 import l2tp_runtime as l2tp
 import migrate as migrate_mod
 import nodes as nodes_mod
@@ -2880,15 +2881,56 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
 
 
 @app.get("/inbounds", response_class=HTMLResponse)
-def inbounds_page(request: Request):
+async def inbounds_page(request: Request):
     if redir := _require(request):
         return redir
     store = _load_store()
     rows = []
     for ib in store["inbounds"]:
         n_clients = sum(1 for c in store["clients"] if ib in xray.client_inbounds(store, c))
-        rows.append({**ib, "n_clients": n_clients, "used": xray.inbound_used_bytes(ib), "ok": xray.inbound_access_ok(ib)})
-    return page(request, "inbounds.html", active="inbounds", items=rows, store=store)
+        try:
+            lint = inbound_lint.summarize(inbound_lint.inbound_issues(store, ib))
+        except Exception:
+            lint = {"errors": 0, "warnings": 0, "title": ""}
+        rows.append({**ib, "n_clients": n_clients, "used": xray.inbound_used_bytes(ib),
+                     "ok": xray.inbound_access_ok(ib), "lint": lint})
+    xtest = await run_in_threadpool(inbound_lint.xray_dry_test, store)
+    return page(request, "inbounds.html", active="inbounds", items=rows, store=store, xtest=xtest)
+
+
+def _inbound_check_model(store: dict, form) -> tuple[dict, list[dict]]:
+    """Parse the edit form onto a copy of the inbound; return (inbound, issues)."""
+    ib_id = _int(form.get("id"))
+    ib = None
+    if ib_id:
+        ib = deepcopy(xray.inbound_by_id(store, ib_id) or {}) or None
+    if ib is None:
+        ib = P.default_inbound(str(form.get("protocol") or "vless"))
+        ib["id"] = ib_id or -1
+    P.ensure_inbound_shape(ib)
+    issues: list[dict] = []
+    err = _inbound_form_to_model(form, ib)
+    if err:
+        issues.append({"field": "", "level": inbound_lint.ERROR, "msg": err})
+    issues.extend(inbound_lint.inbound_issues(store, ib))
+    return ib, issues
+
+
+@app.post("/inbounds/check")
+async def inbound_check(request: Request):
+    """Live validation for the inbound form: field issues + dry `xray run -test`."""
+    if redir := _require(request):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    form = await request.form()
+    store = deepcopy(_load_store())
+
+    def _run() -> dict:
+        ib, issues = _inbound_check_model(store, form)
+        store["inbounds"] = [i for i in store.get("inbounds") or [] if i.get("id") != ib.get("id")] + [ib]
+        xt = inbound_lint.xray_dry_test(store) if ib.get("enabled", True) else {"ok": None, "skipped": True, "error": "inbound выключен"}
+        return {"ok": True, "issues": issues, "summary": inbound_lint.summarize(issues), "xray": xt}
+
+    return await run_in_threadpool(_run)
 
 
 @app.get("/inbounds/new", response_class=HTMLResponse)
@@ -2900,8 +2942,12 @@ def inbound_new(request: Request):
     port = xray.free_inbound_port(store)
     ib = P.default_inbound(proto, port, f"{proto}-{port}")
     xray.ensure_inbound_keys(ib)
+    try:
+        lint_issues = inbound_lint.inbound_issues(store, ib)
+    except Exception:
+        lint_issues = []
     return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=True, store=store,
-                outbounds=xray.all_outbound_tags(store), certs=ops.list_certs())
+                outbounds=xray.all_outbound_tags(store), certs=ops.list_certs(), lint_issues=lint_issues)
 
 
 @app.get("/inbounds/{ib_id}/edit", response_class=HTMLResponse)
@@ -2913,8 +2959,12 @@ def inbound_edit(ib_id: int, request: Request):
     if not ib:
         flash(request, "Inbound не найден", "error")
         return go("/inbounds")
+    try:
+        lint_issues = inbound_lint.inbound_issues(store, ib)
+    except Exception:
+        lint_issues = []
     return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=False, store=store,
-                outbounds=xray.all_outbound_tags(store), certs=ops.list_certs())
+                outbounds=xray.all_outbound_tags(store), certs=ops.list_certs(), lint_issues=lint_issues)
 
 
 @app.post("/inbounds/save")
@@ -2945,6 +2995,10 @@ async def inbound_save(request: Request):
             mine = [p for p in problems if p.startswith(f"{ib['tag']}:") or ib["share_host"] and p.startswith(ib["share_host"])]
             if mine:
                 err = mine[0]
+        if not err:
+            bad = [i for i in inbound_lint.inbound_issues(store, ib) if i["level"] == inbound_lint.ERROR]
+            if bad:
+                err = "Исправьте: " + "; ".join(i["msg"] for i in bad[:3])
         if err:
             flash(request, err, "error")
             return go(f"/inbounds/{ib_id}/edit" if ib_id else "/inbounds/new")
@@ -3084,7 +3138,7 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         client["outbound"] = outbound  # empty = use group
     else:
         outbound = outbound or "direct"
-        if outbound not in allowed_obs:
+        if outbound != xray.NONE_TAG and outbound not in allowed_obs:
             return f"Неизвестный outbound {outbound}"
         client["outbound"] = outbound
     old_email = client.get("email")
@@ -3146,10 +3200,16 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         client["inbounds"] = sel_ib
     known = {t_["tag"] for t_ in xray.selectable_outbound_tags(store)}
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
-    if form.get("select_mode", "all") == "all" or not selected:
+    if form.get("select_mode", "all") == "all":
         client["allowed_tags"] = []
-    else:
+    elif selected:
         client["allowed_tags"] = selected
+    elif gid:
+        client["allowed_tags"] = []
+    elif client["outbound"] == xray.NONE_TAG:
+        return "Выберите основную ссылку или хотя бы одно подключение"
+    else:
+        client["allowed_tags"] = [xray.NONE_TAG]  # only the main link
     limits = {}
     daily_limits = {}
     for tag in known:

@@ -1179,6 +1179,10 @@ def client_group(store: dict, client: dict) -> dict | None:
     return get_group(store, client.get("group_id"))
 
 
+# Client outbound "none" = no main link; allowed_tags ["none"] = no extra connections.
+NONE_TAG = "none"
+
+
 def _merge_tag_lists(base: list[str], extra: list[str]) -> list[str]:
     """Union preserving order. Empty ``base`` means «all» — personal ``extra`` ignored."""
     if not base:
@@ -1187,7 +1191,7 @@ def _merge_tag_lists(base: list[str], extra: list[str]) -> list[str]:
     out = list(base)
     for tag in extra or []:
         t = str(tag or "").strip()
-        if t and t not in seen:
+        if t and t != NONE_TAG and t not in seen:
             seen.add(t)
             out.append(t)
     return out
@@ -1431,8 +1435,17 @@ def client_access_ok(client: dict) -> bool:
 
 
 def tag_allowed_for_client(store: dict, client: dict, tag: str) -> bool:
+    if tag == NONE_TAG:
+        return False
     allowed = client_effective_allowed_tags(store, client)
-    if allowed and tag not in allowed:
+    if NONE_TAG in allowed:
+        # Only the main link: extra connections are off, main outbound stays usable
+        allowed = [t for t in allowed if t != NONE_TAG]
+        if tag == client_default_outbound(store, client):
+            allowed.append(tag)
+        if tag not in allowed:
+            return False
+    elif allowed and tag not in allowed:
         return False
     if client_tag_exceeded(client, tag):
         return False
@@ -1568,6 +1581,8 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
         for ident in client_identities(store, client, ib):
             if ident["main"]:
                 ob = client_default_outbound(store, client)
+                if ob == NONE_TAG:
+                    continue
                 if ob != "direct" and not tag_allowed_for_client(store, client, ob):
                     continue
                 if ob != "direct" and not outbound_ok_for_sub(store, ob):
@@ -1788,7 +1803,7 @@ def build_config(store: dict) -> dict:
                 **_route_target(store, e["tag"], known_outbounds=known_outbounds),
             })
         ob = client_default_outbound(store, c)
-        if ob != "direct" and not tag_allowed_for_client(store, c, ob):
+        if ob == NONE_TAG or (ob != "direct" and not tag_allowed_for_client(store, c, ob)):
             rules.append({"type": "field", "user": [c["email"]], "outboundTag": "block"})
         elif ob != "direct":
             rules.append({

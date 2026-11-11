@@ -37,6 +37,7 @@
     <label class="f">Outbound по умолчанию (основная ссылка){% if group %} <span class="badge">из группы</span>{% endif %}</label>
     <select name="outbound" id="client-outbound">
       {% if group %}<option value="" {% if not c.outbound or c.outbound == 'direct' %}selected{% endif %}>— из группы —</option>{% endif %}
+      {% if not group %}<option value="none" {% if c.outbound == 'none' %}selected{% endif %}>— none (без основной ссылки) —</option>{% endif %}
       <option value="direct" {% if c.outbound == 'direct' and not group %}selected{% endif %}>🏠 Direct</option>
       {% for tg in tags %}<option value="{{ tg.tag }}" {% if tg.tag == c.outbound %}selected{% endif %}>{{ tg.label }}{% if tg.status and tg.status not in ('connected', 'enabled') %} ({{ tg.status }}){% endif %}</option>{% endfor %}
     </select>
@@ -355,12 +356,17 @@
     form.addEventListener('submit', function (e) {
       var groupEl = document.getElementById('client-group');
       if (groupEl && groupEl.value) return; // with group: outbound/inbounds/tags are optional
+      var obEl = document.getElementById('client-outbound');
+      var mainOn = obEl && obEl.value && obEl.value !== 'none';
       var checks = [['allowed_tags', 'select_mode', 'подключение'], ['inbounds', 'ib_mode', 'inbound']];
       for (var i = 0; i < checks.length; i++) {
         var c = checks[i], sel = form.querySelector('input[name="' + c[1] + '"][value="select"]');
+        if (c[0] === 'allowed_tags' && mainOn) continue; // main link alone is enough
         if (sel && sel.checked && boxes(c[0]).length && !boxes(c[0]).some(function (x) { return x.checked; })) {
           e.preventDefault();
-          alert('Отметьте хотя бы одно ' + c[2] + ' или выберите режим «все»');
+          alert(c[0] === 'allowed_tags'
+            ? 'Выберите основную ссылку (не none) или отметьте хотя бы одно подключение'
+            : 'Отметьте хотя бы одно ' + c[2] + ' или выберите режим «все»');
           return;
         }
       }

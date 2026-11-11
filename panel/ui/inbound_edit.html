@@ -5,9 +5,37 @@
 {% block title %}Inbound {{ ib.tag }} · {{ app_name }}{% endblock %}
 {% block page_title %}{% if is_new %}{{ t('Новый inbound') }}{% else %}Inbound · {{ ib.remark or ib.tag }}{% endif %}{% endblock %}
 {% block page_sub %}<a href="{{ bp }}/inbounds">← все inbounds</a>{% endblock %}
+{% block head %}
+<style>
+  .field-err { border-color: var(--danger) !important; box-shadow: 0 0 0 1px var(--danger) }
+  .field-warn { border-color: var(--warn) !important; box-shadow: 0 0 0 1px var(--warn) }
+  .field-msg { font-size: .78rem; margin: .25rem 0 .55rem; line-height: 1.35; white-space: pre-wrap }
+  .field-msg.err { color: var(--danger) }
+  .field-msg.warn { color: var(--warn) }
+  #lint_panel .lint-item { padding: .35rem 0; border-bottom: 1px dashed var(--border); font-size: .85rem }
+  #lint_panel .lint-item:last-child { border-bottom: 0 }
+</style>
+{% endblock %}
 {% block content %}
 <form method="post" action="{{ bp }}/inbounds/save" id="ibform">
 <input type="hidden" name="id" value="{{ ib.id if not is_new else '' }}">
+<div id="lint_panel" class="card" style="margin-bottom:.85rem{% if not lint_issues %};display:none{% endif %}">
+  <div class="flex between" style="gap:.75rem;flex-wrap:wrap">
+    <div>
+      <b id="lint_title">{% if lint_issues %}Проверка параметров{% else %}Проверка{% endif %}</b>
+      <div class="hint" id="lint_hint">Неверные поля подсвечены ниже · автотест Xray после паузы ввода</div>
+    </div>
+    <div class="actions">
+      <span id="xray_badge" class="badge">Xray…</span>
+      <button type="button" class="btn ghost sm" id="btn_lint">Проверить сейчас</button>
+    </div>
+  </div>
+  <div id="lint_list" class="mt">
+    {% for i in lint_issues or [] %}
+    <div class="lint-item"><span class="badge {% if i.level == 'error' %}err{% else %}warn{% endif %}">{{ i.level }}</span> {{ i.msg }}</div>
+    {% endfor %}
+  </div>
+</div>
 <div class="grid g2">
   <div class="card">
     <h3>Основное</h3>
@@ -388,7 +416,7 @@
 </div>
 
 <div class="actions">
-  <button class="btn">{{ t('Сохранить') }} и применить</button>
+  <button class="btn" id="btn_save">{{ t('Сохранить') }} и применить</button>
   <a class="btn ghost" href="{{ bp }}/inbounds">{{ t('Отмена') }}</a>
   {% if not is_new %}<a class="btn ghost" href="{{ bp }}/inbounds/{{ ib.id }}/export" target="_blank">Xray JSON</a>{% endif %}
 </div>
@@ -397,6 +425,7 @@
 {% block scripts %}
 <script>
   var BP = {{ bp|tojson }};
+  var INITIAL_ISSUES = {{ (lint_issues or [])|tojson }};
   function sync() {
     var p = document.getElementById('protocol').value;
     var n = document.getElementById('network').value;
@@ -548,5 +577,108 @@
       applyVlessEnc(this.value);
     }
   });
+
+  // —— Live lint + xray -test ——————————————————————————————
+  (function () {
+    var form = document.getElementById('ibform');
+    var panel = document.getElementById('lint_panel');
+    var list = document.getElementById('lint_list');
+    var title = document.getElementById('lint_title');
+    var badge = document.getElementById('xray_badge');
+    var saveBtn = document.getElementById('btn_save');
+    var timer = null, seq = 0, lastHasError = false;
+
+    function clearMarks() {
+      form.querySelectorAll('.field-err, .field-warn').forEach(function (el) {
+        el.classList.remove('field-err', 'field-warn');
+      });
+      form.querySelectorAll('.field-msg').forEach(function (el) { el.remove(); });
+    }
+    function mark(field, level, msg) {
+      if (!field) return;
+      var el = form.querySelector('[name="' + field + '"]');
+      if (!el) return;
+      el.classList.add(level === 'error' ? 'field-err' : 'field-warn');
+      var note = document.createElement('div');
+      note.className = 'field-msg ' + (level === 'error' ? 'err' : 'warn');
+      note.textContent = msg;
+      el.parentNode.insertBefore(note, el.nextSibling);
+    }
+    function render(data) {
+      var issues = (data && data.issues) || [];
+      var xt = (data && data.xray) || {};
+      var errs = issues.filter(function (i) { return i.level === 'error'; }).length;
+      var warns = issues.filter(function (i) { return i.level !== 'error'; }).length;
+      lastHasError = errs > 0 || xt.ok === false;
+      clearMarks();
+      issues.forEach(function (i) { mark(i.field, i.level, i.msg); });
+      panel.style.display = '';
+      if (errs) title.innerHTML = '<span style="color:var(--danger)">✖ ' + errs + ' ошибк' + (errs === 1 ? 'а' : 'и') + '</span>' +
+        (warns ? ' · <span style="color:var(--warn)">' + warns + ' предупр.</span>' : '');
+      else if (warns) title.innerHTML = '<span style="color:var(--warn)">⚠ ' + warns + ' предупрежден' + (warns === 1 ? 'ие' : 'ий') + '</span>';
+      else title.innerHTML = '<span style="color:var(--ok)">✓ Параметры в порядке</span>';
+      list.innerHTML = issues.map(function (i) {
+        return '<div class="lint-item"><span class="badge ' + (i.level === 'error' ? 'err' : 'warn') + '">' +
+          i.level + '</span> ' + (i.msg || '').replace(/</g, '&lt;') + '</div>';
+      }).join('') || '<div class="dim small">Замечаний нет</div>';
+      if (xt.skipped) {
+        badge.className = 'badge warn';
+        badge.textContent = 'Xray: skip';
+        badge.title = xt.error || '';
+      } else if (xt.ok === true) {
+        badge.className = 'badge ok';
+        badge.textContent = 'Xray OK';
+        badge.title = 'xray run -test прошёл';
+      } else if (xt.ok === false) {
+        badge.className = 'badge err';
+        badge.textContent = 'Xray FAIL';
+        badge.title = xt.error || '';
+        list.innerHTML += '<div class="lint-item"><span class="badge err">xray</span> ' +
+          (xt.error || 'конфиг не проходит -test').replace(/</g, '&lt;') + '</div>';
+      } else {
+        badge.className = 'badge';
+        badge.textContent = 'Xray…';
+      }
+      if (saveBtn) {
+        saveBtn.disabled = errs > 0;
+        saveBtn.title = errs > 0 ? 'Сначала исправьте ошибки' : '';
+      }
+    }
+    function runCheck() {
+      var my = ++seq;
+      badge.className = 'badge';
+      badge.textContent = 'Xray…';
+      fetch(BP + '/inbounds/check', { method: 'POST', body: new FormData(form), credentials: 'same-origin' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) { if (my === seq) render(d); })
+        .catch(function (e) {
+          if (my !== seq) return;
+          badge.className = 'badge err';
+          badge.textContent = 'check fail';
+          badge.title = String(e);
+        });
+    }
+    function schedule() {
+      clearTimeout(timer);
+      timer = setTimeout(runCheck, 650);
+    }
+    form.addEventListener('change', schedule);
+    form.addEventListener('input', schedule);
+    document.getElementById('btn_lint').addEventListener('click', function () {
+      clearTimeout(timer);
+      runCheck();
+    });
+    form.addEventListener('submit', function (e) {
+      if (lastHasError && form.querySelectorAll('.field-err').length) {
+        e.preventDefault();
+        panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        alert('Исправьте подсвеченные ошибки перед сохранением');
+      }
+    });
+    if (INITIAL_ISSUES && INITIAL_ISSUES.length) {
+      render({ issues: INITIAL_ISSUES, xray: {} });
+    }
+    setTimeout(runCheck, 200);
+  })();
 </script>
 {% endblock %}
