@@ -23,6 +23,7 @@ from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPSHandler
 from http.cookiejar import CookieJar
 
+import protocols as P
 import xray_runtime as xray
 
 SOURCES = ("3xui", "pasarguard", "remnawave")
@@ -56,7 +57,11 @@ class NormalizedUser:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d.pop("extra", None)
+        extra = d.pop("extra", None) or {}
+        # Keep inbound tags from 3x-ui so import-from-cache still maps clients
+        ibs = extra.get("inbounds")
+        if ibs:
+            d["inbounds"] = list(ibs)
         return d
 
 
@@ -446,6 +451,9 @@ def apply(
         if not email:
             skipped += 1
             continue
+        # Prefer inbound tags recorded from 3x-ui inbound.settings.clients
+        user_tags = [t for t in ((u.extra or {}).get("inbounds") or []) if t in capable]
+        use_tags = user_tags or tags
         existing = by_email.get(email)
         up_i, down_i = int(u.up or 0), int(u.down or 0)
         if existing and not update_existing:
@@ -503,8 +511,8 @@ def apply(
                     c["source_id"] = str(u.source_id)
                 if u.source:
                     c["source"] = str(u.source)
-                if tags:
-                    c["inbounds"] = list(tags)
+                if use_tags:
+                    c["inbounds"] = list(use_tags)
                 xray.ensure_client(c)
                 _set_imported_traffic(c, up_i, down_i)
                 traffic_bytes += up_i + down_i
@@ -514,7 +522,7 @@ def apply(
                 payload: dict[str, Any] = {
                     "email": email,
                     "enabled": bool(u.enabled),
-                    "inbounds": list(tags),
+                    "inbounds": list(use_tags),
                     "limit_gb": float(u.limit_gb or 0),
                     "expire_at": u.expire_at or "",
                     "comment": u.comment or "",
@@ -553,6 +561,9 @@ def apply(
         "traffic_bytes": traffic_bytes,
         "errors": errors[:30],
         "inbounds": tags,
+        "client_inbound_map": sum(
+            1 for u in users if (u.extra or {}).get("inbounds")
+        ),
     }
 
 
@@ -761,8 +772,9 @@ def parse_3xui_sqlite(path: Path | str) -> list[NormalizedUser]:
             pass
 
         try:
-            for row in conn.execute("SELECT settings FROM inbounds"):
+            for row in conn.execute("SELECT tag, settings FROM inbounds"):
                 try:
+                    ib_tag = str(row["tag"] or "").strip()
                     settings = json.loads(row["settings"] or "{}")
                 except (ValueError, TypeError, KeyError):
                     continue
@@ -788,6 +800,10 @@ def parse_3xui_sqlite(path: Path | str) -> list[NormalizedUser]:
                             cur["totalGB"] = c.get("totalGB")
                         if not cur.get("password") and c.get("password"):
                             cur["password"] = c.get("password")
+                    if ib_tag:
+                        tags = by_email[key].setdefault("_inbounds", [])
+                        if ib_tag not in tags:
+                            tags.append(ib_tag)
         except sqlite3.Error:
             pass
 
@@ -801,20 +817,645 @@ def parse_3xui_sqlite(path: Path | str) -> list[NormalizedUser]:
             tr = traffics.get(key) or {}
             u = _x3_client_from_dict(c, tr)
             if u:
+                ibs = [t for t in (c.get("_inbounds") or []) if t]
+                if ibs:
+                    u.extra["inbounds"] = ibs
                 out.append(u)
 
         global LAST_SOURCE_META
         used = sum(int(u.up) + int(u.down) for u in out)
+        structure = load_3xui_structure(conn)
         LAST_SOURCE_META = {
             **(LAST_SOURCE_META or {}),
             "source": "3xui",
             "traffic_rows": len(traffics),
             "clients": len(out),
             "traffic_bytes": used,
+            "structure": structure,
+            "inbounds": len(structure.get("inbound_rows") or []),
+            "outbounds": len(structure.get("outbounds") or []),
+            "routes": len(structure.get("routes") or []),
         }
         return out
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- 3x-ui structure (inbounds / outbounds / routes)
+
+_SYSTEM_OUTBOUND_TAGS = frozenset({"direct", "block", "blocked", "blackhole", "api", "dns-out", "dns", "freedom"})
+_SKIP_ROUTE_OUTBOUNDS = frozenset({"api"})
+
+
+def _json_obj(raw: Any, default: Any = None) -> Any:
+    if raw is None or raw == "":
+        return default if default is not None else {}
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(str(raw))
+    except (ValueError, TypeError):
+        return default if default is not None else {}
+
+
+def _headers_to_lines(headers: Any) -> str:
+    if not isinstance(headers, dict):
+        return ""
+    lines = []
+    for k, v in headers.items():
+        if isinstance(v, list):
+            for item in v:
+                lines.append(f"{k}: {item}")
+        elif v is not None and str(v) != "":
+            lines.append(f"{k}: {v}")
+    return "\n".join(lines)
+
+
+def stream_from_xray(ss: dict | None) -> dict:
+    """Convert Xray/3x-ui streamSettings JSON into L2X stream model."""
+    ss = ss if isinstance(ss, dict) else {}
+    net = str(ss.get("network") or "tcp").lower()
+    if net in ("tcp", "raw", ""):
+        net = "raw"
+    sec = str(ss.get("security") or "none").lower() or "none"
+    if sec not in ("none", "tls", "reality"):
+        sec = "none"
+    st = P.default_stream("none")
+    st["network"] = net if net in P.NETWORKS else "raw"
+    st["security"] = sec
+    tcp_or_raw = ss.get("tcpSettings") if isinstance(ss.get("tcpSettings"), dict) else (
+        ss.get("rawSettings") if isinstance(ss.get("rawSettings"), dict) else {}
+    )
+    sock = ss.get("sockopt") if isinstance(ss.get("sockopt"), dict) else {}
+    st["accept_proxy_protocol"] = bool(sock.get("acceptProxyProtocol") or tcp_or_raw.get("acceptProxyProtocol"))
+
+    # --- transports
+    if net == "raw":
+        raw_ss = ss.get("rawSettings") or ss.get("tcpSettings") or {}
+        if not isinstance(raw_ss, dict):
+            raw_ss = {}
+        header = raw_ss.get("header") if isinstance(raw_ss.get("header"), dict) else {}
+        htype = str(header.get("type") or "none")
+        req = header.get("request") if isinstance(header.get("request"), dict) else {}
+        path = req.get("path") or ["/"]
+        if isinstance(path, list):
+            path = path[0] if path else "/"
+        hosts = (req.get("headers") or {}).get("Host") if isinstance(req.get("headers"), dict) else []
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        st["raw"].update({
+            "header": "http" if htype == "http" else "none",
+            "http_method": str(req.get("method") or "GET"),
+            "http_path": str(path or "/"),
+            "http_host": ",".join(str(h) for h in (hosts or [])),
+            "http_headers": _headers_to_lines({
+                k: v for k, v in (req.get("headers") or {}).items() if str(k).lower() != "host"
+            }) if isinstance(req.get("headers"), dict) else "",
+            "accept_proxy_protocol": bool(raw_ss.get("acceptProxyProtocol")),
+        })
+    elif net == "ws":
+        ws = ss.get("wsSettings") or {}
+        if isinstance(ws, dict):
+            st["ws"].update({
+                "path": str(ws.get("path") or "/"),
+                "host": str(ws.get("host") or ""),
+                "headers": _headers_to_lines(ws.get("headers")),
+                "heartbeat": int(ws.get("heartbeatPeriod") or P.DEFAULT_WS_HEARTBEAT),
+                "accept_proxy_protocol": bool(ws.get("acceptProxyProtocol")),
+            })
+    elif net == "grpc":
+        g = ss.get("grpcSettings") or {}
+        if isinstance(g, dict):
+            st["grpc"].update({
+                "service_name": str(g.get("serviceName") or "grpc"),
+                "multi_mode": bool(g.get("multiMode")),
+                "authority": str(g.get("authority") or ""),
+                "idle_timeout": int(g.get("idle_timeout") or 0),
+                "health_check_timeout": int(g.get("health_check_timeout") or 0),
+                "permit_without_stream": bool(g.get("permit_without_stream")),
+                "initial_windows_size": int(g.get("initial_windows_size") or 0),
+            })
+    elif net == "httpupgrade":
+        h = ss.get("httpupgradeSettings") or {}
+        if isinstance(h, dict):
+            st["httpupgrade"].update({
+                "path": str(h.get("path") or "/"),
+                "host": str(h.get("host") or ""),
+                "headers": _headers_to_lines(h.get("headers")),
+                "accept_proxy_protocol": bool(h.get("acceptProxyProtocol")),
+            })
+    elif net == "xhttp":
+        x = ss.get("xhttpSettings") or ss.get("splithttpSettings") or {}
+        if isinstance(x, dict):
+            xm = x.get("xmux") if isinstance(x.get("xmux"), dict) else {}
+            st["xhttp"].update({
+                "path": str(x.get("path") or "/"),
+                "host": str(x.get("host") or ""),
+                "mode": str(x.get("mode") or "auto"),
+                "headers": _headers_to_lines(x.get("headers")),
+                "x_padding_bytes": str(x.get("xPaddingBytes") or "100-1000"),
+                "sc_max_buffered_posts": int(x.get("scMaxBufferedPosts") or 30),
+                "sc_max_each_post_bytes": str(x.get("scMaxEachPostBytes") or "1000000"),
+                "sc_min_each_post_bytes": str(x.get("scMinEachPostBytes") or "1"),
+                "sc_stream_up_server_secs": str(x.get("scStreamUpServerSecs") or "20-80"),
+                "sc_min_posts_interval_ms": int(x.get("scMinPostsIntervalMs") or 30),
+                "no_sse_header": bool(x.get("noSSEHeader")),
+                "no_grpc_header": bool(x.get("noGRPCHeader")),
+                "extra": json.dumps(x.get("extra"), ensure_ascii=False) if isinstance(x.get("extra"), (dict, list)) else str(x.get("extra") or ""),
+                "xmux": {
+                    "enabled": bool(xm),
+                    "max_concurrency": str(xm.get("maxConcurrency") or "16-32"),
+                    "max_connections": int(xm.get("maxConnections") or 0),
+                    "c_max_reuse_times": str(xm.get("cMaxReuseTimes") or "0"),
+                    "c_max_lifetime_ms": str(xm.get("cMaxLifetimeMs") or "0"),
+                    "h_max_request_times": str(xm.get("hMaxRequestTimes") or "0"),
+                    "h_max_reusable_secs": str(xm.get("hMaxReusableSecs") or "0"),
+                },
+            })
+    elif net == "kcp":
+        k = ss.get("kcpSettings") or {}
+        if isinstance(k, dict):
+            hdr = k.get("header") if isinstance(k.get("header"), dict) else {}
+            st["kcp"].update({
+                "mtu": int(k.get("mtu") or 1350),
+                "tti": int(k.get("tti") or 20),
+                "uplink": int(k.get("uplinkCapacity") or 5),
+                "downlink": int(k.get("downlinkCapacity") or 20),
+                "congestion": bool(k.get("congestion")),
+                "header": str(hdr.get("type") or "none"),
+                "seed": str(k.get("seed") or ""),
+                "read_buffer": int(k.get("readBufferSize") or 2),
+                "write_buffer": int(k.get("writeBufferSize") or 2),
+            })
+
+    # --- security
+    fp = "firefox"
+    if sec == "tls":
+        t = ss.get("tlsSettings") or {}
+        if isinstance(t, dict):
+            certs = t.get("certificates") or []
+            cert = certs[0] if isinstance(certs, list) and certs and isinstance(certs[0], dict) else {}
+            alpn = t.get("alpn") or ["h2", "http/1.1"]
+            if isinstance(alpn, str):
+                alpn = [a.strip() for a in alpn.split(",") if a.strip()]
+            fp = str(t.get("fingerprint") or fp)
+            st["tls"].update({
+                "server_name": str(t.get("serverName") or ""),
+                "cert_file": str(cert.get("certificateFile") or ""),
+                "key_file": str(cert.get("keyFile") or ""),
+                "alpn": alpn,
+                "fingerprint": fp,
+                "min_version": str(t.get("minVersion") or "1.2"),
+                "max_version": str(t.get("maxVersion") or "1.3"),
+                "cipher_suites": str(t.get("cipherSuites") or ""),
+                "allow_insecure": bool(t.get("allowInsecure")),
+                "reject_unknown_sni": bool(t.get("rejectUnknownSni")),
+                "disable_system_root": bool(t.get("disableSystemRoot")),
+                "ech_server_keys": str(t.get("echServerKeys") or ""),
+            })
+    elif sec == "reality":
+        r = ss.get("realitySettings") or {}
+        if isinstance(r, dict):
+            names = r.get("serverNames") or []
+            if isinstance(names, str):
+                names = [n.strip() for n in names.split(",") if n.strip()]
+            sids = r.get("shortIds") or [""]
+            if isinstance(sids, str):
+                sids = [sids]
+            fp = str(r.get("fingerprint") or fp)
+            priv = str(r.get("privateKey") or "")
+            pub = str(r.get("publicKey") or r.get("password") or "")
+            if priv and not pub:
+                derived = xray.reality_public_from_private(priv)
+                if derived.get("ok"):
+                    pub = derived["public_key"]
+            st["reality"].update({
+                "show": bool(r.get("show")),
+                "dest": str(r.get("dest") or r.get("target") or "www.cloudflare.com:443"),
+                "xver": int(r.get("xver") or 0),
+                "server_names": names or ["www.cloudflare.com"],
+                "private_key": priv,
+                "public_key": pub,
+                "short_ids": [str(s) for s in sids] or [""],
+                "fingerprint": fp,
+                "spider_x": str(r.get("spiderX") or r.get("spider_x") or "/"),
+                "max_time_diff": int(r.get("maxTimeDiff") or 0),
+                "min_client_ver": str(r.get("minClientVer") or ""),
+                "max_client_ver": str(r.get("maxClientVer") or ""),
+                "mldsa65_seed": str(r.get("mldsa65Seed") or ""),
+                "mldsa65_verify": str(r.get("mldsa65Verify") or ""),
+            })
+    st["fingerprint"] = fp
+
+    so = ss.get("sockopt") if isinstance(ss.get("sockopt"), dict) else {}
+    if so:
+        st["sockopt"].update({
+            "enabled": True,
+            "tcp_fast_open": bool(so.get("tcpFastOpen")),
+            "tcp_keep_alive_interval": int(so.get("tcpKeepAliveInterval") or 0),
+            "tcp_keep_alive_idle": int(so.get("tcpKeepAliveIdle") or 0),
+            "tcp_user_timeout": int(so.get("tcpUserTimeout") or 0),
+            "tcp_congestion": str(so.get("tcpCongestion") or so.get("tcpcongestion") or ""),
+            "tcp_window_clamp": int(so.get("tcpWindowClamp") or 0),
+            "tcp_max_seg": int(so.get("tcpMaxSeg") or 0),
+            "mark": int(so.get("mark") or 0),
+            "tproxy": str(so.get("tproxy") or ""),
+            "domain_strategy": str(so.get("domainStrategy") or "AsIs"),
+            "dialer_proxy": str(so.get("dialerProxy") or ""),
+            "interface": str(so.get("interface") or so.get("interfaceName") or ""),
+            "penetrate": bool(so.get("penetrate")),
+            "tcp_mptcp": bool(so.get("tcpMptcp")),
+            "tcp_no_delay": bool(so.get("tcpNoDelay")),
+            "v6only": bool(so.get("V6Only") or so.get("v6only")),
+        })
+    return st
+
+
+def sniffing_from_xray(raw: Any) -> dict:
+    sn = _json_obj(raw, {})
+    if not isinstance(sn, dict):
+        sn = {}
+    dest = sn.get("destOverride") or sn.get("dest") or ["http", "tls", "quic"]
+    if isinstance(dest, str):
+        dest = [d.strip() for d in dest.split(",") if d.strip()]
+    return {
+        "enabled": bool(sn.get("enabled", True)),
+        "dest": [str(d) for d in dest],
+        "route_only": bool(sn.get("routeOnly") or sn.get("route_only")),
+        "metadata_only": bool(sn.get("metadataOnly") or sn.get("metadata_only")),
+        "excluded_domains": [str(d) for d in (sn.get("domainsExcluded") or sn.get("excluded_domains") or []) if d],
+    }
+
+
+def inbound_from_3xui_row(row: dict, *, next_id: int, used_ports: set[int]) -> tuple[dict | None, str]:
+    """Build L2X inbound from a 3x-ui inbounds table row. Returns (ib, warning)."""
+    proto = str(row.get("protocol") or "").lower().strip()
+    if proto == "dokodemo":
+        proto = "dokodemo-door"
+    if proto not in P.ALL_PROTOCOLS:
+        return None, f"протокол {proto or '?'} не поддерживается"
+    tag = str(row.get("tag") or "").strip() or f"{proto}-{next_id}"
+    if not xray.TAG_RE.match(tag):
+        tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:40] or f"{proto}-{next_id}"
+    settings_raw = _json_obj(row.get("settings"), {})
+    if not isinstance(settings_raw, dict):
+        settings_raw = {}
+    stream_raw = _json_obj(row.get("stream_settings") or row.get("streamsettings") or row.get("streamSettings"), {})
+    if not isinstance(stream_raw, dict):
+        stream_raw = {}
+
+    ib = P.default_inbound(proto, 10000, tag)
+    ib["id"] = next_id
+    ib["remark"] = str(row.get("remark") or tag)
+    ib["enabled"] = bool(row.get("enable", row.get("enabled", True)))
+    if isinstance(ib["enabled"], str):
+        ib["enabled"] = ib["enabled"].lower() not in ("0", "false", "no")
+    ib["expire_at"] = expire_from_ms(row.get("expiry_time") or row.get("expirytime") or row.get("expiryTime"))
+    total = _safe_int(row.get("total"), 0)
+    ib["total_gb"] = bytes_to_limit_gb(total) if total > 1024 else _safe_float(total, 0)
+    reset = str(row.get("traffic_reset") or row.get("trafficreset") or "never")
+    ib["traffic_reset"] = reset if reset in P.TRAFFIC_RESETS else "never"
+    up = _safe_int(row.get("up"), 0)
+    down = _safe_int(row.get("down"), 0)
+    ib["traffic"] = {"up": up, "down": down, "last_up": 0, "last_down": 0}
+
+    listen = str(row.get("listen") or "").strip()
+    port = _safe_int(row.get("port"), 0)
+    # 3x-ui public ports → L2X: reserved 22/80/443 or taken → free internal + nginx/direct remap
+    want_direct = listen in ("", "0.0.0.0", "::", "[::]")
+    warn = ""
+    if port <= 0 or xray.port_forbidden_reason(port) or port in used_ports:
+        new_port = next(
+            (p for p in range(10000, 65535) if p not in used_ports and not xray.port_forbidden_reason(p)),
+            0,
+        )
+        if not new_port:
+            return None, f"нет свободного порта для {tag}"
+        if port:
+            warn = f"{tag}: порт {port} занят/запрещён → {new_port}"
+        port = new_port
+        # Keep reachable via nginx :443 when possible
+        want_direct = False
+    ib["port"] = port
+    ib["direct"] = want_direct
+    ib["listen"] = P.inbound_listen(ib)
+    used_ports.add(port)
+
+    # Protocol settings (without clients — they live in store.clients)
+    s = ib["settings"]
+    if proto == "vless":
+        s["decryption"] = str(settings_raw.get("decryption") or "none")
+        s["encryption"] = str(settings_raw.get("encryption") or "none")
+        clients = settings_raw.get("clients") or []
+        flow = ""
+        if isinstance(clients, list):
+            for c in clients:
+                if isinstance(c, dict) and c.get("flow"):
+                    flow = str(c["flow"])
+                    break
+        s["flow"] = flow
+    elif proto == "shadowsocks":
+        s["method"] = str(settings_raw.get("method") or s.get("method") or "2022-blake3-aes-256-gcm")
+        s["password"] = str(settings_raw.get("password") or s.get("password") or "")
+        s["network"] = str(settings_raw.get("network") or "tcp,udp")
+    elif proto == "wireguard":
+        s["secret_key"] = str(settings_raw.get("secretKey") or "")
+        s["mtu"] = int(settings_raw.get("mtu") or 1420)
+    elif proto in ("socks", "http"):
+        s["auth"] = "noauth" if settings_raw.get("auth") == "noauth" else "password"
+        s["udp"] = bool(settings_raw.get("udp", True))
+    elif proto == "dokodemo-door":
+        s["address"] = str(settings_raw.get("address") or "1.1.1.1")
+        s["port"] = int(settings_raw.get("port") or 53)
+        s["network"] = str(settings_raw.get("network") or "tcp,udp")
+        s["follow_redirect"] = bool(settings_raw.get("followRedirect"))
+
+    fbs = []
+    for fb in settings_raw.get("fallbacks") or []:
+        if not isinstance(fb, dict):
+            continue
+        dest = str(fb.get("dest") or "").strip()
+        if not dest:
+            continue
+        fbs.append({
+            "name": str(fb.get("name") or ""),
+            "alpn": str(fb.get("alpn") or ""),
+            "path": str(fb.get("path") or ""),
+            "dest": dest,
+            "xver": _safe_int(fb.get("xver"), 0),
+        })
+    ib["fallbacks"] = fbs
+
+    ib["stream"] = stream_from_xray(stream_raw)
+    ib["sniffing"] = sniffing_from_xray(row.get("sniffing"))
+    # SNI / share host for nginx front
+    if not want_direct:
+        names = P.front_snis(ib)
+        if names and not _is_ip_like(names[0]):
+            ib["share_host"] = names[0]
+    P.ensure_inbound_shape(ib)
+    xray.ensure_inbound_keys(ib)
+    return ib, warn
+
+
+def _is_ip_like(value: str) -> bool:
+    v = (value or "").strip().strip("[]")
+    if not v:
+        return False
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", v):
+        return True
+    return ":" in v and all(c in "0123456789abcdefABCDEF:" for c in v)
+
+
+def outbound_from_xray(ob: dict) -> dict | None:
+    """Map a non-system Xray outbound into outbounds_custom entry."""
+    if not isinstance(ob, dict):
+        return None
+    tag = str(ob.get("tag") or "").strip()
+    proto = str(ob.get("protocol") or "").strip().lower()
+    if not tag or not proto:
+        return None
+    if tag.lower() in _SYSTEM_OUTBOUND_TAGS or proto in ("freedom", "blackhole", "dns", "dokodemo-door"):
+        return None
+    if not xray.TAG_RE.match(tag):
+        tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:40]
+    cfg = json.loads(json.dumps(ob))
+    cfg["tag"] = tag
+    return {
+        "tag": tag,
+        "enabled": True,
+        "kind": proto,
+        "remark": tag,
+        "country": "",
+        "info": _outbound_info_simple(cfg),
+        "in_sub": True,
+        "config": cfg,
+    }
+
+
+def _outbound_info_simple(config: dict) -> str:
+    proto = config.get("protocol") or "?"
+    s = config.get("settings") or {}
+    srv = (s.get("vnext") or s.get("servers") or [None])[0]
+    if isinstance(srv, dict) and srv.get("address"):
+        return f"{proto} {srv['address']}:{srv.get('port', '')}"
+    return proto
+
+
+def route_from_xray_rule(rule: dict, *, idx: int) -> dict | None:
+    if not isinstance(rule, dict):
+        return None
+    if rule.get("type") and rule.get("type") != "field":
+        return None
+    inbound = rule.get("inboundTag") or []
+    if isinstance(inbound, str):
+        inbound = [inbound]
+    inbound = [str(x) for x in inbound if x]
+    if inbound and set(inbound) <= _SKIP_ROUTE_OUTBOUNDS:
+        return None
+    outbound = str(rule.get("outboundTag") or rule.get("balancerTag") or "").strip()
+    if not outbound or outbound.lower() in ("api",):
+        return None
+    # Skip the universal final catch-all — L2X already appends network→direct
+    domain = rule.get("domain") or []
+    ip = rule.get("ip") or []
+    user = rule.get("user") or []
+    source = rule.get("source") or []
+    protocol = rule.get("protocol") or []
+    network = str(rule.get("network") or "")
+    port = str(rule.get("port") or "")
+    if isinstance(domain, str):
+        domain = [domain]
+    if isinstance(ip, str):
+        ip = [ip]
+    if isinstance(user, str):
+        user = [user]
+    if isinstance(source, str):
+        source = [source]
+    if isinstance(protocol, str):
+        protocol = [protocol]
+    if (
+        not domain and not ip and not user and not source and not protocol
+        and not inbound and not port
+        and network in ("tcp,udp", "tcp", "udp", "")
+        and outbound in ("direct", "block")
+    ):
+        return None
+    name = str(rule.get("ruleTag") or f"x3-{idx}")
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:64] or f"x3-{idx}"
+    return {
+        "name": name,
+        "enabled": True,
+        "outbound": outbound,
+        "domain": [str(x) for x in domain if x],
+        "ip": [str(x) for x in ip if x],
+        "user": [str(x) for x in user if x],
+        "source": [str(x) for x in source if x],
+        "protocol": [str(x) for x in protocol if x],
+        "inbound_tags": inbound,
+        "network": network if network not in ("tcp,udp",) else "",
+        "port": port,
+    }
+
+
+def _read_xray_template(conn: sqlite3.Connection) -> dict:
+    """Unwrap 3x-ui xrayTemplateConfig (raw or nested xraySetting)."""
+    try:
+        rows = conn.execute("SELECT key, value FROM settings")
+    except sqlite3.Error:
+        try:
+            rows = conn.execute('SELECT "key", value FROM settings')
+        except sqlite3.Error:
+            return {}
+    kv = {}
+    for row in rows:
+        try:
+            kv[str(row["key"])] = row["value"]
+        except (KeyError, IndexError):
+            keys = list(row.keys())
+            if len(keys) >= 2:
+                kv[str(row[keys[0]])] = row[keys[1]]
+    raw = kv.get("xrayTemplateConfig") or kv.get("xray_template_config") or ""
+    data = _json_obj(raw, {})
+    if not isinstance(data, dict):
+        return {}
+    if isinstance(data.get("xraySetting"), dict):
+        return data["xraySetting"]
+    if isinstance(data.get("xraySettings"), dict):
+        return data["xraySettings"]
+    return data
+
+
+def load_3xui_structure(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Parse inbounds + template outbounds/routes from an open 3x-ui SQLite connection."""
+    inbounds_rows: list[dict] = []
+    try:
+        for row in conn.execute("SELECT * FROM inbounds"):
+            inbounds_rows.append(_row_dict(row))
+    except sqlite3.Error:
+        pass
+    tmpl = _read_xray_template(conn)
+    outbounds = []
+    for ob in tmpl.get("outbounds") or []:
+        mapped = outbound_from_xray(ob)
+        if mapped:
+            outbounds.append(mapped)
+    routes = []
+    routing = tmpl.get("routing") if isinstance(tmpl.get("routing"), dict) else {}
+    for i, rule in enumerate(routing.get("rules") or []):
+        mapped = route_from_xray_rule(rule, idx=i + 1)
+        if mapped:
+            routes.append(mapped)
+    return {
+        "inbound_rows": inbounds_rows,
+        "outbounds": outbounds,
+        "routes": routes,
+        "routing_domain_strategy": str(routing.get("domainStrategy") or ""),
+    }
+
+
+def apply_3xui_structure(
+    store: dict,
+    structure: dict | None,
+    *,
+    restore_inbounds: bool = True,
+    restore_outbounds: bool = True,
+    restore_routes: bool = True,
+) -> dict[str, Any]:
+    """Create/update L2X inbounds, custom outbounds and routes from 3x-ui backup data."""
+    structure = structure or {}
+    report: dict[str, Any] = {
+        "inbounds_created": 0, "inbounds_updated": 0, "inbounds_skipped": 0,
+        "outbounds_created": 0, "outbounds_updated": 0, "outbounds_skipped": 0,
+        "routes_created": 0, "routes_updated": 0, "routes_skipped": 0,
+        "warnings": [], "inbound_tags": [],
+    }
+    xray.ensure_inbounds(store)
+    used_ports = {int(i.get("port") or 0) for i in store.get("inbounds") or []}
+    next_id = max([int(i.get("id") or 0) for i in store.get("inbounds") or []] + [0]) + 1
+    tag_map: dict[str, str] = {}  # original → final tag (usually same)
+
+    if restore_inbounds:
+        for row in structure.get("inbound_rows") or []:
+            tag = str(row.get("tag") or "").strip()
+            existing = xray.inbound_by_tag(store, tag) if tag else None
+            if existing and existing.get("_system"):
+                report["inbounds_skipped"] += 1
+                report["warnings"].append(f"{tag}: систем inbound — пропуск")
+                continue
+            ib, warn = inbound_from_3xui_row(
+                row,
+                next_id=(int(existing["id"]) if existing else next_id),
+                used_ports=used_ports - ({int(existing.get("port") or 0)} if existing else set()),
+            )
+            if warn:
+                report["warnings"].append(warn)
+            if not ib:
+                report["inbounds_skipped"] += 1
+                continue
+            used_ports.add(int(ib["port"]))
+            tag_map[str(row.get("tag") or ib["tag"])] = ib["tag"]
+            report["inbound_tags"].append(ib["tag"])
+            if existing:
+                # Keep id; replace config fields
+                keep_id = existing["id"]
+                existing.clear()
+                existing.update(ib)
+                existing["id"] = keep_id
+                report["inbounds_updated"] += 1
+            else:
+                store.setdefault("inbounds", []).append(ib)
+                next_id = max(next_id, int(ib["id"]) + 1)
+                report["inbounds_created"] += 1
+
+    if restore_outbounds:
+        customs = store.setdefault("outbounds_custom", [])
+        by_tag = {str(o.get("tag") or ""): o for o in customs}
+        for ob in structure.get("outbounds") or []:
+            tag = ob["tag"]
+            if tag in ("direct", "block"):
+                report["outbounds_skipped"] += 1
+                continue
+            if tag in by_tag:
+                cur = by_tag[tag]
+                if cur.get("kind") == "node":
+                    report["outbounds_skipped"] += 1
+                    report["warnings"].append(f"{tag}: node outbound — не перезаписываем")
+                    continue
+                cur.update({k: v for k, v in ob.items() if k != "tag"})
+                cur["tag"] = tag
+                report["outbounds_updated"] += 1
+            else:
+                customs.append(ob)
+                by_tag[tag] = ob
+                report["outbounds_created"] += 1
+
+    if restore_routes:
+        routes = store.setdefault("routes", [])
+        by_name = {str(r.get("name") or ""): r for r in routes}
+        for rule in structure.get("routes") or []:
+            # Remap inbound tags if needed
+            rule = dict(rule)
+            rule["inbound_tags"] = [tag_map.get(t, t) for t in (rule.get("inbound_tags") or [])]
+            name = rule["name"]
+            if name in by_name:
+                by_name[name].update(rule)
+                report["routes_updated"] += 1
+            else:
+                # ensure unique name
+                base = name
+                n = 2
+                while name in by_name:
+                    name = f"{base}-{n}"
+                    n += 1
+                rule["name"] = name
+                routes.append(rule)
+                by_name[name] = rule
+                report["routes_created"] += 1
+
+    return report
 
 
 def fetch_3xui_api(

@@ -13,7 +13,7 @@
 <div class="card" style="margin-bottom:1rem">
   <h3>Что переносится</h3>
   <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит, срок, уже потраченный трафик.
-  Inbounds/ноды чужих панелей не импортируются — клиенты вешаются на выбранные L2X inbounds.</div>
+  Для <b>3x-ui .db</b> дополнительно можно восстановить inbounds, outbounds и маршрутизацию из шаблона Xray.</div>
   <div class="hint" style="margin-top:.5rem">
     Токен клиента (последний сегмент URL) сохраняется. Если в 3x-ui ссылка была вида
     <code>http://host:2096/&lt;path&gt;/&lt;token&gt;</code>, а здесь стало
@@ -67,22 +67,32 @@
     <label class="f">Файл</label>
     <input type="file" name="file" accept=".db,.json,.sql,.zip,.tar,.gz,.tgz,application/octet-stream">
     <div class="hint">
-      <b>3x-ui:</b> SQLite <code>.db</code> (getDb) или JSON export клиентов.<br>
+      <b>3x-ui:</b> SQLite <code>.db</code> (getDb) — клиенты + inbounds/outbounds/routes; или JSON export только клиентов.<br>
       <b>PasarGuard:</b> backup <code>.zip</code>/<code>.tar.gz</code> (<code>db.sqlite3</code>, <code>db_dump/</code>, <code>pg_dump/db-*.sql</code>), SQL dump или JSON users.
       Токен подписки в БД не хранится (подписан JWT) — панель берёт <code>jwt.secret_key</code> из бэкапа и принимает уже выданные клиентам ссылки.<br>
       <b>Remnawave:</b> JSON массив/ответ API с users.
     </div>
   </div>
 
+  <h3 style="margin-top:1.4rem">Структура 3x-ui</h3>
+  <div class="hint">Из полного <code>x-ui.db</code>: inbounds (таблица), outbounds и routing.rules из <code>xrayTemplateConfig</code>. Клиенты привязываются к своим inbound tag из бэкапа.</div>
+  {{ m.check('restore_structure', restore_structure, 'Восстановить inbounds + outbounds + маршрутизацию (3x-ui .db / getDb)') }}
+  {% if source_meta and (source_meta.inbounds or source_meta.outbounds or source_meta.routes) %}
+  <div class="hint" style="margin-top:.4rem">В последнем preview:
+    inbounds {{ source_meta.inbounds or 0 }},
+    outbounds {{ source_meta.outbounds or 0 }},
+    routes {{ source_meta.routes or 0 }}</div>
+  {% endif %}
+
   <h3 style="margin-top:1.4rem">Куда повесить</h3>
-  <div class="hint">Выберите L2X inbounds для импортированных клиентов (по умолчанию — все).</div>
+  <div class="hint">Fallback L2X inbounds, если у клиента нет tag из 3x-ui (по умолчанию — все). После восстановления структуры обычно не нужны.</div>
   <div class="row" style="flex-wrap:wrap;gap:.4rem 1rem;margin-top:.5rem">
     {% for ib in inbounds %}
     <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}"
       {% if not selected_inbounds or ib.tag in selected_inbounds %}checked{% endif %}> {{ ib.tag }}
       <span class="dim">({{ ib.protocol }})</span></label>
     {% else %}
-    <div class="hint">Нет подходящих inbounds — создайте inbound перед импортом.</div>
+    <div class="hint">Нет подходящих inbounds — при восстановлении структуры они создадутся из бэкапа.</div>
     {% endfor %}
   </div>
   <div style="margin-top:.8rem">
@@ -104,7 +114,7 @@
 
   <div class="actions" style="margin-top:1.2rem">
     <button class="btn ghost" type="submit" name="action" value="preview">Проверить</button>
-    <button class="btn" type="submit" name="action" value="import" onclick="return confirm('Импортировать клиентов в панель?')">Импорт</button>
+    <button class="btn" type="submit" name="action" value="import" onclick="return confirm('Импортировать клиентов и структуру в панель?')">Импорт</button>
   </div>
 </form>
 
@@ -149,6 +159,16 @@
     <div><span class="dim">Обновлено</span><div><b>{{ report.updated }}</b></div></div>
     <div><span class="dim">Пропущено</span><div><b>{{ report.skipped }}</b></div></div>
   </div>
+  {% if report.structure %}
+  <div class="row" style="margin-top:.6rem">
+    <div><span class="dim">Inbounds</span><div><b>+{{ report.structure.inbounds_created }} / ~{{ report.structure.inbounds_updated }}</b></div></div>
+    <div><span class="dim">Outbounds</span><div><b>+{{ report.structure.outbounds_created }} / ~{{ report.structure.outbounds_updated }}</b></div></div>
+    <div><span class="dim">Routes</span><div><b>+{{ report.structure.routes_created }} / ~{{ report.structure.routes_updated }}</b></div></div>
+  </div>
+  {% if report.structure.warnings %}
+  <div class="hint" style="margin-top:.4rem">{% for w in report.structure.warnings[:12] %}{{ w }}<br>{% endfor %}</div>
+  {% endif %}
+  {% endif %}
   {% if report.errors %}
   <div class="hint" style="color:var(--err);margin-top:.6rem">
     {% for e in report.errors %}{{ e }}<br>{% endfor %}

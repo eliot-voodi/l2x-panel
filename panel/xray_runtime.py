@@ -113,19 +113,41 @@ def generate_wg_keys() -> dict:
     return _parse_keypair(r)
 
 
-def wg_public_from_private(private_key: str) -> dict:
-    """Derive WireGuard public key from a base64 private key."""
+def _x25519_public_from_private(private_key: str) -> dict:
+    """Derive X25519 public key (WireGuard / Reality) from a private key string."""
+    priv = (private_key or "").strip()
+    if not priv:
+        return {"ok": False, "error": "empty private key"}
+    # Prefer xray CLI (same encoding as keygen)
+    r = _run([XRAY_BIN, "x25519", "-i", priv], timeout=15)
+    parsed = _parse_keypair(r)
+    if parsed.get("ok") and parsed.get("public_key"):
+        return {"ok": True, "private_key": priv, "public_key": parsed["public_key"]}
     try:
         from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
         from cryptography.hazmat.primitives import serialization
-        raw = base64.b64decode(private_key.strip() + "=" * (-len(private_key.strip()) % 4))
+        pad = "=" * (-len(priv) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(priv + pad)
+        except Exception:
+            raw = base64.b64decode(priv + pad)
         if len(raw) != 32:
             return {"ok": False, "error": "private key must be 32 bytes"}
         pub = X25519PrivateKey.from_private_bytes(raw).public_key().public_bytes(
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-        return {"ok": True, "private_key": private_key.strip(), "public_key": base64.b64encode(pub).decode()}
+        return {"ok": True, "private_key": priv, "public_key": base64.urlsafe_b64encode(pub).decode().rstrip("=")}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc) or "derive failed"}
+
+
+def wg_public_from_private(private_key: str) -> dict:
+    """Derive WireGuard public key from a base64 private key."""
+    return _x25519_public_from_private(private_key)
+
+
+def reality_public_from_private(private_key: str) -> dict:
+    """Derive Reality public key from private (restore from 3x-ui without regenerating)."""
+    return _x25519_public_from_private(private_key)
 
 
 def _parse_keypair(r: dict) -> dict:
@@ -1083,6 +1105,10 @@ def ensure_inbound_keys(ib: dict) -> None:
     st = ib["stream"]
     if st.get("security") == "reality":
         r = st["reality"]
+        if r.get("private_key") and not r.get("public_key"):
+            derived = reality_public_from_private(str(r["private_key"]))
+            if derived.get("ok"):
+                r["public_key"] = derived["public_key"]
         if not r.get("private_key") or not r.get("public_key"):
             keys = generate_reality_keys()
             if keys.get("ok"):
