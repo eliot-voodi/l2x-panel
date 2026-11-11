@@ -56,7 +56,8 @@
   <h3 class="mt">Совместимость старых ссылок (3x-ui и др.)</h3>
   <div class="hint">Токен клиента при миграции сохраняется. Если в старой панели путь был не <code>/sub/</code> (например <code>/zdgdjmy3kho5i6qg/</code>) и/или порт <code>2096</code> — укажите их здесь, чтобы старые URL продолжили открываться без смены у пользователей.</div>
   <label class="f">Доп. пути подписки (по одному в строке)</label>
-  <textarea name="path_aliases" class="mono" rows="2" placeholder="zdgdjmy3kho5i6qg">{% for a in (sb.path_aliases or []) %}{{ a }}
+  <textarea name="path_aliases" class="mono" rows="2" placeholder="zdgdjmy3kho5i6qg">{%- for a in (sb.path_aliases or []) -%}
+{{ a }}
 {% endfor %}</textarea>
   <div class="row">
     <div style="max-width:280px">
@@ -71,7 +72,8 @@
   <div class="hint">HTTP — <b>без TLS</b> (как 3x-ui sub, <code>http://host:2096/…</code>). HTTPS — с сертификатом публичного домена (PasarGuard <code>https://host:8000/sub/…</code>). iptables не блокирует эти порты.</div>
 
   <label class="f">PasarGuard / Marzban JWT secret (по одному в строке)</label>
-  <textarea name="legacy_jwt_secrets" class="mono" rows="2" placeholder="значение jwt.secret_key из БД PasarGuard">{% for k in (sb.legacy_jwt_secrets or []) %}{{ k }}
+  <textarea name="legacy_jwt_secrets" class="mono" rows="2" placeholder="значение jwt.secret_key из БД PasarGuard">{%- for k in (sb.legacy_jwt_secrets or []) -%}
+{{ k }}
 {% endfor %}</textarea>
   <div class="hint">Токены подписки PasarGuard подписаны этим ключом — с ним панель принимает <b>любые</b> ранее выданные ссылки клиентов (поиск по id пользователя PasarGuard). Заполняется автоматически при импорте бэкапа.</div>
 

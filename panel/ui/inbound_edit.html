@@ -403,14 +403,16 @@
 
 <div class="card" data-proto="vless trojan">
   <h3>Fallbacks</h3>
-  <textarea name="fallbacks" class="mono" rows="4" placeholder="name | alpn | path | dest | xver&#10;| | /ws | 127.0.0.1:8001 | 0&#10;| | | 8080 | 0">{% for f in ib.fallbacks %}{{ f.name }} | {{ f.alpn }} | {{ f.path }} | {{ f.dest }} | {{ f.xver }}
+  <textarea name="fallbacks" class="mono" rows="4" placeholder="name | alpn | path | dest | xver">{%- for f in ib.fallbacks -%}
+{{ f.name }} | {{ f.alpn }} | {{ f.path }} | {{ f.dest }} | {{ f.xver }}
 {% endfor %}</textarea>
   <div class="hint">По одной строке: <code>name | alpn | path | dest | xver</code>. Работает только с raw + tls (без Reality).</div>
 </div>
 
 <div class="card" data-proto="vless vmess trojan shadowsocks hysteria">
   <h3>External Proxies (адреса в ссылках)</h3>
-  <textarea name="external_proxies" class="mono" rows="3" placeholder="address | port | forceTls(same|tls|reality) | remark&#10;cdn.example.com | 443 | same | via-cdn">{% for p in ib.external_proxies or [] %}{{ p.address }} | {{ p.port or '' }} | {{ p.force_tls or 'same' }} | {{ p.remark or '' }}
+  <textarea name="external_proxies" class="mono" rows="3" placeholder="address | port | forceTls | remark">{%- for p in ib.external_proxies or [] -%}
+{{ p.address }} | {{ p.port or '' }} | {{ p.force_tls or 'same' }} | {{ p.remark or '' }}
 {% endfor %}</textarea>
   <div class="hint">Если задано — в подписку попадут эти адреса вместо listen/share host. Формат: <code>address | port | forceTls | remark</code>.</div>
 </div>

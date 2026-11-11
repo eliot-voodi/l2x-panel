@@ -37,7 +37,8 @@
   {{ m.check('enabled', dns.enabled, 'Встроенный DNS Xray') }}
   <div class="row">
     <div><label class="f">Серверы (по строке)</label><textarea name="servers" class="mono" rows="5" placeholder="https+local://1.1.1.1/dns-query&#10;8.8.8.8&#10;localhost">{{ dns.servers|join('\n') }}</textarea></div>
-    <div><label class="f">Hosts (domain = ip)</label><textarea name="hosts" class="mono" rows="5" placeholder="domain:example.com = 1.2.3.4">{% for k, v in dns.hosts.items() %}{{ k }} = {{ v }}
+    <div><label class="f">Hosts (domain = ip)</label><textarea name="hosts" class="mono" rows="5" placeholder="domain:example.com = 1.2.3.4">{%- for k, v in dns.hosts.items() -%}
+{{ k }} = {{ v }}
 {% endfor %}</textarea></div>
   </div>
   <div class="row">
@@ -101,7 +102,8 @@
   <form class="card" method="post" action="{{ bp }}/xray/settings">
     <input type="hidden" name="section" value="geo_custom">
     <h3>Свои geo-файлы</h3>
-    <textarea name="geo_custom" class="mono" rows="6" placeholder="geoip_RU.dat | https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat">{% for g in store.settings.geo_custom %}{{ g.name }} | {{ g.url }}
+    <textarea name="geo_custom" class="mono" rows="6" placeholder="geoip_RU.dat | https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat">{%- for g in store.settings.geo_custom -%}
+{{ g.name }} | {{ g.url }}
 {% endfor %}</textarea>
     <div class="hint">name | url — по строке. Скачиваются вместе с основными при «Обновить».</div>
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
