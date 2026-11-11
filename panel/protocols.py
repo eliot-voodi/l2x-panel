@@ -619,8 +619,19 @@ def build_stream_settings(stream: dict) -> dict:
     return out
 
 
+def fallbacks_allowed(ib: dict) -> bool:
+    """Fallbacks toggle is on and Xray can accept them (VLESS decryption forbids fallbacks)."""
+    if ib.get("fallbacks_enabled") is False:
+        return False
+    if ib.get("protocol") == "vless" and _vless_enc_on(ib.get("settings")):
+        return False
+    return True
+
+
 def _fallbacks(ib: dict) -> list[dict]:
     out = []
+    if not fallbacks_allowed(ib):
+        return out
     for fb in ib.get("fallbacks") or []:
         dest = str(fb.get("dest") or "").strip()
         if not dest:

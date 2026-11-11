@@ -403,10 +403,15 @@
 
 <div class="card" data-proto="vless trojan">
   <h3>Fallbacks</h3>
-  <textarea name="fallbacks" class="mono" rows="4" placeholder="name | alpn | path | dest | xver">{%- for f in ib.fallbacks -%}
+  {{ m.check('fallbacks_enabled', ib.fallbacks_enabled is not sameas false, 'Включить fallbacks') }}
+  <div id="fb_box" class="mt">
+    <textarea name="fallbacks" class="mono" rows="4" placeholder="name | alpn | path | dest | xver">{%- for f in ib.fallbacks -%}
 {{ f.name }} | {{ f.alpn }} | {{ f.path }} | {{ f.dest }} | {{ f.xver }}
 {% endfor %}</textarea>
-  <div class="hint">По одной строке: <code>name | alpn | path | dest | xver</code>. Работает только с raw + tls (без Reality).</div>
+    <div class="hint">По одной строке: <code>name | alpn | path | dest | xver</code>. Работает только с raw + tls (без Reality).
+      Для RAW на :443 панель сама добавляет fallbacks на nginx (сайт/панель на публичном домене) — галочка отключает и их.</div>
+  </div>
+  <div class="hint" id="fb_enc_note" style="display:none;color:var(--warn)">С VLESS encryption (Authentication ≠ None) Xray не поддерживает fallbacks — выключены.</div>
 </div>
 
 <div class="card" data-proto="vless vmess trojan shadowsocks hysteria">
@@ -564,6 +569,7 @@
       document.getElementById('vless_decryption').value = block.decryption;
       document.getElementById('vless_encryption').value = block.encryption;
       document.getElementById('vless_auth').value = block.id === 'mlkem768' ? 'mlkem768' : (block.id === 'x25519' ? 'x25519' : 'custom');
+      syncFallbacks();
     }).catch(function (e) { alert('запрос не удался: ' + e); });
   }
   document.getElementById('btn_vlessenc').addEventListener('click', function () {
@@ -578,7 +584,27 @@
     } else if (this.value === 'x25519' || this.value === 'mlkem768') {
       applyVlessEnc(this.value);
     }
+    syncFallbacks();
   });
+
+  function syncFallbacks() {
+    var cb = document.querySelector('input[name="fallbacks_enabled"]');
+    if (!cb) return;
+    var proto = document.getElementById('protocol').value;
+    var dec = (document.getElementById('vless_decryption') || {}).value || 'none';
+    var enc = (document.getElementById('vless_encryption') || {}).value || 'none';
+    var encOn = proto === 'vless' && (dec.trim().toLowerCase() !== 'none' || enc.trim().toLowerCase() !== 'none');
+    if (encOn) cb.checked = false;
+    cb.disabled = encOn;
+    document.getElementById('fb_enc_note').style.display = encOn ? '' : 'none';
+    document.getElementById('fb_box').style.display = cb.checked ? '' : 'none';
+  }
+  document.querySelector('input[name="fallbacks_enabled"]').addEventListener('change', syncFallbacks);
+  ['vless_decryption', 'vless_encryption', 'protocol'].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) { el.addEventListener('input', syncFallbacks); el.addEventListener('change', syncFallbacks); }
+  });
+  syncFallbacks();
 
   // —— Live lint + xray -test ——————————————————————————————
   (function () {

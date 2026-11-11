@@ -709,6 +709,8 @@ def _front_raw_tls(store: dict, ib: dict, built: dict) -> None:
         # Re-read certificate files hourly so Let's Encrypt renewals apply without restart
         "certificates": [{"certificateFile": crt, "keyFile": key, "ocspStapling": 3600}],
     }
+    if not P.fallbacks_allowed(ib):
+        return
     built.setdefault("settings", {})["fallbacks"] = [
         {"alpn": "h2", "dest": P.FRONT_FALLBACK_H2_PORT, "xver": 1},
         {"dest": P.FRONT_FALLBACK_H1_PORT, "xver": 1},

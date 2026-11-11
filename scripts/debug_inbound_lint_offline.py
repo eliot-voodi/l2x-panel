@@ -97,17 +97,33 @@ def test_fallbacks_with_decryption():
     ib["settings"]["encryption"] = "mlkem768x25519plus.500s..."
     ib["fallbacks"] = [{"name": "", "alpn": "", "path": "//ms", "dest": "127.0.0.1:8881", "xver": 0}]
     issues = L.inbound_issues(store, ib)
-    fields = {i["field"] for i in issues if i["level"] == L.ERROR}
-    if "fallbacks" not in fields or "vless_decryption" not in fields:
-        fail("fb+dec", f"expected fallbacks+decryption highlights, got {issues}")
+    if any(i["level"] == L.ERROR and i["field"] == "fallbacks" for i in issues):
+        fail("fb+dec", f"conflict should be auto-resolved, got {issues}")
+    if not any(i["field"] == "fallbacks_enabled" for i in issues):
+        fail("fb+dec", f"expected fallbacks_enabled warning, got {issues}")
+    if P.fallbacks_allowed(ib) or P._fallbacks(ib):
+        fail("fb+dec", "fallbacks must be dropped when VLESS encryption is on")
+    built = P.build_inbound(ib, [{"uuid": "u", "email": "e"}])
+    if "fallbacks" in built.get("settings", {}):
+        fail("fb+dec build", str(built["settings"]))
     mapped = L.map_xray_error_fields(
         ib,
         'VLESS settings: "fallbacks" can not be used together with "decryption"',
     )
-    mfields = {i["field"] for i in mapped}
-    if "fallbacks" not in mfields:
+    if "fallbacks_enabled" not in {i["field"] for i in mapped}:
         fail("map-xray", str(mapped))
-    ok("fallbacks + decryption -> highlight")
+    ok("fallbacks + decryption -> auto off")
+
+
+def test_fallbacks_toggle_off():
+    ib = P.default_inbound("vless", 10005, "fb-off")
+    ib["fallbacks"] = [{"name": "", "alpn": "", "path": "", "dest": "8080", "xver": 0}]
+    if not P._fallbacks(ib):
+        fail("fb-default", "fallbacks should be on by default")
+    ib["fallbacks_enabled"] = False
+    if P._fallbacks(ib):
+        fail("fb-off", "toggle off must drop fallbacks")
+    ok("fallbacks toggle")
 
 
 def main():
@@ -117,6 +133,7 @@ def main():
     test_none_outbound_ok()
     test_summarize()
     test_fallbacks_with_decryption()
+    test_fallbacks_toggle_off()
     print("ALL PASSED")
 
 

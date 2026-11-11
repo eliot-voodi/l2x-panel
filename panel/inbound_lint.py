@@ -104,13 +104,15 @@ def inbound_issues(store: dict, ib: dict) -> list[dict]:
         dec, enc = str(s.get("decryption") or "none"), str(s.get("encryption") or "none")
         if (dec == "none") != (enc == "none"):
             _issue(out, "vless_encryption", ERROR, "decryption и encryption должны быть заданы парой (или обе none).")
-        # Xray: fallbacks cannot be used together with decryption != none
-        if ib.get("fallbacks") and P._vless_enc_on(s):
-            msg = ('Fallbacks нельзя вместе с VLESS encryption (decryption ≠ none) — '
-                   'Xray не стартует. Очистите Fallbacks или поставьте Authentication = None.')
-            _issue(out, "fallbacks", ERROR, msg)
-            _issue(out, "vless_decryption", ERROR, msg)
-            _issue(out, "vless_auth", ERROR, msg)
+        if ib.get("fallbacks_enabled") is not False and P._vless_enc_on(s) and (ib.get("fallbacks") or mode == "raw"):
+            _issue(out, "fallbacks_enabled", WARN,
+                   "С VLESS encryption Xray не принимает fallbacks — они будут отключены автоматически.")
+
+    # RAW front on :443: without fallbacks Xray drops all non-VLESS traffic for the public domain
+    if mode == "raw" and not P.fallbacks_allowed(ib):
+        _issue(out, "fallbacks_enabled", WARN,
+               "Fallbacks выключены: сайт/панель на публичном домене через :443 перестанут открываться "
+               "(Xray сбросит всё, что не VLESS). Панель останется доступна по прямому порту.")
 
     # --- Reality
     if sec == "reality":
@@ -138,7 +140,7 @@ def inbound_issues(store: dict, ib: dict) -> list[dict]:
             if len(sid_s) > 16 or len(sid_s) % 2 or any(c not in "0123456789abcdefABCDEF" for c in sid_s):
                 _issue(out, "r_sids", ERROR, f"Short ID «{sid_s}»: hex, чётная длина, до 16 символов.")
                 break
-        if ib.get("fallbacks"):
+        if ib.get("fallbacks") and P.fallbacks_allowed(ib):
             _issue(out, "fallbacks", WARN, "Fallbacks не работают с Reality (только raw + TLS).")
 
     # --- TLS
@@ -188,7 +190,7 @@ def inbound_issues(store: dict, ib: dict) -> list[dict]:
                         raise ValueError
                 except ValueError:
                     _issue(out, "xh_extra", ERROR, "Extra JSON: нужен JSON-объект {…}.")
-        if ib.get("fallbacks") and not (net == "raw" and sec in ("tls", "none")):
+        if ib.get("fallbacks") and P.fallbacks_allowed(ib) and not (net == "raw" and sec in ("tls", "none")):
             _issue(out, "fallbacks", WARN, "Fallbacks работают только с raw + TLS (или raw без security).")
 
     # --- routing
@@ -241,9 +243,8 @@ def map_xray_error_fields(ib: dict, error: str) -> list[dict]:
 
     if "fallback" in low and "decrypt" in low:
         msg = ("Xray: fallbacks нельзя вместе с decryption ≠ none. "
-               "Очистите Fallbacks или Authentication = None.")
-        _issue(out, "fallbacks", ERROR, msg)
-        _issue(out, "vless_decryption", ERROR, msg)
+               "Снимите галочку Fallbacks или Authentication = None.")
+        _issue(out, "fallbacks_enabled", ERROR, msg)
         _issue(out, "vless_auth", ERROR, msg)
         return out
 

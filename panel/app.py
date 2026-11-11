@@ -2866,6 +2866,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         parts += [""] * (5 - len(parts))
         fbs.append({"name": parts[0], "alpn": parts[1], "path": parts[2], "dest": parts[3], "xver": _int(parts[4])})
     ib["fallbacks"] = fbs
+    ib["fallbacks_enabled"] = form.get("fallbacks_enabled") == "1"
     xray.ensure_inbound_keys(ib)
     mode = P.front_mode(ib)
     share = ib["share_host"] or front.public_domain({"settings": SETTINGS_CACHE}) or public_host()
