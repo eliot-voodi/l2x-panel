@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}Миграция · {{ app_name }}{% endblock %}
 {% block page_title %}Миграция клиентов{% endblock %}
-{% block page_sub %}3x-ui · PasarGuard · Remnawave{% endblock %}
+{% block page_sub %}X-UI · PasarGuard · Remnawave{% endblock %}
 {% block top_actions %}
 <div class="actions">
   <a class="btn ghost" href="{{ bp }}/clients">{{ ic.icon('users') }}К клиентам</a>
@@ -13,9 +13,9 @@
 <div class="card" style="margin-bottom:1rem">
   <h3>Что переносится</h3>
   <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит, срок, уже потраченный трафик.
-  Для <b>3x-ui .db</b> ниже выберите: только клиенты / только outbound / только маршруты / всё (включая inbounds).</div>
+  Для <b>x-ui.db</b> ниже выберите: только клиенты / только outbound / только маршруты / всё (включая inbounds).</div>
   <div class="hint" style="margin-top:.5rem">
-    Токен клиента (последний сегмент URL) сохраняется. Если в 3x-ui ссылка была вида
+    Токен клиента (последний сегмент URL) сохраняется. Если в старой панели ссылка была вида
     <code>http://host:2096/&lt;path&gt;/&lt;token&gt;</code>, а здесь стало
     <code>https://host/sub/&lt;token&gt;</code> — это не другой ключ: отличаются <b>путь</b> и <b>порт</b>.
     Ниже можно включить совместимость (alias пути + nginx на :2096). Remnawave: <code>/api/sub/&lt;token&gt;</code>.
@@ -55,7 +55,7 @@
         <input name="api_token" value="" placeholder="Remnawave Bearer / PasarGuard X-Api-Key (вместо пароля)">
         <div class="hint">Если заполнено — пароль не обязателен (PasarGuard, Remnawave).</div>
       </div>
-      <div><label class="f">3x-ui web path</label>
+      <div><label class="f">Web path панели</label>
         <input name="web_base" value="{{ web_base or '' }}" placeholder="пусто или panel">
         <div class="hint">Кастомный webBasePath, если не корень.</div>
       </div>
@@ -67,7 +67,7 @@
     <label class="f">Файл</label>
     <input type="file" name="file" accept=".db,.json,.sql,.zip,.tar,.gz,.tgz,application/octet-stream">
     <div class="hint">
-      <b>3x-ui:</b> SQLite <code>.db</code> (getDb) — клиенты + inbounds/outbounds/routes; или JSON export только клиентов.<br>
+      <b>X-UI:</b> SQLite <code>.db</code> (getDb) — клиенты + inbounds/outbounds/routes; или JSON export только клиентов.<br>
       <b>PasarGuard:</b> backup <code>.zip</code>/<code>.tar.gz</code> (<code>db.sqlite3</code>, <code>db_dump/</code>, <code>pg_dump/db-*.sql</code>), SQL dump или JSON users.
       Токен подписки в БД не хранится (подписан JWT) — панель берёт <code>jwt.secret_key</code> из бэкапа и принимает уже выданные клиентам ссылки.<br>
       <b>Remnawave:</b> JSON массив/ответ API с users.
@@ -75,7 +75,7 @@
   </div>
 
   <h3 style="margin-top:1.4rem">Что переносить</h3>
-  <div class="hint">Для 3x-ui из полного <code>x-ui.db</code> / getDb можно перенести только часть. «Всё» = клиенты + inbounds + outbounds + маршруты.</div>
+  <div class="hint">Из полного <code>x-ui.db</code> / getDb можно перенести только часть. «Всё» = клиенты + inbounds + outbounds + маршруты.</div>
   <div class="row" style="flex-wrap:wrap;gap:.35rem 1.2rem;margin-top:.5rem">
     <label class="check"><input type="radio" name="migrate_what" value="clients" {% if migrate_what == 'clients' %}checked{% endif %}> Только клиенты</label>
     <label class="check"><input type="radio" name="migrate_what" value="outbounds" {% if migrate_what == 'outbounds' %}checked{% endif %}> Только outbound</label>
@@ -90,7 +90,7 @@
   {% endif %}
 
   <h3 style="margin-top:1.4rem">Куда повесить</h3>
-  <div class="hint">Fallback L2X inbounds, если у клиента нет tag из 3x-ui (по умолчанию — все). После восстановления структуры обычно не нужны.</div>
+  <div class="hint">Fallback L2X inbounds, если у клиента нет tag из бэкапа (по умолчанию — все). После восстановления структуры обычно не нужны.</div>
   <div class="row" style="flex-wrap:wrap;gap:.4rem 1rem;margin-top:.5rem">
     {% for ib in inbounds %}
     <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}"
@@ -105,7 +105,7 @@
   </div>
 
   <h3 style="margin-top:1.4rem">Старые ссылки (путь / порт)</h3>
-  <div class="hint">Для 3x-ui: из ссылки <code>http://…:2096/zdgdjmy3kho5i6qg/oyyse3e3oy3tu9bf</code> путь =
+  <div class="hint">Пример: из ссылки <code>http://…:2096/zdgdjmy3kho5i6qg/oyyse3e3oy3tu9bf</code> путь =
     <code>zdgdjmy3kho5i6qg</code>, порт = <code>2096</code>, токен = <code>oyyse3e3oy3tu9bf</code> (уже в клиенте).</div>
   <div class="row">
     <div><label class="f">Старый sub path</label>

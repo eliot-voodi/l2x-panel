@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checks: 3x-ui backup restores inbounds, outbounds, routes + client tags."""
+"""Offline checks: x-ui backup restores inbounds, outbounds, routes + client tags."""
 from __future__ import annotations
 
 import json
@@ -197,11 +197,42 @@ def test_to_dict_keeps_inbounds():
     ok("to_dict inbounds")
 
 
+def test_missing_ext_geo_skipped():
+    store = _empty_store()
+    with tempfile.TemporaryDirectory() as td:
+        old_dir = xray.GEO_DIR
+        xray.GEO_DIR = Path(td)
+        try:
+            only_ext = {"name": "x3-6", "enabled": True, "outbound": "direct",
+                        "domain": ["ext:geosite_RU.dat:ru-available-only-inside"],
+                        "inbound_tags": ["vless"]}
+            mixed = {"name": "mix", "enabled": True, "outbound": "direct",
+                     "domain": ["ext:geosite_RU.dat:ru", "regexp:.*\\.ru$"]}
+            if xray._rule_from_route(store, only_ext) is not None:
+                fail("ext skip", "rule with only missing ext domains must be skipped")
+            rule = xray._rule_from_route(store, mixed)
+            if not rule or rule.get("domain") != ["regexp:.*\\.ru$"]:
+                fail("ext partial", str(rule))
+            store["routes"] = [only_ext, mixed]
+            if xray.missing_ext_geo(store) != ["geosite_RU.dat"]:
+                fail("missing list", str(xray.missing_ext_geo(store)))
+            (Path(td) / "geosite_RU.dat").write_bytes(b"x" * 2048)
+            rule = xray._rule_from_route(store, only_ext)
+            if not rule or rule.get("domain") != only_ext["domain"]:
+                fail("ext present", str(rule))
+            if xray.missing_ext_geo(store):
+                fail("missing after download", str(xray.missing_ext_geo(store)))
+        finally:
+            xray.GEO_DIR = old_dir
+    ok("missing ext geo skipped until downloaded")
+
+
 def main() -> None:
-    print("== 3x-ui structure offline ==")
+    print("== x-ui structure offline ==")
     test_stream_and_route_converters()
     test_to_dict_keeps_inbounds()
     test_parse_and_apply()
+    test_missing_ext_geo_skipped()
     print("all passed")
 
 

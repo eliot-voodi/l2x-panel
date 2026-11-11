@@ -31,7 +31,7 @@ SS_METHODS = (
     "aes-128-gcm",
     "chacha20-poly1305",
 )
-# uTLS client fingerprints for share links / Reality+TLS (aligned with 3x-ui / Xray)
+# uTLS client fingerprints for share links / Reality+TLS (aligned with Xray)
 FINGERPRINTS = (
     "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
     "random", "randomized", "randomizednoalpn", "unsafe",
@@ -674,7 +674,7 @@ def front_mode(ib: dict) -> str | None:
     st = ib.get("stream") or {}
     net = st.get("network") or "raw"
     sec = st.get("security") or "none"
-    # Reality/TLS on path transports (esp. XHTTP/gRPC) use SNI passthrough like 3x-ui
+    # Reality/TLS on path transports (esp. XHTTP/gRPC) use SNI passthrough
     if sec in ("reality", "tls"):
         return "sni"
     if net in FRONT_HTTP_NETWORKS:
@@ -723,7 +723,7 @@ def _vless_enc_on(settings: dict | None) -> bool:
 
 
 def supports_flow(ib: dict) -> bool:
-    """XTLS-Vision: classic raw+tls/reality, or any transport when VLESS encryption is on (3x-ui)."""
+    """XTLS-Vision: classic raw+tls/reality, or any transport when VLESS encryption is on."""
     if ib.get("protocol") != "vless":
         return False
     st = ib.get("stream") or {}

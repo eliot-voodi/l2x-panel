@@ -109,11 +109,11 @@
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
   </form>
   <div class="card">
-    <h3>Готовые пакеты (как в 3x-ui)</h3>
+    <h3>Готовые пакеты</h3>
     <div class="actions" style="flex-wrap:wrap">
       <form method="post" action="{{ bp }}/xray/geo/pack/all?next=/xray?tab=geo"
             onsubmit="return confirm('Скачать Loyalsoldier + Iran + Russia?')">
-        <button class="btn sm">↓ Все как в 3x-ui</button>
+        <button class="btn sm">↓ Все пакеты</button>
       </form>
       {% for key, pack in geo_packs.items() %}
       <form method="post" action="{{ bp }}/xray/geo/pack/{{ key }}?next=/xray?tab=geo"

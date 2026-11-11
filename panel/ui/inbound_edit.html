@@ -276,7 +276,7 @@
     <textarea name="xh_headers" class="mono" rows="2">{{ xh.headers or '' }}</textarea>
     <label class="f">Extra JSON (overlay)</label>
     <textarea name="xh_extra" class="mono" rows="2" placeholder='{"sessionIDPlacement":"query"}'>{{ xh.extra or '' }}</textarea>
-    <div class="hint">Reality/TLS + XHTTP — SNI passthrough (как 3x-ui). Без security — path через nginx.</div>
+    <div class="hint">Reality/TLS + XHTTP — SNI passthrough. Без security — path через nginx.</div>
   </div>
   <div data-net="kcp">
     <div class="row">
@@ -470,13 +470,13 @@
       : 'Снаружи порт inbound закрыт; клиенты подключаются на <b>:443</b> через nginx.';
     var front = !direct && FRONT_PROTOS.indexOf(p) >= 0;
     var http = front && HTTP_NETS.indexOf(n) >= 0;
-    // Path + none → nginx TLS; Reality/TLS on xhttp/grpc/raw → SNI passthrough (3x-ui)
+    // Path + none → nginx TLS; Reality/TLS on xhttp/grpc/raw → SNI passthrough
     if (http && sec !== 'none' && sec !== 'reality' && sec !== 'tls') {
       secEl.value = 'none';
       sec = 'none';
     }
     if (sec === 'reality' && n !== 'raw' && n !== 'grpc' && n !== 'xhttp') {
-      hint.textContent = 'Reality доступен для raw / grpc / xhttp (как в 3x-ui).';
+      hint.textContent = 'Reality доступен для raw / grpc / xhttp.';
     }
     share.required = false;
     if (direct) {

@@ -58,6 +58,12 @@
   {% if geo_missing %}
   <div class="badge err" style="margin-bottom:.6rem">Нет файлов: {{ geo_missing|join(', ') }} — маршруты geosite:/geoip: не работают, нажмите «Обновить geo»</div>
   {% endif %}
+  {% if ext_missing %}
+  <div class="row" style="align-items:center;gap:.6rem;margin-bottom:.6rem">
+    <span class="badge warn">Правила ждут файлы: {{ ext_missing|join(', ') }} — до скачивания они пропускаются</span>
+    <form method="post" action="{{ bp }}/xray/geo/ext-missing?next=/routing"><button class="btn sm">{{ ic.icon('download') }}Скачать недостающие</button></form>
+  </div>
+  {% endif %}
   <div class="table-wrap">
     <table>
       <thead><tr><th>Файл</th><th>Размер</th><th>Обновлён</th></tr></thead>
@@ -71,7 +77,7 @@
     </table>
   </div>
   <div class="hint mt">
-    Как в <b>3x-ui</b>: <code>geoip.dat</code> / <code>geosite.dat</code> (Loyalsoldier) + пакеты Iran / Russia.
+    Базовые <code>geoip.dat</code> / <code>geosite.dat</code> (Loyalsoldier) + пакеты Iran / Russia.
     В правилах: <code>geoip:ru</code>, <code>geosite:category-ru</code>, <code>geosite:category-ads-all</code>,
     <code>ext:geosite_RU.dat:ru</code>, <code>ext:geoip_IR.dat:ir</code>.
     {% if geo_state.last_at %} Последнее обновление: {{ fmt_dt(geo_state.last_at) }}{% if geo_state.last_ok is defined %} · {% if geo_state.last_ok %}ok{% else %}ошибка{% endif %}{% endif %}.{% endif %}
@@ -84,8 +90,8 @@
   </form>
   <div class="actions mt rt-presets">
     <form method="post" action="{{ bp }}/xray/geo/pack/all?next=/routing"
-          onsubmit="return confirm('Скачать geo как в 3x-ui: Loyalsoldier + Iran + Russia?')">
-      <button class="btn sm" title="geoip/geosite + IR + RU">↓ Все как в 3x-ui</button>
+          onsubmit="return confirm('Скачать geo: Loyalsoldier + Iran + Russia?')">
+      <button class="btn sm" title="geoip/geosite + IR + RU">↓ Все пакеты</button>
     </form>
     {% for key, pack in geo_packs.items() %}
     <form method="post" action="{{ bp }}/xray/geo/pack/{{ key }}?next=/routing"
@@ -122,7 +128,8 @@
     {% for r in routes %}
       <tr {% if r.enabled is defined and not r.enabled %}style="opacity:.5"{% endif %}>
         <td class="dim">{{ loop.index }}</td>
-        <td><b>{{ r.name }}</b>{% if r.enabled is defined and not r.enabled %} <span class="badge">выкл</span>{% endif %}</td>
+        <td><b>{{ r.name }}</b>{% if r.enabled is defined and not r.enabled %} <span class="badge">выкл</span>{% endif %}
+          {% if route_missing.get(r.name) %}<div><span class="badge warn" title="Правило пропущено, пока файл не скачан">ждёт {{ route_missing[r.name]|join(', ') }}</span></div>{% endif %}</td>
         <td class="small">
           {% for key, label in [('domain', 'domain'), ('ip', 'ip'), ('user', 'user'), ('source', 'source'), ('protocol', 'protocol'), ('inbound_tags', 'inbound')] %}
             {% set v = r.get(key) %}{% if v %}<div><span class="dim">{{ label }}:</span> <span class="mono">{{ (v if v is string else v|join(', '))|truncate(120) }}</span></div>{% endif %}
@@ -161,6 +168,7 @@
             <span class="dim small">{{ outbound_label(store, r.outbound or r.outbound_tag or 'direct') }}</span>
           </span>
           {% if r.enabled is defined and not r.enabled %}<span class="badge">выкл</span>{% endif %}
+          {% if route_missing.get(r.name) %}<span class="badge warn">ждёт geo</span>{% endif %}
           <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
         </button>
         <div class="rt-detail" hidden>
@@ -256,7 +264,7 @@
   function openRouteEdit(r) {
     var form = document.getElementById('form-route-edit');
     var name = r.name || '';
-    form.action = BP + '/routing/' + encodeURIComponent(name) + '/save';
+    form.action = {{ bp|tojson }} + '/routing/' + encodeURIComponent(name) + '/save';
     fillRouteForm(form, r || {});
     document.getElementById('dlg-edit').showModal();
   }

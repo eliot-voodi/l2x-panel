@@ -59,7 +59,7 @@ def _clean_sub_segment(value: str) -> str:
 
 
 def sub_uri_paths(store: dict | None = None) -> list[str]:
-    """Primary subscription path + aliases (e.g. old 3x-ui subPath)."""
+    """Primary subscription path + aliases (e.g. old panel subPath)."""
     sub = (((store or {}).get("settings") or {}).get("sub") or {})
     out: list[str] = []
     for raw in [sub.get("path") or "sub", *(sub.get("path_aliases") or [])]:
@@ -321,7 +321,7 @@ def _sub_location(path_seg: str, proxy: str) -> str:
     sp = _clean_sub_segment(path_seg) or "sub"
     if sp == "sub":
         return f"    location ^~ /sub/ {{\n{proxy}    }}"
-    # Old 3x-ui style /{subPath}/{token} → panel /sub/{token} (avoids FastAPI /{path}/{token} catching /clients/…)
+    # Old-panel style /{subPath}/{token} → panel /sub/{token} (avoids FastAPI /{path}/{token} catching /clients/…)
     return (
         f"    location ^~ /{sp}/ {{\n"
         f"        rewrite ^/{sp}/(.*)$ /sub/$1 break;\n"
@@ -491,7 +491,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
                 h2 = [f"    listen 127.0.0.1:{P.FRONT_FALLBACK_H2_PORT} proxy_protocol http2;"]
             blocks.append("server {\n" + "\n".join([h1, *content]) + "\n}")
             blocks.append("server {\n" + "\n".join([*h2, *content]) + "\n}")
-    # Legacy subscription ports (HTTP): 3x-ui style http://host:2096/<path>/<token>
+    # Legacy subscription ports (HTTP): old-panel style http://host:2096/<path>/<token>
     # Cannot iptables-REDIRECT to :443 (TLS stream) — dedicated plain-HTTP listeners.
     plain_ports = legacy_sub_plain_ports(store)
     tls_ports = legacy_sub_tls_ports(store)

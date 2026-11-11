@@ -135,7 +135,7 @@ def default_settings() -> dict:
         },
         "sub": {
             "enabled": True, "server_enabled": False, "listen": "0.0.0.0", "port": 2096, "path": "sub",
-            # Extra URI prefixes that also serve subscriptions (e.g. old 3x-ui subPath)
+            # Extra URI prefixes that also serve subscriptions (e.g. old panel subPath)
             "path_aliases": [],
             # Extra HTTP ports nginx listens on for old clients (e.g. 2096); not TLS :443
             "legacy_ports": [],
@@ -349,6 +349,17 @@ def _apply_xray(
                 pass
     if not xray_only and not hold_front_commit:
         _issue_front_certs(store)
+    try:
+        geo = _ensure_ext_geo(runtime)
+    except Exception:
+        geo = {}
+    if geo.get("missing"):
+        note = "правила с " + ", ".join(geo["missing"]) + " пропущены до скачивания"
+        if geo.get("started"):
+            note += " (скачивание запущено)"
+        if geo.get("unknown"):
+            note += f"; нет источника для {', '.join(geo['unknown'])} — добавьте в Xray → Geo"
+        result = {**result, "warning": "; ".join(x for x in (result.get("warning"), note) if x)}
     return result
 
 
@@ -505,7 +516,7 @@ class BasePathMiddleware:
     def _public(self, path: str) -> bool:
         if path.startswith(self.PUBLIC):
             return True
-        # Subscription path aliases (old 3x-ui subPath etc.)
+        # Subscription path aliases (old panel subPath etc.)
         for sp in front.sub_uri_paths({"settings": SETTINGS_CACHE} if SETTINGS_CACHE else None):
             if path == f"/{sp}" or path.startswith(f"/{sp}/"):
                 return True
@@ -1718,6 +1729,53 @@ def _run_geo_update(*, reason: str = "manual") -> dict:
     return res
 
 
+_EXT_GEO_TRIED: dict[str, float] = {}
+_EXT_GEO_RETRY_SEC = 3600
+
+
+def _known_geo_urls() -> dict[str, str]:
+    urls = {f["name"]: f["url"] for p in ops.GEO_PACKS.values() for f in p.get("files") or []}
+    for item in _settings().get("geo_custom") or []:
+        if isinstance(item, dict) and item.get("name") and item.get("url"):
+            name = str(item["name"])
+            urls[name if name.endswith(".dat") else f"{name}.dat"] = str(item["url"])
+    return urls
+
+
+def _ensure_ext_geo(store: dict, *, force: bool = False) -> dict:
+    """Start a background download for ext:*.dat files referenced by routes but missing on disk.
+
+    Rules using them are skipped in the Xray config until the file exists; after download
+    Xray is re-applied so they become active.
+    """
+    missing = xray.missing_ext_geo(store)
+    if not missing:
+        return {"missing": [], "started": [], "unknown": []}
+    known = _known_geo_urls()
+    now = time.time()
+    want = [n for n in missing if n in known and (force or now - _EXT_GEO_TRIED.get(n, 0) > _EXT_GEO_RETRY_SEC)]
+    unknown = [n for n in missing if n not in known]
+    if not want or any(j.get("name") == "geo-ext" and j.get("status") == "running" for j in ops.JOBS.values()):
+        return {"missing": missing, "started": [], "unknown": unknown}
+    for n in want:
+        _EXT_GEO_TRIED[n] = now
+
+    def job():
+        with mutate() as st:
+            custom = st["settings"].setdefault("geo_custom", [])
+            have = {str(x.get("name") or "") for x in custom if isinstance(x, dict)}
+            for n in want:
+                if n not in have:
+                    custom.append({"name": n, "url": known[n]})
+        _refresh_settings_cache()
+        res = _run_geo_update(reason="ext-missing")
+        _apply_xray(_load_store(), xray_only=True)
+        return res
+
+    ops.start_job("geo-ext", job)
+    return {"missing": missing, "started": want, "unknown": unknown}
+
+
 def _geo_update_loop() -> None:
     """Periodically refresh Loyalsoldier geoip/geosite (+ custom packs)."""
     if _stop.wait(120):
@@ -2717,13 +2775,13 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         st["security"] = "none" if proto not in ("vmess",) else "tls"
     if st["network"] not in P.NETWORKS:
         st["network"] = "raw"
-    # Path transports behind nginx TLS use security=none; Reality/TLS → SNI passthrough (3x-ui)
+    # Path transports behind nginx TLS use security=none; Reality/TLS → SNI passthrough
     if st["network"] in P.FRONT_HTTP_NETWORKS and st["security"] not in ("reality", "tls"):
         st["security"] = "none"
     if st["security"] == "reality" and proto not in ("vless", "trojan"):
         st["security"] = "tls" if proto == "vmess" else "none"
     if st["security"] == "reality" and st["network"] not in ("raw", "grpc", "xhttp"):
-        # Reality only on tcp/grpc/xhttp like 3x-ui
+        # Reality only on tcp/grpc/xhttp
         st["network"] = "raw"
     # Browser fingerprint for all inbounds (share links / client uTLS)
     fp = str(form.get("client_fp") or form.get("tls_fp") or form.get("r_fp") or "firefox").strip()
@@ -3411,7 +3469,7 @@ async def clients_migrate_run(request: Request):
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
 
-    # Auto-fill path/port from 3x-ui backup settings when empty
+    # Auto-fill path/port from x-ui backup settings when empty
     meta = migrate_mod.LAST_SOURCE_META or {}
     if not legacy_path and meta.get("path"):
         legacy_path = re.sub(r"[^A-Za-z0-9_-]", "", str(meta["path"]))
@@ -3430,7 +3488,7 @@ async def clients_migrate_run(request: Request):
         flash(request, "Пользователи не найдены", "error")
         return _migrate_page(request, **form_kw)
     if need_structure and not has_structure and not (want_clients and users):
-        flash(request, "В файле нет структуры 3x-ui (нужен полный x-ui.db / getDb)", "error")
+        flash(request, "В файле нет структуры X-UI (нужен полный x-ui.db / getDb)", "error")
         return _migrate_page(request, **form_kw)
     if not users and not has_structure:
         flash(request, "Пользователи не найдены", "error")
@@ -4879,6 +4937,8 @@ def routing_page(request: Request):
         return redir
     store = _load_store()
     return page(request, "routing.html", active="routing", routes=store["routes"], store=store,
+                route_missing={r.get("name"): xray.route_missing_geo(r) for r in store["routes"]},
+                ext_missing=xray.missing_ext_geo(store),
                 outbounds=xray.all_outbound_tags(store), presets=xray.ROUTE_PRESETS,
                 inbound_tags=[i["tag"] for i in store["inbounds"]],
                 geo=ops.geo_files(), geo_missing=ops.geo_missing_core(),
@@ -5314,9 +5374,24 @@ async def xray_geo_settings(request: Request):
     return go(_next(request, "/xray?tab=geo"))
 
 
+@app.post("/xray/geo/ext-missing")
+def xray_geo_ext_missing(request: Request):
+    """Download ext:*.dat files that routing rules reference but are missing on disk."""
+    if redir := _require(request):
+        return redir
+    res = _ensure_ext_geo(_load_store(), force=True)
+    if res.get("started"):
+        flash(request, f"Скачивание запущено: {', '.join(res['started'])}", "info")
+    elif res.get("missing"):
+        flash(request, "Загрузка уже идёт или нет источника: " + ", ".join(res["missing"]), "error")
+    else:
+        flash(request, "Все geo-файлы на месте", "info")
+    return go(_next(request, "/routing"))
+
+
 @app.post("/xray/geo/pack/{key}")
 def xray_geo_pack(key: str, request: Request):
-    """Add a known geo pack (Russia/Iran/all like 3x-ui) to custom sources and download now."""
+    """Add a known geo pack (Russia/Iran/all) to custom sources and download now."""
     if redir := _require(request):
         return redir
     keys = list(ops.GEO_PACKS.keys()) if key == "all" else [key]
@@ -5334,7 +5409,7 @@ def xray_geo_pack(key: str, request: Request):
                 by_name[f["name"]] = {"name": f["name"], "url": f["url"]}
         store["settings"]["geo_custom"] = list(by_name.values())
     _refresh_settings_cache()
-    label = "все пакеты 3x-ui (IR+RU)" if key == "all" else titles[0]
+    label = "все пакеты (IR+RU)" if key == "all" else titles[0]
 
     def job():
         return _run_geo_update(reason=f"pack-{key}")

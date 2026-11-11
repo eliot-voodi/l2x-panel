@@ -463,11 +463,11 @@ GEO_SOURCES = {
     "geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
 }
 
-# Optional packs — same set as 3x-ui (Loyalsoldier core + IR + RU). Use in routes as ext:filename.dat:tag
+# Optional packs (Loyalsoldier core + IR + RU). Use in routes as ext:filename.dat:tag
 GEO_PACKS = {
     "iran": {
         "title": "Iran rules (chocolate4u)",
-        "hint": "как в 3x-ui · ext:geoip_IR.dat:ir · ext:geosite_IR.dat:ir",
+        "hint": "ext:geoip_IR.dat:ir · ext:geosite_IR.dat:ir",
         "files": [
             {"name": "geoip_IR.dat", "url": "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat"},
             {"name": "geosite_IR.dat", "url": "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat"},
@@ -475,7 +475,7 @@ GEO_PACKS = {
     },
     "russia": {
         "title": "Russia rules (runetfreedom)",
-        "hint": "как в 3x-ui · ext:geoip_RU.dat:ru · ext:geosite_RU.dat:ru",
+        "hint": "ext:geoip_RU.dat:ru · ext:geosite_RU.dat:ru",
         "files": [
             {"name": "geoip_RU.dat", "url": "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"},
             {"name": "geosite_RU.dat", "url": "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"},
@@ -491,7 +491,7 @@ def geo_pack_files(key: str) -> list[dict]:
 
 
 def install_geo_packs(keys: list[str], *, custom: list[dict] | None = None) -> dict:
-    """Download core Loyalsoldier geo + selected regional packs (3x-ui style)."""
+    """Download core Loyalsoldier geo + selected regional packs."""
     extra: list[dict] = list(custom or [])
     seen = {str(x.get("name") or "") for x in extra}
     for key in keys:

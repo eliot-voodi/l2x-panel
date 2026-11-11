@@ -1,4 +1,4 @@
-﻿"""Import users from 3x-ui, PasarGuard, or Remnawave (API or backup file).
+﻿"""Import users from X-UI, PasarGuard, or Remnawave (API or backup file).
 
 Preserves subscription tokens, traffic counters, limits, and expiry so clients
 can keep their existing subscription URLs after DNS points at L2X.
@@ -28,12 +28,12 @@ import xray_runtime as xray
 
 SOURCES = ("3xui", "pasarguard", "remnawave")
 SOURCE_LABELS = {
-    "3xui": "3x-ui",
+    "3xui": "X-UI",
     "pasarguard": "PasarGuard",
     "remnawave": "Remnawave",
 }
 
-# Filled by fetch/parse when source exposes sub path/port (3x-ui settings).
+# Filled by fetch/parse when source exposes sub path/port (x-ui settings).
 LAST_SOURCE_META: dict[str, Any] = {}
 
 
@@ -58,7 +58,7 @@ class NormalizedUser:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         extra = d.pop("extra", None) or {}
-        # Keep inbound tags from 3x-ui so import-from-cache still maps clients
+        # Keep inbound tags from the backup so import-from-cache still maps clients
         ibs = extra.get("inbounds")
         if ibs:
             d["inbounds"] = list(ibs)
@@ -282,7 +282,7 @@ def _assign_pg_sub_tokens(users: list[NormalizedUser], secrets: list[str]) -> No
 
 
 def expire_from_ms(ms: Any) -> str:
-    """3x-ui expiryTime is ms since epoch; 0 = unlimited."""
+    """X-UI expiryTime is ms since epoch; 0 = unlimited."""
     n = _safe_int(ms, 0)
     if n <= 0:
         return ""
@@ -451,7 +451,7 @@ def apply(
         if not email:
             skipped += 1
             continue
-        # Prefer inbound tags recorded from 3x-ui inbound.settings.clients
+        # Prefer inbound tags recorded from x-ui inbound.settings.clients
         user_tags = [t for t in ((u.extra or {}).get("inbounds") or []) if t in capable]
         use_tags = user_tags or tags
         existing = by_email.get(email)
@@ -567,7 +567,7 @@ def apply(
     }
 
 
-# ---------------------------------------------------------------- 3x-ui
+# ---------------------------------------------------------------- X-UI
 
 def _row_dict(row: sqlite3.Row | dict) -> dict[str, Any]:
     """SQLite row → dict with lowercase keys (GORM may use email/up/down or mixed)."""
@@ -655,7 +655,7 @@ def parse_3xui_json(raw: bytes | str) -> list[NormalizedUser]:
 
 
 def read_3xui_sub_meta(path: Path | str) -> dict[str, Any]:
-    """Read subPath / subPort from a 3x-ui SQLite backup (settings table)."""
+    """Read subPath / subPort from an x-ui SQLite backup (settings table)."""
     meta: dict[str, Any] = {"path": "", "port": 0}
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -719,7 +719,7 @@ def _load_3xui_traffics(conn: sqlite3.Connection) -> dict[str, dict]:
         key = email.lower()
         up = _safe_int(d.get("up"), 0)
         down = _safe_int(d.get("down"), 0)
-        # After a traffic reset 3x-ui keeps lifetime in allTime / all_time
+        # After a traffic reset X-UI keeps lifetime in allTime / all_time
         all_time = _safe_int(d.get("all_time", d.get("alltime")), 0)
         if up + down <= 0 and all_time > 0:
             down = all_time
@@ -841,7 +841,7 @@ def parse_3xui_sqlite(path: Path | str) -> list[NormalizedUser]:
         conn.close()
 
 
-# ---------------------------------------------------------------- 3x-ui structure (inbounds / outbounds / routes)
+# ---------------------------------------------------------------- X-UI structure (inbounds / outbounds / routes)
 
 _SYSTEM_OUTBOUND_TAGS = frozenset({"direct", "block", "blocked", "blackhole", "api", "dns-out", "dns", "freedom"})
 _SKIP_ROUTE_OUTBOUNDS = frozenset({"api"})
@@ -874,7 +874,7 @@ def _headers_to_lines(headers: Any) -> str:
 
 
 def stream_from_xray(ss: dict | None) -> dict:
-    """Convert Xray/3x-ui streamSettings JSON into L2X stream model."""
+    """Convert Xray streamSettings JSON into L2X stream model."""
     ss = ss if isinstance(ss, dict) else {}
     net = str(ss.get("network") or "tcp").lower()
     if net in ("tcp", "raw", ""):
@@ -1090,7 +1090,7 @@ def sniffing_from_xray(raw: Any) -> dict:
 
 
 def inbound_from_3xui_row(row: dict, *, next_id: int, used_ports: set[int]) -> tuple[dict | None, str]:
-    """Build L2X inbound from a 3x-ui inbounds table row. Returns (ib, warning)."""
+    """Build L2X inbound from an x-ui inbounds table row. Returns (ib, warning)."""
     proto = str(row.get("protocol") or "").lower().strip()
     if proto == "dokodemo":
         proto = "dokodemo-door"
@@ -1123,7 +1123,7 @@ def inbound_from_3xui_row(row: dict, *, next_id: int, used_ports: set[int]) -> t
 
     listen = str(row.get("listen") or "").strip()
     port = _safe_int(row.get("port"), 0)
-    # 3x-ui public ports → L2X: reserved 22/80/443 or taken → free internal + nginx/direct remap
+    # Source public ports → L2X: reserved 22/80/443 or taken → free internal + nginx/direct remap
     want_direct = listen in ("", "0.0.0.0", "::", "[::]")
     warn = ""
     if port <= 0 or xray.port_forbidden_reason(port) or port in used_ports:
@@ -1301,7 +1301,7 @@ def route_from_xray_rule(rule: dict, *, idx: int) -> dict | None:
 
 
 def _read_xray_template(conn: sqlite3.Connection) -> dict:
-    """Unwrap 3x-ui xrayTemplateConfig (raw or nested xraySetting)."""
+    """Unwrap x-ui xrayTemplateConfig (raw or nested xraySetting)."""
     try:
         rows = conn.execute("SELECT key, value FROM settings")
     except sqlite3.Error:
@@ -1329,7 +1329,7 @@ def _read_xray_template(conn: sqlite3.Connection) -> dict:
 
 
 def load_3xui_structure(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Parse inbounds + template outbounds/routes from an open 3x-ui SQLite connection."""
+    """Parse inbounds + template outbounds/routes from an open x-ui SQLite connection."""
     inbounds_rows: list[dict] = []
     try:
         for row in conn.execute("SELECT * FROM inbounds"):
@@ -1364,7 +1364,7 @@ def apply_3xui_structure(
     restore_outbounds: bool = True,
     restore_routes: bool = True,
 ) -> dict[str, Any]:
-    """Create/update L2X inbounds, custom outbounds and routes from 3x-ui backup data."""
+    """Create/update L2X inbounds, custom outbounds and routes from x-ui backup data."""
     structure = structure or {}
     report: dict[str, Any] = {
         "inbounds_created": 0, "inbounds_updated": 0, "inbounds_skipped": 0,
@@ -1495,7 +1495,7 @@ def fetch_3xui_api(
         except Exception as exc:  # noqa: BLE001
             last_err = str(exc)
     if not logged:
-        raise RuntimeError(f"3x-ui login failed: {last_err or 'unknown'}")
+        raise RuntimeError(f"X-UI login failed: {last_err or 'unknown'}")
 
     prefix = f"/{wb}" if wb else ""
     # Try DB download first
@@ -1547,7 +1547,7 @@ def fetch_3xui_api(
                     out.append(u)
         if out:
             return out
-    raise RuntimeError("3x-ui: не удалось получить клиентов (getDb / inbounds/list)")
+    raise RuntimeError("X-UI: не удалось получить клиентов (getDb / inbounds/list)")
 
 
 # ---------------------------------------------------------------- PasarGuard / Marzban-like
@@ -2403,7 +2403,7 @@ def fetch_api(
     src = (source or "").lower().strip()
     if src == "3xui":
         if not username or not password:
-            raise RuntimeError("3x-ui: нужны логин и пароль")
+            raise RuntimeError("X-UI: нужны логин и пароль")
         return fetch_3xui_api(base_url, username, password, insecure=insecure, web_base=web_base)
     if src == "pasarguard":
         return fetch_pasarguard_api(

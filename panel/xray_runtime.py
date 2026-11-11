@@ -146,7 +146,7 @@ def wg_public_from_private(private_key: str) -> dict:
 
 
 def reality_public_from_private(private_key: str) -> dict:
-    """Derive Reality public key from private (restore from 3x-ui without regenerating)."""
+    """Derive Reality public key from private (restore from backup without regenerating)."""
     return _x25519_public_from_private(private_key)
 
 
@@ -1685,6 +1685,44 @@ ROUTE_PRESETS = {
 }
 
 
+GEO_DIR = Path(os.environ.get("XRAY_LOCATION_ASSET", "/usr/local/share/xray"))
+_EXT_GEO_RE = re.compile(r"^ext:([A-Za-z0-9_.-]+\.dat):", re.I)
+
+
+def ext_geo_file(entry: Any) -> str:
+    """'ext:geosite_RU.dat:ru' → 'geosite_RU.dat' ('' for non-ext entries)."""
+    m = _EXT_GEO_RE.match(str(entry or "").strip())
+    return m.group(1) if m else ""
+
+
+def geo_file_present(name: str) -> bool:
+    p = GEO_DIR / name
+    try:
+        return p.is_file() and p.stat().st_size >= 1024
+    except OSError:
+        return False
+
+
+def route_missing_geo(r: dict) -> list[str]:
+    """ext:*.dat files referenced by a route that are not on disk yet."""
+    out: set[str] = set()
+    for key in ("domain", "ip"):
+        for entry in r.get(key) or []:
+            name = ext_geo_file(entry)
+            if name and not geo_file_present(name):
+                out.add(name)
+    return sorted(out)
+
+
+def missing_ext_geo(store: dict) -> list[str]:
+    """All missing ext:*.dat files across enabled routes."""
+    out: set[str] = set()
+    for r in store.get("routes") or []:
+        if r.get("enabled", True):
+            out.update(route_missing_geo(r))
+    return sorted(out)
+
+
 def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None = None) -> dict | None:
     if not r.get("enabled", True):
         return None
@@ -1693,8 +1731,17 @@ def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None =
     for key, xkey in (("domain", "domain"), ("ip", "ip"), ("user", "user"), ("protocol", "protocol"),
                       ("source", "source"), ("inbound_tags", "inboundTag")):
         val = r.get(key)
-        if val:
-            rule[xkey] = val if isinstance(val, list) else [val]
+        if not val:
+            continue
+        vals = val if isinstance(val, list) else [val]
+        if key in ("domain", "ip"):
+            # Xray refuses to start if an ext:*.dat file is missing — drop those entries until downloaded
+            kept = [v for v in vals if not ext_geo_file(v) or geo_file_present(ext_geo_file(v))]
+            if not kept:
+                # Whole condition depended on a missing file: skip rule rather than widen its match
+                return None
+            vals = kept
+        rule[xkey] = vals
     for key, xkey in (("network", "network"), ("port", "port"), ("source_port", "sourcePort")):
         if r.get(key):
             rule[xkey] = str(r[key])
@@ -2180,7 +2227,7 @@ def ban_inbound_ports(store: dict) -> None:
     """Drop incoming non-loopback traffic to every inbound port: clients reach Xray only via nginx :443.
 
     Direct inbounds (ib.direct) listen publicly on their own port and must stay reachable.
-    Ports listed in settings.sub.legacy_ports (e.g. 2096 for old 3x-ui subscription links)
+    Ports listed in settings.sub.legacy_ports (e.g. 2096 for old subscription links)
     stay open so nginx can serve plain-HTTP subscription aliases there.
     """
     import front as front_mod
