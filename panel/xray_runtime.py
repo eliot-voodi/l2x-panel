@@ -950,6 +950,9 @@ def all_outbound_tags(store: dict) -> list[str]:
 
 
 def outbound_label(store: dict, tag: str) -> str:
+    tag = str(tag or "").strip()
+    if not tag or tag.lower() in ("none", "-", "off"):
+        return "— none —"
     if tag in BALANCER_LABELS:
         return BALANCER_LABELS[tag]
     if tag == "direct":
@@ -1754,7 +1757,10 @@ def build_config(store: dict) -> dict:
         if not inbound_access_ok(ib):
             continue
         if ib["protocol"] not in P.USER_PROTOCOLS:
-            ob = ib.get("outbound") or "direct"
+            ob = str(ib.get("outbound") or "").strip()
+            if not ob or ob.lower() in ("none", "-", "off"):
+                # none: do not bind inbound→direct (can loop via dialerProxy / reverse)
+                continue
             per_inbound_rules.append(
                 {"type": "field", "inboundTag": [ib["tag"]], **_route_target(store, ob, known_outbounds=known_outbounds)}
             )

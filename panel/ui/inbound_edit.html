@@ -49,9 +49,10 @@
     <div class="hint" id="front_hint"></div>
     <label class="f">Outbound по умолчанию</label>
     <select name="outbound">
+      <option value="" {% if not ib.outbound or ib.outbound == 'none' %}selected{% endif %}>— none —</option>
       {% for tag in outbounds %}<option value="{{ tag }}" {% if tag == ib.outbound %}selected{% endif %}>{{ outbound_label(store, tag) }}</option>{% endfor %}
     </select>
-    <div class="hint">Для vless/vmess/trojan/ss — только если у клиента не задан свой outbound. Для socks/http/dokodemo/wireguard — весь трафик inbound.</div>
+    <div class="hint">По умолчанию <b>none</b> — без привязки inbound→outbound (нет петли через Direct). Для socks/http/dokodemo/wireguard выбранный outbound принимает весь трафик inbound. Для vless/vmess/trojan/ss outbound клиента важнее; none здесь безопаснее, чем Direct.</div>
     <div class="mt">{{ m.check('enabled', ib.enabled, t('Включён')) }}</div>
     <div class="mt flex gap" style="flex-wrap:wrap;align-items:center">
       <button type="button" class="btn sm" id="btn_max_speed">Профиль: макс. скорость</button>

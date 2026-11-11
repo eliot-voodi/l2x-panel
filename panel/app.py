@@ -2652,7 +2652,9 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["share_host"] = share
     ib["total_gb"] = _float(form.get("total_gb"))
     ib["expire_at"] = local_to_iso(str(form.get("expire_at") or ""))
-    ib["outbound"] = str(form.get("outbound") or "direct")
+    raw_ob = str(form.get("outbound") or "").strip()
+    # empty / none = no per-inbound route (avoids Direct loops); explicit tags keep working
+    ib["outbound"] = "" if raw_ob.lower() in ("", "none", "-", "off") else raw_ob
     reset = str(form.get("traffic_reset") or "never")
     ib["traffic_reset"] = reset if reset in P.TRAFFIC_RESETS else "never"
     ext = []

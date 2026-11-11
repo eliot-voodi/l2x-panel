@@ -236,7 +236,7 @@ def apply_max_speed_profile(ib: dict) -> dict:
     sniff = ib.setdefault("sniffing", {})
     sniff.setdefault("enabled", True)
     sniff.setdefault("dest", ["http", "tls", "quic"])
-    ib.setdefault("outbound", "direct")
+    ib.setdefault("outbound", "")
     return ib
 
 
@@ -279,7 +279,7 @@ def default_inbound(protocol: str = "vless", port: int = 10443, tag: str = "vles
             "route_only": False, "metadata_only": False, "excluded_domains": [],
         },
         "fallbacks": [],
-        "outbound": "direct",
+        "outbound": "",  # none — no inbound→outbound bind (Direct can loop on some setups)
         "share_host": "",
         "external_proxies": [],
         "total_gb": 0,
