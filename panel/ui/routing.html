@@ -71,9 +71,9 @@
     </table>
   </div>
   <div class="hint mt">
-    Основные: <code>geoip.dat</code> / <code>geosite.dat</code> (Loyalsoldier).
-    В правилах: <code>geoip:ru</code>, <code>geosite:google</code>, <code>geosite:category-ads-all</code>,
-    <code>ext:geosite_RU.dat:ru</code>.
+    Как в <b>3x-ui</b>: <code>geoip.dat</code> / <code>geosite.dat</code> (Loyalsoldier) + пакеты Iran / Russia.
+    В правилах: <code>geoip:ru</code>, <code>geosite:category-ru</code>, <code>geosite:category-ads-all</code>,
+    <code>ext:geosite_RU.dat:ru</code>, <code>ext:geoip_IR.dat:ir</code>.
     {% if geo_state.last_at %} Последнее обновление: {{ fmt_dt(geo_state.last_at) }}{% if geo_state.last_ok is defined %} · {% if geo_state.last_ok %}ok{% else %}ошибка{% endif %}{% endif %}.{% endif %}
     Подробнее: <a href="{{ bp }}/xray?tab=geo">Xray → Geo</a>.
   </div>
@@ -83,6 +83,10 @@
     <div><button class="btn ghost sm">Сохранить</button></div>
   </form>
   <div class="actions mt rt-presets">
+    <form method="post" action="{{ bp }}/xray/geo/pack/all?next=/routing"
+          onsubmit="return confirm('Скачать geo как в 3x-ui: Loyalsoldier + Iran + Russia?')">
+      <button class="btn sm" title="geoip/geosite + IR + RU">↓ Все как в 3x-ui</button>
+    </form>
     {% for key, pack in geo_packs.items() %}
     <form method="post" action="{{ bp }}/xray/geo/pack/{{ key }}?next=/routing"
           onsubmit="return confirm('Добавить пакет «{{ pack.title }}» и скачать сейчас?')">
@@ -102,7 +106,11 @@
         {{ '⛔' if p.outbound == 'block' else '🏠' }} {{ p.name }}</button></form>
     {% endfor %}
   </div>
-  <div class="hint">Шаблоны используют теги из geo-файлов выше. Без актуальных <code>geosite.dat</code>/<code>geoip.dat</code> правила вроде direct-ru / block-ads не сработают.</div>
+  <div class="hint">
+    <b>direct-ru</b> — <code>geosite:category-ru</code> + домены <code>.ru</code> / <code>.su</code> / <code>.рф</code> (punycode <code>xn--p1ai</code>) + <code>geoip:ru</code>.
+    <b>direct-ru-pack</b> — то же + <code>ext:geosite_RU.dat</code> / <code>ext:geoip_RU.dat</code> (сначала скачайте Russia pack).
+    Без актуальных geo-файлов правила geosite:/geoip: не сработают.
+  </div>
 </div>
 
 <div class="card" style="padding:0">
@@ -125,6 +133,7 @@
         <td>{{ outbound_label(store, r.outbound or r.outbound_tag or 'direct') }}</td>
         <td>
           <div class="actions" style="justify-content:flex-end">
+            <button type="button" class="btn ghost icon" title="Изменить" onclick='openRouteEdit({{ r|tojson }})'>{{ ic.icon('edit') }}</button>
             <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/up"><button class="btn ghost icon" {% if loop.first %}disabled{% endif %}>{{ ic.icon('up') }}</button></form>
             <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/down"><button class="btn ghost icon" {% if loop.last %}disabled{% endif %}>{{ ic.icon('down') }}</button></form>
             <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
@@ -166,6 +175,7 @@
             <div><span class="lbl">Outbound</span><span class="val">{{ outbound_label(store, r.outbound or r.outbound_tag or 'direct') }}</span></div>
           </div>
           <div class="actions">
+            <button type="button" class="btn ghost sm" onclick='openRouteEdit({{ r|tojson }})'>{{ ic.icon('edit') }}Изменить</button>
             <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/up"><button class="btn ghost sm" {% if loop.first %}disabled{% endif %}>{{ ic.icon('up') }}</button></form>
             <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/down"><button class="btn ghost sm" {% if loop.last %}disabled{% endif %}>{{ ic.icon('down') }}</button></form>
             <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
@@ -183,32 +193,18 @@
 <div class="hint">Порядок итогового конфига: API → эти правила → маршруты подписок по странам → outbound клиента → outbound inbound'а → direct.</div>
 
 <dialog id="dlg-add" style="max-width:760px">
-  <form method="post" action="{{ bp }}/routing">
+  <form method="post" action="{{ bp }}/routing" id="form-route-add">
     <div class="card-head"><h3>Новое правило</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
-    <div class="row">
-      <div><label class="f">Имя</label><input name="name" required></div>
-      <div><label class="f">Outbound</label>
-        <select name="outbound">{% for tag in outbounds %}<option value="{{ tag }}">{{ outbound_label(store, tag) }}</option>{% endfor %}</select></div>
-    </div>
-    <div class="row">
-      <div><label class="f">Домены (по строке)</label><textarea name="domain" class="mono" placeholder="geosite:google&#10;geosite:category-ads-all&#10;geosite:category-ru&#10;ext:geosite_RU.dat:ru&#10;domain:example.com&#10;regexp:.*\.ru$"></textarea>
-        <div class="hint">geosite:tag из geosite.dat · ext:file.dat:tag из доп. пакетов</div></div>
-      <div><label class="f">IP / CIDR</label><textarea name="ip" class="mono" placeholder="geoip:ru&#10;geoip:cn&#10;geoip:private&#10;ext:geoip_RU.dat:ru&#10;8.8.8.8/32"></textarea>
-        <div class="hint">geoip:cc из geoip.dat · CIDR напрямую</div></div>
-    </div>
-    <div class="row">
-      <div><label class="f">Пользователи (email)</label><textarea name="user" class="mono" style="min-height:3.5rem"></textarea></div>
-      <div><label class="f">Источник (IP клиента)</label><textarea name="source" class="mono" style="min-height:3.5rem"></textarea></div>
-    </div>
-    <div class="row">
-      <div><label class="f">Сеть</label><select name="network"><option value="">любая</option><option>tcp</option><option>udp</option><option>tcp,udp</option></select></div>
-      <div><label class="f">Порт(ы)</label><input name="port" placeholder="443, 1000-2000"></div>
-    </div>
-    <label class="f">Протокол (sniffing)</label>
-    <div>{% for p in ('http', 'tls', 'quic', 'bittorrent') %}{{ m.check('proto_' ~ p, False, p) }}{% endfor %}</div>
-    <label class="f">Inbounds</label>
-    <div>{% for tg in inbound_tags %}<label class="check"><input type="checkbox" name="inbound_tags" value="{{ tg }}"> {{ tg }}</label>{% endfor %}</div>
+    {% include "_route_form_fields.html" %}
     <div class="actions mt"><button class="btn">{{ t('Добавить') }}</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-edit" style="max-width:760px">
+  <form method="post" action="{{ bp }}/routing/" id="form-route-edit">
+    <div class="card-head"><h3>Изменить правило</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+    {% include "_route_form_fields.html" %}
+    <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
   </form>
 </dialog>
 {% endblock %}
@@ -230,6 +226,39 @@
     var detail = item.querySelector('.rt-detail');
     if (detail) detail.hidden = !open;
     btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  function _lines(v) {
+    if (!v) return '';
+    return Array.isArray(v) ? v.join('\n') : String(v);
+  }
+  function fillRouteForm(form, r) {
+    form.querySelector('[name="name"]').value = r.name || '';
+    form.querySelector('[name="outbound"]').value = r.outbound || r.outbound_tag || 'direct';
+    form.querySelector('[name="domain"]').value = _lines(r.domain);
+    form.querySelector('[name="ip"]').value = _lines(r.ip);
+    form.querySelector('[name="user"]').value = _lines(r.user);
+    form.querySelector('[name="source"]').value = _lines(r.source);
+    form.querySelector('[name="network"]').value = r.network || '';
+    form.querySelector('[name="port"]').value = r.port || '';
+    var en = form.querySelector('[name="enabled"]');
+    if (en) en.checked = r.enabled !== false;
+    var protos = r.protocol || [];
+    ['http', 'tls', 'quic', 'bittorrent'].forEach(function (p) {
+      var cb = form.querySelector('[name="proto_' + p + '"]');
+      if (cb) cb.checked = protos.indexOf(p) >= 0;
+    });
+    var tags = r.inbound_tags || [];
+    form.querySelectorAll('[name="inbound_tags"]').forEach(function (cb) {
+      cb.checked = tags.indexOf(cb.value) >= 0;
+    });
+  }
+  function openRouteEdit(r) {
+    var form = document.getElementById('form-route-edit');
+    var name = r.name || '';
+    form.action = BP + '/routing/' + encodeURIComponent(name) + '/save';
+    fillRouteForm(form, r || {});
+    document.getElementById('dlg-edit').showModal();
   }
 </script>
 {% endblock %}

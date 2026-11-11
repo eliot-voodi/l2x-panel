@@ -1,0 +1,29 @@
+{% import "_macros.html" as m %}
+<div class="row">
+  <div><label class="f">Имя</label><input name="name" required></div>
+  <div><label class="f">Outbound</label>
+    <select name="outbound">{% for tag in outbounds %}<option value="{{ tag }}">{{ outbound_label(store, tag) }}</option>{% endfor %}</select></div>
+</div>
+{{ m.check('enabled', True, 'Включено') }}
+<div class="row">
+  <div><label class="f">Домены (по строке)</label>
+    <textarea name="domain" class="mono" placeholder="geosite:category-ru&#10;regexp:.*\.ru$&#10;regexp:.*\.su$&#10;regexp:.*\.xn--p1ai$&#10;regexp:.*\.рф$&#10;ext:geosite_RU.dat:ru&#10;geosite:category-ads-all&#10;domain:example.com"></textarea>
+    <div class="hint">geosite:tag · ext:file.dat:tag · regexp: · domain: · для РФ: <code>.ru</code> / <code>.su</code> / <code>.рф</code></div>
+  </div>
+  <div><label class="f">IP / CIDR</label>
+    <textarea name="ip" class="mono" placeholder="geoip:ru&#10;geoip:private&#10;ext:geoip_RU.dat:ru&#10;8.8.8.8/32"></textarea>
+    <div class="hint">geoip:cc · ext:geoip_XX.dat:tag · CIDR</div>
+  </div>
+</div>
+<div class="row">
+  <div><label class="f">Пользователи (email)</label><textarea name="user" class="mono" style="min-height:3.5rem"></textarea></div>
+  <div><label class="f">Источник (IP клиента)</label><textarea name="source" class="mono" style="min-height:3.5rem"></textarea></div>
+</div>
+<div class="row">
+  <div><label class="f">Сеть</label><select name="network"><option value="">любая</option><option>tcp</option><option>udp</option><option>tcp,udp</option></select></div>
+  <div><label class="f">Порт(ы)</label><input name="port" placeholder="443, 1000-2000"></div>
+</div>
+<label class="f">Протокол (sniffing)</label>
+<div>{% for p in ('http', 'tls', 'quic', 'bittorrent') %}{{ m.check('proto_' ~ p, False, p) }}{% endfor %}</div>
+<label class="f">Inbounds</label>
+<div>{% for tg in inbound_tags %}<label class="check"><input type="checkbox" name="inbound_tags" value="{{ tg }}"> {{ tg }}</label>{% endfor %}</div>

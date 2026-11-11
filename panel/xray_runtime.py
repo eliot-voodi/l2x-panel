@@ -1646,9 +1646,41 @@ ROUTE_PRESETS = {
     "block_torrent": {"name": "block-torrent", "outbound": "block", "protocol": ["bittorrent"]},
     "block_private": {"name": "block-private-ip", "outbound": "block", "ip": ["geoip:private"]},
     "block_quic": {"name": "block-quic", "outbound": "block", "network": "udp", "port": "443"},
-    "direct_ru": {"name": "direct-ru", "outbound": "direct", "domain": ["geosite:category-ru", "regexp:.*\\.ru$"], "ip": ["geoip:ru"]},
+    # RU: Loyalsoldier category + TLD .ru / .su / .рф (punycode xn--p1ai) + geoip:ru
+    # After installing Russia pack: add ext:geosite_RU.dat:ru / ext:geoip_RU.dat:ru via edit
+    "direct_ru": {
+        "name": "direct-ru",
+        "outbound": "direct",
+        "domain": [
+            "geosite:category-ru",
+            "regexp:.*\\.ru$",
+            "regexp:.*\\.su$",
+            "regexp:.*\\.xn--p1ai$",
+            "regexp:.*\\.рф$",
+        ],
+        "ip": ["geoip:ru"],
+    },
+    "direct_ru_pack": {
+        "name": "direct-ru-pack",
+        "outbound": "direct",
+        "domain": [
+            "ext:geosite_RU.dat:ru",
+            "geosite:category-ru",
+            "regexp:.*\\.ru$",
+            "regexp:.*\\.su$",
+            "regexp:.*\\.xn--p1ai$",
+            "regexp:.*\\.рф$",
+        ],
+        "ip": ["ext:geoip_RU.dat:ru", "geoip:ru"],
+    },
     "direct_cn": {"name": "direct-cn", "outbound": "direct", "domain": ["geosite:cn"], "ip": ["geoip:cn"]},
     "direct_ir": {"name": "direct-ir", "outbound": "direct", "domain": ["regexp:.*\\.ir$"], "ip": ["geoip:ir"]},
+    "direct_ir_pack": {
+        "name": "direct-ir-pack",
+        "outbound": "direct",
+        "domain": ["ext:geosite_IR.dat:ir", "regexp:.*\\.ir$"],
+        "ip": ["ext:geoip_IR.dat:ir", "geoip:ir"],
+    },
     "block_porn": {"name": "block-porn", "outbound": "block", "domain": ["geosite:category-porn"]},
 }
 

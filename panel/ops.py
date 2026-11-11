@@ -463,17 +463,44 @@ GEO_SOURCES = {
     "geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
 }
 
-# Optional packs — use in routes as ext:filename.dat:tag
+# Optional packs — same set as 3x-ui (Loyalsoldier core + IR + RU). Use in routes as ext:filename.dat:tag
 GEO_PACKS = {
+    "iran": {
+        "title": "Iran rules (chocolate4u)",
+        "hint": "как в 3x-ui · ext:geoip_IR.dat:ir · ext:geosite_IR.dat:ir",
+        "files": [
+            {"name": "geoip_IR.dat", "url": "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat"},
+            {"name": "geosite_IR.dat", "url": "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat"},
+        ],
+    },
     "russia": {
         "title": "Russia rules (runetfreedom)",
-        "hint": "ext:geoip_RU.dat:ru · ext:geosite_RU.dat:ru / category-ads-all",
+        "hint": "как в 3x-ui · ext:geoip_RU.dat:ru · ext:geosite_RU.dat:ru",
         "files": [
             {"name": "geoip_RU.dat", "url": "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"},
             {"name": "geosite_RU.dat", "url": "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"},
         ],
     },
 }
+
+
+def geo_pack_files(key: str) -> list[dict]:
+    """Return [{name, url}, ...] for a GEO_PACKS key."""
+    pack = GEO_PACKS.get(key) or {}
+    return list(pack.get("files") or [])
+
+
+def install_geo_packs(keys: list[str], *, custom: list[dict] | None = None) -> dict:
+    """Download core Loyalsoldier geo + selected regional packs (3x-ui style)."""
+    extra: list[dict] = list(custom or [])
+    seen = {str(x.get("name") or "") for x in extra}
+    for key in keys:
+        for f in geo_pack_files(key):
+            name = str(f.get("name") or "")
+            if name and name not in seen:
+                extra.append({"name": name, "url": f.get("url")})
+                seen.add(name)
+    return update_geo(extra)
 
 
 def update_geo(custom: list[dict] | None = None) -> dict:

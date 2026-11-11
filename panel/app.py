@@ -4852,6 +4852,27 @@ async def balancers_save(key: str, request: Request):
 
 # ================================================================ routing
 
+def _route_rule_from_form(form) -> tuple[dict | None, str]:
+    """Parse routing form → (rule, error). Name may be empty for callers that set it."""
+    name = str(form.get("name") or "").strip()
+    rule = {
+        "name": name,
+        "enabled": form.get("enabled") != "0",
+        "outbound": str(form.get("outbound") or "direct"),
+        "domain": _split_lines(str(form.get("domain") or "")),
+        "ip": _split_lines(str(form.get("ip") or "")),
+        "user": _split_lines(str(form.get("user") or "")),
+        "source": _split_lines(str(form.get("source") or "")),
+        "protocol": [p for p in ("http", "tls", "quic", "bittorrent") if form.get(f"proto_{p}") == "1"],
+        "inbound_tags": [str(x) for x in form.getlist("inbound_tags")],
+        "network": str(form.get("network") or ""),
+        "port": str(form.get("port") or "").strip(),
+    }
+    if not any(rule[k] for k in ("domain", "ip", "user", "source", "protocol", "inbound_tags", "network", "port")):
+        return None, "Нужно хотя бы одно условие"
+    return rule, ""
+
+
 @app.get("/routing", response_class=HTMLResponse)
 def routing_page(request: Request):
     if redir := _require(request):
@@ -4872,29 +4893,56 @@ async def routing_add(request: Request):
     if redir := _require(request):
         return redir
     form = await request.form()
-    name = str(form.get("name") or "").strip()
+    rule, err = _route_rule_from_form(form)
+    if err or not rule:
+        flash(request, err or "Ошибка формы", "error")
+        return go("/routing")
+    name = rule["name"]
     with mutate() as store:
         if not name or any(r.get("name") == name for r in store["routes"]):
             flash(request, "Нужно уникальное имя правила", "error")
             return go("/routing")
-        rule = {
-            "name": name, "enabled": True, "outbound": str(form.get("outbound") or "direct"),
-            "domain": _split_lines(str(form.get("domain") or "")), "ip": _split_lines(str(form.get("ip") or "")),
-            "user": _split_lines(str(form.get("user") or "")), "source": _split_lines(str(form.get("source") or "")),
-            "protocol": [p for p in ("http", "tls", "quic", "bittorrent") if form.get(f"proto_{p}") == "1"],
-            "inbound_tags": [str(x) for x in form.getlist("inbound_tags")],
-            "network": str(form.get("network") or ""), "port": str(form.get("port") or "").strip(),
-        }
-        if not any(rule[k] for k in ("domain", "ip", "user", "source", "protocol", "inbound_tags", "network", "port")):
-            flash(request, "Нужно хотя бы одно условие", "error")
-            return go("/routing")
+        rule["enabled"] = True
         store["routes"].append(rule)
     xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(
         f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> добавлено",
-        f"→ <code>{tgbot.escape(str(form.get('outbound') or 'direct'))}</code>",
+        f"→ <code>{tgbot.escape(str(rule.get('outbound') or 'direct'))}</code>",
     )
     flash(request, *_ok_msg(f"Правило {name} добавлено", xr))
+    return go("/routing")
+
+
+@app.post("/routing/{name}/save")
+async def routing_save(name: str, request: Request):
+    """Update an existing routing rule (edit form)."""
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    rule, err = _route_rule_from_form(form)
+    if err or not rule:
+        flash(request, err or "Ошибка формы", "error")
+        return go("/routing")
+    new_name = rule["name"] or name
+    rule["name"] = new_name
+    with mutate() as store:
+        routes = store["routes"]
+        idx = next((i for i, r in enumerate(routes) if r.get("name") == name), None)
+        if idx is None:
+            flash(request, "Правило не найдено", "error")
+            return go("/routing")
+        if new_name != name and any(r.get("name") == new_name for r in routes):
+            flash(request, f"Имя «{new_name}» уже занято", "error")
+            return go("/routing")
+        rule["enabled"] = form.get("enabled") == "1"
+        routes[idx] = rule
+    xr = _apply_xray(_load_store(), xray_only=True)
+    _tg_change(
+        f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> изменено"
+        + (f" → <b>{tgbot.escape(new_name)}</b>" if new_name != name else ""),
+        f"→ <code>{tgbot.escape(str(rule.get('outbound') or 'direct'))}</code>",
+    )
+    flash(request, *_ok_msg(f"Правило {new_name} сохранено", xr))
     return go("/routing")
 
 
@@ -4920,6 +4968,9 @@ def routing_preset(key: str, request: Request):
 def routing_action(name: str, action: str, request: Request):
     if redir := _require(request):
         return redir
+    if action == "save":
+        # Handled by routing_save — avoid falling through if route order mismatches
+        return go("/routing")
     what = action
     with mutate() as store:
         routes = store["routes"]
@@ -4938,6 +4989,8 @@ def routing_action(name: str, action: str, request: Request):
         elif action == "down" and idx < len(routes) - 1:
             routes[idx + 1], routes[idx] = routes[idx], routes[idx + 1]
             what = "ниже"
+        else:
+            return go("/routing")
     xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(f"🗺 Routing: <b>{tgbot.escape(name)}</b> — {tgbot.escape(what)}")
     flash(request, *_ok_msg(f"{name}: {action}", xr))
@@ -5263,26 +5316,31 @@ async def xray_geo_settings(request: Request):
 
 @app.post("/xray/geo/pack/{key}")
 def xray_geo_pack(key: str, request: Request):
-    """Add a known geo pack (e.g. Russia rules) to custom sources and download now."""
+    """Add a known geo pack (Russia/Iran/all like 3x-ui) to custom sources and download now."""
     if redir := _require(request):
         return redir
-    pack = ops.GEO_PACKS.get(key)
-    if not pack:
+    keys = list(ops.GEO_PACKS.keys()) if key == "all" else [key]
+    if key != "all" and key not in ops.GEO_PACKS:
         flash(request, "Неизвестный geo-пакет", "error")
         return go(_next(request, "/routing"))
+    titles = []
     with mutate() as store:
         custom = store["settings"].setdefault("geo_custom", [])
         by_name = {str(x.get("name") or ""): x for x in custom if isinstance(x, dict)}
-        for f in pack["files"]:
-            by_name[f["name"]] = {"name": f["name"], "url": f["url"]}
+        for k in keys:
+            pack = ops.GEO_PACKS[k]
+            titles.append(pack["title"])
+            for f in pack["files"]:
+                by_name[f["name"]] = {"name": f["name"], "url": f["url"]}
         store["settings"]["geo_custom"] = list(by_name.values())
     _refresh_settings_cache()
+    label = "все пакеты 3x-ui (IR+RU)" if key == "all" else titles[0]
 
     def job():
         return _run_geo_update(reason=f"pack-{key}")
 
     ops.start_job(f"geo-pack-{key}", job)
-    flash(request, f"Пакет «{pack['title']}» добавлен, скачивание запущено", "info")
+    flash(request, f"Пакет «{label}» добавлен, скачивание запущено (вместе с geoip/geosite Loyalsoldier)", "info")
     return go(_next(request, "/routing"))
 
 
