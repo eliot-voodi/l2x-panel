@@ -964,11 +964,20 @@ def outbound_label(store: dict, tag: str) -> str:
             cc = o.get("country") or ""
             if o.get("kind") == "node":
                 icon = flag_emoji(cc) if cc else "🖥️"
-                remark = str(o.get("remark") or tag)
-                # remark already starts with "Node …" from upsert_node_outbound
-                if remark.lower().startswith("node "):
-                    return f"{icon} {remark}"
-                return f"{icon} Node {remark}"
+                title = ""
+                nid = o.get("node_id")
+                if nid:
+                    try:
+                        import nodes as _nodes
+                        for n in _nodes.ensure_list(store):
+                            if n.get("id") == nid:
+                                title = _nodes.node_user_title(n)
+                                break
+                    except Exception:
+                        title = ""
+                if not title:
+                    title = str(o.get("remark") or tag).strip() or tag
+                return f"{icon} {title}"
             icon = flag_emoji(cc) if cc else "🔗"
             return f"{icon} {o.get('remark') or tag}"
     if tag.startswith("node_"):

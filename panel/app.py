@@ -7057,6 +7057,7 @@ async def nodes_add(request: Request):
         mirror = form.get("mirror") == "1"
         node = {
             "id": str(uuid.uuid4()), "name": name, "url": origin, "token": token, "enabled": True,
+            "user_title": str(form.get("user_title") or "").strip()[:80],
             "sync_clients": True if mirror else form.get("sync_clients") == "1",
             "sync_inbounds": True if mirror else form.get("sync_inbounds") == "1",
             "as_outbound": True if mirror or form.get("nat") == "1" else form.get("as_outbound") == "1",
@@ -7098,6 +7099,7 @@ async def nodes_provision(request: Request):
     login = str(form.get("login") or "root").strip()
     password = str(form.get("password") or "")
     name = str(form.get("name") or "").strip()
+    user_title = str(form.get("user_title") or "").strip()[:80]
     port = _int(form.get("ssh_port"), 22)
     as_outbound = form.get("as_outbound") == "1"
     mirror = form.get("mirror") == "1"
@@ -7148,6 +7150,8 @@ async def nodes_provision(request: Request):
             return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}
         node = res["node"]
         node["sync_interval_min"] = sync_interval_min
+        if user_title:
+            node["user_title"] = user_title
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
             # replace same domain if re-provisioning
@@ -7295,7 +7299,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
             form = {}
 
     # --- quick local mutations (no network) ---
-    if action in ("delete", "toggle", "token", "schedule"):
+    if action in ("delete", "toggle", "token", "schedule", "user_title"):
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
             node = next((n for n in nodes if n["id"] == node_id), None)
@@ -7323,6 +7327,12 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     flag="notify_nodes",
                 )
                 flash(request, f"{node['name']}: расписание sync — {label}", "info")
+            elif action == "user_title":
+                title = str(form.get("user_title") or "").strip()[:80]
+                node["user_title"] = title
+                nodes_mod.upsert_node_outbound(store, node)
+                shown = nodes_mod.node_user_title(node)
+                flash(request, f"{node['name']}: название у пользователя — {shown}", "info")
             else:
                 new_tok = str(form.get("token") or "").strip()
                 if len(new_tok) < 8:
@@ -7336,6 +7346,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 flash(request, f"{node['name']}: token обновлён — нажмите Sync", "info")
         if action == "delete":
             _apply_xray(_load_store())
+        elif action == "user_title":
+            _apply_xray(_load_store(), xray_only=True)
         return go("/nodes")
 
     # --- outbound / mirror / sync: flip flags under lock, push in background ---

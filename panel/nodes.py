@@ -36,6 +36,8 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("sync_clients", True)
         n.setdefault("sync_inbounds", True)
         n.setdefault("as_outbound", False)
+        # Name shown to end users in subscription / share links (falls back to name)
+        n.setdefault("user_title", "")
         # Full standby copy of master (clients/outbounds/routes/…) while still acting as outbound
         n.setdefault("mirror", False)
         n.setdefault("domain", "")
@@ -766,6 +768,16 @@ def node_outbound_tag(node: dict) -> str:
     return f"node_{slugify(node.get('name') or 'node')}"
 
 
+def node_user_title(node: dict | None) -> str:
+    """Display name for clients (subscription / share). Empty → technical node name."""
+    if not isinstance(node, dict):
+        return "node"
+    title = str(node.get("user_title") or "").strip()
+    if title:
+        return title
+    return str(node.get("name") or "node").strip() or "node"
+
+
 def node_outbound_config(node: dict) -> dict:
     """Xray outbound on the master that tunnels through the remote node's bridge inbound."""
     ensure_bridge(node)
@@ -803,16 +815,18 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         if existing:
             customs.remove(existing)
         return
+    title = node_user_title(node)
     if uses_l2x_tunnel(node):
         entry = {
             "tag": tag,
-            "remark": f"{node.get('name')} (L2X tunnel)",
+            "remark": title,
             "kind": "node",
             "reverse": False,
             "tunnel": True,
             "node_id": node.get("id"),
             "enabled": True,
             "in_sub": True,
+            "info": "L2X tunnel",
             "country": (node.get("country") or "")[:2].upper(),
             "config": tunnel_node_outbound_config(store, node),
         }
@@ -832,13 +846,14 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         ensure_reverse(node)
         entry = {
             "tag": tag,
-            "remark": f"{node.get('name')} ({'NAT' if node.get('nat') else 'reverse'})",
+            "remark": title,
             "kind": "node",
             "reverse": True,
             "tunnel": False,
             "node_id": node.get("id"),
             "enabled": True,
             "in_sub": True,
+            "info": "NAT" if node.get("nat") else "reverse",
             "country": (node.get("country") or "")[:2].upper(),
             "config": {},
         }
@@ -860,11 +875,12 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         return
     entry = {
         "tag": tag,
-        "remark": str(node.get("name") or tag),
+        "remark": title,
         "kind": "node",
         "node_id": node.get("id"),
         "enabled": True,
         "in_sub": True,
+        "info": "bridge",
         "country": (node.get("country") or "")[:2].upper(),
         "config": node_outbound_config(node),
     }
@@ -932,10 +948,10 @@ def _agent_safe_balancers(balancers: dict, *, keep_node: bool = False) -> dict:
 def _peer_node_export(n: dict) -> dict:
     """Registry fields safe to push to a mirror (no secrets beyond agent token)."""
     keys = (
-        "id", "name", "url", "token", "enabled", "sync_clients", "sync_inbounds",
+        "id", "name", "user_title", "url", "token", "enabled", "sync_clients", "sync_inbounds",
         "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
         "ssh_hostkey_fp", "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "rv_mode",
-        "rv_uuid", "rv_domain", "rv_tag",
+        "rv_uuid", "rv_domain", "rv_tag", "country",
     )
     return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
 
