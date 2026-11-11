@@ -7907,6 +7907,15 @@ def _manage_action(action: str, payload: dict) -> dict:
             role_out = ns.get("role") or "agent"
         return {"ok": True, "error": "", "agent_enabled": True, "role": role_out}
 
+    if action == "demote_to_agent":
+        # Explicit demotion of a former/stuck master so sync can proceed without reinstall.
+        # Allowed on master without allow_master_manage (see manage_action_allowed).
+        if str(payload.get("confirm") or "") != "yes":
+            return {"ok": False, "error": "confirm=yes required"}
+        with mutate() as st:
+            out = nodes_mod.demote_store_to_agent(st)
+        return out
+
     if action == "restart_xray":
         r = ops.xray_control("restart")
         return {"ok": bool(r.get("ok")), "error": "" if r.get("ok") else (r.get("stderr") or "restart failed"), "result": r}
@@ -8436,18 +8445,36 @@ async def agent_apply(request: Request, background_tasks: BackgroundTasks):
     store, err = _agent_auth(request)
     if err:
         return err
-    # Master keeps Agent API online, but must not accept config pushes (use promote)
-    if nodes_mod.is_master(store):
-        return JSONResponse(
-            {"ok": False, "error": "master rejects apply (Agent API online; use /agent/promote)"},
-            status_code=403,
-        )
     try:
         payload = await request.json()
     except ValueError:
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    # Master keeps Agent API online. Plain apply is rejected (use /agent/promote to become
+    # master). Sync payloads carry demote_to_agent so a former master can flip to agent
+    # without SSH reinstall / manual store edits.
+    if nodes_mod.is_master(store):
+        if not nodes_mod.wants_demote_to_agent(payload):
+            return JSONResponse(
+                {"ok": False, "error": "master rejects apply (Agent API online; use /agent/promote)"},
+                status_code=403,
+            )
+
+        def _demote() -> dict:
+            with mutate() as st:
+                return nodes_mod.demote_store_to_agent(st)
+
+        demoted = await run_in_threadpool(_demote)
+        if not demoted.get("ok"):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": demoted.get("error") or "demote failed",
+                    "manual_off": bool(demoted.get("manual_off")),
+                },
+                status_code=403,
+            )
 
     def _run() -> dict:
         return _agent_apply_payload(payload, hold_front_commit=True)

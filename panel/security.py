@@ -200,6 +200,10 @@ def manage_action_allowed(*, action: str, is_master: bool, allow_master_manage: 
     a = (action or "").strip()
     if a in MANAGE_READ:
         return True, ""
+    # Recover stuck former masters without allow_master_manage / SSH reinstall.
+    # Handler still requires confirm=yes and respects agent_manual_off.
+    if a == "demote_to_agent":
+        return True, ""
     if a in MANAGE_ADMIN or a in MANAGE_WRITE:
         if is_master and not allow_master_manage:
             return False, "remote manage на master отключён (nodes.allow_master_manage)"

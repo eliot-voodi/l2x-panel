@@ -149,6 +149,41 @@ def is_master(store: dict) -> bool:
     return (ns.get("role") or "master") != "agent"
 
 
+def wants_demote_to_agent(payload: dict | None) -> bool:
+    """Sync payload asks a former master to accept config as an agent (no reinstall)."""
+    if not isinstance(payload, dict):
+        return False
+    v = payload.get("demote_to_agent")
+    if v is True or v == 1:
+        return True
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def demote_store_to_agent(store: dict) -> dict:
+    """Flip this host to agent in-place. Used by /agent/apply and manage demote_to_agent.
+
+    Keeps Agent API on and sets runtime_preserve so live Xray/L2TP survives until the
+    following apply rewrites the store. Respects agent_manual_off (local admin opt-out).
+    """
+    ns = store.setdefault("settings", {}).setdefault("nodes", {})
+    if ns.get("agent_manual_off"):
+        return {"ok": False, "error": "agent выключен вручную на этой ноде", "manual_off": True}
+    prev = str(ns.get("role") or "master")
+    ns["agent_enabled"] = True
+    ns["role"] = "agent"
+    ns["runtime_preserve"] = True
+    ns["agent_manual_off"] = False
+    if not ns.get("agent_token"):
+        ns["agent_token"] = secrets.token_urlsafe(32)
+    return {
+        "ok": True,
+        "error": "",
+        "role": "agent",
+        "was_role": prev,
+        "demoted": prev != "agent",
+    }
+
+
 def uses_l2x_tunnel(node: dict) -> bool:
     """Egress via l2x-tunneld SOCKS (WSS agent), not Xray VLESS reverse."""
     if not node.get("as_outbound") or not node.get("enabled", True):
@@ -1111,6 +1146,8 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         "mirror": mirror,
         "nat": nat,
         "master_url": master_url,
+        # Former masters accept this push as demotion→agent (no SSH reinstall).
+        "demote_to_agent": True,
         "clients": (clients if node.get("sync_clients", True) and not nat else []) + bridge_clients,
         "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on else [],
         "outbounds_custom": customs,
@@ -1758,6 +1795,32 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             # Old panel without enable_agent: fall back to manage update_panel path is N/A;
             # surface a clear error so admin can Update (manage) or SSH.
             err = f"agent disabled (auto-enable: {heal.get('error') or 'fail'})"
+            result = {"ok": False, "error": err}
+    # Former master still has role=master: demote via manage (or apply flag on new panels), then retry.
+    # No SSH reinstall — token auth is enough. Does not override agent_manual_off.
+    if not result.get("ok") and "master rejects apply" in err.lower():
+        heal = manage_request(
+            node, action="demote_to_agent", params={"confirm": "yes"}, timeout=30,
+        )
+        if heal.get("ok"):
+            result = _push_once(node, payload, timeout=timeout)
+            if result.get("ok"):
+                err = ""
+                warns = list(result.get("warnings") or [])
+                if heal.get("demoted"):
+                    warns.append("нода была master — автоматически переключена в agent")
+                if warns:
+                    result = {**result, "warnings": warns}
+            else:
+                err = str(result.get("error") or err)
+        elif heal.get("manual_off"):
+            err = "agent выключен вручную на ноде"
+            result = {"ok": False, "error": err, "manual_off": True}
+        else:
+            err = (
+                "master rejects apply; авто-demote: "
+                f"{heal.get('error') or 'fail'} — обновите панель на ноде"
+            )
             result = {"ok": False, "error": err}
     node["last_sync"] = now_iso()
     node["last_ok"] = bool(result.get("ok"))

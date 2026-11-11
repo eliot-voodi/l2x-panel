@@ -138,8 +138,9 @@
   {{ m.check('regen_token', False, 'Сгенерировать новый token') }}
   <div class="hint">
     Agent API всегда онлайн после обновлений, перезапусков и promote (панель от root).
-    Снять галочку = выключить вручную. На master config-push (<code>/agent/apply</code>) отклоняется; promote/manage работают по token.
-    Опасные manage-действия на master по умолчанию запрещены — включайте allow_master_manage только если нужно удалённое управление.
+    Снять галочку = выключить вручную. Обычный config-push на master отклоняется; sync с флагом
+    <code>demote_to_agent</code> (или manage <code>demote_to_agent</code>) сам переключает бывший master в agent — без переустановки.
+    Promote поднимает agent в master. Опасные manage-действия на master по умолчанию запрещены — включайте allow_master_manage только если нужно удалённое управление.
   </div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
