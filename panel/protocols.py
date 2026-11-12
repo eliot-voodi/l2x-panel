@@ -865,12 +865,26 @@ def _hysteria_stream(ib: dict) -> dict:
     if mtype == "proxy" and s.get("masquerade_url"):
         hy["hysteriaSettings"]["masquerade"] = {"type": "proxy", "url": s["masquerade_url"], "rewriteHost": True}
     elif mtype == "file" and s.get("masquerade_dir"):
-        hy["hysteriaSettings"]["masquerade"] = {"type": "file", "dir": s["masquerade_dir"]}
+        hy["hysteriaSettings"]["masquerade"] = {"type": "file", "dir": hysteria_masq_dir(s.get("masquerade_dir"))}
     else:
         hy["hysteriaSettings"]["masquerade"] = {
             "type": "string", "content": s.get("masquerade_content") or "OK", "statusCode": 200,
         }
     return hy
+
+
+def hysteria_masq_dir(raw: str | None) -> str:
+    """Normalize masquerade file root: directory, not path to index.html."""
+    d = str(raw or "").strip()
+    if not d:
+        return ""
+    # Users often paste …/index.html; Xray/nginx need the directory.
+    low = d.lower().replace("\\", "/")
+    for name in ("/index.html", "/index.htm", "/index"):
+        if low.endswith(name):
+            d = d[: len(d) - len(name)]
+            break
+    return d.rstrip("/\\") or d
 
 
 # ---------------------------------------------------------------- endpoints

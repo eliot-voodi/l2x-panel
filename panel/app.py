@@ -2765,7 +2765,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         s["masquerade_type"] = str(form.get("hy_mask") or "string")
         s["masquerade_content"] = str(form.get("hy_mask_content") or "OK")
         s["masquerade_url"] = str(form.get("hy_mask_url") or "")
-        s["masquerade_dir"] = str(form.get("hy_mask_dir") or "")
+        s["masquerade_dir"] = P.hysteria_masq_dir(form.get("hy_mask_dir"))
     st = ib["stream"]
     st["network"] = str(form.get("network") or "raw")
     st["security"] = str(form.get("security") or "none")

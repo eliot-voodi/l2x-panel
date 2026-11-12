@@ -580,7 +580,90 @@ def render(store: dict) -> tuple[str, str, list[str]]:
                     "    location / { return 404; }\n"
                     "}"
                 )
+    # Direct Hysteria: Xray masquerade is HTTP/3 (UDP only). Browsers open TCP/HTTPS —
+    # serve the same camouflage on TCP via nginx (UDP stays with Xray on that port).
+    used_tcp = set(plain_ports) | set(tls_ports) | {80, 443, P.FRONT_PORT, P.FRONT_INTERNAL_PORT}
+    blocks.extend(_hysteria_tcp_masq_blocks(store, pub, used_tcp))
     return stream, "\n\n".join(blocks) + "\n", p["problems"]
+
+
+def _nginx_escape(s: str) -> str:
+    return str(s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _hysteria_tcp_masq_blocks(store: dict, pub: str, used_ports: set[int]) -> list[str]:
+    """HTTPS (TCP) stubs for direct Hysteria ports so https://host:port works in a browser."""
+    out: list[str] = []
+    seen: set[int] = set()
+    for ib in store.get("inbounds") or []:
+        if not ib.get("enabled", True) or ib.get("protocol") != "hysteria" or not P.is_direct(ib):
+            continue
+        try:
+            port = int(ib.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if port < 1 or port > 65535 or port in used_ports or port in seen:
+            continue
+        s = ib.get("settings") or {}
+        st = ib.get("stream") or {}
+        tls = st.get("tls") or {}
+        host = normalize_host(ib.get("share_host") or "") or pub
+        if not host:
+            continue
+        crt = str(tls.get("cert_file") or "").strip()
+        key = str(tls.get("key_file") or "").strip()
+        if not (crt and key):
+            crt, key, _ = cert_for(host)
+        mtype = str(s.get("masquerade_type") or "string")
+        listen_lines = f"    listen {port} ssl;\n"
+        if _ipv6():
+            listen_lines += f"    listen [::]:{port} ssl;\n"
+        if mtype == "proxy" and s.get("masquerade_url"):
+            url = str(s["masquerade_url"]).strip().rstrip("/")
+            body = (
+                "    location / {\n"
+                f"        proxy_pass {url}/;\n"
+                "        proxy_ssl_server_name on;\n"
+                "        proxy_set_header Host $proxy_host;\n"
+                "        proxy_set_header X-Real-IP $remote_addr;\n"
+                "        proxy_set_header X-Forwarded-For $remote_addr;\n"
+                "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+                "    }\n"
+            )
+        elif mtype == "file" and s.get("masquerade_dir"):
+            root = P.hysteria_masq_dir(s.get("masquerade_dir"))
+            if not root:
+                continue
+            body = (
+                f"    root {_nginx_escape(root)};\n"
+                "    index index.html index.htm;\n"
+                "    location / {\n"
+                "        try_files $uri $uri/ =404;\n"
+                "    }\n"
+            )
+        else:
+            content = _nginx_escape(s.get("masquerade_content") or "OK")
+            body = (
+                "    location / {\n"
+                "        default_type text/plain;\n"
+                f'        return 200 "{content}";\n'
+                "    }\n"
+            )
+        out.append(
+            "server {\n"
+            f"{listen_lines}"
+            f"    server_name {host} _;\n"
+            "    server_tokens off;\n"
+            f"    ssl_certificate {crt};\n"
+            f"    ssl_certificate_key {key};\n"
+            "    ssl_protocols TLSv1.2 TLSv1.3;\n"
+            "    error_page 497 =301 https://$host:$server_port$request_uri;\n"
+            f"{body}"
+            "}"
+        )
+        seen.add(port)
+        used_ports.add(port)
+    return out
 
 
 def _location(loc: dict) -> str:

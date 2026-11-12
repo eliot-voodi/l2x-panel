@@ -163,7 +163,8 @@
       <label class="f">Masquerade content / URL / dir</label>
       <input name="hy_mask_content" value="{{ s.masquerade_content or 'OK' }}" placeholder="текст ответа">
       <input name="hy_mask_url" value="{{ s.masquerade_url or '' }}" placeholder="https://… для proxy">
-      <input name="hy_mask_dir" value="{{ s.masquerade_dir or '' }}" placeholder="/var/www для file">
+      <input name="hy_mask_dir" value="{{ s.masquerade_dir or '' }}" placeholder="/var/www/masq — каталог, не index.html">
+      <div class="hint">В браузере (TCP/HTTPS) сайт на этом порту отдаёт nginx; Xray masquerade — только HTTP/3 по UDP. Для <code>file</code> укажите каталог (например <code>/var/www/masq</code>), не путь к <code>index.html</code>.</div>
     </div>
 
     <h3 class="mt">Sniffing</h3>
