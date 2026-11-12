@@ -1,0 +1,493 @@
+{% extends "base.html" %}
+{% import "_icons.html" as ic %}
+{% block title %}{{ t('Схема трафика') }} · {{ app_name }}{% endblock %}
+{% block page_title %}{{ t('Схема') }}{% endblock %}
+{% block page_sub %}устройство → протокол → фильтр → правила → маршрут → выход{% endblock %}
+{% block top_actions %}
+  <div class="seg" id="view-seg">
+    <a href="#" data-view="schema" class="active">Схема</a>
+    <a href="#" data-view="list">Список</a>
+  </div>
+  <button class="btn sm" type="button" id="btn-check-panel">{{ ic.icon('activity') }}Куда пойдет?</button>
+  <form method="post" action="{{ bp }}/schema/apply" style="margin:0">
+    <button class="btn sm">{{ ic.icon('play') }}Применить</button>
+  </form>
+{% endblock %}
+{% block head %}
+<style>
+  .content { max-width: none; padding-bottom: 1rem }
+  .sch-wrap { position: relative; display: flex; gap: 1rem; align-items: stretch; min-height: calc(100dvh - 11rem) }
+  .sch-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .75rem }
+  .sch-stats { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center }
+  .sch-stats .badge { font-size: .75rem }
+  .sch-hint { color: var(--muted); font-size: .82rem }
+  .sch-board {
+    position: relative; flex: 1; overflow: auto; border: 1px solid var(--border);
+    border-radius: 16px; background:
+      radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--border) 70%, transparent) 1px, transparent 0) 0 0 / 22px 22px,
+      var(--bg-2);
+    min-height: 520px;
+  }
+  .sch-cols {
+    display: flex; gap: 1.25rem; padding: 1.25rem 1.5rem 2rem; width: max-content; min-width: 100%;
+    align-items: flex-start;
+  }
+  .sch-col { width: 220px; flex-shrink: 0; display: flex; flex-direction: column; gap: .55rem }
+  .sch-col-h {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
+    padding: 0 .2rem; display: flex; justify-content: space-between; align-items: center;
+  }
+  .sch-card {
+    background: var(--surface); border: 1px solid var(--border-2); border-radius: 14px;
+    padding: .75rem .85rem; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .12s;
+    position: relative;
+  }
+  .sch-card:hover { border-color: var(--accent); transform: translateY(-1px) }
+  .sch-card.on { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft) }
+  .sch-card.path { border-color: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft) }
+  .sch-card .t { font-weight: 650; font-size: .92rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+  .sch-card .m { color: var(--muted); font-size: .75rem; margin-top: .2rem; line-height: 1.35 }
+  .sch-card .row2 { display: flex; gap: .35rem; flex-wrap: wrap; margin-top: .45rem }
+  .sch-card.off { opacity: .45 }
+  .sch-card .ring {
+    position: absolute; left: -.35rem; top: 50%; width: 12px; height: 12px; margin-top: -6px;
+    border-radius: 50%; background: var(--surface); border: 2px solid var(--border-2);
+  }
+  .sch-card.on .ring, .sch-card.path .ring { border-color: var(--accent); background: var(--accent) }
+  .sch-card .ring.out { left: auto; right: -.35rem }
+  .sch-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible }
+  .sch-wires path { fill: none; stroke: var(--border-2); stroke-width: 2; opacity: .85 }
+  .sch-wires path.active { stroke: var(--accent); stroke-width: 3; opacity: 1; filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 50%, transparent)) }
+  .sch-side {
+    width: min(360px, 100%); flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 1rem 1.1rem; display: none; flex-direction: column; gap: .65rem;
+    max-height: calc(100dvh - 11rem); overflow: auto;
+  }
+  .sch-side.open { display: flex }
+  .sch-side h3 { margin: 0; font-size: 1rem }
+  .sch-result {
+    border-radius: 12px; padding: .75rem .85rem; border: 1px solid var(--border);
+    background: var(--surface-2); font-size: .86rem; line-height: 1.45;
+  }
+  .sch-result.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: var(--ok-soft) }
+  .sch-result.block { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); background: var(--danger-soft) }
+  .sch-result.err { border-color: var(--danger); color: var(--danger) }
+  .sch-path { display: flex; flex-direction: column; gap: .35rem; margin-top: .5rem }
+  .sch-path .step { display: flex; gap: .5rem; align-items: flex-start; font-size: .8rem }
+  .sch-path .n {
+    width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+    display: grid; place-items: center; font-size: .7rem; font-weight: 700; flex-shrink: 0;
+  }
+  .sch-list { display: none }
+  .sch-list.on { display: block }
+  .sch-board.on-list { display: none }
+  .toolbar { display: flex; gap: .35rem; flex-wrap: wrap }
+  @media (max-width: 960px) {
+    .sch-wrap { flex-direction: column }
+    .sch-side { width: 100%; max-height: none }
+    .sch-col { width: 190px }
+  }
+</style>
+{% endblock %}
+{% block content %}
+<div class="sch-wrap">
+  <div class="sch-main">
+    <div class="sch-stats">
+      <span class="badge ok"><span class="dot on"></span> {{ schema.stats.clients_online }} из {{ schema.stats.clients_total }} на связи</span>
+      <span class="badge">Inbounds: {{ schema.stats.inbounds }}</span>
+      <span class="badge {% if schema.stats.exits_up == schema.stats.exits_total %}ok{% elif schema.stats.exits_up %}warn{% endif %}">
+        Выходы: работают {{ schema.stats.exits_up }} из {{ schema.stats.exits_total }}
+      </span>
+      <span class="sch-hint">Одна линия — путь трафика. Подсветка — выбранный клиент / результат проверки.</span>
+    </div>
+    <div class="toolbar">
+      <button class="btn ghost sm" type="button" id="btn-hl-online">Выделить активные</button>
+      <button class="btn ghost sm" type="button" id="btn-fit">Вписать</button>
+      <a class="btn ghost sm" href="{{ bp }}/routing">Правила</a>
+      <a class="btn ghost sm" href="{{ bp }}/outbounds">Выходы</a>
+    </div>
+
+    <div class="sch-board" id="sch-board">
+      <svg class="sch-wires" id="sch-wires"></svg>
+      <div class="sch-cols" id="sch-cols">
+        <div class="sch-col" data-col="client">
+          <div class="sch-col-h"><span>Пользователь</span><span>{{ schema.clients|length }}</span></div>
+          {% for c in schema.clients %}
+          <div class="sch-card" data-col="client" data-id="{{ c.email }}" data-online="{{ 1 if c.online else 0 }}"
+               data-inbounds="{{ c.inbounds|join(',') }}" data-outbound="{{ c.outbound }}">
+            <span class="ring"></span><span class="ring out"></span>
+            <div class="t">{{ c.remark }}</div>
+            <div class="m mono">{{ c.email }}{% if c.ips %} · {{ c.ips[0] }}{% endif %}</div>
+            <div class="row2">
+              {% if c.online %}<span class="badge ok">online</span>{% else %}<span class="badge">offline</span>{% endif %}
+              <span class="badge">{{ c.outbound_label }}</span>
+            </div>
+          </div>
+          {% else %}
+          <div class="empty">Нет клиентов</div>
+          {% endfor %}
+        </div>
+
+        <div class="sch-col" data-col="inbound">
+          <div class="sch-col-h"><span>Протокол</span><span>{{ schema.inbounds|length }}</span></div>
+          {% for ib in schema.inbounds %}
+          <div class="sch-card" data-col="inbound" data-id="{{ ib.tag }}" data-protocol="{{ ib.protocol }}">
+            <span class="ring"></span><span class="ring out"></span>
+            <div class="t">{{ ib.remark }}</div>
+            <div class="m">{{ ib.protocol }} · {{ ib.network }}/{{ ib.security or 'none' }} · :{{ ib.port }}{% if ib.direct %} · direct{% endif %}</div>
+            <div class="row2"><span class="badge accent mono">{{ ib.tag }}</span></div>
+          </div>
+          {% else %}
+          <div class="empty">Нет inbounds</div>
+          {% endfor %}
+        </div>
+
+        <div class="sch-col" data-col="filter">
+          <div class="sch-col-h"><span>Фильтр узла</span><span>{{ schema.filters|length }}</span></div>
+          {% for f in schema.filters %}
+          <div class="sch-card {% if not f.enabled %}off{% endif %}" data-col="filter" data-id="{{ f.name }}" data-kind="{{ f.filter_kind }}">
+            <span class="ring"></span><span class="ring out"></span>
+            <div class="t">{{ f.name }}</div>
+            <div class="m">{% if f.filter_kind == 'ads' %}Реклама / телеметрия{% elif f.filter_kind == 'torrent' %}Торренты{% elif f.filter_kind == 'porn' %}18+{% else %}Блок{% endif %}
+              · {% if f.enabled %}отсеиваются{% else %}выключено{% endif %}</div>
+            <div class="row2">
+              <form method="post" action="{{ bp }}/routing/{{ f.name|urlencode }}/toggle?next=/schema" onclick="event.stopPropagation()">
+                <button class="btn ghost sm" type="submit">{{ 'Выкл' if f.enabled else 'Вкл' }}</button>
+              </form>
+            </div>
+          </div>
+          {% else %}
+          <div class="sch-card" data-col="filter" data-id="none">
+            <span class="ring"></span><span class="ring out"></span>
+            <div class="t">Остальное</div>
+            <div class="m">Нет block-фильтров — весь трафик к правилам</div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="sch-col" data-col="rule">
+          <div class="sch-col-h"><span>Правила</span><span>{{ schema.rules|length }}</span></div>
+          {% for r in schema.rules %}
+          <div class="sch-card {% if not r.enabled %}off{% endif %}" data-col="rule" data-id="{{ r.name }}" data-outbound="{{ r.outbound }}">
+            <span class="ring"></span><span class="ring out"></span>
+            <div class="t">{{ r.name }}</div>
+            <div class="m">→ {{ r.label }}
+              {% if r.domain %} · {{ r.domain[:2]|join(', ') }}{% if r.domain|length > 2 %}…{% endif %}{% endif %}
+              {% if r.ip %} · {{ r.ip[:2]|join(', ') }}{% endif %}
+            </div>
+            <div class="row2">
+              <a class="btn ghost sm" href="{{ bp }}/routing" onclick="event.stopPropagation()">Правила</a>
+              <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/toggle?next=/schema" onclick="event.stopPropagation()">
+                <button class="btn ghost sm" type="submit">{{ 'Выкл' if r.enabled else 'Вкл' }}</button>
+              </form>
+            </div>
+          </div>
+          {% else %}
+          <div class="sch-card" data-col="rule" data-id="default" data-outbound="direct">
+            <span class="ring"></span><span class="ring out"></span>
+            <div class="t">Всё через выход клиента</div>
+            <div class="m">Своих правил нет — outbound клиента / direct</div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="sch-col" data-col="exit">
+          <div class="sch-col-h"><span>Выход</span><span>{{ schema.exits|length }}</span></div>
+          {% for e in schema.exits %}
+          <div class="sch-card" data-col="exit" data-id="{{ e.tag }}" data-kind="{{ e.kind }}">
+            <span class="ring"></span>
+            <div class="t">{{ e.label }}</div>
+            <div class="m">
+              {% if e.kind == 'direct' %}Напрямую с адреса сервера
+              {% elif e.kind == 'block' %}Блок — трафик отбрасывается
+              {% elif e.kind == 'pool' %}Пул: {{ (e.members or [])[:4]|join(', ') }}{% if (e.members or [])|length > 4 %}…{% endif %}
+              {% else %}Outbound · {{ e.status or '—' }}{% endif %}
+            </div>
+            <div class="row2"><span class="badge mono">{{ e.tag }}</span>
+              {% if e.kind == 'pool' %}<span class="badge accent">pool</span>
+              {% elif e.status == 'connected' %}<span class="badge ok">up</span>
+              {% elif e.status == 'disconnected' %}<span class="badge err">down</span>{% endif %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="sch-list card" id="sch-list">
+      <h3>Список пути</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Клиент</th><th>Outbound</th><th>Inbounds</th><th>Онлайн</th></tr></thead>
+          <tbody>
+            {% for c in schema.clients %}
+            <tr>
+              <td><b>{{ c.remark }}</b><div class="small mono muted">{{ c.email }}</div></td>
+              <td>{{ c.outbound_label }}</td>
+              <td class="mono small">{{ c.inbounds|join(', ') or 'все' }}</td>
+              <td>{% if c.online %}<span class="badge ok">online</span>{% else %}—{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <h3 class="mt">Правила</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Имя</th><th>Тип</th><th>Outbound</th><th>Условия</th><th></th></tr></thead>
+          <tbody>
+            {% for r in schema.filters + schema.rules %}
+            <tr class="{% if not r.enabled %}dim{% endif %}">
+              <td class="mono">{{ r.name }}</td>
+              <td>{% if r.filter_kind %}<span class="badge">фильтр</span>{% else %}<span class="badge accent">правило</span>{% endif %}</td>
+              <td>{{ r.label }}</td>
+              <td class="small mono">{{ (r.domain + r.ip + r.protocol)[:4]|join(', ') }}</td>
+              <td><a href="{{ bp }}/routing">открыть</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">Правил нет</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <aside class="sch-side" id="sch-side">
+    <div class="flex between">
+      <h3>Куда пойдет трафик?</h3>
+      <button class="btn ghost sm" type="button" id="btn-side-close">✕</button>
+    </div>
+    <div class="hint">Проверка по правилам панели (domain/regexp/CIDR). geosite/geoip без .dat не угадываются — их применит Xray.</div>
+    <label class="f">Чей трафик</label>
+    <select id="chk-email">
+      {% for c in schema.clients %}
+      <option value="{{ c.email }}">{{ c.remark }} ({{ c.email }})</option>
+      {% endfor %}
+    </select>
+    <label class="f">Через inbound</label>
+    <select id="chk-inbound">
+      {% for ib in schema.inbounds %}
+      <option value="{{ ib.tag }}">{{ ib.remark }} · {{ ib.protocol }}</option>
+      {% endfor %}
+    </select>
+    <label class="f">Домен или IP</label>
+    <div class="import">
+      <input id="chk-dest" placeholder="2ip.ru / 1.1.1.1" value="2ip.ru">
+      <button class="btn" type="button" id="btn-check">Проверить</button>
+    </div>
+    <div id="chk-result" class="sch-result" hidden></div>
+    <div id="chk-path" class="sch-path" hidden></div>
+  </aside>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+(function () {
+  var BP = {{ bp|tojson }};
+  var board = document.getElementById('sch-board');
+  var cols = document.getElementById('sch-cols');
+  var wires = document.getElementById('sch-wires');
+  var side = document.getElementById('sch-side');
+  var list = document.getElementById('sch-list');
+  var selected = { client: null, inbound: null, filter: null, rule: null, exit: null };
+  var pathIds = {};
+
+  function cards(col) {
+    return Array.prototype.slice.call(document.querySelectorAll('.sch-card[data-col="' + col + '"]'));
+  }
+
+  function clearPath() {
+    pathIds = {};
+    document.querySelectorAll('.sch-card.path').forEach(function (el) { el.classList.remove('path'); });
+  }
+
+  function markPath(path) {
+    clearPath();
+    (path || []).forEach(function (step) {
+      pathIds[step.col] = step.id;
+      var el = document.querySelector('.sch-card[data-col="' + step.col + '"][data-id="' + CSS.escape(step.id) + '"]');
+      if (el) el.classList.add('path');
+      // map rule/exit aliases
+      if (step.col === 'route' && step.id === 'direct') {
+        var d = document.querySelector('.sch-card[data-col="exit"][data-id="direct"]');
+        if (d) d.classList.add('path');
+      }
+      if (step.col === 'exit') {
+        var e = document.querySelector('.sch-card[data-col="exit"][data-id="' + CSS.escape(step.id) + '"]');
+        if (e) e.classList.add('path');
+      }
+    });
+    drawWires();
+  }
+
+  function selectCard(el) {
+    var col = el.getAttribute('data-col');
+    var id = el.getAttribute('data-id');
+    cards(col).forEach(function (c) { c.classList.toggle('on', c === el); });
+    selected[col] = id;
+    if (col === 'client') {
+      var ibs = (el.getAttribute('data-inbounds') || '').split(',').filter(Boolean);
+      cards('inbound').forEach(function (c) {
+        c.classList.toggle('on', !ibs.length || ibs.indexOf(c.getAttribute('data-id')) >= 0);
+      });
+      var ob = el.getAttribute('data-outbound');
+      cards('exit').forEach(function (c) {
+        c.classList.toggle('on', c.getAttribute('data-id') === ob || (ob && ob.indexOf('lb_') === 0 && c.getAttribute('data-kind') === 'pool' && c.getAttribute('data-id') === ob));
+      });
+      var sel = document.getElementById('chk-email');
+      if (sel) sel.value = id;
+      if (ibs.length) {
+        var isel = document.getElementById('chk-inbound');
+        if (isel && ibs.indexOf(isel.value) < 0) isel.value = ibs[0];
+      }
+    }
+    drawWires();
+  }
+
+  function portCenter(el, which) {
+    var ring = el.querySelector('.ring' + (which === 'out' ? '.out' : ':not(.out)'));
+    var br = board.getBoundingClientRect();
+    var rr = (ring || el).getBoundingClientRect();
+    return {
+      x: rr.left + rr.width / 2 - br.left + board.scrollLeft,
+      y: rr.top + rr.height / 2 - br.top + board.scrollTop
+    };
+  }
+
+  function bezier(a, b) {
+    var dx = Math.max(40, (b.x - a.x) * 0.45);
+    return 'M' + a.x + ',' + a.y + ' C' + (a.x + dx) + ',' + a.y + ' ' + (b.x - dx) + ',' + b.y + ' ' + b.x + ',' + b.y;
+  }
+
+  function drawWires() {
+    if (!wires || !board) return;
+    var w = board.scrollWidth, h = Math.max(board.clientHeight, cols.scrollHeight);
+    wires.setAttribute('width', w);
+    wires.setAttribute('height', h);
+    wires.style.width = w + 'px';
+    wires.style.height = h + 'px';
+    var order = ['client', 'inbound', 'filter', 'rule', 'exit'];
+    var html = [];
+    for (var i = 0; i < order.length - 1; i++) {
+      var left = cards(order[i]).filter(function (c) {
+        return c.classList.contains('on') || c.classList.contains('path') || (!document.querySelector('.sch-card[data-col="' + order[i] + '"].on') && !document.querySelector('.sch-card[data-col="' + order[i] + '"].path'));
+      });
+      // default: connect first visible non-off of each column when nothing selected
+      if (!document.querySelector('.sch-card.on') && !document.querySelector('.sch-card.path')) {
+        left = cards(order[i]).filter(function (c) { return !c.classList.contains('off'); }).slice(0, 3);
+      } else {
+        left = cards(order[i]).filter(function (c) { return c.classList.contains('on') || c.classList.contains('path'); });
+        if (!left.length) left = cards(order[i]).filter(function (c) { return !c.classList.contains('off'); }).slice(0, 1);
+      }
+      var right = cards(order[i + 1]).filter(function (c) { return c.classList.contains('on') || c.classList.contains('path'); });
+      if (!right.length) right = cards(order[i + 1]).filter(function (c) { return !c.classList.contains('off'); }).slice(0, 2);
+      left.forEach(function (a) {
+        right.forEach(function (b) {
+          if (!a.querySelector('.ring.out') || !b.querySelector('.ring:not(.out)')) return;
+          var p1 = portCenter(a, 'out'), p2 = portCenter(b, 'in');
+          var active = (a.classList.contains('path') || a.classList.contains('on')) && (b.classList.contains('path') || b.classList.contains('on'));
+          html.push('<path class="' + (active ? 'active' : '') + '" d="' + bezier(p1, p2) + '"/>');
+        });
+      });
+    }
+    wires.innerHTML = html.join('');
+  }
+
+  document.querySelectorAll('.sch-card').forEach(function (el) {
+    el.addEventListener('click', function () { selectCard(el); });
+  });
+
+  document.getElementById('view-seg').addEventListener('click', function (e) {
+    var a = e.target.closest('a[data-view]');
+    if (!a) return;
+    e.preventDefault();
+    document.querySelectorAll('#view-seg a').forEach(function (x) { x.classList.toggle('active', x === a); });
+    var v = a.getAttribute('data-view');
+    board.classList.toggle('on-list', v === 'list');
+    list.classList.toggle('on', v === 'list');
+    if (v === 'schema') setTimeout(drawWires, 30);
+  });
+
+  function openSide() { side.classList.add('open'); }
+  function closeSide() { side.classList.remove('open'); }
+  document.getElementById('btn-check-panel').addEventListener('click', openSide);
+  document.getElementById('btn-side-close').addEventListener('click', closeSide);
+
+  document.getElementById('btn-hl-online').addEventListener('click', function () {
+    cards('client').forEach(function (c) {
+      c.classList.toggle('on', c.getAttribute('data-online') === '1');
+    });
+    drawWires();
+  });
+
+  document.getElementById('btn-fit').addEventListener('click', function () {
+    board.scrollTo({ left: 0, top: 0, behavior: 'smooth' });
+    drawWires();
+  });
+
+  document.getElementById('btn-check').addEventListener('click', runCheck);
+  document.getElementById('chk-dest').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); runCheck(); }
+  });
+
+  function runCheck() {
+    var email = document.getElementById('chk-email').value;
+    var inbound = document.getElementById('chk-inbound').value;
+    var dest = document.getElementById('chk-dest').value.trim();
+    var box = document.getElementById('chk-result');
+    var pathBox = document.getElementById('chk-path');
+    box.hidden = false; pathBox.hidden = false;
+    box.className = 'sch-result';
+    box.textContent = 'Проверка…';
+    pathBox.innerHTML = '';
+    var fd = new FormData();
+    fd.append('email', email);
+    fd.append('inbound', inbound);
+    fd.append('dest', dest);
+    fetch(BP + '/schema/check', { method: 'POST', body: fd, credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.ok) {
+          box.className = 'sch-result err';
+          box.textContent = data.error || 'Ошибка';
+          return;
+        }
+        var kind = (data.exit && data.exit.kind) || '';
+        box.className = 'sch-result ' + (kind === 'block' ? 'block' : 'ok');
+        box.innerHTML = '<b>' + (data.summary || '') + '</b><div class="small muted mt">' +
+          (data.detail || '') + (data.matched_rule ? ' · правило <code>' + data.matched_rule.name + '</code>' : '') + '</div>';
+        pathBox.innerHTML = (data.path || []).map(function (s, i) {
+          return '<div class="step"><span class="n">' + (i + 1) + '</span><div><b>' + s.title + '</b>' +
+            (s.meta ? '<div class="muted">' + s.meta + '</div>' : '') + '</div></div>';
+        }).join('');
+        // select cards along path
+        document.querySelectorAll('.sch-card.on').forEach(function (c) { c.classList.remove('on'); });
+        (data.path || []).forEach(function (s) {
+          if (s.col === 'route') return;
+          var el = document.querySelector('.sch-card[data-col="' + s.col + '"][data-id="' + CSS.escape(s.id) + '"]');
+          if (el) el.classList.add('on');
+          if (s.col === 'client' || s.col === 'inbound') selected[s.col] = s.id;
+        });
+        if (data.exit && data.exit.tag) {
+          var ex = document.querySelector('.sch-card[data-col="exit"][data-id="' + CSS.escape(data.exit.tag) + '"]');
+          if (ex) ex.classList.add('on');
+        }
+        markPath(data.path || []);
+        openSide();
+      })
+      .catch(function (err) {
+        box.className = 'sch-result err';
+        box.textContent = String(err);
+      });
+  }
+
+  board.addEventListener('scroll', function () { drawWires(); });
+  window.addEventListener('resize', function () { drawWires(); });
+  setTimeout(drawWires, 50);
+  // auto-select first online client
+  var first = document.querySelector('.sch-card[data-col="client"][data-online="1"]') || document.querySelector('.sch-card[data-col="client"]');
+  if (first) selectCard(first);
+})();
+</script>
+{% endblock %}

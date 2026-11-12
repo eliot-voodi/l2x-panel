@@ -2680,7 +2680,7 @@ def xray_apply(request: Request):
     result = _apply_xray(_load_store())
     flash(request, *(("Конфиг Xray применён", "info") if result.get("ok") else (f"Xray: {result.get('error')}", "error")))
     ref = request.headers.get("referer") or ""
-    for path in ("/inbounds", "/clients", "/balancers", "/routing", "/outbounds", "/l2tp", "/xray", "/settings"):
+    for path in ("/inbounds", "/clients", "/balancers", "/routing", "/schema", "/outbounds", "/l2tp", "/xray", "/settings"):
         if path in ref:
             return go(path)
     return go("/")
@@ -4926,6 +4926,45 @@ async def balancers_save(key: str, request: Request):
     return go("/balancers")
 
 
+# ================================================================ traffic schema
+
+@app.get("/schema", response_class=HTMLResponse)
+def schema_page(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    import traffic_schema as tschema
+    schema = tschema.build_schema(store, online=ONLINE)
+    return page(
+        request, "traffic_schema.html", active="schema",
+        schema=schema, store=store,
+    )
+
+
+@app.post("/schema/check")
+async def schema_check(request: Request):
+    if not _user(request):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    form = await request.form()
+    store = _load_store()
+    import traffic_schema as tschema
+    return JSONResponse(tschema.check_destination(
+        store,
+        email=str(form.get("email") or ""),
+        inbound_tag=str(form.get("inbound") or ""),
+        dest=str(form.get("dest") or ""),
+    ))
+
+
+@app.post("/schema/apply")
+def schema_apply(request: Request):
+    if redir := _require(request):
+        return redir
+    xr = _apply_xray(_load_store(), xray_only=True)
+    flash(request, *_ok_msg("Схема: конфиг Xray применён", xr))
+    return go("/schema")
+
+
 # ================================================================ routing
 
 def _route_rule_from_form(form) -> tuple[dict | None, str]:
@@ -5046,15 +5085,16 @@ def routing_preset(key: str, request: Request):
 def routing_action(name: str, action: str, request: Request):
     if redir := _require(request):
         return redir
+    nxt = _next(request, "/routing")
     if action == "save":
         # Handled by routing_save — avoid falling through if route order mismatches
-        return go("/routing")
+        return go(nxt)
     what = action
     with mutate() as store:
         routes = store["routes"]
         idx = next((i for i, r in enumerate(routes) if r.get("name") == name), None)
         if idx is None:
-            return go("/routing")
+            return go(nxt)
         if action == "delete":
             routes.pop(idx)
             what = "удалено"
@@ -5068,11 +5108,11 @@ def routing_action(name: str, action: str, request: Request):
             routes[idx + 1], routes[idx] = routes[idx], routes[idx + 1]
             what = "ниже"
         else:
-            return go("/routing")
+            return go(nxt)
     xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(f"🗺 Routing: <b>{tgbot.escape(name)}</b> — {tgbot.escape(what)}")
     flash(request, *_ok_msg(f"{name}: {action}", xr))
-    return go("/routing")
+    return go(nxt)
 
 
 # ================================================================ xray settings
