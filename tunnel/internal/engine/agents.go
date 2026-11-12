@@ -191,22 +191,22 @@ func (e *Engine) writeAgent(nodeID string, packet []byte) error {
 	if a == nil {
 		return errNoPeer
 	}
+	// Prefer UDP when the agent punched a public path (profile=udp / both).
+	if a.udp != nil && e.Pool != nil {
+		path := e.Pool.Next()
+		if path != nil {
+			_, err := path.Conn.WriteToUDP(packet, a.udp)
+			if err == nil {
+				e.Stats.PacketsOut.Add(1)
+				return nil
+			}
+		}
+	}
 	if a.ws != nil {
 		a.writeMu.Lock()
 		defer a.writeMu.Unlock()
 		_ = a.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		err := a.ws.WriteMessage(websocket.BinaryMessage, packet)
-		if err == nil {
-			e.Stats.PacketsOut.Add(1)
-		}
-		return err
-	}
-	if a.udp != nil && e.Pool != nil {
-		path := e.Pool.Next()
-		if path == nil {
-			return errNoPeer
-		}
-		_, err := path.Conn.WriteToUDP(packet, a.udp)
 		if err == nil {
 			e.Stats.PacketsOut.Add(1)
 		}

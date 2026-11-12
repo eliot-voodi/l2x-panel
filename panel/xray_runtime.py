@@ -2715,19 +2715,28 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
             t0 = time.time()
             cfg = o.get("config") or {}
             servers = ((cfg.get("settings") or {}).get("servers") or [{}])
-            host = str((servers[0] or {}).get("address") or "127.0.0.1")
+            srv0 = servers[0] or {}
+            host = str(srv0.get("address") or "127.0.0.1")
             try:
-                port = int((servers[0] or {}).get("port") or 11080)
+                port = int(srv0.get("port") or 11080)
             except (TypeError, ValueError):
                 port = 11080
-            r = _run(
-                [
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
-                    "--max-time", str(timeout),
-                    "--socks5-hostname", f"{host}:{port}", url,
-                ],
-                timeout=timeout + 5,
-            )
+            # Multi-agent portal requires SOCKS user=node_id (without it curl always fails).
+            sock_user = ""
+            sock_pass = "l2x"
+            users = srv0.get("users") or []
+            if users and isinstance(users[0], dict):
+                sock_user = str(users[0].get("user") or "").strip()
+                sock_pass = str(users[0].get("pass") or "l2x") or "l2x"
+            curl_cmd = [
+                "curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
+                "--max-time", str(timeout),
+                "--socks5-hostname", f"{host}:{port}",
+            ]
+            if sock_user:
+                curl_cmd.extend(["-U", f"{sock_user}:{sock_pass}"])
+            curl_cmd.append(url)
+            r = _run(curl_cmd, timeout=timeout + 5)
             parts = (r.get("stdout") or "").strip().split()
             code = parts[0] if parts else "000"
             ms = int(float(parts[1]) * 1000) if len(parts) > 1 else int((time.time() - t0) * 1000)

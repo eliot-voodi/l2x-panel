@@ -101,15 +101,17 @@ TUNNEL_PROFILES = {
         "id": "dpi_lite",
         "label": "DPI lite (WSS, TLS only)",
         "transport": "wss",
-        "cipher": "null",
+        # Use "none" (not YAML null keyword). Portal AltCipher must accept it.
+        "cipher": "none",
         "hint": "Только TLS (без ChaCha) — меньше CPU, всё ещё WSS",
     },
     "udp": {
         "id": "udp",
         "label": "UDP (max speed)",
-        "transport": "udp",
+        # Agent uses both: WSS fallback (old binaries) + UDP when supported.
+        "transport": "both",
         "cipher": "chacha20poly1305",
-        "hint": "Сырой UDP :4443 — максимум скорости, заметен для DPI",
+        "hint": "UDP :4443 + запасной WSS — максимум скорости",
     },
 }
 
@@ -328,9 +330,21 @@ def fleet_needs_udp_tunnel(store: dict) -> bool:
     for n in ensure_list(store):
         if not n.get("enabled", True) or not uses_l2x_tunnel(n):
             continue
-        if normalize_tunnel_profile(n.get("tunnel_profile")) == "udp":
+        if tunnel_profile_spec(n)["transport"] in ("udp", "both"):
             return True
     return False
+
+
+def portal_supports_alt_cipher() -> bool:
+    """True when local l2x-tunneld advertises dpi_lite (none) acceptance."""
+    try:
+        import json as _json
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:9109/health", timeout=1.5) as resp:
+            data = _json.loads(resp.read().decode() or "{}")
+        return bool(isinstance(data, dict) and data.get("alt_cipher"))
+    except Exception:
+        return False
 
 
 def build_tunnel_agent_config(store: dict, node: dict) -> dict | None:
@@ -343,25 +357,33 @@ def build_tunnel_agent_config(store: dict, node: dict) -> dict | None:
     if not psk or not token:
         return None
     spec = tunnel_profile_spec(node)
+    transport = spec["transport"]
+    cipher = spec["cipher"]
+    # Old tunneld without AltCipher cannot open cipher=none — keep ChaCha until rebuilt.
+    if cipher.lower() in ("none", "null", "off") and not portal_supports_alt_cipher():
+        cipher = "chacha20poly1305"
+    ws_url = tunnel_public_ws_url(store)
+    peer_udp = tunnel_public_udp(store)
+    # WSS required for no_dpi/dpi_lite/both; UDP peer required for udp/both.
+    if transport in ("wss", "both") and not ws_url:
+        return None
+    if transport in ("udp", "both") and not peer_udp:
+        # Fall back to WSS-only rather than shipping a dead UDP-only config.
+        if not ws_url:
+            return None
+        transport = "wss"
     out = {
         "profile": spec["id"],
-        "transport": spec["transport"],
-        "cipher": spec["cipher"],
+        "transport": transport,
+        "cipher": cipher,
         "psk": psk,
         "token": token,
         "node_id": tunnel_agent_id(node),
-        "ws_url": "",
-        "peer_udp": "",
+        "ws_url": ws_url if transport in ("wss", "both") else "",
+        "peer_udp": peer_udp if transport in ("udp", "both") else "",
         "binary_url": tunnel_agent_binary_url(store),
+        "force": True,
     }
-    if spec["transport"] == "wss":
-        out["ws_url"] = tunnel_public_ws_url(store)
-        if not out["ws_url"]:
-            return None
-    else:
-        out["peer_udp"] = tunnel_public_udp(store)
-        if not out["peer_udp"]:
-            return None
     return out
 
 
@@ -369,6 +391,9 @@ def render_agent_tunnel_yaml(cfg: dict) -> str:
     """Render /etc/l2x-tunnel/agent.yaml from profile config."""
     transport = str(cfg.get("transport") or "wss").strip() or "wss"
     cipher = str(cfg.get("cipher") or "chacha20poly1305").strip() or "chacha20poly1305"
+    # Never emit bare YAML null/bool keywords.
+    if cipher.lower() in ("null", "none", "off"):
+        cipher = "none"
     psk = str(cfg.get("psk") or "").strip()
     token = str(cfg.get("token") or "").strip()
     node_id = str(cfg.get("node_id") or "node").strip() or "node"
@@ -383,7 +408,7 @@ def render_agent_tunnel_yaml(cfg: dict) -> str:
     lines.append(f"  psk: {json.dumps(psk)}")
     lines.append(f"  token: {json.dumps(token)}")
     lines.append(f"  node_id: {json.dumps(node_id)}")
-    lines.append(f"  cipher: {cipher}")
+    lines.append(f"  cipher: {json.dumps(cipher)}")
     lines.append("  max_streams: 4000")
     if transport in ("udp", "both"):
         peer = str(cfg.get("peer_udp") or "").strip()
@@ -419,6 +444,99 @@ WantedBy=multi-user.target
 """
 
 
+def _download_tunnel_binary(url: str, dest: Path) -> bool:
+    """Download a tunnel binary to dest; return True on success."""
+    if not url:
+        return False
+    import subprocess
+    tmp = Path(str(dest) + ".new")
+    try:
+        r = subprocess.run(
+            ["curl", "-fsSL", "--connect-timeout", "20", "--max-time", "180", "-o", str(tmp), url],
+            capture_output=True, text=True, timeout=200, check=False,
+        )
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1000:
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)
+            return True
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return False
+
+
+def ensure_tunnel_binaries(*, publish_agent: bool = True) -> dict:
+    """Build/refresh l2x-tunneld (+ agent) from panel tree when Go is available."""
+    import subprocess
+    import shutil
+
+    out: dict = {"ok": False, "built": False, "published": False}
+    src = Path("/opt/l2xpanel/tunnel")
+    if not (src / "go.mod").exists():
+        out["error"] = "tunnel sources missing"
+        return out
+    go = shutil.which("go")
+    if not go:
+        # Best-effort one-shot install (dpi_lite / UDP need rebuilt tunneld).
+        try:
+            import subprocess as _sp
+            _sp.run(
+                ["apt-get", "install", "-y", "golang-go"],
+                capture_output=True, text=True, timeout=600, check=False,
+            )
+            go = shutil.which("go")
+        except Exception:
+            go = None
+        if not go:
+            out["error"] = "go not installed"
+            return out
+    Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "CGO_ENABLED": "0", "GOOS": "linux"}
+    built = []
+    for name, cmd_dir in (("l2x-tunneld", "cmd/l2x-tunneld"), ("l2x-tunnel-agent", "cmd/l2x-tunnel-agent")):
+        dest = Path("/usr/local/bin") / name
+        r = subprocess.run(
+            [go, "build", "-ldflags=-s -w", "-o", str(dest), f"./{cmd_dir}"],
+            cwd=str(src), env=env, capture_output=True, text=True, timeout=300, check=False,
+        )
+        if r.returncode != 0:
+            out["error"] = (r.stderr or r.stdout or "go build failed")[-400:]
+            return out
+        try:
+            os.chmod(dest, 0o755)
+        except OSError:
+            pass
+        built.append(name)
+    out["built"] = True
+    out["bins"] = built
+    if publish_agent:
+        pub = Path("/var/www/l2x-public")
+        try:
+            pub.mkdir(parents=True, exist_ok=True)
+            shutil.copy2("/usr/local/bin/l2x-tunnel-agent", pub / "l2x-tunnel-agent")
+            os.chmod(pub / "l2x-tunnel-agent", 0o755)
+            out["published"] = True
+        except OSError as exc:
+            out["publish_error"] = str(exc)
+    # Restart portal if unit exists
+    try:
+        subprocess.run(
+            ["systemctl", "restart", "l2x-tunneld"],
+            capture_output=True, timeout=30, check=False,
+        )
+        out["restarted"] = True
+    except Exception:
+        pass
+    out["ok"] = True
+    return out
+
+
 def apply_tunnel_agent_local(cfg: dict | None) -> dict:
     """Write agent.yaml on this host and restart l2x-tunnel-agent (NAT/reverse pull/push)."""
     if not isinstance(cfg, dict):
@@ -433,9 +551,8 @@ def apply_tunnel_agent_local(cfg: dict | None) -> dict:
         path = Path("/etc/l2x-tunnel/agent.yaml")
         old = path.read_text(encoding="utf-8") if path.exists() else ""
         changed = body != old
-        if changed:
-            path.write_text(body, encoding="utf-8")
-            os.chmod("/etc/l2x-tunnel/agent.yaml", 0o600)
+        path.write_text(body, encoding="utf-8")
+        os.chmod("/etc/l2x-tunnel/agent.yaml", 0o600)
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -444,38 +561,30 @@ def apply_tunnel_agent_local(cfg: dict | None) -> dict:
     bin_path = Path("/usr/local/bin/l2x-tunnel-agent")
     if not bin_path.exists():
         url = str(cfg.get("binary_url") or "").strip()
-        if url:
-            try:
-                tmp = str(bin_path) + ".new"
-                r = subprocess.run(
-                    ["curl", "-fsSL", "--connect-timeout", "20", "--max-time", "180", "-o", tmp, url],
-                    capture_output=True, text=True, timeout=200, check=False,
-                )
-                if r.returncode == 0 and Path(tmp).exists() and Path(tmp).stat().st_size > 1000:
-                    os.chmod(tmp, 0o755)
-                    os.replace(tmp, bin_path)
-                else:
-                    try:
-                        Path(tmp).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            except Exception:
-                pass
+        if not _download_tunnel_binary(url, bin_path):
+            # Last resort: build from local panel tree (reverse nodes that are also masters-of-nothing)
+            ensure_tunnel_binaries(publish_agent=False)
     unit = Path("/etc/systemd/system/l2x-tunnel-agent.service")
     try:
         if not unit.exists():
             unit.write_text(_TUNNEL_AGENT_UNIT, encoding="utf-8")
             subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30, check=False)
-        if bin_path.exists():
-            subprocess.run(
-                ["systemctl", "enable", "--now", "l2x-tunnel-agent"],
-                capture_output=True, timeout=30, check=False,
-            )
-            if changed:
-                subprocess.run(
-                    ["systemctl", "restart", "l2x-tunnel-agent"],
-                    capture_output=True, timeout=30, check=False,
-                )
+        if not bin_path.exists():
+            return {
+                "ok": False,
+                "changed": changed,
+                "error": "l2x-tunnel-agent binary missing — положите в /var/www/l2x-public/ на мастере или установите Go",
+                "has_binary": False,
+            }
+        subprocess.run(
+            ["systemctl", "enable", "--now", "l2x-tunnel-agent"],
+            capture_output=True, timeout=30, check=False,
+        )
+        # Always restart so profile/PSK changes take effect even if yaml matched.
+        subprocess.run(
+            ["systemctl", "restart", "l2x-tunnel-agent"],
+            capture_output=True, timeout=30, check=False,
+        )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "changed": changed}
     return {"ok": True, "changed": changed, "profile": cfg.get("profile"), "has_binary": bin_path.exists()}
@@ -534,7 +643,10 @@ def render_tunnel_yaml(
     cipher = str(bundle.get("cipher") or "chacha20poly1305").strip() or "chacha20poly1305"
     transport = "both" if enable_udp else "wss"
     listen_udp = str(tun_settings.get("udp_listen") or "0.0.0.0:4443").strip() if enable_udp else "127.0.0.1:0"
-    path_count = 4 if enable_udp else 1
+    # Single UDP path — multi-port bind (4443..4446) previously killed tunneld if any port busy.
+    path_count = 1
+    if cipher.lower() in ("null", "none", "off", ""):
+        cipher = "chacha20poly1305"
     return (
         "role: portal\n"
         f"transport: {transport}\n"
@@ -543,7 +655,7 @@ def render_tunnel_yaml(
         f"  token: {json.dumps(token)}\n"
         f"  listen_udp: {json.dumps(listen_udp)}\n"
         f"  path_count: {path_count}\n"
-        f"  cipher: {cipher}\n"
+        f"  cipher: {json.dumps(cipher)}\n"
         "  max_streams: 4000\n"
         f"proxy_listen: {json.dumps(str(bundle.get('proxy_listen') or '127.0.0.1:18080'))}\n"
         f"socks_listen: {json.dumps(f'{socks}:{socks_port}')}\n"
@@ -556,30 +668,32 @@ def render_tunnel_yaml(
 
 def sync_tunneld_for_fleet(store: dict) -> dict:
     """Rewrite tunneld.yaml when fleet UDP profile requires public UDP listen."""
+    bins = ensure_tunnel_binaries(publish_agent=True)
     bundle = export_tunnel_bundle()
     if not bundle.get("psk") or not bundle.get("token"):
-        return {"ok": False, "error": "tunneld.yaml missing psk/token", "skipped": True}
+        return {"ok": False, "error": "tunneld.yaml missing psk/token", "skipped": True, "bins": bins}
     tun = ensure_tunnel_settings(store)
     need_udp = fleet_needs_udp_tunnel(store)
     body = render_tunnel_yaml(bundle, tun, enable_udp=need_udp)
     if not body:
-        return {"ok": False, "error": "render failed"}
+        return {"ok": False, "error": "render failed", "bins": bins}
     path = Path("/etc/l2x-tunnel/tunneld.yaml")
     try:
         old = path.read_text(encoding="utf-8") if path.exists() else ""
-        if body == old:
-            return {"ok": True, "unchanged": True, "udp": need_udp}
-        Path("/etc/l2x-tunnel").mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
-        os.chmod("/etc/l2x-tunnel/tunneld.yaml", 0o600)
+        unchanged = body == old
+        if not unchanged:
+            Path("/etc/l2x-tunnel").mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            os.chmod("/etc/l2x-tunnel/tunneld.yaml", 0o600)
     except OSError as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "bins": bins}
     try:
         import subprocess
+        # Always restart after profile churn so AltCipher / UDP listen pick up.
         subprocess.run(["systemctl", "restart", "l2x-tunneld"], capture_output=True, timeout=30, check=False)
     except Exception:
         pass
-    return {"ok": True, "udp": need_udp, "restarted": True}
+    return {"ok": True, "udp": need_udp, "restarted": True, "unchanged": unchanged, "bins": bins}
 
 
 def apply_tunnel_bundle(bundle: dict | None, tun_settings: dict | None = None) -> dict:
