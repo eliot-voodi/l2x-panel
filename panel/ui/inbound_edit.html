@@ -82,6 +82,10 @@
     </select>
     <div class="hint">По умолчанию <b>none</b> — без привязки inbound→outbound (нет петли через Direct). Для socks/http/dokodemo/wireguard выбранный outbound принимает весь трафик inbound. Для vless/vmess/trojan/ss outbound клиента важнее; none здесь безопаснее, чем Direct.</div>
     <div class="mt">{{ m.check('enabled', ib.enabled, t('Включён')) }}</div>
+    {% if is_new %}
+    <div class="mt">{{ m.check('propagate_users', False, 'Раздать всем клиентам / группам') }}</div>
+    <div class="hint">Без галочки новый inbound не попадёт к тем, у кого список inbound = «все» (список зафиксируется без него). С галочкой — как раньше: пустой список = все, включая этот.</div>
+    {% endif %}
     <div class="mt flex gap" style="flex-wrap:wrap;align-items:center">
       <button type="button" class="btn sm" id="btn_max_speed">Профиль: макс. скорость</button>
       {% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}

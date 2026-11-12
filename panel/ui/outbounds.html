@@ -153,6 +153,10 @@
       <div><label class="f">Название</label><input name="remark" id="f-remark"></div>
       <div style="max-width:100px"><label class="f">Страна</label><input name="country" id="f-country" maxlength="2" style="text-transform:uppercase" placeholder="DE"></div>
     </div>
+    <div id="propagate_users_wrap" class="mt">
+      <label class="check"><input type="checkbox" name="propagate_users" id="propagate_users" value="1"> Раздать всем клиентам / группам</label>
+      <div class="hint">Без галочки outbound не появится у тех, у кого список подключений = «все» (список зафиксируется без него). С галочкой — пустой список = все, включая этот.</div>
+    </div>
 
     {# Shared for form / JSON / WARP / Nord / PIA: dialerProxy through another outbound #}
     <div class="sec" id="wrap-sec">
@@ -681,6 +685,10 @@
     $('ob-title').textContent = tag ? 'Редактировать ' + tag : 'Новый outbound';
     $('ob-submit').textContent = tag ? 'Сохранить' : 'Добавить';
     document.querySelectorAll('#otabs [data-new]').forEach(function (a) { a.hidden = !!tag; });
+    var propWrap = $('propagate_users_wrap');
+    var propCb = $('propagate_users');
+    if (propWrap) propWrap.hidden = !!tag;
+    if (propCb) propCb.checked = false;
     filterWrapOptions(tag || '');
     curMode = 'form';
     loadOb(item ? item.config : { protocol: 'vless' });

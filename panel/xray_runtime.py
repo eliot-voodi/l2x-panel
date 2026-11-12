@@ -1548,6 +1548,66 @@ def selectable_outbound_tags(store: dict) -> list[dict]:
     return out
 
 
+def _all_inbound_tags(store: dict, *, exclude: str = "") -> list[str]:
+    tags = [i["tag"] for i in client_capable_inbounds(store) if i.get("tag")]
+    if exclude:
+        tags = [t for t in tags if t != exclude]
+    return tags
+
+
+def _all_outbound_assign_tags(store: dict, *, exclude: str = "") -> list[str]:
+    tags = [x["tag"] for x in selectable_outbound_tags(store) if x.get("tag")]
+    if exclude:
+        tags = [t for t in tags if t != exclude]
+    return tags
+
+
+def apply_tag_to_users(store: dict, *, kind: str, tag: str, propagate: bool) -> dict:
+    """Add a new inbound/outbound tag to clients and groups, or freeze «all» lists without it.
+
+    Empty ``inbounds`` / ``allowed_tags`` means «all». Without an explicit freeze, every new
+    tag instantly appears for those users. ``propagate=False`` materializes the previous
+    universe (all tags except ``tag``) so the new one stays opt-in.
+    """
+    tag = str(tag or "").strip()
+    if not tag or kind not in ("inbound", "outbound"):
+        return {"clients": 0, "groups": 0, "mode": "skip"}
+    key = "inbounds" if kind == "inbound" else "allowed_tags"
+    universe = (
+        _all_inbound_tags(store, exclude=tag) if kind == "inbound"
+        else _all_outbound_assign_tags(store, exclude=tag)
+    )
+    clients_n = groups_n = 0
+    for c in store.get("clients") or []:
+        cur = list(c.get(key) or [])
+        if propagate:
+            if not cur:
+                continue  # empty = all → already includes the new tag
+            if tag not in cur and NONE_TAG not in cur:
+                cur.append(tag)
+                c[key] = cur
+                clients_n += 1
+        else:
+            if not cur:
+                c[key] = list(universe)
+                clients_n += 1
+            # non-empty personal lists already exclude the new tag unless listed
+    for g in ensure_groups(store):
+        cur = list(g.get(key) or [])
+        if propagate:
+            if not cur:
+                continue
+            if tag not in cur and NONE_TAG not in cur:
+                cur.append(tag)
+                g[key] = cur
+                groups_n += 1
+        else:
+            if not cur:
+                g[key] = list(universe)
+                groups_n += 1
+    return {"clients": clients_n, "groups": groups_n, "mode": "add" if propagate else "freeze"}
+
+
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
     """One identity per balancer / connected country / enabled custom outbound.
 

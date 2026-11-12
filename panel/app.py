@@ -3040,6 +3040,7 @@ async def inbound_save(request: Request):
         return redir
     form = await request.form()
     ib_id = _int(form.get("id"))
+    prop_note = ""
     with mutate() as store:
         if ib_id:
             ib = xray.inbound_by_id(store, ib_id)
@@ -3071,6 +3072,12 @@ async def inbound_save(request: Request):
             return go(f"/inbounds/{ib_id}/edit" if ib_id else "/inbounds/new")
         if not ib_id:
             store["inbounds"].append(ib)
+            propagate = form.get("propagate_users") == "1"
+            stats = xray.apply_tag_to_users(store, kind="inbound", tag=ib["tag"], propagate=propagate)
+            if propagate:
+                prop_note = f" · всем клиентам (+{stats['clients']} списков, +{stats['groups']} групп)"
+            else:
+                prop_note = f" · без автораздачи (зафиксировано {stats['clients']} клиентов / {stats['groups']} групп)"
         elif old_tag != ib["tag"]:
             for c in store["clients"]:
                 c["inbounds"] = [ib["tag"] if x == old_tag else x for x in c.get("inbounds") or []]
@@ -3084,7 +3091,7 @@ async def inbound_save(request: Request):
         f"{tgbot.escape(st.get('network') or '')}/{tgbot.escape(st.get('security') or '')} · "
         f"fp=<code>{tgbot.escape(st.get('fingerprint') or '')}</code>",
     )
-    flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён", result))
+    flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён{prop_note}", result))
     return go("/inbounds")
 
 
@@ -3126,6 +3133,8 @@ def inbound_action(ib_id: int, action: str, request: Request):
                 clone["stream"]["reality"]["private_key"] = clone["stream"]["reality"]["public_key"] = ""
             xray.ensure_inbound_keys(clone)
             store["inbounds"].append(clone)
+            # Clone is a new inbound — do not auto-spread to «all» clients
+            xray.apply_tag_to_users(store, kind="inbound", tag=clone["tag"], propagate=False)
             what = f"клонирован → <b>{tgbot.escape(clone['tag'])}</b> port <code>{clone['port']}</code>"
         else:
             flash(request, "Неизвестное действие", "error")
@@ -4679,6 +4688,7 @@ async def outbound_add(request: Request):
     if wrap_err:
         flash(request, f"Outbound: {wrap_err}", "error")
         return go("/outbounds")
+    prop_note = ""
     with mutate() as store:
         previous = json.loads(json.dumps(store["outbounds_custom"]))
         if edit_tag:
@@ -4704,6 +4714,14 @@ async def outbound_add(request: Request):
                     o["pia_reconnected_at"] = datetime.now(timezone.utc).isoformat()
                     cfg = _pia_settings(store)
                     cfg["last_reconnect_at"] = o["pia_reconnected_at"]
+            if not err:
+                propagate = form.get("propagate_users") == "1"
+                stats = xray.apply_tag_to_users(store, kind="outbound", tag=tag, propagate=propagate)
+                prop_note = (
+                    f" · всем клиентам (+{stats['clients']} списков, +{stats['groups']} групп)"
+                    if propagate else
+                    f" · без автораздачи (зафиксировано {stats['clients']} клиентов / {stats['groups']} групп)"
+                )
     if err:
         flash(request, err, "error")
         return go("/outbounds")
@@ -4715,7 +4733,7 @@ async def outbound_add(request: Request):
         return go("/outbounds")
     act = "обновлён" if edit_tag else "добавлен"
     _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b> {act}")
-    flash(request, f"Outbound {tag} {act}", "info")
+    flash(request, f"Outbound {tag} {act}{prop_note}", "info")
     return go("/outbounds")
 
 
