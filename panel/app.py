@@ -717,7 +717,7 @@ class CsrfMiddleware:
     """
 
     EXEMPT_PREFIXES = (
-        "/agent/", "/panel/api/", "/sub/", "/api/sub/", "/doh/", "/health", "/static/",
+        "/agent/", "/panel/api/", "/sub/", "/api/sub/", "/doh/", "/pihole/", "/health", "/static/",
     )
 
     def __init__(self, inner):

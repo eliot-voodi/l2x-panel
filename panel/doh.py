@@ -597,8 +597,19 @@ def set_pihole_password(password: str, *, update_env: bool = True) -> dict:
         invalidate_pihole_session()
     except Exception:
         pass
+
+    # Verify FTL actually accepts the new password (catches ignored setpassword / stale pin)
+    cfg = {**default_settings(), "pihole_password": pwd, "pihole_web": "127.0.0.1:8089"}
+    auth = _pihole_auth(cfg, force=True)
+    if not auth.get("ok"):
+        return {
+            "ok": False,
+            "error": f"пароль записан в CLI, но API не принял его: {auth.get('error') or 'auth failed'}",
+            "log": ((sp.get("stdout") or "") + (sp.get("stderr") or "")).strip()[-1500:],
+        }
+
     log = ((up.get("stdout") or "") + "\n" + (sp.get("stdout") or "") + (sp.get("stderr") or "")).strip()
-    return {"ok": True, "log": log[-2000:], "via": "pihole setpassword"}
+    return {"ok": True, "log": log[-2000:], "via": "pihole setpassword", "verified": True}
 
 
 def stop_pihole() -> dict:
