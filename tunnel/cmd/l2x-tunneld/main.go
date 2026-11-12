@@ -61,6 +61,14 @@ func main() {
 	}
 
 	eng := engine.New("portal", ciph, p, cfg.Tunnel.Token, "portal", cfg.DefaultDial, cfg.Tunnel.MaxStreams)
+	// Accept dpi_lite agents (cipher=null, TLS-only) alongside default chacha.
+	cipherName := strings.ToLower(strings.TrimSpace(cfg.Tunnel.Cipher))
+	if cipherName == "" || cipherName == "chacha20poly1305" || cipherName == "chacha" {
+		if alt, err := crypto.New("null", cfg.Tunnel.PSK); err == nil {
+			eng.SetAltCipher(alt)
+			log.Printf("l2x-tunneld alt cipher=null (dpi_lite agents)")
+		}
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go eng.Run(ctx)

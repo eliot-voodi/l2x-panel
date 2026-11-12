@@ -39,6 +39,7 @@ type Engine struct {
 	Token    string
 	NodeID   string
 	Cipher   crypto.Cipher
+	AltCipher crypto.Cipher // portal: accept dpi_lite (null) agents alongside chacha
 	Pool     *pool.Pool
 	Peer     *net.UDPAddr
 	DefDial  string
@@ -59,9 +60,10 @@ type Engine struct {
 	wsWriteMu sync.Mutex
 	ws        wsConn
 
-	// Portal: many agents keyed by node_id (WSS).
+	// Portal: many agents keyed by node_id (WSS and/or UDP).
 	agentsMu sync.RWMutex
 	agents   map[string]*agentLink
+	altMu    sync.RWMutex
 }
 
 // wsConn is satisfied by *websocket.Conn (binary messages).
@@ -175,16 +177,44 @@ func (e *Engine) handlePacket(path *pool.Path, addr *net.UDPAddr, packet []byte)
 	e.handleCipherPacket(packet, addr)
 }
 
+func (e *Engine) minOverhead() int {
+	oh := e.Cipher.Overhead()
+	e.altMu.RLock()
+	alt := e.AltCipher
+	e.altMu.RUnlock()
+	if alt != nil && alt.Overhead() < oh {
+		oh = alt.Overhead()
+	}
+	return oh
+}
+
+func (e *Engine) openBody(pathID uint8, seq uint32, body, hdr []byte) ([]byte, crypto.Cipher, error) {
+	nonce := crypto.Nonce12(pathID, seq)
+	plain, err := e.Cipher.Open(nil, nonce, body, hdr)
+	if err == nil {
+		return plain, e.Cipher, nil
+	}
+	e.altMu.RLock()
+	alt := e.AltCipher
+	e.altMu.RUnlock()
+	if alt != nil {
+		plain, err = alt.Open(nil, nonce, body, hdr)
+		if err == nil {
+			return plain, alt, nil
+		}
+	}
+	return nil, nil, err
+}
+
 func (e *Engine) handleCipherPacket(packet []byte, addr *net.UDPAddr) {
-	if len(packet) < proto.HeaderSize+e.Cipher.Overhead() {
+	if len(packet) < proto.HeaderSize+e.minOverhead() {
 		return
 	}
 	hdr := packet[:proto.HeaderSize]
 	body := packet[proto.HeaderSize:]
 	seq := binary.BigEndian.Uint32(hdr[6:10])
 	pathID := hdr[1] & 0x0f // sender path id in low nibble of flags
-	nonce := crypto.Nonce12(pathID, seq)
-	plain, err := e.Cipher.Open(nil, nonce, body, hdr)
+	plain, used, err := e.openBody(pathID, seq, body, hdr)
 	if err != nil {
 		return
 	}
@@ -195,23 +225,27 @@ func (e *Engine) handleCipherPacket(packet []byte, addr *net.UDPAddr) {
 		return
 	}
 	e.Stats.BytesIn.Add(uint64(len(plain)))
-	e.dispatchFrame(fr, pathID, addr)
+	if addr != nil {
+		e.touchAgentByUDP(addr)
+	}
+	e.dispatchFrame(fr, pathID, addr, used)
 }
 
-func (e *Engine) dispatchFrame(fr proto.Frame, pathID uint8, addr *net.UDPAddr) {
+func (e *Engine) dispatchFrame(fr proto.Frame, pathID uint8, addr *net.UDPAddr, used crypto.Cipher) {
 	switch fr.Type {
 	case proto.TypeHELLO:
 		if e.Role == "portal" {
-			if addr != nil {
-				e.SetPeer(addr)
-			} else {
-				e.online.Store(true)
-				e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
-			}
 			nodeID, _ := parseHelloPayload(fr.Payload, e.Token)
 			if nodeID == "" {
 				// legacy: payload may be raw "token|node" already logged
 				nodeID = string(fr.Payload)
+			}
+			if addr != nil {
+				e.registerAgentUDP(nodeID, addr, used)
+			} else {
+				e.online.Store(true)
+				e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+				e.setAgentCipher(nodeID, used)
 			}
 			_ = e.sendForAgent(nodeID, proto.Frame{Type: proto.TypeHELLOOK, Payload: []byte("ok")}, pathID)
 			log.Printf("agent hello via %s node=%s", linkKind(addr), string(fr.Payload))
@@ -308,7 +342,11 @@ func (e *Engine) sendToAgent(addr *net.UDPAddr, agentID string, fr proto.Frame, 
 		}
 	}
 	fr.Flags = (fr.Flags & 0xf0) | (pathID & 0x0f)
-	raw := make([]byte, proto.HeaderSize+len(fr.Payload)+e.Cipher.Overhead()+16)
+	ciph := e.Cipher
+	if e.Role == "portal" && agentID != "" {
+		ciph = e.cipherForAgent(agentID)
+	}
+	raw := make([]byte, proto.HeaderSize+len(fr.Payload)+ciph.Overhead()+16)
 	n, err := proto.Encode(raw, fr)
 	if err != nil {
 		return err
@@ -316,12 +354,12 @@ func (e *Engine) sendToAgent(addr *net.UDPAddr, agentID string, fr proto.Frame, 
 	hdr := raw[:proto.HeaderSize]
 	plain := raw[proto.HeaderSize:n]
 	nonce := crypto.Nonce12(pathID, seq)
-	ct := e.Cipher.Seal(nil, nonce, plain, hdr)
+	ct := ciph.Seal(nil, nonce, plain, hdr)
 	out := append(append([]byte{}, hdr...), ct...)
 
-	// Portal → specific agent WSS
+	// Portal → specific agent (WSS or UDP)
 	if e.Role == "portal" && agentID != "" {
-		if err := e.writeAgentWS(agentID, out); err != nil {
+		if err := e.writeAgent(agentID, out); err != nil {
 			return err
 		}
 		e.Stats.BytesOut.Add(uint64(len(plain)))

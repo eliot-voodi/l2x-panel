@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,8 +50,14 @@ func main() {
 		nodeID, _ = os.Hostname()
 	}
 
-	// Local UDP pool only needed for legacy udp transport.
-	p, err := pool.Listen(1, "127.0.0.1:0")
+	bind := "127.0.0.1:0"
+	if transport == "udp" || transport == "both" {
+		bind = strings.TrimSpace(cfg.Tunnel.ListenUDP)
+		if bind == "" {
+			bind = "0.0.0.0:0"
+		}
+	}
+	p, err := pool.Listen(1, bind)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -78,8 +85,12 @@ func main() {
 		if cfg.Tunnel.PeerUDP == "" {
 			log.Fatal("tunnel.peer_udp is required for udp transport")
 		}
-		log.Printf("l2x-tunnel-agent transport=udp peer=%s", cfg.Tunnel.PeerUDP)
-		// Legacy path kept for lab; production apricot uses wss only.
+		peer, err := net.ResolveUDPAddr("udp", cfg.Tunnel.PeerUDP)
+		if err != nil {
+			log.Fatalf("peer_udp: %v", err)
+		}
+		eng.SetPeer(peer)
+		log.Printf("l2x-tunnel-agent transport=udp peer=%s cipher=%s", peer, cfg.Tunnel.Cipher)
 	}
 
 	mux := http.NewServeMux()
@@ -90,6 +101,8 @@ func main() {
 			"bytes_in": in, "bytes_out": out, "streams": streams,
 			"packets_in": pin, "packets_out": pout,
 			"transport": transport, "ws_url": cfg.WSURL,
+			"peer_udp":  cfg.Tunnel.PeerUDP,
+			"cipher":    cfg.Tunnel.Cipher,
 		})
 	})
 	go func() {

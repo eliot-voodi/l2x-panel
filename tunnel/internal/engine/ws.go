@@ -13,7 +13,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/eliot-voodi/l2x-panel/tunnel/internal/crypto"
 	"github.com/eliot-voodi/l2x-panel/tunnel/internal/proto"
 )
 
@@ -112,7 +111,7 @@ func (e *Engine) serveWSConn(c *websocket.Conn, remote string) {
 
 // tryRegisterFromPacket decrypts one packet; on HELLO registers the agent WS.
 func (e *Engine) tryRegisterFromPacket(c *websocket.Conn, packet []byte) string {
-	if len(packet) < proto.HeaderSize {
+	if len(packet) < proto.HeaderSize+e.minOverhead() {
 		return ""
 	}
 	hdr := packet[:proto.HeaderSize]
@@ -123,8 +122,7 @@ func (e *Engine) tryRegisterFromPacket(c *websocket.Conn, packet []byte) string 
 	}
 	seq := binary.BigEndian.Uint32(hdr[6:10])
 	pathID := hdr[1] & 0x0f
-	nonce := crypto.Nonce12(pathID, seq)
-	plain, err := e.Cipher.Open(nil, nonce, body, hdr)
+	plain, used, err := e.openBody(pathID, seq, body, hdr)
 	if err != nil {
 		return ""
 	}
@@ -139,7 +137,7 @@ func (e *Engine) tryRegisterFromPacket(c *websocket.Conn, packet []byte) string 
 	if !ok || nodeID == "" {
 		return ""
 	}
-	e.registerAgent(nodeID, c)
+	e.registerAgent(nodeID, c, used)
 	return nodeID
 }
 

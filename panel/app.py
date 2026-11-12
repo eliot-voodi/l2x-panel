@@ -6851,6 +6851,7 @@ def nodes_page(request: Request):
                 master_version=panel_version(),
                 master_xray=_cached_master_xray(),
                 sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
+                tunnel_profiles=nodes_mod.TUNNEL_PROFILES,
                 update_queue=node_update_queue_snapshot(),
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
@@ -7340,6 +7341,8 @@ async def nodes_add(request: Request):
             node["sync_clients"] = False
             node["sync_inbounds"] = False
             node["tunnel_mode"] = "l2x_udp"
+            node["tunnel_profile"] = "no_dpi"
+            nodes_mod.tunnel_agent_id(node)
         elif node["as_outbound"]:
             nodes_mod.ensure_bridge(node)
         nodes_mod.ensure_list(store).append(node)
@@ -7553,6 +7556,78 @@ def _node_push_job(node_id: str, label: str, host: str):
     }
 
 
+@app.post("/nodes/{node_id}/tunnel-profile")
+async def nodes_tunnel_profile(node_id: str, request: Request):
+    """Switch L2X tunnel profile: no_dpi / dpi_lite / udp (NAT and +Reverse)."""
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    profile = nodes_mod.normalize_tunnel_profile(form.get("profile"))
+    ssh_password = str(form.get("password") or "")
+    with mutate() as store:
+        if not nodes_mod.is_master(store):
+            flash(request, "Только мастер может менять профиль туннеля", "error")
+            return go("/nodes")
+        node = next((n for n in nodes_mod.ensure_list(store) if n["id"] == node_id), None)
+        if not node:
+            flash(request, "Нода не найдена", "error")
+            return go("/nodes")
+        if not (node.get("nat") or node.get("rv_mode") or str(node.get("tunnel_mode") or "") == "l2x_udp"):
+            flash(request, "Профиль туннеля доступен для NAT / +Reverse / L2X", "error")
+            return go("/nodes")
+        node["as_outbound"] = True
+        node["tunnel_mode"] = "l2x_udp"
+        node["tunnel_profile"] = profile
+        nodes_mod.tunnel_agent_id(node)
+        nodes_mod.upsert_node_outbound(store, node)
+        tun_sync = nodes_mod.sync_tunneld_for_fleet(store)
+        name = node.get("name") or node_id
+        node_snap = dict(node)
+    spec = nodes_mod.tunnel_profile_spec(profile=profile)
+    tip = ""
+    if profile == "udp" and tun_sync.get("udp"):
+        tip = " (мастер слушает UDP :4443 — откройте порт в firewall)"
+    # Tunnel-only: push yaml over SSH when password given
+    if nodes_mod.is_tunnel_only_node(node_snap) and ssh_password:
+        tac = nodes_mod.build_tunnel_agent_config(_load_store(), node_snap) or {}
+        ret = nodes_mod.retarget_tunnel_agent_ssh(
+            node_snap,
+            ws_url=str(tac.get("ws_url") or ""),
+            psk=str(tac.get("psk") or ""),
+            token=str(tac.get("token") or ""),
+            peer_udp=str(tac.get("peer_udp") or ""),
+            transport=str(tac.get("transport") or ""),
+            cipher=str(tac.get("cipher") or ""),
+            agent_yaml=nodes_mod.render_agent_tunnel_yaml(tac) if tac else "",
+            ssh_password=ssh_password,
+        )
+        if not ret.get("ok"):
+            flash(request, f"{name}: профиль {spec['label']}, SSH retarget: {ret.get('error')}", "error")
+            return go("/nodes")
+    elif node_snap.get("nat") or node_snap.get("token"):
+        # Panel agent: next /agent/pull or Sync pushes tunnel_agent block
+        pass
+    flash(
+        request,
+        f"{name}: туннель → {spec['label']}{tip}. "
+        f"{'NAT: агент подхватит на ближайшем pull' if node_snap.get('nat') else 'Нажмите Sync (или SSH для tunnel-only)'}",
+        "info",
+    )
+    _tg_admin(
+        f"🔀 Нода <b>{tgbot.escape(name)}</b>: tunnel profile <code>{tgbot.escape(profile)}</code>",
+        flag="notify_nodes",
+    )
+    # Non-NAT with panel: kick sync so tunnel_agent applies soon
+    if node_snap.get("token") and not node_snap.get("nat"):
+        running = NODES_JOB.get("id")
+        if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
+            NODES_JOB["id"] = ops.start_job(
+                f"node-tunnel-profile-{name}",
+                _node_push_job, node_id, f"{name}: tunnel {profile}", public_host(),
+            )
+    return go("/nodes")
+
+
 @app.post("/nodes/{node_id}/{action}")
 async def nodes_action(node_id: str, action: str, request: Request):
     if redir := _require(request):
@@ -7627,7 +7702,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 return go("/nodes")
             if action == "reverse":
                 if node.get("nat"):
-                    flash(request, "Нода за NAT: egress через l2x_udp (не Xray reverse)", "info")
+                    flash(request, "Нода за NAT: egress через L2X tunnel (профиль ниже)", "info")
                     return go("/nodes")
                 if not nodes_mod.is_master(store):
                     flash(request, "Только мастер может менять режим outbound", "error")
@@ -7637,12 +7712,18 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 node.pop("reverse_ok", None)
                 if node["rv_mode"]:
                     node["as_outbound"] = True
-                    node["tunnel_mode"] = "xray_reverse"
-                    nodes_mod.ensure_reverse(node)
+                    # +Reverse → L2X agent tunnel (same profiles as NAT), not Xray reverse
+                    node["tunnel_mode"] = "l2x_udp"
+                    node["tunnel_profile"] = nodes_mod.normalize_tunnel_profile(
+                        node.get("tunnel_profile") or "no_dpi"
+                    )
+                    nodes_mod.tunnel_agent_id(node)
+                    nodes_mod.sync_tunneld_for_fleet(store)
                 else:
                     node["tunnel_mode"] = ""
                     nodes_mod.ensure_bridge(node)
-                label = f"reverse outbound {'вкл' if node['rv_mode'] else 'выкл'}"
+                    nodes_mod.sync_tunneld_for_fleet(store)
+                label = f"reverse/L2X {'вкл' if node['rv_mode'] else 'выкл'}"
             elif action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")
                 if node["as_outbound"]:
@@ -8680,6 +8761,12 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
             elif rb is None or payload.get("nat") is False:
                 ns.pop("reverse_bridge", None)
                 ns.pop("nat", None)
+    tunnel_agent_res = None
+    if isinstance(payload.get("tunnel_agent"), dict):
+        try:
+            tunnel_agent_res = nodes_mod.apply_tunnel_agent_local(payload.get("tunnel_agent"))
+        except Exception as exc:  # noqa: BLE001
+            tunnel_agent_res = {"ok": False, "error": str(exc)}
     res = _apply_xray(_load_store(), hold_front_commit=hold_front_commit)
     err = res.get("error") or ""
     try:
@@ -8700,6 +8787,14 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
     except Exception:
         pass
     out = {"ok": bool(res.get("ok")), "error": err, "mirror": mirror, "warnings": warnings}
+    if tunnel_agent_res is not None:
+        out["tunnel_agent"] = tunnel_agent_res
+        if not tunnel_agent_res.get("ok"):
+            warnings.append(
+                "L2X tunnel-agent: "
+                + str(tunnel_agent_res.get("error") or "не применился — проверьте бинарь /usr/local/bin/l2x-tunnel-agent")
+            )
+            out["warnings"] = warnings
     if hold_front_commit and res.get("_front_staged") is not None:
         out["_front_staged"] = res["_front_staged"]
     return out

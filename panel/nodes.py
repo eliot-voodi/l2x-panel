@@ -72,15 +72,62 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("rv_mode", False)
         # Egress datapath for NAT/reverse: xray_reverse | l2x_udp
         n.setdefault("tunnel_mode", "")
+        n.setdefault("tunnel_profile", "no_dpi")
         n.setdefault("last_pull", "")
         if not str(n.get("tunnel_mode") or "").strip() and (n.get("nat") or n.get("rv_mode")):
             # Keep Xray reverse when the node already has reverse identity (promote/sync
             # must not silently flip am/root to l2x_udp and break egress).
-            if n.get("rv_uuid") or n.get("rv_mode"):
-                n["tunnel_mode"] = "xray_reverse"
+            if n.get("rv_uuid") or (n.get("rv_mode") and not n.get("nat")):
+                if str(n.get("tunnel_mode") or "") != "l2x_udp":
+                    n["tunnel_mode"] = "xray_reverse"
             else:
                 n["tunnel_mode"] = "l2x_udp"
+        if n.get("nat") and not str(n.get("tunnel_mode") or "").strip():
+            n["tunnel_mode"] = "l2x_udp"
+        n["tunnel_profile"] = normalize_tunnel_profile(n.get("tunnel_profile"))
     return nodes
+
+
+# L2X tunnel profiles for NAT / +Reverse (agent → master datapath).
+TUNNEL_PROFILES = {
+    "no_dpi": {
+        "id": "no_dpi",
+        "label": "No DPI (WSS+ChaCha)",
+        "transport": "wss",
+        "cipher": "chacha20poly1305",
+        "hint": "HTTPS camouflage + AEAD — по умолчанию, скрыт от DPI",
+    },
+    "dpi_lite": {
+        "id": "dpi_lite",
+        "label": "DPI lite (WSS, TLS only)",
+        "transport": "wss",
+        "cipher": "null",
+        "hint": "Только TLS (без ChaCha) — меньше CPU, всё ещё WSS",
+    },
+    "udp": {
+        "id": "udp",
+        "label": "UDP (max speed)",
+        "transport": "udp",
+        "cipher": "chacha20poly1305",
+        "hint": "Сырой UDP :4443 — максимум скорости, заметен для DPI",
+    },
+}
+
+
+def normalize_tunnel_profile(raw) -> str:
+    p = str(raw or "").strip().lower().replace("-", "_")
+    if p in ("nodpi", "wss", "default", "chacha"):
+        return "no_dpi"
+    if p in ("dpi", "lite", "null", "tls"):
+        return "dpi_lite"
+    if p in TUNNEL_PROFILES:
+        return p
+    return "no_dpi"
+
+
+def tunnel_profile_spec(node: dict | None = None, profile: str = "") -> dict:
+    pid = normalize_tunnel_profile(profile or ((node or {}).get("tunnel_profile")))
+    return dict(TUNNEL_PROFILES[pid])
 
 
 SYNC_INTERVAL_CHOICES = (
@@ -229,6 +276,8 @@ def ensure_tunnel_settings(store: dict) -> dict:
     tun.setdefault("socks_port", 11080)
     tun.setdefault("ws_listen", "127.0.0.1:11081")
     tun.setdefault("ws_public_port", 8000)
+    tun.setdefault("udp_listen", "0.0.0.0:4443")
+    tun.setdefault("udp_public_port", 4443)
     if not str(tun.get("ws_path") or "").strip():
         alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         tun["ws_path"] = "/ws-" + "".join(secrets.choice(alphabet) for _ in range(10))
@@ -251,6 +300,185 @@ def tunnel_public_ws_url(store: dict, master_host: str = "") -> str:
     if port in (443, 0):
         return f"wss://{host}{path}"
     return f"wss://{host}:{port}{path}"
+
+
+def tunnel_public_udp(store: dict, master_host: str = "") -> str:
+    """Public UDP endpoint for profile=udp agents (host:port)."""
+    tun = ensure_tunnel_settings(store)
+    host = _normalize_domain(master_host) or next(iter(sorted(master_public_domains(store))), "")
+    if not host:
+        return ""
+    try:
+        port = int(tun.get("udp_public_port") or 4443)
+    except (TypeError, ValueError):
+        port = 4443
+    return f"{host}:{port}"
+
+
+def tunnel_agent_binary_url(store: dict, master_host: str = "") -> str:
+    """HTTPS URL to download l2x-tunnel-agent binary from master front."""
+    host = _normalize_domain(master_host) or next(iter(sorted(master_public_domains(store))), "")
+    if not host:
+        return ""
+    return f"https://{host}/l2x-tunnel-agent"
+
+
+def fleet_needs_udp_tunnel(store: dict) -> bool:
+    """True when any L2X node uses the UDP profile (portal must listen publicly)."""
+    for n in ensure_list(store):
+        if not n.get("enabled", True) or not uses_l2x_tunnel(n):
+            continue
+        if normalize_tunnel_profile(n.get("tunnel_profile")) == "udp":
+            return True
+    return False
+
+
+def build_tunnel_agent_config(store: dict, node: dict) -> dict | None:
+    """Payload block for agent.yaml on NAT / L2X reverse nodes."""
+    if not uses_l2x_tunnel(node):
+        return None
+    bundle = export_tunnel_bundle()
+    psk = str(bundle.get("psk") or "").strip()
+    token = str(bundle.get("token") or "").strip()
+    if not psk or not token:
+        return None
+    spec = tunnel_profile_spec(node)
+    out = {
+        "profile": spec["id"],
+        "transport": spec["transport"],
+        "cipher": spec["cipher"],
+        "psk": psk,
+        "token": token,
+        "node_id": tunnel_agent_id(node),
+        "ws_url": "",
+        "peer_udp": "",
+        "binary_url": tunnel_agent_binary_url(store),
+    }
+    if spec["transport"] == "wss":
+        out["ws_url"] = tunnel_public_ws_url(store)
+        if not out["ws_url"]:
+            return None
+    else:
+        out["peer_udp"] = tunnel_public_udp(store)
+        if not out["peer_udp"]:
+            return None
+    return out
+
+
+def render_agent_tunnel_yaml(cfg: dict) -> str:
+    """Render /etc/l2x-tunnel/agent.yaml from profile config."""
+    transport = str(cfg.get("transport") or "wss").strip() or "wss"
+    cipher = str(cfg.get("cipher") or "chacha20poly1305").strip() or "chacha20poly1305"
+    psk = str(cfg.get("psk") or "").strip()
+    token = str(cfg.get("token") or "").strip()
+    node_id = str(cfg.get("node_id") or "node").strip() or "node"
+    lines = [
+        "role: agent",
+        f"transport: {transport}",
+    ]
+    if transport in ("wss", "both"):
+        ws = str(cfg.get("ws_url") or "").strip()
+        lines.append(f"ws_url: {json.dumps(ws)}")
+    lines.append("tunnel:")
+    lines.append(f"  psk: {json.dumps(psk)}")
+    lines.append(f"  token: {json.dumps(token)}")
+    lines.append(f"  node_id: {json.dumps(node_id)}")
+    lines.append(f"  cipher: {cipher}")
+    lines.append("  max_streams: 4000")
+    if transport in ("udp", "both"):
+        peer = str(cfg.get("peer_udp") or "").strip()
+        lines.append(f"  peer_udp: {json.dumps(peer)}")
+        lines.append('  listen_udp: "0.0.0.0:0"')
+        lines.append("  path_count: 1")
+    lines.extend([
+        "metrics:",
+        '  listen: "127.0.0.1:9110"',
+        "",
+    ])
+    return "\n".join(lines)
+
+
+_TUNNEL_AGENT_UNIT = """[Unit]
+Description=L2X Tunnel Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=-/sbin/modprobe tcp_bbr
+ExecStartPre=-/bin/bash -c 'command -v sysctl >/dev/null && sysctl -e -p /etc/sysctl.d/99-l2xpanel-perf.conf || true'
+ExecStart=/usr/local/bin/l2x-tunnel-agent -config /etc/l2x-tunnel/agent.yaml
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def apply_tunnel_agent_local(cfg: dict | None) -> dict:
+    """Write agent.yaml on this host and restart l2x-tunnel-agent (NAT/reverse pull/push)."""
+    if not isinstance(cfg, dict):
+        return {"ok": False, "error": "tunnel_agent missing"}
+    psk = str(cfg.get("psk") or "").strip()
+    token = str(cfg.get("token") or "").strip()
+    if not psk or not token:
+        return {"ok": False, "error": "tunnel_agent missing psk/token"}
+    body = render_agent_tunnel_yaml(cfg)
+    try:
+        Path("/etc/l2x-tunnel").mkdir(parents=True, exist_ok=True)
+        path = Path("/etc/l2x-tunnel/agent.yaml")
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+        changed = body != old
+        if changed:
+            path.write_text(body, encoding="utf-8")
+            os.chmod("/etc/l2x-tunnel/agent.yaml", 0o600)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    import subprocess
+
+    bin_path = Path("/usr/local/bin/l2x-tunnel-agent")
+    if not bin_path.exists():
+        url = str(cfg.get("binary_url") or "").strip()
+        if url:
+            try:
+                tmp = str(bin_path) + ".new"
+                r = subprocess.run(
+                    ["curl", "-fsSL", "--connect-timeout", "20", "--max-time", "180", "-o", tmp, url],
+                    capture_output=True, text=True, timeout=200, check=False,
+                )
+                if r.returncode == 0 and Path(tmp).exists() and Path(tmp).stat().st_size > 1000:
+                    os.chmod(tmp, 0o755)
+                    os.replace(tmp, bin_path)
+                else:
+                    try:
+                        Path(tmp).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+    unit = Path("/etc/systemd/system/l2x-tunnel-agent.service")
+    try:
+        if not unit.exists():
+            unit.write_text(_TUNNEL_AGENT_UNIT, encoding="utf-8")
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30, check=False)
+        if bin_path.exists():
+            subprocess.run(
+                ["systemctl", "enable", "--now", "l2x-tunnel-agent"],
+                capture_output=True, timeout=30, check=False,
+            )
+            if changed:
+                subprocess.run(
+                    ["systemctl", "restart", "l2x-tunnel-agent"],
+                    capture_output=True, timeout=30, check=False,
+                )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "changed": changed}
+    return {"ok": True, "changed": changed, "profile": cfg.get("profile"), "has_binary": bin_path.exists()}
 
 
 def export_tunnel_bundle() -> dict:
@@ -281,7 +509,12 @@ def export_tunnel_bundle() -> dict:
     return out
 
 
-def render_tunnel_yaml(bundle: dict | None, tun_settings: dict | None = None) -> str:
+def render_tunnel_yaml(
+    bundle: dict | None,
+    tun_settings: dict | None = None,
+    *,
+    enable_udp: bool = False,
+) -> str:
     """Render l2x-tunneld.yaml from promote tunnel bundle + settings."""
     bundle = dict(bundle or {})
     tun_settings = dict(tun_settings or {})
@@ -299,14 +532,17 @@ def render_tunnel_yaml(bundle: dict | None, tun_settings: dict | None = None) ->
         socks_port = 11080
     ws_listen = str(tun_settings.get("ws_listen") or bundle.get("ws_listen") or "127.0.0.1:11081").strip()
     cipher = str(bundle.get("cipher") or "chacha20poly1305").strip() or "chacha20poly1305"
+    transport = "both" if enable_udp else "wss"
+    listen_udp = str(tun_settings.get("udp_listen") or "0.0.0.0:4443").strip() if enable_udp else "127.0.0.1:0"
+    path_count = 4 if enable_udp else 1
     return (
         "role: portal\n"
-        "transport: wss\n"
+        f"transport: {transport}\n"
         "tunnel:\n"
         f"  psk: {json.dumps(psk)}\n"
         f"  token: {json.dumps(token)}\n"
-        "  listen_udp: \"127.0.0.1:0\"\n"
-        "  path_count: 1\n"
+        f"  listen_udp: {json.dumps(listen_udp)}\n"
+        f"  path_count: {path_count}\n"
         f"  cipher: {cipher}\n"
         "  max_streams: 4000\n"
         f"proxy_listen: {json.dumps(str(bundle.get('proxy_listen') or '127.0.0.1:18080'))}\n"
@@ -318,9 +554,37 @@ def render_tunnel_yaml(bundle: dict | None, tun_settings: dict | None = None) ->
     )
 
 
+def sync_tunneld_for_fleet(store: dict) -> dict:
+    """Rewrite tunneld.yaml when fleet UDP profile requires public UDP listen."""
+    bundle = export_tunnel_bundle()
+    if not bundle.get("psk") or not bundle.get("token"):
+        return {"ok": False, "error": "tunneld.yaml missing psk/token", "skipped": True}
+    tun = ensure_tunnel_settings(store)
+    need_udp = fleet_needs_udp_tunnel(store)
+    body = render_tunnel_yaml(bundle, tun, enable_udp=need_udp)
+    if not body:
+        return {"ok": False, "error": "render failed"}
+    path = Path("/etc/l2x-tunnel/tunneld.yaml")
+    try:
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+        if body == old:
+            return {"ok": True, "unchanged": True, "udp": need_udp}
+        Path("/etc/l2x-tunnel").mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        os.chmod("/etc/l2x-tunnel/tunneld.yaml", 0o600)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        import subprocess
+        subprocess.run(["systemctl", "restart", "l2x-tunneld"], capture_output=True, timeout=30, check=False)
+    except Exception:
+        pass
+    return {"ok": True, "udp": need_udp, "restarted": True}
+
+
 def apply_tunnel_bundle(bundle: dict | None, tun_settings: dict | None = None) -> dict:
     """Write /etc/l2x-tunnel/tunneld.yaml essentials on a newly promoted master."""
-    body = render_tunnel_yaml(bundle, tun_settings)
+    body = render_tunnel_yaml(bundle, tun_settings, enable_udp=False)
     if not body:
         return {"ok": False, "error": "tunnel bundle missing psk/token"}
     try:
@@ -341,23 +605,45 @@ def apply_tunnel_bundle(bundle: dict | None, tun_settings: dict | None = None) -
 def retarget_tunnel_agent_ssh(
     node: dict,
     *,
-    ws_url: str,
+    ws_url: str = "",
     psk: str = "",
     token: str = "",
     ssh_password: str = "",
     timeout: int = 60,
+    transport: str = "",
+    cipher: str = "",
+    peer_udp: str = "",
+    agent_yaml: str = "",
 ) -> dict:
-    """Point a Go tunnel-only agent at the new master's WSS URL (after promote)."""
-    if not uses_l2x_tunnel(node) or not is_tunnel_only_node(node):
+    """Point a Go tunnel-only agent at the master (WSS/UDP profile) after promote or profile change."""
+    if not uses_l2x_tunnel(node):
+        return {"ok": False, "error": "not an L2X tunnel node", "skipped": True}
+    if not is_tunnel_only_node(node) and not agent_yaml:
+        # Panel agents get tunnel_agent via /agent/pull|apply; SSH retarget is for tunnel-only.
         return {"ok": False, "error": "not a tunnel-only node", "skipped": True}
-    if not ws_url:
-        return {"ok": False, "error": "ws_url required"}
     domain = node.get("domain") or ""
     user = node.get("ssh_user") or "root"
     port = int(node.get("ssh_port") or 22)
     if not domain or not ssh_password:
         return {"ok": False, "error": "нужны domain и SSH-пароль для retarget L2X agent"}
     aid = tunnel_agent_id(node)
+    spec = tunnel_profile_spec(node)
+    transport = (transport or spec["transport"]).strip() or "wss"
+    cipher = (cipher or spec["cipher"]).strip() or "chacha20poly1305"
+    if not agent_yaml:
+        if transport == "wss" and not ws_url:
+            return {"ok": False, "error": "ws_url required"}
+        if transport == "udp" and not peer_udp:
+            return {"ok": False, "error": "peer_udp required"}
+        agent_yaml = render_agent_tunnel_yaml({
+            "transport": transport,
+            "cipher": cipher,
+            "psk": psk,
+            "token": token,
+            "node_id": aid,
+            "ws_url": ws_url,
+            "peer_udp": peer_udp,
+        })
     try:
         client, fp = _ssh_connect(
             domain, user, ssh_password, port,
@@ -371,24 +657,28 @@ def retarget_tunnel_agent_ssh(
         remote = (
             "import json,re,subprocess\n"
             "from pathlib import Path\n"
-            f"ws={ws_url!r}; psk={psk!r}; tok={token!r}; nid={aid!r}\n"
+            f"body={agent_yaml!r}; ws={ws_url!r}; psk={psk!r}; tok={token!r}; nid={aid!r}\n"
             "p=Path('/etc/l2x-tunnel/agent.yaml')\n"
-            "text=p.read_text() if p.exists() else ''\n"
-            "if not text.strip():\n"
-            "  text='role: agent\\ntransport: wss\\nws_url: %s\\ntunnel:\\n'"
-            "  '  psk: %s\\n  token: %s\\n  node_id: %s\\n  cipher: chacha20poly1305\\n'"
-            "  '  max_streams: 4000\\nmetrics:\\n  listen: 127.0.0.1:9110\\n' % ("
-            "ws, json.dumps(psk), json.dumps(tok), json.dumps(nid))\n"
+            "p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "if body.strip():\n"
+            "  p.write_text(body); print('retargeted', 'yaml')\n"
             "else:\n"
-            "  if re.search(r'(?m)^ws_url:\\s*', text):\n"
-            "    text=re.sub(r'(?m)^ws_url:\\s*.*$', 'ws_url: '+ws, text, count=1)\n"
+            "  text=p.read_text() if p.exists() else ''\n"
+            "  if not text.strip():\n"
+            "    text='role: agent\\ntransport: wss\\nws_url: %s\\ntunnel:\\n'"
+            "    '  psk: %s\\n  token: %s\\n  node_id: %s\\n  cipher: chacha20poly1305\\n'"
+            "    '  max_streams: 4000\\nmetrics:\\n  listen: 127.0.0.1:9110\\n' % ("
+            "ws, json.dumps(psk), json.dumps(tok), json.dumps(nid))\n"
             "  else:\n"
-            "    text=text.rstrip()+'\\nws_url: '+ws+'\\n'\n"
-            "  if psk and re.search(r'(?m)^\\s*psk:\\s*', text):\n"
-            "    text=re.sub(r'(?m)^(\\s*psk:\\s*).*$', lambda m: m.group(1)+json.dumps(psk), text, count=1)\n"
-            "  if tok and re.search(r'(?m)^\\s*token:\\s*', text):\n"
-            "    text=re.sub(r'(?m)^(\\s*token:\\s*).*$', lambda m: m.group(1)+json.dumps(tok), text, count=1)\n"
-            "p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text); print('retargeted', ws)\n"
+            "    if re.search(r'(?m)^ws_url:\\s*', text):\n"
+            "      text=re.sub(r'(?m)^ws_url:\\s*.*$', 'ws_url: '+ws, text, count=1)\n"
+            "    else:\n"
+            "      text=text.rstrip()+'\\nws_url: '+ws+'\\n'\n"
+            "    if psk and re.search(r'(?m)^\\s*psk:\\s*', text):\n"
+            "      text=re.sub(r'(?m)^(\\s*psk:\\s*).*$', lambda m: m.group(1)+json.dumps(psk), text, count=1)\n"
+            "    if tok and re.search(r'(?m)^\\s*token:\\s*', text):\n"
+            "      text=re.sub(r'(?m)^(\\s*token:\\s*).*$', lambda m: m.group(1)+json.dumps(tok), text, count=1)\n"
+            "  p.write_text(text); print('retargeted', ws)\n"
             "# network perf even when agent binary is older than netperf.Apply()\n"
             "mem=1024\n"
             "try:\n"
@@ -396,7 +686,7 @@ def retarget_tunnel_agent_ssh(
             "    if line.startswith('MemTotal:'): mem=int(line.split()[1])//1024; break\n"
             "except Exception: pass\n"
             "buf,ct=(67108864,1048576) if mem>=3500 else ((33554432,524288) if mem>=1800 else (16777216,262144))\n"
-            "body=('\\n'.join([\n"
+            "sysbody=('\\n'.join([\n"
             "  f'# managed by l2x-panel retarget — network perf (RAM {mem} MB)',\n"
             "  'net.core.default_qdisc = fq','net.ipv4.tcp_congestion_control = bbr',\n"
             "  f'net.core.rmem_max = {buf}',f'net.core.wmem_max = {buf}',\n"
@@ -411,7 +701,7 @@ def retarget_tunnel_agent_ssh(
             "  f'-net.netfilter.nf_conntrack_max = {ct}',\n"
             "])+ '\\n')\n"
             "Path('/etc/sysctl.d').mkdir(parents=True, exist_ok=True)\n"
-            "Path('/etc/sysctl.d/99-l2xpanel-perf.conf').write_text(body)\n"
+            "Path('/etc/sysctl.d/99-l2xpanel-perf.conf').write_text(sysbody)\n"
             "Path('/etc/modules-load.d').mkdir(parents=True, exist_ok=True)\n"
             "Path('/etc/modules-load.d/l2x-perf.conf').write_text('tcp_bbr\\n')\n"
             "subprocess.run(['modprobe','tcp_bbr'], capture_output=True)\n"
@@ -986,7 +1276,7 @@ def _peer_node_export(n: dict) -> dict:
         "id", "name", "user_title", "url", "token", "enabled", "sync_clients", "sync_inbounds",
         "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
         "ssh_hostkey_fp", "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "rv_mode",
-        "rv_uuid", "rv_domain", "rv_tag", "country",
+        "rv_uuid", "rv_domain", "rv_tag", "country", "tunnel_mode", "tunnel_profile", "tunnel_node_id",
     )
     return {k: n.get(k) for k in keys if k in n or n.get(k) is not None}
 
@@ -1174,6 +1464,9 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         out["reverse_bridge"] = None
     if tunnel_on:
         out["tunnel_mode"] = "l2x_udp"
+        tac = build_tunnel_agent_config(store, node)
+        if tac:
+            out["tunnel_agent"] = tac
     return out
 
 
@@ -2058,9 +2351,10 @@ def provision_via_ssh(
         "url": f"https://{domain}", "last_sync": "", "last_error": "", "last_ok": False,
         "nat": bool(nat),
         "tunnel_mode": "l2x_udp" if nat else "",
+        "tunnel_profile": "no_dpi",
     }
     if nat:
-        pass  # egress via l2x-tunneld SOCKS (tunnel_mode=l2x_udp); no Xray reverse
+        tunnel_agent_id(node)  # egress via l2x-tunneld SOCKS; profile via /agent/pull
     else:
         ensure_bridge(node)
     log: list[str] = [f"provision {name} @ {domain}" + (" [NAT/l2x_udp]" if nat else "")]
