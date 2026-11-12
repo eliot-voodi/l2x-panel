@@ -126,10 +126,10 @@ def _rule_matches(rule: dict, *, kind: str, value: str, email: str, inbound_tag:
     elif kind == "ip" and domain and not ips:
         ambiguous = True
 
-    if proto and not hit:
-        # Protocol rules need sniffing at runtime — mark possible for torrent etc.
-        if not domain and not ips:
-            return True, "protocol " + ",".join(proto) + " (если sniff совпадёт)"
+    if proto and not hit and not domain and not ips:
+        # Destination checker only knows domain/IP — L7 sniff (bittorrent/…) is runtime-only.
+        # Never treat protocol-only rules as a match for youtube.com etc.
+        return False, "protocol " + ",".join(proto) + " (только sniff в Xray)"
 
     if hit:
         return True, "совпало: " + ", ".join(reason_bits[:3])
