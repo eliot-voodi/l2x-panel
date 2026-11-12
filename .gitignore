@@ -21,3 +21,6 @@ secret_key
 Thumbs.db
 .idea/
 .vscode/
+
+# local cross-compiled tunnel binaries (uploaded to GitHub Releases)
+/dist/
