@@ -85,7 +85,7 @@
       <input name="max_loss_pct" type="number" min="0" max="100" value="{{ sb.max_loss_pct if sb.max_loss_pct is defined else 20 }}">
     </div>
   </div>
-  <div class="hint">L2TP не в <code>connected</code>, custom с проваленным тестом, или loss выше порога — не попадают в подписку (и в balancer), пока не восстановятся. Клиент увидит изменения после обновления подписки.</div>
+  <div class="hint">Custom с проваленным тестом или loss выше порога — не попадают в подписку (и в balancer), пока не восстановятся. Клиент увидит изменения после обновления подписки.</div>
 
   <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
   <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. <b>Mux по умолчанию выключен</b> (иначе сильно режет скорость, особенно upload). Включайте явно: <code>{"enabled":true,"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}</code>. Пустой Fragment/Noise = не трогать.</div>
@@ -162,7 +162,6 @@
   {{ m.check('notify_login', tg.notify_login, 'Входы в панель') }}
   {{ m.check('notify_quota', tg.notify_quota, 'Истечение срока / исчерпание трафика / авто-сброс') }}
   {{ m.check('notify_iplimit', tg.notify_iplimit, 'Блокировки по лимиту IP') }}
-  {{ m.check('notify_tunnel', tg.notify_tunnel, 'Падение L2TP-туннелей') }}
   {{ m.check('notify_nodes', tg.notify_nodes if tg.notify_nodes is defined else True, 'Ноды: online/offline, sync, update, provision, promote, любые изменения') }}
   {{ m.check('notify_changes', tg.notify_changes if tg.notify_changes is defined else True, 'Изменения: кто (логин+IP) и что сделал — клиенты, inbounds, outbounds, settings, DoH…') }}
   {{ m.check('notify_updates', tg.notify_updates if tg.notify_updates is defined else True, 'Обновления: новая версия Xray или панели на GitHub') }}
@@ -368,7 +367,7 @@
 <div class="grid g2">
   <div class="card">
     <h3>Создать бэкап</h3>
-    <div class="small muted">Полный архив: store.json (клиенты, inbounds, outbounds, DNS, DoH/Pi-hole настройки, Telegram…), admin, secret_key, L2TP secrets, TLS-сертификаты (<code>/etc/l2xpanel/certs</code>), каталог DoH/Pi-hole (<code>/opt/l2xpanel/doh</code> — compose, .env, gravity/lists).</div>
+    <div class="small muted">Полный архив: store.json (клиенты, inbounds, outbounds, DNS, DoH/Pi-hole настройки, Telegram…), admin, secret_key, TLS-сертификаты (<code>/etc/l2xpanel/certs</code>), каталог DoH/Pi-hole (<code>/opt/l2xpanel/doh</code> — compose, .env, gravity/lists).</div>
     <div class="actions mt">
       <a class="btn" href="{{ bp }}/backup/download">{{ ic.icon('download') }}Скачать .zip</a>
       <form method="post" action="{{ bp }}/backup/telegram"><button class="btn ghost" {% if not tg.enabled %}disabled title="Telegram-бот выключен"{% endif %}>Отправить в Telegram</button></form>

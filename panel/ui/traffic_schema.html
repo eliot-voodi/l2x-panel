@@ -2,90 +2,139 @@
 {% import "_icons.html" as ic %}
 {% block title %}{{ t('Схема трафика') }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ t('Схема') }}{% endblock %}
-{% block page_sub %}устройство → протокол → фильтр → правила → маршрут → выход{% endblock %}
+{% block page_sub %}устройство → протокол → фильтр → правила → выход{% endblock %}
 {% block top_actions %}
   <div class="seg" id="view-seg">
     <a href="#" data-view="schema" class="active">Схема</a>
     <a href="#" data-view="list">Список</a>
   </div>
-  <button class="btn sm" type="button" id="btn-check-panel">{{ ic.icon('activity') }}Куда пойдет?</button>
   <form method="post" action="{{ bp }}/schema/apply" style="margin:0">
     <button class="btn sm">{{ ic.icon('play') }}Применить</button>
   </form>
 {% endblock %}
 {% block head %}
 <style>
-  .content { max-width: none; padding-bottom: 1rem }
-  .sch-wrap { position: relative; display: flex; gap: 1rem; align-items: stretch; min-height: calc(100dvh - 11rem) }
-  .sch-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .75rem }
-  .sch-stats { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center }
+  .content { max-width: none; padding-bottom: .5rem }
+  .sch-wrap {
+    position: relative; display: grid; grid-template-columns: 1fr min(380px, 36vw);
+    gap: 1rem; align-items: stretch; min-height: calc(100dvh - 10.5rem);
+  }
+  .sch-main { min-width: 0; display: flex; flex-direction: column; gap: .65rem }
+  .sch-stats { display: flex; flex-wrap: wrap; gap: .45rem .85rem; align-items: center }
   .sch-stats .badge { font-size: .75rem }
-  .sch-hint { color: var(--muted); font-size: .82rem }
+  .sch-hint { color: var(--muted); font-size: .8rem }
+
   .sch-board {
-    position: relative; flex: 1; overflow: auto; border: 1px solid var(--border);
-    border-radius: 16px; background:
-      radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--border) 70%, transparent) 1px, transparent 0) 0 0 / 22px 22px,
-      var(--bg-2);
-    min-height: 520px;
+    position: relative; flex: 1; overflow: hidden; border: 1px solid var(--border);
+    border-radius: 18px; background:
+      radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--border) 65%, transparent) 1px, transparent 0) 0 0 / 24px 24px,
+      linear-gradient(180deg, color-mix(in srgb, var(--bg-2) 88%, #000), var(--bg-2));
+    min-height: 560px; cursor: grab; touch-action: none; user-select: none;
   }
-  .sch-cols {
-    display: flex; gap: 1.25rem; padding: 1.25rem 1.5rem 2rem; width: max-content; min-width: 100%;
-    align-items: flex-start;
+  .sch-board.panning { cursor: grabbing }
+  .sch-board.dragging-node { cursor: grabbing }
+  .sch-world {
+    position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform;
   }
-  .sch-col { width: 220px; flex-shrink: 0; display: flex; flex-direction: column; gap: .55rem }
-  .sch-col-h {
-    font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
-    padding: 0 .2rem; display: flex; justify-content: space-between; align-items: center;
+  .sch-wires { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none }
+  .sch-wires path {
+    fill: none; stroke: color-mix(in srgb, var(--accent) 35%, var(--border-2));
+    stroke-width: 2.5; opacity: .55;
   }
-  .sch-card {
-    background: var(--surface); border: 1px solid var(--border-2); border-radius: 14px;
-    padding: .75rem .85rem; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .12s;
-    position: relative;
+  .sch-wires path.active {
+    stroke: var(--accent); stroke-width: 3.5; opacity: 1;
+    filter: drop-shadow(0 0 8px color-mix(in srgb, var(--accent) 55%, transparent));
   }
-  .sch-card:hover { border-color: var(--accent); transform: translateY(-1px) }
-  .sch-card.on { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft) }
-  .sch-card.path { border-color: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft) }
-  .sch-card .t { font-weight: 650; font-size: .92rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-  .sch-card .m { color: var(--muted); font-size: .75rem; margin-top: .2rem; line-height: 1.35 }
-  .sch-card .row2 { display: flex; gap: .35rem; flex-wrap: wrap; margin-top: .45rem }
-  .sch-card.off { opacity: .45 }
-  .sch-card .ring {
-    position: absolute; left: -.35rem; top: 50%; width: 12px; height: 12px; margin-top: -6px;
+
+  .sch-node {
+    position: absolute; width: 240px; background: color-mix(in srgb, var(--surface) 92%, #000);
+    border: 1px solid var(--border-2); border-radius: 16px; padding: .85rem .95rem .9rem;
+    box-shadow: 0 10px 28px rgba(0,0,0,.22); cursor: grab;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .sch-node:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-2)) }
+  .sch-node.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent),
+                0 12px 32px rgba(0,0,0,.28),
+                0 0 28px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+  .sch-node.exit-ok { border-color: color-mix(in srgb, var(--ok) 70%, var(--border-2)) }
+  .sch-node.exit-block {
+    border-color: color-mix(in srgb, var(--danger) 65%, var(--border-2));
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 25%, transparent);
+  }
+  .sch-node .col-tag {
+    font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; color: var(--dim);
+    margin-bottom: .35rem;
+  }
+  .sch-node .t { font-weight: 700; font-size: .98rem; line-height: 1.25; word-break: break-word }
+  .sch-node .m { color: var(--muted); font-size: .76rem; margin-top: .28rem; line-height: 1.35 }
+  .sch-node .row2 { display: flex; gap: .35rem; flex-wrap: wrap; margin-top: .55rem }
+  .sch-node .port {
+    position: absolute; top: 50%; width: 12px; height: 12px; margin-top: -6px;
     border-radius: 50%; background: var(--surface); border: 2px solid var(--border-2);
   }
-  .sch-card.on .ring, .sch-card.path .ring { border-color: var(--accent); background: var(--accent) }
-  .sch-card .ring.out { left: auto; right: -.35rem }
-  .sch-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible }
-  .sch-wires path { fill: none; stroke: var(--border-2); stroke-width: 2; opacity: .85 }
-  .sch-wires path.active { stroke: var(--accent); stroke-width: 3; opacity: 1; filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 50%, transparent)) }
-  .sch-side {
-    width: min(360px, 100%); flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 16px; padding: 1rem 1.1rem; display: none; flex-direction: column; gap: .65rem;
-    max-height: calc(100dvh - 11rem); overflow: auto;
+  .sch-node.active .port { border-color: var(--accent); background: var(--accent) }
+  .sch-node .port.in { left: -7px }
+  .sch-node .port.out { right: -7px }
+
+  .sch-empty {
+    position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+    pointer-events: none; font-size: .95rem; text-align: center; padding: 2rem;
   }
-  .sch-side.open { display: flex }
-  .sch-side h3 { margin: 0; font-size: 1rem }
+  .sch-zoom {
+    position: absolute; left: 12px; bottom: 12px; z-index: 3;
+    display: flex; align-items: center; gap: .25rem;
+    background: color-mix(in srgb, var(--surface) 92%, transparent);
+    border: 1px solid var(--border); border-radius: 12px; padding: .25rem;
+    backdrop-filter: blur(8px);
+  }
+  .sch-zoom button {
+    width: 32px; height: 32px; border: 0; border-radius: 9px; background: transparent;
+    color: var(--text); cursor: pointer; font-weight: 700;
+  }
+  .sch-zoom button:hover { background: var(--surface-2) }
+  .sch-zoom .pct {
+    min-width: 3.2rem; text-align: center; font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+
+  .sch-side {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 18px;
+    padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: .55rem;
+    max-height: calc(100dvh - 10.5rem); overflow: auto;
+  }
+  .sch-side h3 { margin: 0; font-size: 1.05rem }
+  .sch-side .hint { color: var(--muted); font-size: .8rem; line-height: 1.4 }
+  .sch-side label.f { margin-top: .35rem }
   .sch-result {
-    border-radius: 12px; padding: .75rem .85rem; border: 1px solid var(--border);
+    border-radius: 12px; padding: .8rem .9rem; border: 1px solid var(--border);
     background: var(--surface-2); font-size: .86rem; line-height: 1.45;
   }
   .sch-result.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: var(--ok-soft) }
   .sch-result.block { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); background: var(--danger-soft) }
   .sch-result.err { border-color: var(--danger); color: var(--danger) }
-  .sch-path { display: flex; flex-direction: column; gap: .35rem; margin-top: .5rem }
+  .sch-path { display: flex; flex-direction: column; gap: .35rem; margin-top: .15rem }
   .sch-path .step { display: flex; gap: .5rem; align-items: flex-start; font-size: .8rem }
   .sch-path .n {
     width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent);
     display: grid; place-items: center; font-size: .7rem; font-weight: 700; flex-shrink: 0;
   }
+  .sch-filter {
+    display: flex; gap: .4rem; margin-bottom: .15rem;
+  }
+  .sch-filter input {
+    flex: 1; min-width: 0;
+  }
+
   .sch-list { display: none }
   .sch-list.on { display: block }
-  .sch-board.on-list { display: none }
-  .toolbar { display: flex; gap: .35rem; flex-wrap: wrap }
-  @media (max-width: 960px) {
-    .sch-wrap { flex-direction: column }
-    .sch-side { width: 100%; max-height: none }
-    .sch-col { width: 190px }
+  .sch-board.on-list, .sch-side.on-list { display: none }
+
+  @media (max-width: 1100px) {
+    .sch-wrap { grid-template-columns: 1fr; }
+    .sch-side { max-height: none; order: -1 }
+    .sch-board { min-height: 480px }
   }
 </style>
 {% endblock %}
@@ -98,124 +147,25 @@
       <span class="badge {% if schema.stats.exits_up == schema.stats.exits_total %}ok{% elif schema.stats.exits_up %}warn{% endif %}">
         Выходы: работают {{ schema.stats.exits_up }} из {{ schema.stats.exits_total }}
       </span>
-      <span class="sch-hint">Одна линия — путь трафика. Подсветка — выбранный клиент / результат проверки.</span>
-    </div>
-    <div class="toolbar">
-      <button class="btn ghost sm" type="button" id="btn-hl-online">Выделить активные</button>
-      <button class="btn ghost sm" type="button" id="btn-fit">Вписать</button>
-      <a class="btn ghost sm" href="{{ bp }}/routing">Правила</a>
-      <a class="btn ghost sm" href="{{ bp }}/outbounds">Выходы</a>
+      <span class="sch-hint">На схеме — только выбранный клиент и фактический путь к назначению. Перетаскивайте узлы, колёсико — масштаб, пустое место — панорама.</span>
     </div>
 
     <div class="sch-board" id="sch-board">
-      <svg class="sch-wires" id="sch-wires"></svg>
-      <div class="sch-cols" id="sch-cols">
-        <div class="sch-col" data-col="client">
-          <div class="sch-col-h"><span>Пользователь</span><span>{{ schema.clients|length }}</span></div>
-          {% for c in schema.clients %}
-          <div class="sch-card" data-col="client" data-id="{{ c.email }}" data-online="{{ 1 if c.online else 0 }}"
-               data-inbounds="{{ c.inbounds|join(',') }}" data-outbound="{{ c.outbound }}">
-            <span class="ring"></span><span class="ring out"></span>
-            <div class="t">{{ c.remark }}</div>
-            <div class="m mono">{{ c.email }}{% if c.ips %} · {{ c.ips[0] }}{% endif %}</div>
-            <div class="row2">
-              {% if c.online %}<span class="badge ok">online</span>{% else %}<span class="badge">offline</span>{% endif %}
-              <span class="badge">{{ c.outbound_label }}</span>
-            </div>
-          </div>
-          {% else %}
-          <div class="empty">Нет клиентов</div>
-          {% endfor %}
-        </div>
-
-        <div class="sch-col" data-col="inbound">
-          <div class="sch-col-h"><span>Протокол</span><span>{{ schema.inbounds|length }}</span></div>
-          {% for ib in schema.inbounds %}
-          <div class="sch-card" data-col="inbound" data-id="{{ ib.tag }}" data-protocol="{{ ib.protocol }}">
-            <span class="ring"></span><span class="ring out"></span>
-            <div class="t">{{ ib.remark }}</div>
-            <div class="m">{{ ib.protocol }} · {{ ib.network }}/{{ ib.security or 'none' }} · :{{ ib.port }}{% if ib.direct %} · direct{% endif %}</div>
-            <div class="row2"><span class="badge accent mono">{{ ib.tag }}</span></div>
-          </div>
-          {% else %}
-          <div class="empty">Нет inbounds</div>
-          {% endfor %}
-        </div>
-
-        <div class="sch-col" data-col="filter">
-          <div class="sch-col-h"><span>Фильтр узла</span><span>{{ schema.filters|length }}</span></div>
-          {% for f in schema.filters %}
-          <div class="sch-card {% if not f.enabled %}off{% endif %}" data-col="filter" data-id="{{ f.name }}" data-kind="{{ f.filter_kind }}">
-            <span class="ring"></span><span class="ring out"></span>
-            <div class="t">{{ f.name }}</div>
-            <div class="m">{% if f.filter_kind == 'ads' %}Реклама / телеметрия{% elif f.filter_kind == 'torrent' %}Торренты{% elif f.filter_kind == 'porn' %}18+{% else %}Блок{% endif %}
-              · {% if f.enabled %}отсеиваются{% else %}выключено{% endif %}</div>
-            <div class="row2">
-              <form method="post" action="{{ bp }}/routing/{{ f.name|urlencode }}/toggle?next=/schema" onclick="event.stopPropagation()">
-                <button class="btn ghost sm" type="submit">{{ 'Выкл' if f.enabled else 'Вкл' }}</button>
-              </form>
-            </div>
-          </div>
-          {% else %}
-          <div class="sch-card" data-col="filter" data-id="none">
-            <span class="ring"></span><span class="ring out"></span>
-            <div class="t">Остальное</div>
-            <div class="m">Нет block-фильтров — весь трафик к правилам</div>
-          </div>
-          {% endfor %}
-        </div>
-
-        <div class="sch-col" data-col="rule">
-          <div class="sch-col-h"><span>Правила</span><span>{{ schema.rules|length }}</span></div>
-          {% for r in schema.rules %}
-          <div class="sch-card {% if not r.enabled %}off{% endif %}" data-col="rule" data-id="{{ r.name }}" data-outbound="{{ r.outbound }}">
-            <span class="ring"></span><span class="ring out"></span>
-            <div class="t">{{ r.name }}</div>
-            <div class="m">→ {{ r.label }}
-              {% if r.domain %} · {{ r.domain[:2]|join(', ') }}{% if r.domain|length > 2 %}…{% endif %}{% endif %}
-              {% if r.ip %} · {{ r.ip[:2]|join(', ') }}{% endif %}
-            </div>
-            <div class="row2">
-              <a class="btn ghost sm" href="{{ bp }}/routing" onclick="event.stopPropagation()">Правила</a>
-              <form method="post" action="{{ bp }}/routing/{{ r.name|urlencode }}/toggle?next=/schema" onclick="event.stopPropagation()">
-                <button class="btn ghost sm" type="submit">{{ 'Выкл' if r.enabled else 'Вкл' }}</button>
-              </form>
-            </div>
-          </div>
-          {% else %}
-          <div class="sch-card" data-col="rule" data-id="default" data-outbound="direct">
-            <span class="ring"></span><span class="ring out"></span>
-            <div class="t">Всё через выход клиента</div>
-            <div class="m">Своих правил нет — outbound клиента / direct</div>
-          </div>
-          {% endfor %}
-        </div>
-
-        <div class="sch-col" data-col="exit">
-          <div class="sch-col-h"><span>Выход</span><span>{{ schema.exits|length }}</span></div>
-          {% for e in schema.exits %}
-          <div class="sch-card" data-col="exit" data-id="{{ e.tag }}" data-kind="{{ e.kind }}">
-            <span class="ring"></span>
-            <div class="t">{{ e.label }}</div>
-            <div class="m">
-              {% if e.kind == 'direct' %}Напрямую с адреса сервера
-              {% elif e.kind == 'block' %}Блок — трафик отбрасывается
-              {% elif e.kind == 'pool' %}Пул: {{ (e.members or [])[:4]|join(', ') }}{% if (e.members or [])|length > 4 %}…{% endif %}
-              {% else %}Outbound · {{ e.status or '—' }}{% endif %}
-            </div>
-            <div class="row2"><span class="badge mono">{{ e.tag }}</span>
-              {% if e.kind == 'pool' %}<span class="badge accent">pool</span>
-              {% elif e.status == 'connected' %}<span class="badge ok">up</span>
-              {% elif e.status == 'disconnected' %}<span class="badge err">down</span>{% endif %}
-            </div>
-          </div>
-          {% endfor %}
-        </div>
+      <div class="sch-world" id="sch-world">
+        <svg class="sch-wires" id="sch-wires"></svg>
+        <div id="sch-nodes"></div>
+      </div>
+      <div class="sch-empty" id="sch-empty">Выберите клиента и нажмите «Проверить»</div>
+      <div class="sch-zoom">
+        <button type="button" id="zoom-out" title="−">−</button>
+        <span class="pct" id="zoom-pct">100%</span>
+        <button type="button" id="zoom-in" title="+">+</button>
+        <button type="button" id="zoom-fit" title="Вписать">⤢</button>
       </div>
     </div>
 
     <div class="sch-list card" id="sch-list">
-      <h3>Список пути</h3>
+      <h3>Клиенты</h3>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Клиент</th><th>Outbound</th><th>Inbounds</th><th>Онлайн</th></tr></thead>
@@ -254,23 +204,23 @@
   </div>
 
   <aside class="sch-side" id="sch-side">
-    <div class="flex between">
-      <h3>Куда пойдет трафик?</h3>
-      <button class="btn ghost sm" type="button" id="btn-side-close">✕</button>
-    </div>
-    <div class="hint">Проверка по правилам панели (domain/regexp/CIDR). geosite/geoip без .dat не угадываются — их применит Xray.</div>
+    <h3>Куда пойдёт трафик?</h3>
+    <div class="hint">На холсте только фактический маршрут выбранного клиента. geosite/geoip без .dat не угадываются — их применит Xray.</div>
+
     <label class="f">Чей трафик</label>
-    <select id="chk-email">
+    <div class="sch-filter">
+      <input id="chk-filter" type="search" placeholder="Поиск клиента…" autocomplete="off">
+    </div>
+    <select id="chk-email" size="8" style="height:auto; min-height:9.5rem">
       {% for c in schema.clients %}
-      <option value="{{ c.email }}">{{ c.remark }} ({{ c.email }})</option>
+      <option value="{{ c.email }}" data-remark="{{ c.remark }}" data-online="{{ 1 if c.online else 0 }}"
+              data-inbounds="{{ c.inbounds|join(',') }}">{{ c.remark }}{% if c.online %} · online{% endif %}</option>
       {% endfor %}
     </select>
+
     <label class="f">Через inbound</label>
-    <select id="chk-inbound">
-      {% for ib in schema.inbounds %}
-      <option value="{{ ib.tag }}">{{ ib.remark }} · {{ ib.protocol }}</option>
-      {% endfor %}
-    </select>
+    <select id="chk-inbound"></select>
+
     <label class="f">Домен или IP</label>
     <div class="import">
       <input id="chk-dest" placeholder="2ip.ru / 1.1.1.1" value="2ip.ru">
@@ -278,6 +228,9 @@
     </div>
     <div id="chk-result" class="sch-result" hidden></div>
     <div id="chk-path" class="sch-path" hidden></div>
+    <div class="hint" style="margin-top:.4rem">
+      <a href="{{ bp }}/routing">Правила</a> · <a href="{{ bp }}/outbounds">Выходы</a>
+    </div>
   </aside>
 </div>
 {% endblock %}
@@ -285,118 +238,306 @@
 <script>
 (function () {
   var BP = {{ bp|tojson }};
+  var SCHEMA = {{ schema|tojson }};
+  var COL_LABEL = { client: 'Пользователь', inbound: 'Протокол', filter: 'Фильтр', rule: 'Правила', exit: 'Выход' };
+  var COL_X = { client: 40, inbound: 340, filter: 640, rule: 940, exit: 1240 };
+
   var board = document.getElementById('sch-board');
-  var cols = document.getElementById('sch-cols');
+  var world = document.getElementById('sch-world');
   var wires = document.getElementById('sch-wires');
-  var side = document.getElementById('sch-side');
+  var nodesEl = document.getElementById('sch-nodes');
+  var emptyEl = document.getElementById('sch-empty');
   var list = document.getElementById('sch-list');
-  var selected = { client: null, inbound: null, filter: null, rule: null, exit: null };
-  var pathIds = {};
+  var side = document.getElementById('sch-side');
+  var emailSel = document.getElementById('chk-email');
+  var inboundSel = document.getElementById('chk-inbound');
+  var filterInp = document.getElementById('chk-filter');
 
-  function cards(col) {
-    return Array.prototype.slice.call(document.querySelectorAll('.sch-card[data-col="' + col + '"]'));
+  var view = { x: 40, y: 60, z: 1 };
+  var nodes = [];
+  var drag = null;
+  var pan = null;
+  var checkTimer = null;
+
+  function clientByEmail(email) {
+    for (var i = 0; i < (SCHEMA.clients || []).length; i++) {
+      if (SCHEMA.clients[i].email === email) return SCHEMA.clients[i];
+    }
+    return null;
   }
 
-  function clearPath() {
-    pathIds = {};
-    document.querySelectorAll('.sch-card.path').forEach(function (el) { el.classList.remove('path'); });
+  function inboundByTag(tag) {
+    for (var i = 0; i < (SCHEMA.inbounds || []).length; i++) {
+      if (SCHEMA.inbounds[i].tag === tag) return SCHEMA.inbounds[i];
+    }
+    return null;
   }
 
-  function markPath(path) {
-    clearPath();
-    (path || []).forEach(function (step) {
-      pathIds[step.col] = step.id;
-      var el = document.querySelector('.sch-card[data-col="' + step.col + '"][data-id="' + CSS.escape(step.id) + '"]');
-      if (el) el.classList.add('path');
-      // map rule/exit aliases
-      if (step.col === 'route' && step.id === 'direct') {
-        var d = document.querySelector('.sch-card[data-col="exit"][data-id="direct"]');
-        if (d) d.classList.add('path');
+  function applyClientFilter() {
+    var q = (filterInp.value || '').trim().toLowerCase();
+    var opts = emailSel.options;
+    var firstVisible = null;
+    for (var i = 0; i < opts.length; i++) {
+      var o = opts[i];
+      var hay = ((o.getAttribute('data-remark') || '') + ' ' + o.value).toLowerCase();
+      var show = !q || hay.indexOf(q) >= 0;
+      o.hidden = !show;
+      if (show && !firstVisible) firstVisible = o;
+    }
+    if (emailSel.selectedOptions[0] && emailSel.selectedOptions[0].hidden && firstVisible) {
+      emailSel.value = firstVisible.value;
+      syncInbounds();
+    }
+  }
+
+  function syncInbounds() {
+    var c = clientByEmail(emailSel.value);
+    var allowed = (c && c.inbounds && c.inbounds.length) ? c.inbounds.slice() : (SCHEMA.inbounds || []).map(function (x) { return x.tag; });
+    var prev = inboundSel.value;
+    inboundSel.innerHTML = '';
+    allowed.forEach(function (tag) {
+      var ib = inboundByTag(tag);
+      if (!ib) return;
+      var o = document.createElement('option');
+      o.value = tag;
+      o.textContent = (ib.remark || tag) + ' · ' + ib.protocol;
+      inboundSel.appendChild(o);
+    });
+    if (!inboundSel.options.length) {
+      var o = document.createElement('option');
+      o.value = '';
+      o.textContent = 'Нет inbound';
+      inboundSel.appendChild(o);
+    } else if (prev && allowed.indexOf(prev) >= 0) {
+      inboundSel.value = prev;
+    }
+  }
+
+  function setTransform() {
+    world.style.transform = 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.z + ')';
+    document.getElementById('zoom-pct').textContent = Math.round(view.z * 100) + '%';
+  }
+
+  function nodeKey(step) { return step.col + '::' + step.id; }
+
+  function layoutPath(path) {
+    var cols = [];
+    var seen = {};
+    (path || []).forEach(function (s) {
+      if (!s || !s.col || s.col === 'route') return;
+      if (seen[nodeKey(s)]) return;
+      seen[nodeKey(s)] = true;
+      cols.push(s);
+    });
+    var byCol = {};
+    cols.forEach(function (s) {
+      (byCol[s.col] = byCol[s.col] || []).push(s);
+    });
+    var order = ['client', 'inbound', 'filter', 'rule', 'exit'];
+    var out = [];
+    order.forEach(function (col) {
+      var list = byCol[col] || [];
+      list.forEach(function (s, idx) {
+        var x = COL_X[col] != null ? COL_X[col] : 40;
+        var y = 120 + idx * 150;
+        out.push({
+          key: nodeKey(s),
+          col: s.col,
+          id: s.id,
+          title: s.title || s.id,
+          meta: s.meta || '',
+          badges: s.badges || [],
+          x: x,
+          y: y,
+          active: true
+        });
+      });
+    });
+    return out;
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function badgeHtml(b) {
+    var kind = (b && b.kind) || '';
+    var cls = 'badge' + (kind === 'ok' ? ' ok' : kind === 'err' ? ' err' : kind === 'warn' ? ' warn' : kind === 'mono' ? ' mono' : kind === 'accent' ? ' accent' : '');
+    return '<span class="' + cls + '">' + esc(b.text || '') + '</span>';
+  }
+
+  function renderNodes() {
+    if (!nodes.length) {
+      nodesEl.innerHTML = '';
+      emptyEl.hidden = false;
+      wires.innerHTML = '';
+      return;
+    }
+    emptyEl.hidden = true;
+    nodesEl.innerHTML = nodes.map(function (n) {
+      var extra = '';
+      if (n.col === 'exit') {
+        if ((n.id || '') === 'block' || /block/i.test(n.title || '')) extra = ' exit-block';
+        else extra = ' exit-ok';
       }
-      if (step.col === 'exit') {
-        var e = document.querySelector('.sch-card[data-col="exit"][data-id="' + CSS.escape(step.id) + '"]');
-        if (e) e.classList.add('path');
-      }
+      return '<div class="sch-node active' + extra + '" data-key="' + esc(n.key) + '" style="left:' + n.x + 'px;top:' + n.y + 'px">' +
+        (n.col !== 'client' ? '<span class="port in"></span>' : '') +
+        (n.col !== 'exit' ? '<span class="port out"></span>' : '') +
+        '<div class="col-tag">' + esc(COL_LABEL[n.col] || n.col) + '</div>' +
+        '<div class="t">' + esc(n.title) + '</div>' +
+        (n.meta ? '<div class="m">' + esc(n.meta) + '</div>' : '') +
+        '<div class="row2">' + (n.badges || []).map(badgeHtml).join('') + '</div>' +
+      '</div>';
+    }).join('');
+    Array.prototype.forEach.call(nodesEl.querySelectorAll('.sch-node'), function (el) {
+      el.addEventListener('pointerdown', onNodeDown);
     });
     drawWires();
   }
 
-  function selectCard(el) {
-    var col = el.getAttribute('data-col');
-    var id = el.getAttribute('data-id');
-    cards(col).forEach(function (c) { c.classList.toggle('on', c === el); });
-    selected[col] = id;
-    if (col === 'client') {
-      var ibs = (el.getAttribute('data-inbounds') || '').split(',').filter(Boolean);
-      cards('inbound').forEach(function (c) {
-        c.classList.toggle('on', !ibs.length || ibs.indexOf(c.getAttribute('data-id')) >= 0);
-      });
-      var ob = el.getAttribute('data-outbound');
-      cards('exit').forEach(function (c) {
-        c.classList.toggle('on', c.getAttribute('data-id') === ob || (ob && ob.indexOf('lb_') === 0 && c.getAttribute('data-kind') === 'pool' && c.getAttribute('data-id') === ob));
-      });
-      var sel = document.getElementById('chk-email');
-      if (sel) sel.value = id;
-      if (ibs.length) {
-        var isel = document.getElementById('chk-inbound');
-        if (isel && ibs.indexOf(isel.value) < 0) isel.value = ibs[0];
-      }
-    }
-    drawWires();
-  }
-
   function portCenter(el, which) {
-    var ring = el.querySelector('.ring' + (which === 'out' ? '.out' : ':not(.out)'));
-    var br = board.getBoundingClientRect();
-    var rr = (ring || el).getBoundingClientRect();
+    var port = el.querySelector('.port.' + (which === 'out' ? 'out' : 'in'));
+    var r = (port || el).getBoundingClientRect();
+    var wr = world.getBoundingClientRect();
     return {
-      x: rr.left + rr.width / 2 - br.left + board.scrollLeft,
-      y: rr.top + rr.height / 2 - br.top + board.scrollTop
+      x: (r.left + r.width / 2 - wr.left) / view.z,
+      y: (r.top + r.height / 2 - wr.top) / view.z
     };
   }
 
   function bezier(a, b) {
-    var dx = Math.max(40, (b.x - a.x) * 0.45);
+    var dx = Math.max(48, (b.x - a.x) * 0.45);
     return 'M' + a.x + ',' + a.y + ' C' + (a.x + dx) + ',' + a.y + ' ' + (b.x - dx) + ',' + b.y + ' ' + b.x + ',' + b.y;
   }
 
   function drawWires() {
-    if (!wires || !board) return;
-    var w = board.scrollWidth, h = Math.max(board.clientHeight, cols.scrollHeight);
-    wires.setAttribute('width', w);
-    wires.setAttribute('height', h);
-    wires.style.width = w + 'px';
-    wires.style.height = h + 'px';
-    var order = ['client', 'inbound', 'filter', 'rule', 'exit'];
+    if (!nodes.length) { wires.innerHTML = ''; return; }
+    var maxX = 0, maxY = 0;
+    nodes.forEach(function (n) {
+      maxX = Math.max(maxX, n.x + 280);
+      maxY = Math.max(maxY, n.y + 180);
+    });
+    wires.setAttribute('width', maxX);
+    wires.setAttribute('height', maxY);
+    wires.style.width = maxX + 'px';
+    wires.style.height = maxY + 'px';
+
+    var byKey = {};
+    Array.prototype.forEach.call(nodesEl.querySelectorAll('.sch-node'), function (el) {
+      byKey[el.getAttribute('data-key')] = el;
+    });
     var html = [];
-    for (var i = 0; i < order.length - 1; i++) {
-      var left = cards(order[i]).filter(function (c) {
-        return c.classList.contains('on') || c.classList.contains('path') || (!document.querySelector('.sch-card[data-col="' + order[i] + '"].on') && !document.querySelector('.sch-card[data-col="' + order[i] + '"].path'));
-      });
-      // default: connect first visible non-off of each column when nothing selected
-      if (!document.querySelector('.sch-card.on') && !document.querySelector('.sch-card.path')) {
-        left = cards(order[i]).filter(function (c) { return !c.classList.contains('off'); }).slice(0, 3);
-      } else {
-        left = cards(order[i]).filter(function (c) { return c.classList.contains('on') || c.classList.contains('path'); });
-        if (!left.length) left = cards(order[i]).filter(function (c) { return !c.classList.contains('off'); }).slice(0, 1);
-      }
-      var right = cards(order[i + 1]).filter(function (c) { return c.classList.contains('on') || c.classList.contains('path'); });
-      if (!right.length) right = cards(order[i + 1]).filter(function (c) { return !c.classList.contains('off'); }).slice(0, 2);
-      left.forEach(function (a) {
-        right.forEach(function (b) {
-          if (!a.querySelector('.ring.out') || !b.querySelector('.ring:not(.out)')) return;
-          var p1 = portCenter(a, 'out'), p2 = portCenter(b, 'in');
-          var active = (a.classList.contains('path') || a.classList.contains('on')) && (b.classList.contains('path') || b.classList.contains('on'));
-          html.push('<path class="' + (active ? 'active' : '') + '" d="' + bezier(p1, p2) + '"/>');
-        });
-      });
+    for (var i = 0; i < nodes.length - 1; i++) {
+      var a = byKey[nodes[i].key], b = byKey[nodes[i + 1].key];
+      if (!a || !b) continue;
+      var p1 = portCenter(a, 'out'), p2 = portCenter(b, 'in');
+      html.push('<path class="active" d="' + bezier(p1, p2) + '"/>');
     }
     wires.innerHTML = html.join('');
   }
 
-  document.querySelectorAll('.sch-card').forEach(function (el) {
-    el.addEventListener('click', function () { selectCard(el); });
+  function fitView() {
+    if (!nodes.length) {
+      view = { x: 40, y: 60, z: 1 };
+      setTransform();
+      return;
+    }
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + 240);
+      maxY = Math.max(maxY, n.y + 120);
+    });
+    var bw = board.clientWidth, bh = board.clientHeight;
+    var pad = 48;
+    var zw = (bw - pad * 2) / Math.max(1, maxX - minX);
+    var zh = (bh - pad * 2) / Math.max(1, maxY - minY);
+    view.z = Math.max(0.35, Math.min(1.25, Math.min(zw, zh)));
+    view.x = (bw - (maxX + minX) * view.z) / 2;
+    view.y = Math.max(24, (bh - (maxY + minY) * view.z) / 2);
+    setTransform();
+  }
+
+  function onNodeDown(e) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    var el = e.currentTarget;
+    var key = el.getAttribute('data-key');
+    var n = nodes.find(function (x) { return x.key === key; });
+    if (!n) return;
+    el.setPointerCapture(e.pointerId);
+    board.classList.add('dragging-node');
+    drag = {
+      key: key,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: n.x,
+      origY: n.y
+    };
+  }
+
+  function onPointerMove(e) {
+    if (drag) {
+      var n = nodes.find(function (x) { return x.key === drag.key; });
+      if (!n) return;
+      n.x = drag.origX + (e.clientX - drag.startX) / view.z;
+      n.y = drag.origY + (e.clientY - drag.startY) / view.z;
+      var el = nodesEl.querySelector('[data-key="' + CSS.escape(drag.key) + '"]');
+      if (el) {
+        el.style.left = n.x + 'px';
+        el.style.top = n.y + 'px';
+      }
+      drawWires();
+      return;
+    }
+    if (pan) {
+      view.x = pan.origX + (e.clientX - pan.startX);
+      view.y = pan.origY + (e.clientY - pan.startY);
+      setTransform();
+    }
+  }
+
+  function onPointerUp() {
+    drag = null;
+    pan = null;
+    board.classList.remove('panning', 'dragging-node');
+  }
+
+  board.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0 && e.button !== 1) return;
+    if (e.target.closest('.sch-node') || e.target.closest('.sch-zoom')) return;
+    board.setPointerCapture(e.pointerId);
+    board.classList.add('panning');
+    pan = { startX: e.clientX, startY: e.clientY, origX: view.x, origY: view.y };
   });
+  board.addEventListener('pointermove', onPointerMove);
+  board.addEventListener('pointerup', onPointerUp);
+  board.addEventListener('pointercancel', onPointerUp);
+
+  board.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var rect = board.getBoundingClientRect();
+    var mx = e.clientX - rect.left;
+    var my = e.clientY - rect.top;
+    var before = view.z;
+    var next = Math.max(0.25, Math.min(2.2, view.z * (e.deltaY < 0 ? 1.08 : 0.92)));
+    var wx = (mx - view.x) / before;
+    var wy = (my - view.y) / before;
+    view.z = next;
+    view.x = mx - wx * next;
+    view.y = my - wy * next;
+    setTransform();
+  }, { passive: false });
+
+  document.getElementById('zoom-in').addEventListener('click', function () {
+    view.z = Math.min(2.2, view.z * 1.12); setTransform();
+  });
+  document.getElementById('zoom-out').addEventListener('click', function () {
+    view.z = Math.max(0.25, view.z / 1.12); setTransform();
+  });
+  document.getElementById('zoom-fit').addEventListener('click', fitView);
 
   document.getElementById('view-seg').addEventListener('click', function (e) {
     var a = e.target.closest('a[data-view]');
@@ -405,38 +546,30 @@
     document.querySelectorAll('#view-seg a').forEach(function (x) { x.classList.toggle('active', x === a); });
     var v = a.getAttribute('data-view');
     board.classList.toggle('on-list', v === 'list');
+    side.classList.toggle('on-list', v === 'list');
     list.classList.toggle('on', v === 'list');
-    if (v === 'schema') setTimeout(drawWires, 30);
+    if (v === 'schema') setTimeout(function () { drawWires(); }, 30);
   });
 
-  function openSide() { side.classList.add('open'); }
-  function closeSide() { side.classList.remove('open'); }
-  document.getElementById('btn-check-panel').addEventListener('click', openSide);
-  document.getElementById('btn-side-close').addEventListener('click', closeSide);
-
-  document.getElementById('btn-hl-online').addEventListener('click', function () {
-    cards('client').forEach(function (c) {
-      c.classList.toggle('on', c.getAttribute('data-online') === '1');
-    });
-    drawWires();
-  });
-
-  document.getElementById('btn-fit').addEventListener('click', function () {
-    board.scrollTo({ left: 0, top: 0, behavior: 'smooth' });
-    drawWires();
-  });
-
-  document.getElementById('btn-check').addEventListener('click', runCheck);
-  document.getElementById('chk-dest').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); runCheck(); }
-  });
+  function scheduleCheck() {
+    clearTimeout(checkTimer);
+    checkTimer = setTimeout(runCheck, 120);
+  }
 
   function runCheck() {
-    var email = document.getElementById('chk-email').value;
-    var inbound = document.getElementById('chk-inbound').value;
+    var email = emailSel.value;
+    var inbound = inboundSel.value;
     var dest = document.getElementById('chk-dest').value.trim();
     var box = document.getElementById('chk-result');
     var pathBox = document.getElementById('chk-path');
+    if (!email || !inbound || !dest) {
+      box.hidden = false; pathBox.hidden = true;
+      box.className = 'sch-result err';
+      box.textContent = 'Выберите клиента, inbound и назначение';
+      nodes = [];
+      renderNodes();
+      return;
+    }
     box.hidden = false; pathBox.hidden = false;
     box.className = 'sch-result';
     box.textContent = 'Проверка…';
@@ -451,30 +584,22 @@
         if (!data.ok) {
           box.className = 'sch-result err';
           box.textContent = data.error || 'Ошибка';
+          nodes = [];
+          renderNodes();
           return;
         }
         var kind = (data.exit && data.exit.kind) || '';
         box.className = 'sch-result ' + (kind === 'block' ? 'block' : 'ok');
-        box.innerHTML = '<b>' + (data.summary || '') + '</b><div class="small muted mt">' +
-          (data.detail || '') + (data.matched_rule ? ' · правило <code>' + data.matched_rule.name + '</code>' : '') + '</div>';
+        box.innerHTML = '<b>' + esc(data.summary || '') + '</b><div class="small muted mt">' +
+          esc(data.detail || '') +
+          (data.matched_rule ? ' · правило <code>' + esc(data.matched_rule.name) + '</code>' : '') + '</div>';
         pathBox.innerHTML = (data.path || []).map(function (s, i) {
-          return '<div class="step"><span class="n">' + (i + 1) + '</span><div><b>' + s.title + '</b>' +
-            (s.meta ? '<div class="muted">' + s.meta + '</div>' : '') + '</div></div>';
+          return '<div class="step"><span class="n">' + (i + 1) + '</span><div><b>' + esc(s.title) + '</b>' +
+            (s.meta ? '<div class="muted">' + esc(s.meta) + '</div>' : '') + '</div></div>';
         }).join('');
-        // select cards along path
-        document.querySelectorAll('.sch-card.on').forEach(function (c) { c.classList.remove('on'); });
-        (data.path || []).forEach(function (s) {
-          if (s.col === 'route') return;
-          var el = document.querySelector('.sch-card[data-col="' + s.col + '"][data-id="' + CSS.escape(s.id) + '"]');
-          if (el) el.classList.add('on');
-          if (s.col === 'client' || s.col === 'inbound') selected[s.col] = s.id;
-        });
-        if (data.exit && data.exit.tag) {
-          var ex = document.querySelector('.sch-card[data-col="exit"][data-id="' + CSS.escape(data.exit.tag) + '"]');
-          if (ex) ex.classList.add('on');
-        }
-        markPath(data.path || []);
-        openSide();
+        nodes = layoutPath(data.path || []);
+        renderNodes();
+        fitView();
       })
       .catch(function (err) {
         box.className = 'sch-result err';
@@ -482,12 +607,29 @@
       });
   }
 
-  board.addEventListener('scroll', function () { drawWires(); });
+  filterInp.addEventListener('input', applyClientFilter);
+  emailSel.addEventListener('change', function () { syncInbounds(); scheduleCheck(); });
+  inboundSel.addEventListener('change', scheduleCheck);
+  document.getElementById('btn-check').addEventListener('click', runCheck);
+  document.getElementById('chk-dest').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); runCheck(); }
+  });
+  document.getElementById('chk-dest').addEventListener('change', scheduleCheck);
+
+  // Prefer online client on first paint
+  (function initSelect() {
+    var prefer = null;
+    for (var i = 0; i < emailSel.options.length; i++) {
+      if (emailSel.options[i].getAttribute('data-online') === '1') { prefer = emailSel.options[i]; break; }
+    }
+    if (prefer) emailSel.value = prefer.value;
+    applyClientFilter();
+    syncInbounds();
+    setTransform();
+    scheduleCheck();
+  })();
+
   window.addEventListener('resize', function () { drawWires(); });
-  setTimeout(drawWires, 50);
-  // auto-select first online client
-  var first = document.querySelector('.sch-card[data-col="client"][data-online="1"]') || document.querySelector('.sch-card[data-col="client"]');
-  if (first) selectCard(first);
 })();
 </script>
 {% endblock %}

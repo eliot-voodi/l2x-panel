@@ -77,7 +77,7 @@ run_installer() {
 
 show_status() {
   c_head "Статус"
-  for u in l2xpanel l2xpanel-next xray nginx caddy xl2tpd strongswan-starter ipsec; do
+  for u in l2xpanel l2xpanel-next xray nginx caddy; do
     systemctl list-unit-files "$u.service" >/dev/null 2>&1 || continue
     st=$(systemctl is-active "$u" 2>/dev/null)
     [ -z "$st" ] && continue
@@ -208,7 +208,7 @@ EOF
 }
 
 logs() {
-  read -r -p "Сервис [l2xpanel/xray/xl2tpd] (xray): " u
+  read -r -p "Сервис [l2xpanel/xray] (xray): " u
   journalctl -u "${u:-xray}" -n 200 --no-pager
 }
 

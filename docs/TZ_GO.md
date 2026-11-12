@@ -1,6 +1,6 @@
 # Техническое задание: L2X Panel (Go)
 
-**Продукт:** веб-панель управления Xray-core с мульти-L2TP egress, мульти-нодами и подписками  
+**Продукт:** веб-панель управления Xray-core с мульти-нодами, custom outbounds и подписками  
 **Цель ТЗ:** полная реализация на **Go** (без Python-рантайма панели)  
 **Эталон функционала:** текущий L2X Panel ≈ v1.6.4 (`eliot-voodi/l2x-panel`)  
 **Лицензия:** MIT  
@@ -14,13 +14,12 @@
 Один бинарник (или минимальный набор бинарников) на Go, который:
 
 - управляет Xray-core (inbounds / clients / routes / balancers / outbounds / DNS / policy);
-- поднимает и мониторит L2TP/IPsec-туннели (strongSwan + xl2tpd / NetworkManager);
 - отдаёт admin UI + subscription endpoints + REST API;
 - поддерживает кластер master↔agent с зеркалированием и failover.
 
 ### 1.2. Вне скоупа (v1 Go)
 
-- Переписывание Xray-core / nginx / strongSwan (используются как есть).
+- Переписывание Xray-core / nginx (используются как есть).
 - Мобильные нативные клиенты.
 - Платежный биллинг (можно заложить хуки API).
 
@@ -56,10 +55,10 @@
 Клиент VPN ──► nginx:443 / Xray inbounds
                  │
                  ▼
-            Xray-core (routing → l2tp_* / node_* / warp / direct)
+            Xray-core (routing → node_* / warp / custom / direct)
                  │
                  ▼
-         L2TP PPP / WG / custom outbound
+         WG / custom outbound / node reverse
 
 Admin ──HTTPS──► nginx ──► l2xpanel (:8090)
                               ├─ UI
@@ -73,12 +72,11 @@ Admin ──HTTPS──► nginx ──► l2xpanel (:8090)
 - `l2xpanel.service` — основной демон Go
 - `xray.service` — ядро
 - `nginx` — TLS front + camouflage
-- `strongswan` / `xl2tpd` (или nmcli) — L2TP
 
 **Фоновые воркеры (goroutines):**
 
 1. Xray watchdog + online/stats poll
-2. L2TP health + auto-select best N
+2. Outbound health / observatory
 3. History / speed samples
 4. Panel update check
 5. Xray update check
@@ -101,7 +99,6 @@ internal/
   auth/            # session, TOTP, rate-limit login
   xraycfg/         # build_config, apply, test, clean errors
   protocols/       # share links, inbound builders
-  l2tp/            # connect/disconnect/status/secrets
   outbounds/       # parse URI, WARP, Nord, PIA, WG keys
   front/           # nginx stage/commit/rollback
   nodes/           # provision, push, promote, mirror, schedule
@@ -125,7 +122,7 @@ web/ui/            # templates + static (embed.FS)
 - Логин/пароль, cookie session, опциональный TOTP.
 - Секретный `base_path` панели; публичные только `/health`, `/sub/`, `/panel/api/`, ACME.
 - Rate-limit неудачных логинов.
-- Шифрование L2TP password/PSK at rest.
+- Шифрование секретов outbound at rest.
 - API tokens; agent Bearer token (constant-time compare).
 
 ### 5.2. Inbounds
@@ -137,30 +134,23 @@ CRUD + enable/disable + привязка outbound.
 ### 5.3. Clients
 
 - UUID/password, лимиты GB/IP/HWID, expiry, start-on-first-connect, reset cycle.
-- Привязка к inbounds и outbound (`direct` / `l2tp_*` / `node_*` / balancers).
+- Привязка к inbounds и outbound (`direct` / `node_*` / custom / balancers).
 - Bulk ops, QR, client page, traffic counters, online list.
 
-### 5.4. L2TP
-
-- CRUD туннелей, connect/disconnect, status, country flag.
-- Watchdog: down → убрать из routing/balancers, TG notify.
-- Auto-select лучших N по ping/speed по расписанию.
-- Secrets вне store или encrypted fields.
-
-### 5.5. Outbounds / Balancers / Routing
+### 5.4. Outbounds / Balancers / Routing
 
 - Custom outbounds + URI import.
 - WARP one-click, NordLynx, WG keygen.
 - Balancers `leastPing` / `leastLoad`; **пустые members → fallback `[direct]`, не эмитить broken observatory**.
 - Routes; неизвестные outbound tags на agent → `direct`.
 
-### 5.6. Подписки
+### 5.5. Подписки
 
 Форматы: base64, plain, xray-json, clash-meta, sing-box, HTML.  
 Happ headers: profile-title, userinfo, announce, hwid, new-url.  
 HTTPS через nginx/LE (domain или IP).
 
-### 5.7. Ops / System
+### 5.6. Ops / System
 
 - Install/update Xray с rollback если `-test`/start fail.
 - Geo files update.
@@ -169,14 +159,14 @@ HTTPS через nginx/LE (domain или IP).
 - BBR, speedtest, logs viewer, sysmon dashboard.
 - i18n RU/EN, dark/light.
 
-### 5.8. Multi-node (критичный блок, как в 1.6.x)
+### 5.7. Multi-node (критичный блок, как в 1.6.x)
 
 | Возможность | Требование |
 |-------------|------------|
 | Provision | SSH domain/login/pass → install agent, token, base_path, optional outbound+mirror |
 | Sync | Push clients/inbounds/routes/… на agent |
 | Outbound node | Bridge VLESS/WS на агенте → `node_<slug>` на мастере |
-| Mirror | Полная копия master data; runtime agent безопасный; L2TP локальный не требовать |
+| Mirror | Полная копия master data; runtime agent безопасный |
 | Schedule sync | Per-node interval: off/5m…24h |
 | Update node | Agent API `/agent/update` или SSH |
 | Promote | **Сначала** поднять remote master + verify `/health.role`, **потом** demote old; `runtime_preserve` |
@@ -212,13 +202,11 @@ HTTPS через nginx/LE (domain или IP).
     "telegram": {},
     "webhooks": {},
     "panel_update": {},
-    "xray_update": {},
-    "l2tp_auto": {}
+    "xray_update": {}
   },
   "admin": {},
   "inbounds": [],
   "clients": [],
-  "l2tp": [],
   "outbounds_custom": [],
   "routes": [],
   "balancers": {},
@@ -257,7 +245,7 @@ HTTPS через nginx/LE (domain или IP).
 
 ### 7.1. UI (SSR)
 
-`/login`, `/`, `/inbounds`, `/clients`, `/l2tp`, `/outbounds`, `/balancers`, `/routing`, `/xray`, `/nodes`, `/logs`, `/settings`, `/bans`, `/api-docs`
+`/login`, `/`, `/inbounds`, `/clients`, `/outbounds`, `/balancers`, `/routing`, `/schema`, `/xray`, `/nodes`, `/logs`, `/settings`, `/bans`, `/api-docs`
 
 ### 7.2. Public
 
@@ -278,10 +266,10 @@ HTTPS через nginx/LE (domain или IP).
 Порт логики `panel/xray_runtime.py`:
 
 - inbounds + clients emails;
-- outbounds: direct, block, api, l2tp_*, custom, node_*;
+- outbounds: direct, block, api, custom, node_*;
 - balancers + observatory только при валидных members;
 - routing: api, user rules, default;
-- на agent: `AgentRuntimeStore` — preserve L2TP если локально есть / `runtime_preserve`; иначе sanitize.
+- на agent: `AgentRuntimeStore` — sanitize legacy tags; `runtime_preserve` для локального runtime.
 
 Apply pipeline:
 
@@ -296,7 +284,7 @@ Apply pipeline:
 
 `install.sh`:
 
-- зависимости ОС (nginx, xray, strongswan, xl2tpd, curl…);
+- зависимости ОС (nginx, xray, curl…);
 - скачать `l2xpanel` / `l2x` binary под arch;
 - systemd, panel.env, первый admin + base_path;
 - опции `--update` (сохранить store/certs).
@@ -348,7 +336,7 @@ Self-update панели = замена binary + `systemctl restart l2xpanel`.
 |------|------------|-----------|
 | **M1** | store, auth, UI shell, health, settings | логин + пустой дашборд |
 | **M2** | xraycfg + inbounds/clients/routes/outbounds/balancers | полный single-node Xray |
-| **M3** | L2TP + watchdog + auto-select | мульти-egress |
+| **M3** | custom outbounds + balancers + schema | мульти-egress |
 | **M4** | front/nginx + sub + certs | прод HTTPS/подписки |
 | **M5** | ops (xray/panel update, geo, backup), TG, API | ops parity |
 | **M6** | nodes (provision/sync/mirror/schedule/promote) | cluster parity 1.6.4 |
@@ -369,4 +357,4 @@ Self-update панели = замена binary + `systemctl restart l2xpanel`.
 ## 15. Связанные документы
 
 - [API.md](API.md) — REST API текущей панели (семантика для порта)
-- Эталон кода: `panel/app.py`, `panel/nodes.py`, `panel/xray_runtime.py`, `panel/front.py`, `panel/l2tp_runtime.py`, `panel/ops.py`
+- Эталон кода: `panel/app.py`, `panel/nodes.py`, `panel/xray_runtime.py`, `panel/front.py`, `panel/ops.py`

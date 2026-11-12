@@ -26,7 +26,6 @@ TRACKED_KEYS = (
     "dns",
     "xray_settings",
     "settings",
-    "l2tp",
     "certs",
     "doh_bundle",
     "ip_bans",
@@ -37,10 +36,6 @@ _VOLATILE_CLIENT = {
     "traffic", "last_online", "ips", "tg_notify_expire_on", "tg_notify_low_gb",
 }
 _VOLATILE_INBOUND = {"traffic"}
-_VOLATILE_L2TP = {
-    "status", "last_error", "addr", "local_ip", "peer_ip", "public_ip", "vrf",
-    "metrics", "connected_at", "latency_ms",
-}
 _VOLATILE_NODE = {"last_seen", "last_update", "online", "version", "error", "health"}
 
 _REDACT_SEGMENTS = {
@@ -53,7 +48,6 @@ _REDACT_SEGMENTS = {
 _KIND_LABEL = {
     "client": "Клиент",
     "inbound": "Inbound",
-    "l2tp": "L2TP",
     "route": "Маршрут",
     "balancer": "Balancer",
     "outbound": "Outbound",
@@ -213,10 +207,6 @@ def _strip_inbound(ib: dict) -> dict:
     return {k: deepcopy(v) for k, v in ib.items() if k not in _VOLATILE_INBOUND}
 
 
-def _strip_l2tp(item: dict) -> dict:
-    return {k: deepcopy(v) for k, v in item.items() if k not in _VOLATILE_L2TP}
-
-
 def _strip_settings(s: dict) -> dict:
     s = deepcopy(s or {})
     nodes = s.get("nodes")
@@ -244,8 +234,6 @@ def canonical_state(store: dict | None) -> dict:
             out[key] = [_strip_client(c) for c in val if isinstance(c, dict)]
         elif key == "inbounds" and isinstance(val, list):
             out[key] = [_strip_inbound(i) for i in val if isinstance(i, dict)]
-        elif key == "l2tp" and isinstance(val, list):
-            out[key] = [_strip_l2tp(i) for i in val if isinstance(i, dict)]
         elif key == "settings" and isinstance(val, dict):
             out[key] = _strip_settings(val)
         else:
@@ -317,8 +305,6 @@ def _entity_title(kind: str, item: dict, key: str) -> str:
         name = item.get("tag") or item.get("remark") or key
         proto = item.get("protocol") or ""
         return f"{label} «{name}»" + (f" ({proto})" if proto else "")
-    if kind == "l2tp":
-        return f"{label} «{item.get('name') or key}»"
     if kind in ("balancer", "outbound"):
         return f"{label} «{item.get('tag') or key}»"
     if kind == "cert":
@@ -432,10 +418,6 @@ def describe_changes(before: dict | None, after: dict | None) -> list[dict]:
     events += _diff_entities(
         before.get("inbounds") or [], after.get("inbounds") or [],
         kind="inbound", id_keys=("tag", "id"),
-    )
-    events += _diff_entities(
-        before.get("l2tp") or [], after.get("l2tp") or [],
-        kind="l2tp", id_keys=("name",), skip_fields={"password", "secret"},
     )
     events += _diff_entities(
         before.get("outbounds_custom") or [], after.get("outbounds_custom") or [],

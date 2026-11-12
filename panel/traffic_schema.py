@@ -179,11 +179,6 @@ def _exit_meta(store: dict, tag: str) -> dict:
         if o.get("tag") == tag:
             status = xray.custom_outbound_status(o)
             break
-    for t in store.get("l2tp") or []:
-        lt = t.get("outbound") or f"l2tp_{t.get('name')}"
-        if lt == tag:
-            status = t.get("status") or ""
-            break
     return {"tag": tag, "label": label, "kind": kind, "status": status}
 
 
@@ -271,13 +266,6 @@ def build_schema(store: dict, *, online: dict | None = None) -> dict:
         if t and t not in seen:
             exits.append(_exit_meta(store, t))
             seen.add(t)
-    for t in store.get("l2tp") or []:
-        if t.get("status") != "connected":
-            continue
-        tag = t.get("outbound") or f"l2tp_{t.get('name')}"
-        if tag not in seen:
-            exits.append(_exit_meta(store, tag))
-            seen.add(tag)
 
     working = sum(1 for e in exits if e["kind"] != "block" and e.get("status") in ("", "connected", "ok", None))
     # count non-block exits that look up
@@ -333,9 +321,29 @@ def check_destination(
     if allowed_ibs and inbound_tag not in allowed_ibs:
         return {"ok": False, "error": "Этот inbound не назначен клиенту"}
 
+    ib = capable[inbound_tag]
+    ib_st = ib.get("stream") or {}
+    ib_proto = ib.get("protocol") or ""
+    ib_net = ib_st.get("network") or ("hysteria" if ib_proto == "hysteria" else "raw")
+    ib_sec = ib_st.get("security") or "none"
+    client_ob = xray.client_default_outbound(store, client)
     path: list[dict[str, Any]] = [
-        {"col": "client", "id": email, "title": client.get("remark") or email},
-        {"col": "inbound", "id": inbound_tag, "title": inbound_tag},
+        {
+            "col": "client",
+            "id": email,
+            "title": client.get("remark") or email,
+            "meta": email,
+            "badges": [
+                {"text": xray.outbound_label(store, client_ob), "kind": ""},
+            ],
+        },
+        {
+            "col": "inbound",
+            "id": inbound_tag,
+            "title": ib.get("remark") or inbound_tag,
+            "meta": f"{ib_proto} · {ib_net}/{ib_sec} · :{ib.get('port')}",
+            "badges": [{"text": inbound_tag, "kind": "mono"}],
+        },
     ]
 
     matched_filters: list[dict] = []
@@ -379,29 +387,64 @@ def check_destination(
 
     if not target:
         # subscription identity catch-alls are per email~tag — main email uses client outbound
-        ob = xray.client_default_outbound(store, client)
-        if ob == xray.NONE_TAG:
+        if client_ob == xray.NONE_TAG:
             target = "block"
             detail = "outbound клиента = none"
         else:
-            target = xray.normalize_outbound_tag(ob)
+            target = xray.normalize_outbound_tag(client_ob)
             detail = "outbound по умолчанию клиента"
 
     for f in matched_filters:
-        path.append({"col": "filter", "id": f["name"], "title": f["name"], "meta": f["why"]})
-    if matched_rule and not matched_rule.get("filter_kind"):
+        fk = f.get("filter_kind") or "block"
         path.append({
-            "col": "rule", "id": matched_rule["name"], "title": matched_rule["name"],
+            "col": "filter",
+            "id": f["name"],
+            "title": f["name"],
+            "meta": f["why"],
+            "badges": [{"text": fk, "kind": "warn" if fk != "block" else "err"}],
+        })
+    if matched_rule and matched_rule.get("filter_kind") and target == "block":
+        # block filter already in path; still show exit below
+        pass
+    elif matched_rule and not matched_rule.get("filter_kind"):
+        path.append({
+            "col": "rule",
+            "id": matched_rule["name"],
+            "title": matched_rule["name"],
             "meta": matched_rule["why"],
+            "badges": [{"text": "→ " + xray.outbound_label(store, matched_rule["outbound"]), "kind": ""}],
         })
     elif not matched_rule:
-        path.append({"col": "rule", "id": "default", "title": "По умолчанию", "meta": detail})
+        path.append({
+            "col": "rule",
+            "id": "default",
+            "title": "По умолчанию",
+            "meta": detail,
+            "badges": [{"text": "client outbound", "kind": ""}],
+        })
 
     exit_info = _exit_meta(store, target)
-    path.append({"col": "route", "id": exit_info["kind"], "title": {
+    route_title = {
         "direct": "Напрямую", "block": "Блок", "pool": "Пул выходов",
-    }.get(exit_info["kind"], "Выход")})
-    path.append({"col": "exit", "id": exit_info["tag"], "title": exit_info["label"], "meta": exit_info.get("status") or ""})
+    }.get(exit_info["kind"], "Выход")
+    path.append({
+        "col": "exit",
+        "id": exit_info["tag"],
+        "title": exit_info["label"] if exit_info["kind"] != "direct" else route_title,
+        "meta": {
+            "direct": "С адреса сервера",
+            "block": "blackhole — трафик отбрасывается",
+            "pool": "Пул: " + (", ".join((exit_info.get("members") or [])[:6]) or "—"),
+        }.get(exit_info["kind"], exit_info.get("status") or exit_info["tag"]),
+        "badges": [
+            {"text": exit_info["tag"], "kind": "mono"},
+            *(
+                [{"text": "up", "kind": "ok"}]
+                if exit_info.get("status") in ("", "connected", "ok", None) and exit_info["kind"] != "block"
+                else ([{"text": "block", "kind": "err"}] if exit_info["kind"] == "block" else [])
+            ),
+        ],
+    })
 
     summary = ""
     if exit_info["kind"] == "block":

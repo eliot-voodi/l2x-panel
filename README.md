@@ -2,10 +2,10 @@
 
 # L2X Panel
 
-**Веб-панель для Xray-core с выходом в интернет через несколько L2TP/IPsec-туннелей**
+**Веб-панель для Xray-core с мульти-нодами и гибкими outbounds**
 
 Клиенты подключаются к серверу по VLESS / VMess / Trojan / Shadowsocks / Hysteria2,<br>
-а трафик уходит в интернет через выбранный L2TP-туннель, WireGuard, WARP или напрямую.
+а трафик уходит в интернет через выбранный outbound (WireGuard, WARP, NordVPN, PIA, node) или напрямую.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Version](https://img.shields.io/badge/version-1.6.4-cyan)
@@ -26,7 +26,7 @@
 
 ## Зачем это
 
-Обычные панели выпускают трафик клиентов с IP самого сервера. L2X Panel решает другую задачу: **один сервер — много выходных IP**. Панель поднимает несколько L2TP/IPsec-подключений к внешним VPN-провайдерам, и каждый клиент или каждая страна получает свой выход в интернет. Если туннель падает, балансировщики переводят трафик на живые.
+Обычные панели выпускают трафик клиентов с IP самого сервера. L2X Panel решает другую задачу: **один сервер — много выходных IP**. Панель поднимает custom outbounds (WARP, WireGuard, NordVPN, PIA, VLESS…) и ноды, и каждый клиент или каждая страна получает свой выход в интернет. Если outbound падает, балансировщики переводят трафик на живые.
 
 ```
  Клиент (Happ, v2RayTun, Hiddify, Clash, sing-box)
@@ -34,10 +34,8 @@
         ▼
  ┌────────────── Сервер с L2X Panel ──────────────┐
  │  Xray-core: inbounds → routing → outbounds     │
- │      ├── l2tp_germany ─► ppp l2x-germany ──────┼──► 🇩🇪 VPN-провайдер
- │      ├── l2tp_usa     ─► ppp l2x-usa ──────────┼──► 🇺🇸 VPN-провайдер
- │      ├── lb_least_ping (балансировщик) ────────┼──► лучший из туннелей
- │      ├── warp / wireguard / vless …  ──────────┼──► внешние прокси
+ │      ├── lb_least_ping (балансировщик) ────────┼──► лучший из пула
+ │      ├── warp / wireguard / vless / node … ────┼──► внешние прокси / ноды
  │      └── direct ───────────────────────────────┼──► IP сервера
  └────────────────────────────────────────────────┘
 ```
@@ -49,12 +47,6 @@
 - **Транспорты**: RAW, WebSocket, gRPC, HTTPUpgrade, XHTTP, mKCP; TLS и Reality с генерацией ключей.
 - Управление версией Xray-core (установка любого релиза из GitHub), обновление geoip/geosite, редактор DNS, policy, логов.
 - Автопроверка новых релизов Xray-core (по умолчанию раз в 12 ч): баннер в панели и уведомление в Telegram. Обновление ставится только после подтверждения; если текущий конфиг не проходит `xray -test` или ядро не стартует, возвращается прежняя версия.
-
-### Мульти-L2TP
-- Неограниченное число L2TP/IPsec-туннелей (strongSwan + xl2tpd), у каждого свой PPP-интерфейс и таблица маршрутизации.
-- Watchdog: проверка живости туннелей; упавший туннель отключается и выводится из маршрутизации, балансировщики переключаются на живые, приходит уведомление в Telegram.
-- Флаги стран, привязка туннеля к клиенту, inbound или правилу маршрутизации.
-- Автовыбор лучших N туннелей по ping и скорости (по расписанию или вручную).
 
 ### Outbounds
 - Форма и JSON-редактор для VLESS, VMess, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard, freedom, blackhole, DNS.
@@ -90,7 +82,6 @@
 ### Требования
 - VPS с **Debian 12+** или **Ubuntu 22.04+**, x86_64 или arm64, root-доступ.
 - 1 vCPU / 512 МБ RAM достаточно для десятков клиентов.
-- Для L2TP: ядро с модулями `ppp_generic`, `l2tp_ppp` и xfrm (на KVM работает; на OpenVZ/LXC обычно нет).
 
 ### Установка одной командой
 
@@ -117,7 +108,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/ins
   Выбор [3]:
 ```
 
-После подтверждения он поставит Xray-core, strongSwan, xl2tpd, nginx и Python-окружение, создаст systemd-сервисы, при выборе HTTPS выпустит сертификат и включит HTTPS-сервер подписок, а в конце покажет данные для входа:
+После подтверждения он поставит Xray-core, nginx, wireguard-tools и Python-окружение, создаст systemd-сервисы, при выборе HTTPS выпустит сертификат и включит HTTPS-сервер подписок, а в конце покажет данные для входа:
 
 ```
   ════════════════════ L2X Panel установлена ════════════════════
@@ -191,13 +182,13 @@ docker compose up -d --build
 docker compose logs -f   # пароль администратора печатается при первом старте
 ```
 
-Панель будет доступна на `http://<IP>:2053/`. Пароль генерируется при первом запуске и пишется в лог и в `./data/initial_credentials.txt`. Контейнеру нужны `network_mode: host` и `privileged: true` (PPP-устройства, IPsec, порты Xray). Для продакшена рекомендуется установка на хост: так проще работают автопродление сертификатов и L2TP.
+Панель будет доступна на `http://<IP>:2053/`. Пароль генерируется при первом запуске и пишется в лог и в `./data/initial_credentials.txt`. Контейнеру нужны `network_mode: host` и `privileged: true` (порты Xray, WireGuard). Для продакшена рекомендуется установка на хост: так проще работают автопродление сертификатов.
 
 ## Первые шаги
 
 1. **Inbounds → Добавить**: VLESS Reality создаётся в пару кликов, ключи генерируются автоматически. Клиенты подключаются на `:443` через nginx (см. «Публичный вход :443»).
-2. **L2TP → Добавить**: сервер, логин, пароль и PSK вашего VPN-провайдера, затем Connect. Появится outbound `l2tp_<name>`.
-3. **Клиенты → Добавить**: выберите outbound (туннель, балансировщик или `direct`), лимиты и срок.
+2. **Outbounds → Добавить**: WARP, WireGuard, NordVPN, PIA или свой прокси; при необходимости включите балансировщик.
+3. **Клиенты → Добавить**: выберите outbound (custom, балансировщик или `direct`), лимиты и срок.
 4. Отдайте клиенту ссылку подписки или QR-код со страницы клиента.
 
 ## Подписки и HTTPS
@@ -269,10 +260,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 | L2X Panel (FastAPI + uvicorn) | `/opt/l2xpanel`, `127.0.0.1:8090` | Веб-интерфейс, API, подписки, генерация конфига Xray, watchdog |
 | nginx | `:80`, `:443` | Reverse proxy к панели, webroot Let's Encrypt, публичный вход для inbounds (stream SNI + HTTPS path) |
 | Xray-core | `/usr/local/bin/xray` | Inbounds, маршрутизация, outbounds, статистика (gRPC API `127.0.0.1:10085`) |
-| strongSwan + xl2tpd | systemd | IPsec и L2TP; у каждого туннеля свой PPP-интерфейс `l2x-<name>` |
 | acme.sh | `/root/.acme.sh` | Выпуск и продление сертификатов Let's Encrypt |
-
-Outbound `l2tp_<name>` в Xray привязан к интерфейсу туннеля через `sockopt.interface`, поэтому трафик клиента уходит именно в этот туннель, не затрагивая маршрут по умолчанию сервера.
 
 ### Файлы и каталоги
 
@@ -283,7 +271,6 @@ Outbound `l2tp_<name>` в Xray привязан к интерфейсу тунн
 | `/etc/l2xpanel/certs` | Выпущенные сертификаты |
 | `/var/lib/l2xpanel/store.json` | База: клиенты, inbounds, outbounds, маршруты, настройки |
 | `/var/lib/l2xpanel/admin.json` | Учётная запись администратора (bcrypt) |
-| `/var/lib/l2xpanel/l2tp*`, `ipsec/` | Профили туннелей и зашифрованные секреты |
 | `/etc/xray/config.json` | Конфиг Xray (генерируется панелью, не редактируйте вручную) |
 
 ### Порты
@@ -304,7 +291,6 @@ l2x-panel/
 │   ├── app.py            # FastAPI: страницы, REST API, подписки
 │   ├── xray_runtime.py   # модель данных, генерация конфига Xray, статистика
 │   ├── protocols.py      # протоколы, транспорты, ссылки и форматы подписок
-│   ├── l2tp_runtime.py   # L2TP/IPsec-туннели (strongSwan + xl2tpd)
 │   ├── ops.py            # Xray, geo, сертификаты, бэкапы, WARP/NordVPN
 │   ├── hwid.py           # HWID-лимиты устройств
 │   ├── nodes.py          # мульти-ноды
@@ -313,7 +299,7 @@ l2x-panel/
 │   ├── sysmon.py         # метрики сервера и outbounds
 │   ├── totp.py           # 2FA
 │   └── ui/               # Jinja2-шаблоны интерфейса
-├── deploy/               # systemd-юниты, nginx.conf, sysctl, конфиги strongSwan/xl2tpd
+├── deploy/               # systemd-юниты, nginx.conf, sysctl
 ├── docker/               # entrypoint и supervisord для контейнера
 ├── scripts/l2x.sh        # CLI-меню
 ├── docs/API.md           # документация API

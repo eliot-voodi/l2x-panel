@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}Outbounds · {{ app_name }}{% endblock %}
 {% block page_title %}Outbounds{% endblock %}
-{% block page_sub %}Выходы трафика: direct, L2TP-туннели, свои прокси, WARP, NordVPN, PIA{% endblock %}
+{% block page_sub %}Выходы трафика: direct, свои прокси, WARP, NordVPN, PIA, node{% endblock %}
 {% block top_actions %}<button class="btn" type="button" onclick="obOpen()">{{ ic.icon('plus') }}{{ t('Добавить') }}</button>{% endblock %}
 {% block head %}
 <style>
@@ -64,7 +64,7 @@
     {% for o in items %}
       <tr>
         <td><b>{{ o.label }}</b><div class="dim small mono">{{ o.tag }}</div></td>
-        <td><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.sub_live %} <span class="badge ok" title="доступен в подписках">в подписке</span>{% elif o.custom and o.in_sub %}<span class="badge" title="вкл. в подписку, но disconnected — скрыт">скрыт</span>{% endif %}</td>
+        <td><span class="badge">{{ o.kind }}</span>{% if o.custom and o.sub_live %} <span class="badge ok" title="доступен в подписках">в подписке</span>{% elif o.custom and o.in_sub %}<span class="badge" title="вкл. в подписку, но disconnected — скрыт">скрыт</span>{% endif %}</td>
         <td>{{ m.status_badge(o.status if o.status else 'active') }}</td>
         <td class="small mono">{{ o.info or '' }}{% if o.via %}<div class="dim">via {{ o.via }}</div>{% endif %}</td>
         <td class="small nowrap">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</td>
@@ -106,7 +106,7 @@
         </button>
         <div class="ob-detail" hidden>
           <div class="kv">
-            <div><span class="lbl">Тип</span><span class="val"><span class="badge {% if o.kind == 'l2tp' %}accent{% endif %}">{{ o.kind }}</span>{% if o.custom and o.sub_live %} · в подписке{% elif o.custom and o.in_sub %} · скрыт (нет пинга){% endif %}</span></div>
+            <div><span class="lbl">Тип</span><span class="val"><span class="badge">{{ o.kind }}</span>{% if o.custom and o.sub_live %} · в подписке{% elif o.custom and o.in_sub %} · скрыт (нет пинга){% endif %}</span></div>
             {% if o.info %}<div><span class="lbl">Инфо</span><span class="val mono">{{ o.info }}</span></div>{% endif %}
             {% if o.via %}<div><span class="lbl">Via</span><span class="val mono">{{ o.via }}</span></div>{% endif %}
             <div><span class="lbl">Трафик</span><span class="val">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</span></div>
@@ -171,7 +171,7 @@
           {% for tg in dialer_tags %}<option value="{{ tg }}">{{ tg }}</option>{% endfor %}
         </select>
         <div class="hint mt">Соединение с сервером этого outbound пойдёт через выбранный выход (Xray <code>sockopt.dialerProxy</code>).
-          Так новый прокси / WARP / Nord / PIA может ходить через уже созданный outbound (L2TP, VLESS, node…).</div>
+          Так новый прокси / WARP / Nord / PIA может ходить через уже созданный outbound (VLESS, node…).</div>
       </div>
     </div>
 

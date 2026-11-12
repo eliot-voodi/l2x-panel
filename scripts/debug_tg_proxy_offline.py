@@ -111,7 +111,6 @@ def test_xray_injects_socks():
         },
         "inbounds": [],
         "clients": [],
-        "l2tp": [],
         "outbounds_custom": [
             {"tag": "warp1", "enabled": True, "protocol": "wireguard", "remark": "WARP",
              "settings": {}, "stream": {}},

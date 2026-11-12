@@ -31,7 +31,6 @@ def fail(name: str, msg: object) -> None:
 def _store() -> dict:
     store = {
         "settings": {"sub": {}},
-        "l2tp": [{"name": "de", "status": "connected"}, {"name": "nl", "status": "connected"}],
         "outbounds_custom": [{"tag": "vless-fi", "enabled": True, "in_sub": True}],
         "inbounds": [],
         "clients": [],

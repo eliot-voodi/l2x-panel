@@ -30,7 +30,6 @@ def _empty_store() -> dict:
         "settings": {"panel": {"public_host": "panel.example.com"}, "nodes": {"role": "master"}},
         "inbounds": [],
         "clients": [],
-        "l2tp": [],
         "outbounds_custom": [],
         "routes": [],
     }

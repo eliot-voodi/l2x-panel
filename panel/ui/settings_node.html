@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}Settings Node · {{ app_name }}{% endblock %}
 {% block page_title %}Settings Node{% endblock %}
-{% block page_sub %}Удалённое управление другой нодой: L2TP, Xray, настройки, логи, обновление{% endblock %}
+{% block page_sub %}Удалённое управление другой нодой: Xray, настройки, логи, обновление{% endblock %}
 {% block content %}
 
 {% if not is_master %}
@@ -61,7 +61,6 @@
     <div><span class="dim small">Версия</span><div class="mono">{{ snap.version or '?' }}</div></div>
     <div><span class="dim small">Xray</span><div>{% if (snap.xray or {}).active %}<span class="badge ok">up {{ (snap.xray or {}).version }}</span>{% else %}<span class="badge err">down{% if (snap.xray or {}).state %} · {{ (snap.xray or {}).state }}{% endif %}</span>{% endif %}</div></div>
     <div><span class="dim small">Клиенты</span><div class="mono">{{ (snap.counts or {}).clients or 0 }}</div></div>
-    <div><span class="dim small">L2TP</span><div class="mono">{{ (snap.counts or {}).l2tp_up or 0 }}/{{ (snap.counts or {}).l2tp or 0 }}</div></div>
     <div><span class="dim small">Outbounds</span><div class="mono">{{ (snap.counts or {}).custom or 0 }}</div></div>
   </div>
   {% if snap.sys %}
@@ -77,7 +76,7 @@
 
 {% if ok or node.nat %}
 <div class="tabs">
-  {% for k, l in [('overview','Обзор'), ('l2tp','L2TP'), ('settings','Настройки'), ('system','Система'), ('logs','Логи')] %}
+  {% for k, l in [('overview','Обзор'), ('settings','Настройки'), ('system','Система'), ('logs','Логи')] %}
   <a href="{{ bp }}/settings-node?id={{ node.id }}&tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
   {% endfor %}
 </div>
@@ -95,8 +94,6 @@
           onsubmit="return confirm('Обновить Xray на ноде до latest?')"><input type="hidden" name="action" value="update_xray"><button class="btn">Обновить Xray</button></form>
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="restart_xray"><button class="btn ghost">Restart Xray</button></form>
     <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="apply_xray"><button class="btn ghost">Apply config</button></form>
-    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action"><input type="hidden" name="action" value="refresh_l2tp"><button class="btn ghost">Refresh L2TP status</button></form>
-    <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" onsubmit="return confirm('Запустить select-best L2TP на ноде?')"><input type="hidden" name="action" value="select_best_l2tp"><button class="btn ghost">Select best L2TP</button></form>
     <form method="post" action="{{ bp }}/nodes/{{ node.id }}/sync"><button class="btn ghost">Sync с мастера</button></form>
   </div>
   <div class="hint mt">Sync пушит конфиг с этого master. Остальные кнопки выполняются на удалённой ноде.</div>
@@ -104,41 +101,6 @@
 <div class="card">
   <h3>Сводка</h3>
   <div class="mono small" style="white-space:pre-wrap">{{ snap.summary or '' }}</div>
-</div>
-
-{% elif tab == 'l2tp' and ok %}
-<div class="card" style="padding:0">
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th>Туннель</th><th>Сервер</th><th>Статус</th><th>IP</th><th class="right">Действия</th></tr></thead>
-    <tbody>
-    {% for t in snap.l2tp or [] %}
-      <tr>
-        <td><b>{{ t.name }}</b></td>
-        <td class="small mono">{{ t.server_host }}</td>
-        <td>{% if t.status == 'connected' %}<span class="badge ok">connected</span>{% elif t.status == 'error' %}<span class="badge err">error</span>{% else %}<span class="badge">{{ t.status or '—' }}</span>{% endif %}
-          {% if t.last_error %}<div class="dim small">{{ t.last_error[:80] }}</div>{% endif %}
-        </td>
-        <td class="small mono">{{ t.public_ip or '—' }}</td>
-        <td>
-          <div class="actions" style="justify-content:flex-end">
-            <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action">
-              <input type="hidden" name="action" value="l2tp_connect"><input type="hidden" name="name" value="{{ t.name }}">
-              <button class="btn ghost sm">Connect</button>
-            </form>
-            <form method="post" action="{{ bp }}/settings-node/{{ node.id }}/action">
-              <input type="hidden" name="action" value="l2tp_disconnect"><input type="hidden" name="name" value="{{ t.name }}">
-              <button class="btn ghost sm">Disconnect</button>
-            </form>
-          </div>
-        </td>
-      </tr>
-    {% else %}
-      <tr><td colspan="5" class="empty">На ноде нет L2TP туннелей</td></tr>
-    {% endfor %}
-    </tbody>
-  </table>
-  </div>
 </div>
 
 {% elif tab == 'settings' and ok %}
@@ -271,7 +233,7 @@
     <div>
       <label class="f">Источник</label>
       <select name="src">
-        {% for s in ['xray','panel','l2tp','access'] %}
+        {% for s in ['xray','panel','access'] %}
         <option value="{{ s }}" {% if log_src==s %}selected{% endif %}>{{ s }}</option>
         {% endfor %}
       </select>

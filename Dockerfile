@@ -14,8 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv ca-certificates curl unzip openssl socat procps cron \
-      iproute2 iptables iputils-ping kmod ppp xl2tpd strongswan strongswan-starter \
-      libstrongswan-standard-plugins wireguard-tools supervisor nginx libnginx-mod-stream \
+      iproute2 iptables iputils-ping kmod wireguard-tools supervisor nginx libnginx-mod-stream \
     && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
 
 RUN set -eux; \
@@ -38,8 +37,6 @@ RUN python3 -m venv .venv && .venv/bin/pip install --no-cache-dir -r requirement
 
 COPY panel/ ./
 COPY scripts/l2x.sh /usr/local/bin/l2x
-COPY deploy/ipsec.conf /etc/ipsec.conf
-COPY deploy/xl2tpd.conf /etc/xl2tpd/xl2tpd.conf
 COPY docker/systemctl docker/journalctl /usr/local/bin/
 COPY docker/supervisord.conf /etc/supervisor/conf.d/l2x.conf
 COPY docker/entrypoint.sh /entrypoint.sh

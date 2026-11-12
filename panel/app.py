@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""L2X Panel — multi-tunnel L2TP + Xray (multi-inbound) control panel."""
+"""L2X Panel — Xray (multi-inbound) control panel."""
 from __future__ import annotations
 
 import base64
@@ -33,7 +33,6 @@ import admins
 import front
 import hwid
 import inbound_lint
-import l2tp_runtime as l2tp
 import migrate as migrate_mod
 import nodes as nodes_mod
 import ops
@@ -61,10 +60,6 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("L2XPANEL_DATA", "/var/lib/l2xpanel"))
 DATA.mkdir(parents=True, exist_ok=True)
-SECRETS_DIR = DATA / "l2tp_secrets"
-SECRETS_DIR.mkdir(parents=True, exist_ok=True)
-l2tp.ensure_runtime_dirs()
-
 APP_NAME_DEFAULT = os.environ.get("APP_NAME", "L2X Panel")
 ADMIN_USER_ENV = os.environ.get("PANEL_ADMIN_USER", "admin")
 ADMIN_PASSWORD_ENV = os.environ.get("PANEL_ADMIN_PASSWORD", "").strip()
@@ -160,10 +155,6 @@ def default_settings() -> dict:
         "panel_update": {"auto_check": True, "interval_hours": 12},
         "iplimit": {"ban_minutes": 30},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
-        "l2tp_auto": {
-            "enabled": False, "max_connected": 4, "interval_minutes": 60,
-            "candidate_extra": 3, "dl_bytes": 8_000_000, "ul_bytes": 2_000_000,
-        },
         "pia": {
             "username": "", "password_enc": "", "token_enc": "", "token_expires_at": "",
             "auto_refresh": True, "reconnect_hours": 24, "last_refresh_at": "",
@@ -198,6 +189,7 @@ def _ensure_settings(store: dict) -> dict:
                     cur.setdefault(kk, vv)
         else:
             s.setdefault(k, v)
+    s.pop("l2tp_auto", None)
     return s
 
 
@@ -208,10 +200,13 @@ def _load_store() -> dict:
             data = json.loads(STORE.read_text(encoding="utf-8"))
         except ValueError:
             data = {}
-    for key, default in (("l2tp", []), ("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
-                         ("ip_ban_stats", {}), ("xray_update_state", {}), ("l2tp_auto_state", {}),
+    for key, default in (("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
+                         ("ip_ban_stats", {}), ("xray_update_state", {}),
                          ("panel_update_state", {}), ("nodes", []), ("groups", [])):
         data.setdefault(key, default)
+    # Drop legacy L2TP keys (feature removed)
+    data.pop("l2tp", None)
+    data.pop("l2tp_auto_state", None)
     data.setdefault("reverse", {"bridges": [], "portals": []})
     xray.ensure_balancers(data)
     xray.ensure_inbounds(data)
@@ -287,13 +282,13 @@ def _apply_xray(
 ) -> dict:
     """nginx front and Xray are verified before either is loaded; nothing is applied if a check fails.
 
-    On agent nodes, Xray is built from a runtime view (no local L2TP) while the persisted
+    On agent nodes, Xray is built from a runtime view while the persisted
     store may still hold a full mirror of the master for fast failover.
 
     hold_front_commit: stage+test nginx but leave reload to the caller (BackgroundTasks on
     /agent/apply) so the sync HTTP response is not cut by reloading the proxying nginx.
     defer_front_reload: legacy Timer-based delay inside commit (prefer hold_front_commit).
-    xray_only: clients / outbounds / routing / L2TP / Xray DNS — skip nginx stage/reload,
+    xray_only: clients / outbounds / routing / Xray DNS — skip nginx stage/reload,
     cert jobs, and iptables (front unchanged). Still rebuilds+tests+restarts Xray.
     clients_only: alias of xray_only (kept for older call sites).
     """
@@ -668,7 +663,7 @@ templates = Jinja2Templates(directory=str(ROOT / "ui"))
 # ================================================================ i18n / template helpers
 
 I18N_EN = {
-    "Дашборд": "Dashboard", "Inbounds": "Inbounds", "Клиенты": "Clients", "L2TP": "L2TP",
+    "Дашборд": "Dashboard", "Inbounds": "Inbounds", "Клиенты": "Clients",
     "Outbounds": "Outbounds", "Балансировщики": "Balancers", "Маршрутизация": "Routing", "Xray": "Xray",
     "Логи": "Logs", "Настройки": "Settings", "Выход": "Logout", "Сохранить": "Save", "Удалить": "Delete",
     "Добавить": "Add", "Изменить": "Edit", "Отмена": "Cancel", "Применить": "Apply", "Поиск": "Search",
@@ -887,140 +882,8 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
-# ================================================================ L2TP helpers
-
-def _save_l2tp_secrets(name: str, password: str, psk: str) -> None:
-    path = SECRETS_DIR / f"{name}.json"
-    payload = {"password": _enc(password) if password else "", "psk": _enc(psk) if psk else ""}
-    if path.exists() and (not password or not psk):
-        old = json.loads(path.read_text(encoding="utf-8"))
-        if not password:
-            payload["password"] = old.get("password", "")
-        if not psk:
-            payload["psk"] = old.get("psk", "")
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    os.chmod(path, 0o600)
-
-
-def _load_l2tp_secrets(name: str) -> tuple[str, str]:
-    path = SECRETS_DIR / f"{name}.json"
-    if not path.exists():
-        return "", ""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return (_dec(data["password"]) if data.get("password") else "", _dec(data["psk"]) if data.get("psk") else "")
-
-
-def _delete_l2tp_secrets(name: str) -> None:
-    path = SECRETS_DIR / f"{name}.json"
-    if path.exists():
-        path.unlink()
-
-
-def _l2tp_bindings(store: dict, item: dict) -> dict:
-    outbound = item.get("outbound") or f"l2tp_{item['name']}"
-    clients = [c["email"] for c in store.get("clients", []) if c.get("outbound") == outbound]
-    routes = [r.get("name") or "?" for r in store.get("routes", []) if (r.get("outbound") or r.get("outbound_tag")) == outbound]
-    inbounds = [i["tag"] for i in store.get("inbounds") or [] if i.get("outbound") == outbound]
-    bals = [b.get("tag") or k for k, b in (store.get("balancers") or {}).items()
-            if outbound in (b.get("members") or []) or (not b.get("members") and b.get("enabled", True))]
-    return {"outbound": outbound, "clients": clients, "routes": routes, "inbounds": inbounds,
-            "balancers": bals, "blocked": bool(clients or routes or inbounds)}
-
-
 def _allowed_outbounds(store: dict) -> set[str]:
     return set(xray.all_outbound_tags(store))
-
-
-def _probe_tunnel_alive(item: dict) -> tuple[bool, str]:
-    name = item["name"]
-    iface = l2tp.ifname_for(name)
-    if not l2tp.is_connected(name):
-        return False, "iface down"
-    peer = item.get("peer_ip") or ""
-    if not peer:
-        local, peer = l2tp.parse_ppp_endpoints(iface)
-        if local:
-            item["local_ip"] = local
-        if peer:
-            item["peer_ip"] = peer
-    target = peer or "1.1.1.1"
-    stats = l2tp.ping_stats(target, iface=iface, count=5, timeout=2)
-    metrics = dict(item.get("metrics") or {})
-    if stats.get("ms") is not None:
-        metrics["ping_ms"] = stats["ms"]
-    if stats.get("loss_pct") is not None:
-        metrics["loss_pct"] = stats["loss_pct"]
-    metrics["probed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    item["metrics"] = metrics
-    if stats.get("ok"):
-        return True, "ok"
-    pub = l2tp.probe_public_ip(iface, timeout=5)
-    if pub:
-        item["public_ip"] = pub
-        # Tunnel still has egress; keep up but leave loss_pct=100 for sub filter if ping failed
-        if metrics.get("loss_pct") is None:
-            metrics["loss_pct"] = 100.0
-            item["metrics"] = metrics
-        return True, "ok"
-    return False, "ping/egress failed"
-
-
-def connect_l2tp(item: dict) -> dict:
-    password, psk = _load_l2tp_secrets(item["name"])
-    result = l2tp.connect_tunnel(item, password, psk)
-    if result.get("ok"):
-        item["ifname"] = result.get("ifname") or l2tp.ifname_for(item["name"])
-        for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-            item[key] = result.get(key) or ""
-    return result
-
-
-def disconnect_l2tp(item: dict, store: dict | None = None) -> dict:
-    return l2tp.disconnect_tunnel(item, store_l2tp=(store or {}).get("l2tp"))
-
-
-def refresh_statuses(store: dict) -> dict:
-    changed = False
-    for item in store.get("l2tp", []):
-        active = l2tp.is_connected(item["name"])
-        new_status = "connected" if active else ("error" if item.get("status") == "error" else "disconnected")
-        iface = l2tp.ifname_for(item["name"])
-        if item.get("ifname") != iface:
-            item["ifname"] = iface
-            changed = True
-        if active and item.get("status") != "connected":
-            item["status"] = "connected"
-            changed = True
-        elif not active and item.get("status") == "connected":
-            item["status"] = new_status
-            changed = True
-        if active:
-            addr = l2tp.iface_addrs(iface)
-            local, peer = l2tp.parse_ppp_endpoints(iface)
-            for key, val in (("addr", addr), ("local_ip", local), ("peer_ip", peer)):
-                if val and item.get(key) != val:
-                    item[key] = val
-                    changed = True
-            if item.get("last_error"):
-                item["last_error"] = ""
-                changed = True
-        else:
-            for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-                if item.get(key):
-                    item[key] = ""
-                    changed = True
-    if changed:
-        with STORE_LOCK:
-            fresh = _load_store()
-            by_name = {i["name"]: i for i in store.get("l2tp", [])}
-            for i in fresh["l2tp"]:
-                src = by_name.get(i["name"])
-                if src:
-                    for key in ("status", "ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf", "last_error"):
-                        if key in src:
-                            i[key] = src[key]
-            _save_store(fresh)
-    return store
 
 
 # ================================================================ background workers
@@ -1049,14 +912,12 @@ def _tg_report() -> str:
     mem = snap["mem"]
     total_up = sum(int(c["traffic"].get("up") or 0) for c in store["clients"])
     total_down = sum(int(c["traffic"].get("down") or 0) for c in store["clients"])
-    connected = sum(1 for x in store["l2tp"] if x.get("status") == "connected")
     return (
         f"<b>{app_title()}</b>\n"
         f"CPU {snap['cpu']}% · RAM {xray.format_traffic(mem['used'])}/{xray.format_traffic(mem['total'])}\n"
         f"Uptime {fmt_uptime(snap['uptime'])} · Load {snap['load'][0]}\n"
         f"Xray {xs['version']} {'🟢' if xs['active'] else '🔴'}\n"
         f"Клиенты: {len(store['clients'])} (онлайн {len(ONLINE)})\n"
-        f"L2TP: {connected}/{len(store['l2tp'])} connected\n"
         f"Трафик клиентов: ↑{xray.format_traffic(total_up)} ↓{xray.format_traffic(total_down)}"
     )
 
@@ -1196,12 +1057,6 @@ def _tg_clients() -> str:
                      f"{xray.format_traffic(xray.client_used_bytes(c))}" for c in store["clients"]) or "Нет клиентов"
 
 
-def _tg_tunnels() -> str:
-    store = _load_store()
-    return "\n".join(f"{'🟢' if x.get('status') == 'connected' else '🔴'} {xray.flag_emoji(xray.country_code(x))} "
-                     f"{x['name']} {x.get('public_ip') or ''}" for x in store["l2tp"]) or "Нет туннелей"
-
-
 def _tg_backup() -> tuple[str, bytes]:
     return f"l2xpanel-{datetime.now().strftime('%Y%m%d-%H%M')}.zip", ops.make_backup(DATA)
 
@@ -1250,7 +1105,7 @@ def _bot_should_poll() -> bool:
 
 BOT = tgbot.Bot(_bot_settings, {
     "report": _tg_report, "usage": _tg_usage, "online": _tg_online, "clients": _tg_clients,
-    "tunnels": _tg_tunnels, "backup": _tg_backup,
+    "backup": _tg_backup,
     "backup_send": lambda: _send_backup_to_telegram(
         caption="Автоматический бэкап L2X Panel", scheduled=True,
     ),
@@ -1387,8 +1242,6 @@ def _notify_events(events: list[dict]) -> None:
                         BOT.send(user_text + "\n\n" + _client_summary(c), c["tg_id"])
         elif typ == "ip_ban" and s.get("notify_iplimit"):
             BOT.send(f"🚫 {e['email']}: превышен лимит IP, заблокирован {e['ip']}")
-        elif typ == "tunnel_down" and s.get("notify_tunnel"):
-            BOT.send(f"🔴 L2TP {e['name']}: {e.get('reason')}")
 
 
 def _expiry_warnings(store: dict) -> None:
@@ -1457,64 +1310,13 @@ def _expiry_warnings(store: dict) -> None:
         BOT.send(text, chat)
 
 
-def _tunnel_sub_health_key(item: dict, max_loss: float) -> tuple:
-    """Stable key for subscription/balancer eligibility of an L2TP tunnel."""
-    status = item.get("status") or ""
-    loss = (item.get("metrics") or {}).get("loss_pct")
-    try:
-        loss_f = float(loss) if loss is not None else None
-    except (TypeError, ValueError):
-        loss_f = None
-    unhealthy = status != "connected" or (loss_f is not None and loss_f > max_loss)
-    return (item.get("name"), status, unhealthy, loss_f)
-
-
 def _watchdog_cycle() -> None:
     global ONLINE
-    # 1) L2TP health (slow; no lock)
-    snapshot = _load_store()
-    sub_cfg = xray.sub_health_settings(snapshot)
-    max_loss = float(sub_cfg["max_loss_pct"])
-    bad: dict[str, str] = {}
-    probed_metrics: dict[str, dict] = {}
-    for item in snapshot.get("l2tp") or []:
-        if item.get("status") == "connected":
-            ok, reason = _probe_tunnel_alive(item)
-            if item.get("metrics"):
-                probed_metrics[item["name"]] = dict(item["metrics"])
-            if not ok:
-                bad[item["name"]] = reason
     need_apply = False
     with STORE_LOCK:
         store = _load_store()
         events: list[dict] = []
-        health_before = {_tunnel_sub_health_key(t, max_loss) for t in store.get("l2tp") or []}
-        for item in store["l2tp"]:
-            m = probed_metrics.get(item["name"])
-            if m:
-                item["metrics"] = m
-            if item["name"] in bad:
-                item["status"] = "error"
-                item["last_error"] = f"watchdog: {bad[item['name']]}"
-                for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-                    item[key] = ""
-                try:
-                    disconnect_l2tp(item, store)
-                except Exception:
-                    pass
-                events.append({"type": "tunnel_down", "name": item["name"], "reason": bad[item["name"]]})
-                need_apply = True
-        before = [(t["name"], t.get("status")) for t in store["l2tp"]]
-        for item in store["l2tp"]:
-            if item.get("status") == "connected" and not l2tp.is_connected(item["name"]):
-                item["status"] = "disconnected"
-        if before != [(t["name"], t.get("status")) for t in store["l2tp"]]:
-            need_apply = True
-        health_after = {_tunnel_sub_health_key(t, max_loss) for t in store.get("l2tp") or []}
-        if health_before != health_after:
-            # Loss crossed threshold or status flipped — rebuild balancers / sub view
-            need_apply = True
-        # 2) traffic + quotas
+        # traffic + quotas
         try:
             xray.harvest_traffic(store)
             OB_STATS.update(_ob_totals(store))
@@ -1862,171 +1664,6 @@ def _panel_update_loop() -> None:
             return
 
 
-# ================================================================ L2TP auto-select (best N by ping + speed)
-
-L2TP_AUTO_JOB: dict[str, str] = {}
-
-
-def _persist_l2tp_item(name: str, item: dict, *, connected: bool, error: str = "") -> None:
-    with mutate() as store:
-        it = next((x for x in store["l2tp"] if x["name"] == name), None)
-        if not it:
-            return
-        if connected:
-            for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-                it[k] = item.get(k, "")
-            it["status"], it["last_error"] = "connected", ""
-            if item.get("metrics"):
-                it["metrics"] = item["metrics"]
-        else:
-            it["status"] = "disconnected"
-            for k in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-                it[k] = ""
-            it["last_error"] = error
-            if item.get("metrics"):
-                it["metrics"] = item["metrics"]
-
-
-def select_best_l2tp(*, force: bool = False) -> dict:
-    """Connect at most N best L2TP tunnels ranked by egress ping + download/upload speed.
-
-    1) ICMP ping to each LNS (no tunnel needed) → shortlist
-    2) Connect shortlist, measure through each PPP iface
-    3) Keep top max_connected, disconnect the rest of the shortlist
-    """
-    cfg = (_settings().get("l2tp_auto") or {})
-    max_n = max(1, min(32, _int(cfg.get("max_connected"), 4)))
-    extra = max(0, min(20, _int(cfg.get("candidate_extra"), 3)))
-    dl_bytes = max(1_000_000, _int(cfg.get("dl_bytes"), 8_000_000))
-    ul_bytes = max(100_000, _int(cfg.get("ul_bytes"), 2_000_000))
-    store = _load_store()
-    tunnels = list(store.get("l2tp") or [])
-    if not tunnels:
-        return {"ok": False, "error": "нет L2TP туннелей", "log": ""}
-    log: list[str] = [f"select best of {len(tunnels)}, keep ≤{max_n}"]
-
-    # --- phase 1: LNS ping ---
-    ranked: list[tuple[float, dict]] = []
-    for t in tunnels:
-        ms = l2tp.ping_host_ms(t.get("server_host") or "", timeout=3)
-        metrics = dict(t.get("metrics") or {})
-        metrics["lns_ping_ms"] = ms
-        metrics["probed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        t["metrics"] = metrics
-        with mutate() as s:
-            it = next((x for x in s["l2tp"] if x["name"] == t["name"]), None)
-            if it:
-                it["metrics"] = metrics
-        key = ms if ms is not None else 99999.0
-        ranked.append((key, t))
-        log.append(f"  LNS {t['name']}: {ms if ms is not None else 'fail'} ms")
-    ranked.sort(key=lambda x: x[0])
-    shortlist_n = min(len(ranked), max_n + extra)
-    shortlist = [t for _, t in ranked[:shortlist_n]]
-    short_names = {t["name"] for t in shortlist}
-    log.append(f"shortlist ({shortlist_n}): " + ", ".join(t["name"] for t in shortlist))
-
-    # Disconnect tunnels that will never be candidates this round (except keep already-good ones outside? no — enforce max)
-    # First bring shortlist up, measure, then disconnect losers including previously connected outsiders.
-
-    # --- phase 2: connect shortlist ---
-    connected_ok: list[dict] = []
-    for t in shortlist:
-        fresh = next((x for x in _load_store()["l2tp"] if x["name"] == t["name"]), t)
-        if fresh.get("status") == "connected" and l2tp.is_connected(fresh["name"]):
-            t.update({k: fresh.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf", "status")})
-            connected_ok.append(t)
-            log.append(f"  already up {t['name']}")
-            continue
-        result = connect_l2tp(fresh)
-        if result.get("ok"):
-            t.update({k: fresh.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf")})
-            t["status"] = "connected"
-            _persist_l2tp_item(t["name"], t, connected=True)
-            connected_ok.append(t)
-            log.append(f"  connected {t['name']} egress {t.get('public_ip') or '?'}")
-        else:
-            err = result.get("error") or "connect failed"
-            t["metrics"] = {**(t.get("metrics") or {}), "error": err}
-            _persist_l2tp_item(t["name"], t, connected=False, error=err)
-            log.append(f"  FAIL {t['name']}: {err}")
-
-    # --- phase 3: measure egress ---
-    scored: list[tuple[float, dict]] = []
-    for t in connected_ok:
-        iface = t.get("ifname") or l2tp.ifname_for(t["name"])
-        m = l2tp.measure_iface(iface, dl_bytes=dl_bytes, ul_bytes=ul_bytes)
-        metrics = {**(t.get("metrics") or {}), **{k: m.get(k) for k in ("ping_ms", "dl_mbps", "ul_mbps", "ok", "error")}}
-        metrics["score"] = l2tp.score_tunnel(metrics)
-        metrics["probed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        t["metrics"] = metrics
-        with mutate() as s:
-            it = next((x for x in s["l2tp"] if x["name"] == t["name"]), None)
-            if it:
-                it["metrics"] = metrics
-        scored.append((float(metrics["score"]), t))
-        log.append(
-            f"  measure {t['name']}: ping={metrics.get('ping_ms')}ms "
-            f"↓{metrics.get('dl_mbps')} ↑{metrics.get('ul_mbps')} Mbps score={metrics['score']}"
-        )
-    scored.sort(key=lambda x: -x[0])
-    winners = [t for _, t in scored[:max_n]]
-    winner_names = {t["name"] for t in winners}
-    log.append("winners: " + (", ".join(t["name"] for t in winners) or "—"))
-
-    # --- phase 4: disconnect everyone not in winners ---
-    store = _load_store()
-    for t in store.get("l2tp") or []:
-        if t["name"] in winner_names:
-            continue
-        if t.get("status") == "connected" or l2tp.is_connected(t["name"]):
-            disconnect_l2tp(t, store)
-            _persist_l2tp_item(t["name"], t, connected=False)
-            log.append(f"  disconnect {t['name']}")
-
-    xr = _apply_xray(_load_store(), xray_only=True)
-    log.append(f"xray ok={xr.get('ok')} {xr.get('error') or xr.get('warning') or ''}".strip())
-    summary = {
-        "ok": bool(winners),
-        "max_connected": max_n,
-        "winners": [
-            {"name": t["name"], "score": (t.get("metrics") or {}).get("score"),
-             "ping_ms": (t.get("metrics") or {}).get("ping_ms"),
-             "dl_mbps": (t.get("metrics") or {}).get("dl_mbps"),
-             "ul_mbps": (t.get("metrics") or {}).get("ul_mbps"),
-             "public_ip": t.get("public_ip")}
-            for t in winners
-        ],
-        "ran_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "log": "\n".join(log),
-        "xray_ok": bool(xr.get("ok")),
-    }
-    with mutate() as s:
-        s["l2tp_auto_state"] = {
-            "ran_at": summary["ran_at"], "max_connected": max_n,
-            "winners": summary["winners"], "log": summary["log"][-6000:],
-            "ok": summary["ok"], "error": "" if summary["ok"] else "не удалось выбрать туннели",
-        }
-    return summary
-
-
-def _l2tp_auto_loop() -> None:
-    if _stop.wait(120):
-        return
-    while True:
-        cfg = (_settings().get("l2tp_auto") or {})
-        minutes = max(15, _int(cfg.get("interval_minutes"), 60))
-        if cfg.get("enabled"):
-            running = L2TP_AUTO_JOB.get("id")
-            if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
-                try:
-                    L2TP_AUTO_JOB["id"] = ops.start_job("l2tp-auto-select", select_best_l2tp)
-                except Exception:
-                    pass
-        if _stop.wait(minutes * 60):
-            return
-
-
 def _history_loop() -> None:
     sysmon.cpu_percent()
     try:
@@ -2158,7 +1795,7 @@ def _startup():
     except Exception:
         pass
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
-                   _geo_update_loop, _l2tp_auto_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
+                   _geo_update_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
                    _agent_pull_loop, _tg_backup_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
@@ -2585,8 +2222,7 @@ def dashboard(request: Request):
         "expired": sum(1 for c in clients if xray.client_status(c) == "expired"),
         "limited": sum(1 for c in clients if xray.client_status(c) == "limited"),
         "inbounds": len(store["inbounds"]),
-        "l2tp": len(store["l2tp"]),
-        "l2tp_up": sum(1 for x in store["l2tp"] if x.get("status") == "connected"),
+        "customs": len(store.get("outbounds_custom") or []),
         "up": sum(int(i["traffic"].get("up") or 0) for i in store["inbounds"]),
         "down": sum(int(i["traffic"].get("down") or 0) for i in store["inbounds"]),
     }
@@ -2607,8 +2243,6 @@ def _outbound_usage(store: dict) -> dict:
     """Per-outbound totals, share, current/avg/peak speed and 1h sparkline."""
     ot = store.get("outbound_traffic") or {}
     kinds: dict[str, tuple[str, str]] = {"direct": ("system", "active")}
-    for t_ in store.get("l2tp") or []:
-        kinds[t_.get("outbound") or f"l2tp_{t_['name']}"] = ("l2tp", t_.get("status") or "")
     for o in store.get("outbounds_custom") or []:
         kinds[o["tag"]] = (o.get("kind") or "custom", "active" if o.get("enabled", True) else "disabled")
     tags = list(kinds) + [t_ for t_ in ot if t_ not in kinds]
@@ -2680,7 +2314,7 @@ def xray_apply(request: Request):
     result = _apply_xray(_load_store())
     flash(request, *(("Конфиг Xray применён", "info") if result.get("ok") else (f"Xray: {result.get('error')}", "error")))
     ref = request.headers.get("referer") or ""
-    for path in ("/inbounds", "/clients", "/balancers", "/routing", "/schema", "/outbounds", "/l2tp", "/xray", "/settings"):
+    for path in ("/inbounds", "/clients", "/balancers", "/routing", "/schema", "/outbounds", "/xray", "/settings"):
         if path in ref:
             return go(path)
     return go("/")
@@ -4000,181 +3634,6 @@ def client_wg_conf(email: str, request: Request):
     return PlainTextResponse(P.wireguard_conf(eps[0]), headers={"content-disposition": f'attachment; filename="{email}.conf"'})
 
 
-# ================================================================ L2TP
-
-@app.get("/l2tp", response_class=HTMLResponse)
-def l2tp_page(request: Request):
-    if redir := _require(request):
-        return redir
-    store = refresh_statuses(_load_store())
-    items = [{**item, "bindings": _l2tp_bindings(store, item),
-              "traffic": (store.get("outbound_traffic") or {}).get(item.get("outbound") or f"l2tp_{item['name']}", {})}
-             for item in store["l2tp"]]
-    # winners first, then connected, then by score/name
-    winners = {w.get("name") for w in (store.get("l2tp_auto_state") or {}).get("winners") or []}
-    def sort_key(i):
-        m = i.get("metrics") or {}
-        return (0 if i["name"] in winners else 1, 0 if i.get("status") == "connected" else 1,
-                -(float(m.get("score") or -9999)), i["name"])
-    items.sort(key=sort_key)
-    running = L2TP_AUTO_JOB.get("id")
-    job = ops.JOBS.get(running) if running else None
-    return page(request, "l2tp.html", active="l2tp", items=items,
-                auto_cfg=store["settings"].get("l2tp_auto") or {},
-                auto_state=store.get("l2tp_auto_state") or {},
-                auto_job=job, auto_job_id=running,
-                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5])
-
-
-@app.post("/l2tp/auto/settings")
-async def l2tp_auto_settings(request: Request):
-    if redir := _require(request):
-        return redir
-    form = await request.form()
-    with mutate() as store:
-        store["settings"]["l2tp_auto"] = {
-            "enabled": form.get("enabled") == "1",
-            "max_connected": max(1, min(32, _int(form.get("max_connected"), 4))),
-            "interval_minutes": max(15, min(24 * 60, _int(form.get("interval_minutes"), 60))),
-            "candidate_extra": max(0, min(20, _int(form.get("candidate_extra"), 3))),
-            "dl_bytes": max(1_000_000, _int(form.get("dl_bytes"), 8_000_000)),
-            "ul_bytes": max(100_000, _int(form.get("ul_bytes"), 2_000_000)),
-        }
-    _refresh_settings_cache()
-    flash(request, "Автовыбор L2TP сохранён", "info")
-    return go("/l2tp")
-
-
-@app.post("/l2tp/auto/run")
-def l2tp_auto_run(request: Request):
-    if redir := _require(request):
-        return redir
-    running = L2TP_AUTO_JOB.get("id")
-    if running and ops.JOBS.get(running, {}).get("status") == "running":
-        flash(request, "Подбор лучших серверов уже идёт", "info")
-        return go("/l2tp")
-    L2TP_AUTO_JOB["id"] = ops.start_job("l2tp-auto-select", select_best_l2tp)
-    flash(request, "Запущен подбор лучших L2TP (пинг LNS → скорость через туннель). Это займёт несколько минут.", "info")
-    return go("/l2tp")
-
-
-@app.post("/l2tp")
-def l2tp_add(request: Request, name: str = Form(...), server_host: str = Form(...), username: str = Form(...),
-             password: str = Form(""), psk: str = Form(""), country: str = Form("")):
-    if redir := _require(request):
-        return redir
-    name, country = name.strip(), country.strip().upper()
-    if country and not re.fullmatch(r"[A-Z]{2}", country):
-        flash(request, "Страна: двухбуквенный ISO-код", "error")
-        return go("/l2tp")
-    if not SLUG_RE.match(name):
-        flash(request, "Имя: латиница/цифры/_/-, до 32 символов", "error")
-        return go("/l2tp")
-    if not password:
-        flash(request, "Нужен пароль L2TP", "error")
-        return go("/l2tp")
-    with mutate() as store:
-        if any(x["name"] == name for x in store["l2tp"]):
-            flash(request, f"L2TP '{name}' уже существует", "error")
-            return go("/l2tp")
-        item = {"name": name, "server_host": server_host.strip(), "username": username.strip(), "password_set": True,
-                "psk_set": bool(psk), "status": "disconnected", "outbound": f"l2tp_{name}",
-                "ifname": l2tp.ifname_for(name), "addr": "", "last_error": ""}
-        if country:
-            item["country"] = country
-        _save_l2tp_secrets(name, password, psk)
-        store["l2tp"].append(item)
-        prepared = l2tp.write_tunnel_configs(item, password, psk)
-        if not prepared.get("ok"):
-            item["last_error"] = prepared.get("error", "tunnel config failed")
-    flash(request, f"L2TP '{name}' добавлен. Нажмите Connect." if not item["last_error"] else item["last_error"],
-          "info" if not item["last_error"] else "error")
-    return go("/l2tp")
-
-
-@app.post("/l2tp/{name}/country")
-def l2tp_set_country(name: str, request: Request, country: str = Form("")):
-    if redir := _require(request):
-        return redir
-    country = country.strip().upper()
-    if country and not re.fullmatch(r"[A-Z]{2}", country):
-        flash(request, "Страна: двухбуквенный ISO-код", "error")
-        return go("/l2tp")
-    with mutate() as store:
-        item = next((x for x in store["l2tp"] if x["name"] == name), None)
-        if item:
-            if country:
-                item["country"] = country
-            else:
-                item.pop("country", None)
-    return go("/l2tp")
-
-
-@app.post("/l2tp/{name}/connect")
-def l2tp_connect(name: str, request: Request):
-    if redir := _require(request):
-        return redir
-    store = _load_store()
-    item = next((x for x in store["l2tp"] if x["name"] == name), None)
-    if not item:
-        flash(request, "Не найдено", "error")
-        return go("/l2tp")
-    result = connect_l2tp(item)
-    with mutate() as fresh:
-        it = next(x for x in fresh["l2tp"] if x["name"] == name)
-        if result["ok"]:
-            it.update({k: item.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf")})
-            it["status"], it["last_error"] = "connected", ""
-        else:
-            it["status"], it["last_error"] = "disconnected", result.get("error", "connect failed")
-    if result["ok"]:
-        xr = _apply_xray(_load_store(), xray_only=True)
-        flash(request, *_ok_msg(f"{name}: connected, egress {item.get('public_ip') or '?'}", xr))
-    else:
-        flash(request, f"{name}: {result.get('error')}", "error")
-    return go("/l2tp")
-
-
-@app.post("/l2tp/{name}/disconnect")
-def l2tp_disconnect(name: str, request: Request):
-    if redir := _require(request):
-        return redir
-    with mutate() as store:
-        item = next((x for x in store["l2tp"] if x["name"] == name), None)
-        if not item:
-            flash(request, "Не найдено", "error")
-            return go("/l2tp")
-        result = disconnect_l2tp(item, store)
-        item["status"] = "disconnected"
-        for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-            item[key] = ""
-        item["last_error"] = "" if result["ok"] else result.get("error", "")
-    xr = _apply_xray(_load_store(), xray_only=True)
-    flash(request, *_ok_msg(f"{name}: disconnected", xr))
-    return go("/l2tp")
-
-
-@app.post("/l2tp/{name}/delete")
-def l2tp_delete(name: str, request: Request):
-    if redir := _require(request):
-        return redir
-    with mutate() as store:
-        item = next((x for x in store["l2tp"] if x["name"] == name), None)
-        if not item:
-            flash(request, "Не найдено", "error")
-            return go("/l2tp")
-        b = _l2tp_bindings(store, item)
-        if b["blocked"]:
-            flash(request, f"Нельзя удалить {name}: привязан к клиентам {b['clients']}, правилам {b['routes']}, inbounds {b['inbounds']}", "error")
-            return go("/l2tp")
-        l2tp.delete_tunnel(item, store_l2tp=store["l2tp"])
-        _delete_l2tp_secrets(name)
-        store["l2tp"] = [x for x in store["l2tp"] if x["name"] != name]
-    xr = _apply_xray(_load_store(), xray_only=True)
-    flash(request, *_ok_msg(f"L2TP {name} удалён", xr))
-    return go("/l2tp")
-
-
 # ================================================================ PIA account + auto reconnect
 
 def _pia_settings(store: dict | None = None) -> dict:
@@ -4482,10 +3941,6 @@ def outbounds_page(request: Request):
     store = _load_store()
     ot = store.get("outbound_traffic") or {}
     rows = [{"tag": "direct", "kind": "system", "label": "🏠 Direct", "enabled": True, "status": "active"}]
-    for t_ in store["l2tp"]:
-        tag = t_.get("outbound") or f"l2tp_{t_['name']}"
-        rows.append({"tag": tag, "kind": "l2tp", "label": xray.outbound_label(store, tag), "enabled": True,
-                     "status": t_.get("status"), "info": t_.get("public_ip") or t_.get("server_host")})
     hide_unhealthy = xray.sub_health_settings(store)["hide_unhealthy"]
     for o in store["outbounds_custom"]:
         status = xray.custom_outbound_status(o)
@@ -4884,7 +4339,7 @@ def balancers_page(request: Request):
     bals = xray.ensure_balancers(store)
     active = {k: xray.balancer_member_tags(store, b) for k, b in bals.items()}
     return page(request, "balancers.html", active="balancers", balancers=bals, active_members=active,
-                l2tp=store["l2tp"], custom=store["outbounds_custom"], watchdog_sec=WATCHDOG_INTERVAL, store=store)
+                custom=store["outbounds_custom"], watchdog_sec=WATCHDOG_INTERVAL, store=store)
 
 
 @app.post("/balancers/{key}")
@@ -4902,14 +4357,11 @@ async def balancers_save(key: str, request: Request):
         raw_fb = str(form.get("fallback") or "direct").strip()
         b["fallback"] = "none" if raw_fb.lower() in ("none", "-", "off") else (raw_fb or "direct")
         members = [str(x) for x in form.getlist("members")]
-        all_l2tp = {t_.get("outbound") or f"l2tp_{t_['name']}" for t_ in store["l2tp"]}
         all_custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("tag")}
-        all_auto = all_l2tp | all_custom
-        # [] = auto pool (connected L2TP + enabled customs). Explicit all-L2TP-only keeps the list.
+        all_auto = all_custom
+        # [] = auto pool (enabled customs).
         if not members or set(members) == all_auto:
             b["members"] = []
-        elif set(members) == all_l2tp and all_custom:
-            b["members"] = sorted(all_l2tp)
         else:
             b["members"] = members
         if key == "least_load":
@@ -5491,7 +4943,7 @@ def logs_page(request: Request):
         if grep:
             text = "\n".join(line for line in text.splitlines() if grep in line)
     else:
-        text = ops.journal({"xray": "xray", "panel": "l2xpanel", "l2tp": "xl2tpd"}.get(src, "xray"), lines, grep)
+        text = ops.journal({"xray": "xray", "panel": "l2xpanel"}.get(src, "xray"), lines, grep)
     return page(request, "logs.html", active="logs", src=src, text=text, n=lines, q=grep)
 
 
@@ -6102,7 +5554,7 @@ async def settings_save(request: Request):
                 "admin_ids": admin_ids,
                 "receive_commands": form.get("receive_commands") == "1",
                 "notify_login": form.get("notify_login") == "1", "notify_quota": form.get("notify_quota") == "1",
-                "notify_iplimit": form.get("notify_iplimit") == "1", "notify_tunnel": form.get("notify_tunnel") == "1",
+                "notify_iplimit": form.get("notify_iplimit") == "1",
                 "notify_nodes": form.get("notify_nodes") == "1",
                 "notify_changes": form.get("notify_changes") == "1",
                 "notify_updates": form.get("notify_updates") == "1",
@@ -6335,20 +5787,16 @@ async def backup_restore(request: Request, file: UploadFile = File(...)):
     if not res["ok"]:
         flash(request, f"Восстановление: {res['error']}", "error")
         return go("/settings?tab=backup")
-    # Restored secret_key file may differ from env SECRET_KEY — realign ciphertexts.
-    sec_align = ops.realign_l2tp_secrets(DATA, SECRET_KEY)
     _refresh_settings_cache()
     xr = _apply_xray(_load_store())
     restored = res.get("restored") or {}
     detail = (
         f"data={restored.get('data', '?')}, certs={restored.get('certs', 0)}, "
-        f"doh={restored.get('doh', 0)}, l2tp_secrets={sec_align.get('reencrypted', 0)}"
+        f"doh={restored.get('doh', 0)}"
     )
     msg = f"Бэкап восстановлен ({detail}; копия до: {res['safety_copy']})"
     if res.get("doh_warning"):
         msg += f". DoH: {res['doh_warning']}"
-    if sec_align.get("failed"):
-        msg += f". L2TP secrets не расшифрованы: {sec_align['failed']}"
     flash(request, *_ok_msg(msg, xr))
     return go("/settings?tab=backup")
 
@@ -6505,8 +5953,6 @@ async def rest_api(path: str, request: Request):
                 xray.reset_client_traffic(c)
         _apply_xray(_load_store(), xray_only=True)
         return _api_ok(None, "reset all")
-    if parts == ["l2tp", "list"]:
-        return _api_ok([{k: v for k, v in x.items() if k not in ("password",)} for x in store["l2tp"]])
     if parts == ["outbounds", "list"]:
         return _api_ok({"tags": xray.all_outbound_tags(store), "traffic": store.get("outbound_traffic") or {},
                         "rates": OB_STATS.rates, "summary_1h": OB_STATS.summary(60), "summary_24h": OB_STATS.summary(1440)})
@@ -7194,8 +6640,6 @@ async def settings_node_action(node_id: str, request: Request):
         tab = "settings"
     elif action == "set_admin_password":
         tab = "settings"
-    elif action.startswith("l2tp") or action in ("refresh_l2tp", "select_best_l2tp"):
-        tab = "l2tp"
     elif action in ("update_panel", "rollback_panel", "restore_master", "restart_panel",
                     "check_xray", "update_xray", "rollback_xray", "restart_xray",
                     "iperf3_bench", "ensure_network_perf"):
@@ -7299,8 +6743,6 @@ async def settings_node_action(node_id: str, request: Request):
         msg = res.get("error") or f"{action}: ok"
         if action == "update_panel" and res.get("started"):
             msg = "Обновление панели на ноде запущено"
-        elif action == "select_best_l2tp":
-            msg = "Select-best L2TP запущен на ноде"
         elif action == "set_admin_password":
             msg = "Пароль админа на ноде обновлён"
         elif action == "check_xray":
@@ -7911,22 +7353,13 @@ async def nodes_action(node_id: str, action: str, request: Request):
             }
             nodes_mod.ensure_bridge(old)
             # Full master data → new master; outbound to THIS node remapped to direct
-            l2tp_secrets = {}
-            for t in store.get("l2tp") or []:
-                tname = t.get("name")
-                if not tname:
-                    continue
-                pw, psk = _load_l2tp_secrets(tname)
-                if pw or psk:
-                    l2tp_secrets[tname] = {"password": pw, "psk": psk}
-            snap = nodes_mod.promote_snapshot(store, node, l2tp_secrets=l2tp_secrets)
+            snap = nodes_mod.promote_snapshot(store, node)
             peers = [nodes_mod._peer_node_export(n) for n in nodes if n.get("id") != node.get("id")]
             node_copy = dict(node)
             use_api = bool(node.get("mirror")) and not ssh_password
             name = node["name"]
             drop_tags = snap.get("drop_outbound_tags") or [nodes_mod.node_outbound_tag(node)]
             n_custom = int(snap.get("transferred_custom") or 0)
-            n_l2tp = int(snap.get("transferred_l2tp") or 0)
 
         def job():
             import time as _time
@@ -7981,7 +7414,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     "log": "\n".join(x for x in log_lines if x),
                 }
 
-            # 3) Only now demote ourselves; preserve live Xray (L2TP) until new master pushes
+            # 3) Only now demote ourselves; preserve live Xray until new master pushes
             with mutate() as st:
                 ns = st.setdefault("settings", {}).setdefault("nodes", {})
                 ns["agent_enabled"] = True
@@ -8024,7 +7457,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 f"✅ Promote → <b>{tgbot.escape(name)}</b> OK ({via}). "
                 f"certs={int(snap.get('transferred_certs') or 0)}, "
                 f"doh_files={int(snap.get('transferred_doh_files') or 0)}, "
-                f"custom={n_custom}, l2tp={n_l2tp}",
+                f"custom={n_custom}",
                 flag="notify_nodes",
             )
             return {
@@ -8032,11 +7465,11 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 "log": "\n".join(x for x in log_lines if x)
                 + f"\n[{via}] Новый master: https://{node_copy.get('domain')}/ — откройте его панель."
                 + f"\nOutbound {', '.join(drop_tags)} → direct;"
-                + f" перенесено custom={n_custom}, l2tp={n_l2tp}"
+                + f" перенесено custom={n_custom}"
                 + f", certs={int(snap.get('transferred_certs') or 0)}"
                 + f", doh_files={int(snap.get('transferred_doh_files') or 0)}"
                 + f", tunnel={bool(snap.get('transferred_tunnel'))}"
-                + " (туннели disconnected — Connect на новом master; settings/DoH/Pi-hole включены)."
+                + " (settings/DoH/Pi-hole включены)."
                 + "\nСтарый master стал agent с runtime_preserve (трафик не срезается)."
                 + ("\n" + "\n".join(retarget_logs) if retarget_logs else ""),
             }
@@ -8210,26 +7643,9 @@ def _agent_manage_auth(request: Request) -> tuple[dict | None, JSONResponse | No
 
 def _manage_snapshot(store: dict) -> dict:
     """Compact remote state for Settings Node console."""
-    # Live iface status into a working copy (do not persist here)
     store = json.loads(json.dumps(store))
-    try:
-        refresh_statuses(store)
-    except Exception:
-        pass
     ns = (store.get("settings") or {}).get("nodes") or {}
     panel = (store.get("settings") or {}).get("panel") or {}
-    l2tp_rows = []
-    for t in store.get("l2tp") or []:
-        l2tp_rows.append({
-            "name": t.get("name"),
-            "server_host": t.get("server_host") or "",
-            "status": t.get("status") or "disconnected",
-            "public_ip": t.get("public_ip") or "",
-            "last_error": (t.get("last_error") or "")[:200],
-            "psk_set": bool(t.get("psk_set")),
-            "outbound": t.get("outbound") or f"l2tp_{t.get('name')}",
-        })
-    up = sum(1 for t in l2tp_rows if t.get("status") == "connected")
     xs = xray.xray_status()
     try:
         snap_sys = sysmon.snapshot()
@@ -8242,7 +7658,6 @@ def _manage_snapshot(store: dict) -> dict:
         f"ver={panel_version()} host={host} path=/{bp}/\n"
         f"clients={len(store.get('clients') or [])} "
         f"inbounds={len(store.get('inbounds') or [])} "
-        f"l2tp={up}/{len(l2tp_rows)} "
         f"custom={len(store.get('outbounds_custom') or [])} "
         f"routes={len(store.get('routes') or [])}"
     )
@@ -8266,12 +7681,9 @@ def _manage_snapshot(store: dict) -> dict:
         "counts": {
             "clients": len(store.get("clients") or []),
             "inbounds": len(store.get("inbounds") or []),
-            "l2tp": len(l2tp_rows),
-            "l2tp_up": up,
             "custom": len(store.get("outbounds_custom") or []),
             "routes": len(store.get("routes") or []),
         },
-        "l2tp": l2tp_rows,
         "xray": xs,
         "sys": snap_sys,
         "summary": summary,
@@ -8372,50 +7784,6 @@ def _manage_action(action: str, payload: dict) -> dict:
     if action == "apply_xray":
         res = _apply_xray(_load_store())
         return {"ok": bool(res.get("ok")), "error": res.get("error") or ""}
-
-    if action == "refresh_l2tp":
-        with mutate() as st:
-            refresh_statuses(st)
-        return _manage_snapshot(_load_store())
-
-    if action == "l2tp_connect":
-        name = str(payload.get("name") or "").strip()
-        store = _load_store()
-        item = next((x for x in store.get("l2tp") or [] if x.get("name") == name), None)
-        if not item:
-            return {"ok": False, "error": f"l2tp {name} not found"}
-        result = connect_l2tp(item)
-        with mutate() as fresh:
-            it = next((x for x in fresh["l2tp"] if x["name"] == name), None)
-            if it:
-                if result.get("ok"):
-                    it.update({k: item.get(k, "") for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf")})
-                    it["status"], it["last_error"] = "connected", ""
-                else:
-                    it["status"], it["last_error"] = "disconnected", result.get("error", "connect failed")
-        if result.get("ok"):
-            _apply_xray(_load_store(), xray_only=True)
-        return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "name": name}
-
-    if action == "l2tp_disconnect":
-        name = str(payload.get("name") or "").strip()
-        with mutate() as store:
-            item = next((x for x in store.get("l2tp") or [] if x.get("name") == name), None)
-            if not item:
-                return {"ok": False, "error": f"l2tp {name} not found"}
-            result = disconnect_l2tp(item, store)
-            item["status"] = "disconnected"
-            for key in ("addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-                item[key] = ""
-            item["last_error"] = "" if result.get("ok") else result.get("error", "")
-        _apply_xray(_load_store(), xray_only=True)
-        return {"ok": True, "error": "", "name": name}
-
-    if action == "select_best_l2tp":
-        def job():
-            return select_best_l2tp(force=True)
-        jid = ops.start_job("remote-l2tp-best", job)
-        return {"ok": True, "job_id": jid, "error": ""}
 
     if action == "save_panel":
         with mutate() as st:
@@ -8533,7 +7901,7 @@ def _manage_action(action: str, payload: dict) -> dict:
             if grep:
                 text = "\n".join(line for line in text.splitlines() if grep in line)
         else:
-            text = ops.journal({"xray": "xray", "panel": "l2xpanel", "l2tp": "xl2tpd"}.get(src, "xray"), lines, grep)
+            text = ops.journal({"xray": "xray", "panel": "l2xpanel"}.get(src, "xray"), lines, grep)
         return {"ok": True, "text": text, "src": src, "n": lines, "q": grep}
 
     if action == "xray_debug":
@@ -8650,7 +8018,7 @@ async def agent_promote(request: Request):
                 "role": ns.get("role") or "agent",
                 "mirror": bool(ns.get("mirror")),
             }
-            for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "l2tp", "ip_bans"):
+            for key in ("clients", "inbounds", "routes", "balancers", "outbounds_custom", "dns", "xray_settings", "ip_bans"):
                 if key in payload and payload[key] is not None:
                     st[key] = payload[key]
             if payload.get("settings"):
@@ -8686,11 +8054,6 @@ async def agent_promote(request: Request):
             tun = payload.get("tunnel_settings")
             if isinstance(tun, dict) and tun:
                 ns["tunnel"] = tun
-        # Re-encrypt L2TP secrets with this host's SECRET_KEY (plaintext over agent TLS + Bearer)
-        for tname, sec in (payload.get("l2tp_secrets") or {}).items():
-            if not tname or not isinstance(sec, dict):
-                continue
-            _save_l2tp_secrets(str(tname), str(sec.get("password") or ""), str(sec.get("psk") or ""))
         if payload.get("tunnel_bundle"):
             try:
                 nodes_mod.apply_tunnel_bundle(payload.get("tunnel_bundle"), payload.get("tunnel_settings"))
@@ -8721,11 +8084,10 @@ async def agent_promote(request: Request):
             except Exception:
                 pass
             return JSONResponse({"ok": False, "error": err_txt, "rolled_back": True}, status_code=500)
-        n_l2tp = len(payload.get("l2tp") or [])
         n_custom = len(payload.get("outbounds_custom") or [])
         return {
             "ok": True, "error": "", "role": "master", "version": panel_version(),
-            "transferred_l2tp": n_l2tp, "transferred_custom": n_custom,
+            "transferred_custom": n_custom,
             "transferred_certs": n_certs,
             "transferred_doh_files": doh_files,
             "doh_pihole_async": bool(doh_files),

@@ -226,7 +226,6 @@
     <select name="outbound">
       <option value="direct">🏠 Direct</option>
       {% for b in store.balancers.values() if b.enabled %}<option value="{{ b.tag }}">{{ outbound_label(store, b.tag) }}</option>{% endfor %}
-      {% for x in store.l2tp %}{% set tg = x.outbound or ('l2tp_' ~ x.name) %}<option value="{{ tg }}">{{ outbound_label(store, tg) }}</option>{% endfor %}
       {% for o in store.outbounds_custom %}<option value="{{ o.tag }}">{{ outbound_label(store, o.tag) }}</option>{% endfor %}
     </select>
     <div class="actions mt"><button class="btn">Создать</button></div>

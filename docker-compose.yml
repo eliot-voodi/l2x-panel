@@ -3,7 +3,7 @@ services:
     build: .
     image: l2xpanel:latest
     container_name: l2xpanel
-    # host networking + privileged are required for L2TP/IPsec (PPP devices, xfrm) and Xray ports
+    # host networking + privileged help with Xray ports and WireGuard (WARP/Nord/PIA)
     network_mode: host
     privileged: true
     restart: unless-stopped

@@ -15,7 +15,7 @@
   - [Inbounds](#inbounds)
   - [Клиенты](#клиенты)
   - [HWID-устройства](#hwid-устройства)
-  - [L2TP и outbounds](#l2tp-и-outbounds)
+  - [Outbounds](#outbounds)
   - [Xray](#xray)
   - [Бэкап](#бэкап)
 - [Подписки](#подписки)
@@ -111,7 +111,7 @@ POST-запросы должны иметь `Content-Type: application/json`. Е
   "tg_id": "123456789",
   "sub_url": "https://vpn.example.com:2096/sub/eWnpMHl8KeGqmSHInxpFNTSx",
   "reset_period": "monthly",
-  "outbound_limits": {"l2tp_germany": 20},
+  "outbound_limits": {"warp": 20},
   "allowed_tags": []
 }
 ```
@@ -186,10 +186,9 @@ POST-запросы должны иметь `Content-Type: application/json`. Е
 |---|---|
 | `direct` | Выход напрямую с сервера |
 | `block` | Блокировать трафик |
-| `l2tp_<name>` | L2TP-туннель с именем `<name>` (страница L2TP) |
-| `lb_least_ping` | Балансировщик по минимальному пингу между туннелями |
+| `lb_least_ping` | Балансировщик по минимальному пингу |
 | `lb_least_load` | Балансировщик по наименьшей нагрузке |
-| `<custom>` | Пользовательские outbounds (WireGuard, WARP, NordVPN, PIA, VLESS / VMess / Trojan / Shadowsocks, SOCKS, HTTP) |
+| `<custom>` | Пользовательские outbounds (WireGuard, WARP, NordVPN, PIA, VLESS / VMess / Trojan / Shadowsocks, SOCKS, HTTP, node) |
 
 ### DoH (Pi-hole)
 
@@ -222,7 +221,6 @@ POST-запросы должны иметь `Content-Type: application/json`. Е
 | POST | [`clients/resetAll`](#post-clientsresetall) | Сбросить трафик всех клиентов |
 | GET | [`clients/{email}/hwids`](#get-clientsemailhwids) | HWID-устройства клиента |
 | DELETE | [`clients/{email}/hwids`](#delete-clientsemailhwids) | Сбросить HWID-устройства |
-| GET | [`l2tp/list`](#get-l2tplist) | L2TP-туннели |
 | GET | [`outbounds/list`](#get-outboundslist) | Outbounds, трафик и скорость |
 | POST | [`xray/restart`](#post-xrayrestart) | Перезапустить Xray |
 | GET | [`xray/config`](#get-xrayconfig) | Итоговый `config.json` Xray |
@@ -376,36 +374,7 @@ HWID-устройства регистрируются, когда клиент�
 {"success": true, "msg": "", "obj": {"cleared": 2}}
 ```
 
-### L2TP и outbounds
-
-#### `GET l2tp/list`
-
-L2TP-туннели без паролей:
-
-```json
-{
-  "success": true, "msg": "",
-  "obj": [
-    {
-      "name": "germany",
-      "server_host": "de.vpn.example.net",
-      "username": "user1",
-      "password_set": true,
-      "psk_set": true,
-      "status": "connected",
-      "outbound": "l2tp_germany",
-      "ifname": "l2x-germany",
-      "addr": "10.10.0.15",
-      "local_ip": "10.10.0.15",
-      "peer_ip": "10.10.0.1",
-      "country": "DE",
-      "last_error": ""
-    }
-  ]
-}
-```
-
-`status`: `connected`, `disconnected`, `error`. Набор дополнительных полей зависит от состояния туннеля. Пароль и PSK хранятся отдельно в зашифрованном виде и через API не отдаются.
+### Outbounds
 
 #### `GET outbounds/list`
 
@@ -415,11 +384,11 @@ L2TP-туннели без паролей:
 {
   "success": true, "msg": "",
   "obj": {
-    "tags": ["direct", "block", "l2tp_germany", "warp", "lb_least_ping", "lb_least_load"],
-    "traffic": {"l2tp_germany": {"up": 1048576, "down": 73400320}},
-    "rates": {"l2tp_germany": {"up": 12000, "down": 845000}},
-    "summary_1h": {"l2tp_germany": {"avg_up": 9000.5, "avg_down": 640000.2, "peak_up": 52000, "peak_down": 3100000}},
-    "summary_24h": {"l2tp_germany": {"avg_up": 4000.1, "avg_down": 310000.7, "peak_up": 88000, "peak_down": 5400000}}
+    "tags": ["direct", "block", "warp", "lb_least_ping", "lb_least_load"],
+    "traffic": {"warp": {"up": 1048576, "down": 73400320}},
+    "rates": {"warp": {"up": 12000, "down": 845000}},
+    "summary_1h": {"warp": {"avg_up": 9000.5, "avg_down": 640000.2, "peak_up": 52000, "peak_down": 3100000}},
+    "summary_24h": {"warp": {"avg_up": 4000.1, "avg_down": 310000.7, "peak_up": 88000, "peak_down": 5400000}}
   }
 }
 ```
@@ -444,7 +413,7 @@ L2TP-туннели без паролей:
 
 #### `GET backup`
 
-Возвращает `application/zip` (не JSON) со всеми данными панели: `store.json`, `admin.json`, ключи, L2TP-профили. Восстановление — в веб-интерфейсе (Settings → Backup).
+Возвращает `application/zip` (не JSON) со всеми данными панели: `store.json`, `admin.json`, ключи, сертификаты. Восстановление — в веб-интерфейсе (Settings → Backup).
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -o l2x-backup.zip "http://$HOST/panel/api/backup"
@@ -588,7 +557,7 @@ Content-Type: application/json
 }
 ```
 
-Каждый переданный ключ (кроме `config`, `pushed_at`, `node_id`) заменяет соответствующий раздел базы ноды; отсутствующие ключи не трогаются. L2TP-outbounds мастера на ноде превращаются в `freedom`: L2TP-интерфейсов там нет.
+Каждый переданный ключ (кроме `config`, `pushed_at`, `node_id`) заменяет соответствующий раздел базы ноды; отсутствующие ключи не трогаются.
 
 | Код | Ответ |
 |---|---|

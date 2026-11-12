@@ -5,8 +5,6 @@ action="$1"; shift
 map() {
   case "$1" in
     xray|xray.service) echo xray ;;
-    xl2tpd|xl2tpd.service) echo xl2tpd ;;
-    strongswan-starter|strongswan|ipsec|strongswan-starter.service) echo ipsec ;;
     l2xpanel|l2xpanel.service) echo l2xpanel ;;
     nginx|nginx.service) echo nginx ;;
     cron) echo cron ;;

@@ -68,7 +68,6 @@ def default_settings() -> dict:
         "notify_quota": True,
         "notify_expire_days": 3,
         "notify_iplimit": True,
-        "notify_tunnel": True,
         "notify_nodes": True,      # online/offline, sync, update, provision, promote, changes
         "notify_changes": True,    # clients, inbounds, outbounds, DoH, settings
         "notify_updates": True,    # new Xray core / panel releases on GitHub
@@ -509,7 +508,7 @@ class Bot:
                     f"Админ-бот L2X. Ваш chat id: <code>{escape(chat_id)}</code>\n"
                     f"Профиль: {escape(profile.get('display') or '—')}\n"
                     f"Админов в настройках: <b>{len(admins)}</b>\n"
-                    "Команды: /help /status /online /clients /tunnels /usage /backup /restart_xray /admins",
+                    "Команды: /help /status /online /clients /usage /backup /restart_xray /admins",
                     chat_id,
                 )
                 return
@@ -562,7 +561,7 @@ class Bot:
         if cmd == "/help":
             self.send(
                 "/status — состояние сервера\n/online — клиенты онлайн\n/usage email — трафик клиента\n"
-                "/clients — список клиентов\n/tunnels — L2TP туннели\n/backup — бэкап\n"
+                "/clients — список клиентов\n/backup — бэкап\n"
                 "/restart_xray — перезапуск Xray\n/report — отчёт\n"
                 "/admins — список admin chat id\n/id — ваш chat id / username / имя",
                 chat_id,
@@ -582,8 +581,6 @@ class Bot:
             self.send(self.hooks["usage"](arg) if arg else "Формат: /usage email", chat_id)
         elif cmd == "/clients":
             self.send(self.hooks["clients"](), chat_id)
-        elif cmd == "/tunnels":
-            self.send(self.hooks["tunnels"](), chat_id)
         elif cmd == "/backup":
             hook = self.hooks.get("backup_send")
             if callable(hook):

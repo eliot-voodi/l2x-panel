@@ -1,13 +1,10 @@
 #!/bin/sh
 set -e
-mkdir -p "$L2XPANEL_DATA" "$L2XPANEL_DATA/ipsec" "$L2XPANEL_DATA/l2tp" /etc/l2xpanel/certs /etc/xray \
-  /var/log/xray /var/log/supervisor /var/run/xl2tpd /etc/ppp
+mkdir -p "$L2XPANEL_DATA" /etc/l2xpanel/certs /etc/xray \
+  /var/log/xray /var/log/supervisor
 
-for m in ppp_generic l2tp_ppp l2tp_netlink pppol2tp af_key xfrm_user; do modprobe "$m" 2>/dev/null || true; done
-[ -e /dev/ppp ] || mknod /dev/ppp c 108 0 2>/dev/null || true
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
-[ -f /etc/ipsec.secrets ] || install -m 600 /dev/null /etc/ipsec.secrets
 if [ ! -s /etc/xray/config.json ]; then
   cat > /etc/xray/config.json <<'EOF'
 {"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]}

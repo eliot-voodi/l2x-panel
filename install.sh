@@ -116,7 +116,7 @@ banner() {
    ███████╗███████╗██╔╝ ██╗    ██║     ██║  ██║██║ ╚████║███████╗███████╗
    ╚══════╝╚══════╝╚═╝  ╚═╝    ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝
 EOF
-  printf '%s        Xray-core + multi-L2TP · VLESS / VMess / Trojan / SS / Hysteria2%s\n\n' "$N" "$N"
+  printf '%s        Xray-core · VLESS / VMess / Trojan / SS / Hysteria2 · multi-node%s\n\n' "$N" "$N"
 }
 
 # ---------------------------------------------------------------- checks
@@ -244,11 +244,7 @@ install_packages() {
   apt-get install -y -qq --no-install-recommends \
     curl ca-certificates unzip jq openssl socat cron kmod iproute2 iptables \
     python3 python3-venv \
-    ppp xl2tpd strongswan strongswan-starter strongswan-charon libstrongswan-standard-plugins wireguard-tools >/dev/null
-  # Debian 13+: metapackage may pull charon-systemd (conflicts with strongswan-starter/ipsec.conf path)
-  if dpkg -l charon-systemd 2>/dev/null | grep -q '^ii'; then
-    apt-get install -y -qq --no-install-recommends strongswan-charon >/dev/null || true
-  fi
+    wireguard-tools >/dev/null
   ok "Системные пакеты"
   # nginx is always the public entry: :443 front for inbounds (Xray listens only on 127.0.0.1)
   if systemctl is-active -q caddy 2>/dev/null; then
@@ -525,23 +521,13 @@ install_system() {
     sysctl -e -p /etc/sysctl.d/99-l2xpanel-swap.conf >/dev/null || true
   fi
 
-  backup_unmanaged /etc/ipsec.conf
-  install -m 644 "$SRC/deploy/ipsec.conf" /etc/ipsec.conf
-  [ -f /etc/ipsec.secrets ] || install -m 600 /dev/null /etc/ipsec.secrets
-  mkdir -p /etc/xl2tpd /var/run/xl2tpd "$DATA_DIR/ipsec" "$DATA_DIR/l2tp"
-  if ! grep -q 'managed by l2x-panel' /etc/xl2tpd/xl2tpd.conf 2>/dev/null; then
-    backup_unmanaged /etc/xl2tpd/xl2tpd.conf
-    install -m 644 "$SRC/deploy/xl2tpd.conf" /etc/xl2tpd/xl2tpd.conf
-  fi
-
   install -m 644 "$SRC/deploy/xray.service" /etc/systemd/system/xray.service
   install -m 644 "$SRC/deploy/l2xpanel.service" /etc/systemd/system/l2xpanel.service
   install -m 644 "$SRC/deploy/l2xpanel-next.service" /etc/systemd/system/l2xpanel-next.service
   systemctl daemon-reload
-  systemctl enable -q strongswan-starter xl2tpd xray 2>/dev/null || true
+  systemctl enable -q xray 2>/dev/null || true
   ensure_slot_layout
   enable_active_unit
-  systemctl restart strongswan-starter xl2tpd 2>/dev/null || warn "strongSwan/xl2tpd не запустились — L2TP-туннели будут недоступны"
 
   mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge" /etc/nginx/l2x
   if [ "$MODE" = nginx ]; then
@@ -565,13 +551,13 @@ install_system() {
   nginx -t -q 2>/dev/null || die "Ошибка конфигурации nginx: nginx -t"
   systemctl enable -q nginx
   systemctl restart nginx
-  ok "systemd, sysctl, strongSwan, xl2tpd, nginx ($MODE)"
+  ok "systemd, sysctl, nginx ($MODE)"
 }
 
 write_env() {
   local bind=127.0.0.1 port=8090 key
   [ "$MODE" = direct ] && { bind=0.0.0.0; port=$PANEL_PORT; }
-  # reuse the key of a previous install: it encrypts stored L2TP secrets and signs sessions
+  # reuse the key of a previous install: it signs sessions and encrypts stored secrets
   key=$(sed -n 's/^SECRET_KEY=//p' "$ENV_FILE" 2>/dev/null || true)
   [ -n "$key" ] || key=$(cat "$DATA_DIR/secret_key" 2>/dev/null || true)
   [ -n "$key" ] || key=$(openssl rand -hex 32)

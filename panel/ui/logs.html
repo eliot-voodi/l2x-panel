@@ -6,7 +6,7 @@
 {% block content %}
 <form class="flex" method="get" style="flex-wrap:wrap;margin-bottom:1rem">
   <div class="seg">
-    {% for k, l in [('xray', 'Xray'), ('access', 'Access log'), ('panel', 'Панель'), ('l2tp', 'xl2tpd')] %}
+    {% for k, l in [('xray', 'Xray'), ('access', 'Access log'), ('panel', 'Панель')] %}
     <a href="?src={{ k }}&n={{ n }}&q={{ q|urlencode }}" class="{% if src == k %}active{% endif %}">{{ l }}</a>
     {% endfor %}
   </div>

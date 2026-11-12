@@ -1,4 +1,4 @@
-"""Xray config builder: multi-inbound, L2TP/custom outbounds, balancers, per-user routing, quotas."""
+"""Xray config builder: multi-inbound, custom outbounds, balancers, per-user routing, quotas."""
 from __future__ import annotations
 
 import base64
@@ -335,14 +335,6 @@ def _is_balancer_target(store: dict, tag: str) -> bool:
     return tag in balancer_tags(store)
 
 
-def _l2tp_tag(t: dict) -> str:
-    return t.get("outbound") or f"l2tp_{t['name']}"
-
-
-def connected_l2tp_tags(store: dict) -> list[str]:
-    return [_l2tp_tag(t) for t in store.get("l2tp") or [] if t.get("status") == "connected"]
-
-
 def sub_health_settings(store: dict) -> dict:
     """Subscription health gate: hide disconnected / high-loss outbounds from client links."""
     sub = ((store.get("settings") or {}).get("sub") or {})
@@ -428,20 +420,6 @@ def outbound_member_ok(store: dict, tag: str) -> bool:
     tag = str(tag or "").strip()
     if not tag or tag in ("direct", "block", "blackhole"):
         return True
-    max_loss = sub_health_settings(store)["max_loss_pct"]
-    for t in store.get("l2tp") or []:
-        if _l2tp_tag(t) != tag:
-            continue
-        if t.get("status") != "connected":
-            return False
-        metrics = t.get("metrics") or {}
-        loss = metrics.get("loss_pct")
-        try:
-            if loss is not None and float(loss) > max_loss:
-                return False
-        except (TypeError, ValueError):
-            pass
-        return True
     for o in store.get("outbounds_custom") or []:
         if o.get("tag") != tag:
             continue
@@ -525,11 +503,6 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
         return False
     seen.add(tag)
 
-    for t in store.get("l2tp") or []:
-        if _l2tp_tag(t) != tag:
-            continue
-        return outbound_member_ok(store, tag)
-
     for o in store.get("outbounds_custom") or []:
         if o.get("tag") != tag:
             continue
@@ -542,18 +515,16 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
             continue
         if not b.get("enabled", True):
             return False
-        # Enabled balancers always appear in subscription. Member pool may be empty
-        # (no L2TP / customs down) — Xray then uses fallback; clients still get links.
+        # Enabled balancers always appear in subscription. Empty pool → Xray fallback.
         return True
 
     return True
 
 
 def balancer_auto_pool(store: dict) -> list[str]:
-    """Default balancer pool when members is empty: connected L2TP + enabled customs."""
-    connected = connected_l2tp_tags(store)
-    seen = set(connected)
-    out = list(connected)
+    """Default balancer pool when members is empty: enabled custom outbounds."""
+    out: list[str] = []
+    seen: set[str] = set()
     for o in store.get("outbounds_custom") or []:
         if not o.get("enabled", True):
             continue
@@ -566,41 +537,19 @@ def balancer_auto_pool(store: dict) -> list[str]:
 
 
 def balancer_member_tags(store: dict, balancer: dict, *, healthy_only: bool = False) -> list[str]:
-    """explicit members ∩ live outbounds; empty members → auto pool (L2TP + enabled customs)."""
-    connected = connected_l2tp_tags(store)
+    """explicit members ∩ live outbounds; empty members → auto pool (enabled customs)."""
     members = balancer.get("members") or []
     if not members:
         pool_list = balancer_auto_pool(store)
     else:
         custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True)}
-        pool = set(connected) | custom
-        pool_list = [t for t in members if t in pool]
+        pool_list = [t for t in members if t in custom]
     if not healthy_only or not sub_health_settings(store)["hide_unhealthy"]:
         return pool_list
     return [t for t in pool_list if outbound_member_ok(store, t)]
 
 
 # ---------------------------------------------------------------- outbounds
-
-def _l2tp_outbounds(store: dict) -> list[dict]:
-    out = []
-    for t in store.get("l2tp") or []:
-        if t.get("status") != "connected":
-            continue
-        out.append({
-            "tag": _l2tp_tag(t),
-            "protocol": "freedom",
-            "settings": {"domainStrategy": "UseIPv4"},
-            "streamSettings": {
-                "sockopt": {
-                    "interface": t.get("ifname") or f"l2x-{t['name']}",
-                    "tcpCongestion": "bbr",
-                    "tcpNoDelay": True,
-                },
-            },
-        })
-    return out
-
 
 def _custom_outbounds(store: dict) -> list[dict]:
     out = []
@@ -966,7 +915,6 @@ def ensure_reverse_front_inbound(store: dict) -> dict | None:
 
 def all_outbound_tags(store: dict) -> list[str]:
     tags = ["direct", "block"]
-    tags += [_l2tp_tag(t) for t in store.get("l2tp") or []]
     tags += [o["tag"] for o in store.get("outbounds_custom") or []]
     tags += reverse_portal_tags(store)
     tags += balancer_tags(store)
@@ -983,9 +931,6 @@ def outbound_label(store: dict, tag: str) -> str:
         return "🏠 Direct"
     if tag == "block":
         return "⛔ Block"
-    for t in store.get("l2tp") or []:
-        if _l2tp_tag(t) == tag:
-            return f"{flag_emoji(country_code(t))} {t['name'].replace('_', ' ')}"
     for o in store.get("outbounds_custom") or []:
         if o["tag"] == tag:
             cc = o.get("country") or ""
@@ -1027,7 +972,7 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
     """Map a logical tag to a routing target.
 
     Balancer tags stay as ``balancerTag`` whenever the balancer is enabled and has
-    any selectable members (connected L2TP / enabled customs). Do **not** rewrite
+    any selectable members (enabled customs). Do **not** rewrite
     to fallback based on momentary probe health — that made routes flip on every
     watchdog apply. Dead members are handled by Xray observatory + ``fallbackTag``.
     """
@@ -1539,9 +1484,6 @@ def selectable_outbound_tags(store: dict) -> list[dict]:
     for b in store["balancers"].values():
         if b.get("enabled", True):
             out.append({"tag": b["tag"], "label": outbound_label(store, b["tag"]), "kind": "balancer"})
-    for t in sorted(store.get("l2tp") or [], key=lambda x: x["name"]):
-        tag = _l2tp_tag(t)
-        out.append({"tag": tag, "label": outbound_label(store, tag), "kind": "l2tp", "status": t.get("status") or ""})
     for o in store.get("outbounds_custom") or []:
         out.append({"tag": o["tag"], "label": outbound_label(store, o["tag"]), "kind": "custom",
                     "status": custom_outbound_status(o)})
@@ -1609,17 +1551,16 @@ def apply_tag_to_users(store: dict, *, kind: str, tag: str, propagate: bool) -> 
 
 
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
-    """One identity per balancer / connected country / enabled custom outbound.
+    """One identity per balancer / enabled custom outbound.
 
-    Unhealthy outbounds (disconnected L2TP, high packet loss, failed custom probe)
-    are omitted so clients do not keep dead nodes until the next refresh.
+    Unhealthy outbounds (failed custom probe) are omitted so clients do not keep
+    dead links until the next refresh.
     """
     if not client.get("uuid") or not client.get("sub_enabled", True):
         return []
     if not ignore_quota and not client_access_ok(client):
         return []
     tags = [b["tag"] for b in ensure_balancers(store).values() if b.get("enabled", True)]
-    tags += [_l2tp_tag(t) for t in sorted(store.get("l2tp") or [], key=lambda t: t["name"]) if t.get("status") == "connected"]
     tags += [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
     entries = []
     for tag in tags:
@@ -1970,7 +1911,6 @@ def build_config(store: dict) -> dict:
     except Exception:
         pass
 
-    outbounds.extend(_l2tp_outbounds(store))
     outbounds.extend(_custom_outbounds(store))
     if fake.get("enabled"):
         outbounds.append({"tag": "dns-out", "protocol": "dns"})
@@ -2097,10 +2037,10 @@ def build_config(store: dict) -> dict:
 def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
     """Emit enabled balancers with a stable selector (no probe-health filter).
 
-    Health probes still update ``last_test`` / L2TP metrics for subscriptions, but
-    routing must not rebuild selector on every loss spike — that flipped user routes
-    between balancer and fallback. Observatory + ``fallbackTag`` handle dead peers.
-    Selector = connected L2TP + enabled customs (outbounds that exist in config).
+    Health probes still update ``last_test`` for subscriptions, but routing must not
+    rebuild selector on every probe spike — that flipped user routes between balancer
+    and fallback. Observatory + ``fallbackTag`` handle dead peers.
+    Selector = enabled customs (outbounds that exist in config).
     """
     bals = ensure_balancers(store)
     out: list[dict] = []
@@ -2901,7 +2841,7 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
             return {"ok": False, "error": "NAT-нода не на связи (нет reverse pull)", "ms": 0}
 
     ob = None
-    for o in _l2tp_outbounds(store) + _custom_outbounds(store):
+    for o in _custom_outbounds(store):
         if o["tag"] == tag:
             ob = copy.deepcopy(o)
     if tag == "direct":

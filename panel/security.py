@@ -135,7 +135,6 @@ _API_SCOPE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("xray", "config"), "xray"),
     (("clients",), "clients"),
     (("inbounds",), "inbounds"),
-    (("l2tp",), "read"),
     (("outbounds",), "read"),
     (("server",), "read"),
 ]
@@ -182,12 +181,12 @@ def required_scope(parts: list[str]) -> str:
 # Read-ish actions always allowed with valid agent token
 MANAGE_READ = frozenset({
     "", "snapshot", "status", "check_xray", "get_logs", "xray_config", "xray_debug",
-    "nodes", "refresh_l2tp",
+    "nodes",
 })
 # Mutating ops OK on agents; blocked on master unless allow_master_manage
 MANAGE_WRITE = frozenset({
-    "restart_xray", "update_xray", "rollback_xray", "apply_xray", "l2tp_connect", "l2tp_disconnect",
-    "select_best_l2tp", "save_panel", "enable_agent", "node_diag", "ensure_network_perf",
+    "restart_xray", "update_xray", "rollback_xray", "apply_xray",
+    "save_panel", "enable_agent", "node_diag", "ensure_network_perf",
     "iperf3_ensure", "iperf3_client", "iperf3_serve",
 })
 # High-impact: need confirm + blocked on master by default

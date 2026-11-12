@@ -211,7 +211,7 @@ def wants_demote_to_agent(payload: dict | None) -> bool:
 def demote_store_to_agent(store: dict) -> dict:
     """Flip this host to agent in-place. Used by /agent/apply and manage demote_to_agent.
 
-    Keeps Agent API on and sets runtime_preserve so live Xray/L2TP survives until the
+    Keeps Agent API on and sets runtime_preserve so live Xray survives until the
     following apply rewrites the store. Respects agent_manual_off (local admin opt-out).
     """
     ns = store.setdefault("settings", {}).setdefault("nodes", {})
@@ -1381,7 +1381,7 @@ def sync_all_node_outbounds(store: dict) -> None:
 
 
 def _agent_safe_clients(clients: list[dict], *, keep_node: bool = False) -> list[dict]:
-    """Agent has no master's L2TP ifaces — remap dangling outbound tags to direct."""
+    """Remap dangling legacy/foreign outbound tags to direct on an agent."""
     out = []
     for c in clients or []:
         c = dict(c)
@@ -1405,7 +1405,7 @@ def _agent_safe_routes(routes: list[dict], *, keep_node: bool = False) -> list[d
 
 
 def _agent_safe_balancers(balancers: dict, *, keep_node: bool = False) -> dict:
-    """Drop explicit L2TP members — agent will use connected local tunnels or [direct]."""
+    """Drop legacy l2tp_* and non-mirrored node_* members from balancer pools."""
     bals = json.loads(json.dumps(balancers or {}))  # deep copy
     for b in bals.values():
         if not isinstance(b, dict):
@@ -1437,31 +1437,23 @@ def _peer_node_export(n: dict) -> dict:
 def agent_runtime_store(store: dict) -> dict:
     """Deep copy for live Xray on an agent.
 
-    - runtime_preserve: keep full config (former master just demoted — do not strip L2TP)
-    - local l2tp entries present: keep them (this host still has tunnels)
+    - runtime_preserve: keep full config (former master just demoted)
     - mirror: keep peer node_* outbounds
+    - always drop legacy l2tp_* tags/members (feature removed)
     """
     s = json.loads(json.dumps(store))
     ns = (s.get("settings") or {}).get("nodes") or {}
     if ns.get("runtime_preserve"):
         return s
-    has_local_l2tp = bool(s.get("l2tp"))
     keep_node = bool(ns.get("mirror"))
-    if not has_local_l2tp:
-        s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
-        s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
-        s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=keep_node)
-        s["l2tp"] = []
-    else:
-        # Former master / host with tunnels: only remap missing node_* if not mirroring
-        s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
-        s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
-        s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=True)
-        # keep s["l2tp"]
+    s.pop("l2tp", None)
+    s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
+    s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
+    s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=keep_node)
     customs = []
     for o in s.get("outbounds_custom") or []:
         tag = str(o.get("tag") or "")
-        if not has_local_l2tp and (tag.startswith("l2tp_") or o.get("kind") == "l2tp"):
+        if tag.startswith("l2tp_") or o.get("kind") == "l2tp":
             continue
         if not keep_node and (o.get("kind") == "node" or tag.startswith("node_")):
             continue
@@ -2794,28 +2786,12 @@ def _remap_inbounds_drop_tags(inbounds: list[dict], drop_tags: set[str]) -> list
     return out
 
 
-def promote_l2tp_entries(store: dict) -> list[dict]:
-    """Copy L2TP tunnel configs for the new master (disconnected — ifaces are host-local)."""
-    out = []
-    for t in store.get("l2tp") or []:
-        item = json.loads(json.dumps(t))
-        item["status"] = "disconnected"
-        item["last_error"] = ""
-        for k in ("ifname", "addr", "local_ip", "peer_ip", "public_ip", "vrf"):
-            item[k] = ""
-        item.pop("metrics", None)
-        out.append(item)
-    return out
-
-
-def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | None = None) -> dict:
+def promote_snapshot(store: dict, target_node: dict) -> dict:
     """Full master copy for the new master.
 
-    Transfers all outbounds/clients/routes/L2TP/settings (incl. DoH)/certs/Pi-hole files
+    Transfers all outbounds/clients/routes/settings (incl. DoH)/certs/Pi-hole files
     except the outbound that pointed at the target node itself (node_<slug>) — that tag
-    is removed and every reference to it is rewritten to ``direct``. L2TP tunnels arrive
-    disconnected; secrets are passed plaintext in ``l2tp_secrets`` so the new host can
-    re-encrypt with its key.
+    is removed and every reference to it is rewritten to ``direct``.
     """
     import ops as ops_mod
 
@@ -2829,16 +2805,9 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
             if tag:
                 drop.add(tag)
             continue
-        customs.append(json.loads(json.dumps(o)))  # deep copy
-    l2tp = promote_l2tp_entries(store)
-    secrets = {}
-    for name, sec in (l2tp_secrets or {}).items():
-        if not name or not isinstance(sec, dict):
+        if tag.startswith("l2tp_") or o.get("kind") == "l2tp":
             continue
-        secrets[str(name)] = {
-            "password": str(sec.get("password") or ""),
-            "psk": str(sec.get("psk") or ""),
-        }
+        customs.append(json.loads(json.dumps(o)))  # deep copy
     settings = json.loads(json.dumps(store.get("settings") or {}))
     # Receiving node will force role=master; don't ship old agent flags as truth.
     # Keep tunnel block so L2X WSS portal survives promote.
@@ -2861,13 +2830,10 @@ def promote_snapshot(store: dict, target_node: dict, *, l2tp_secrets: dict | Non
         "tunnel_settings": tunnel_settings,
         "tunnel_bundle": tunnel_bundle,
         "ip_bans": json.loads(json.dumps(store.get("ip_bans") or [])),
-        "l2tp": l2tp,
-        "l2tp_secrets": secrets,
         "certs": certs,
         "doh_bundle": doh_bundle,
         "drop_outbound_tags": sorted(drop),
         "transferred_custom": len(customs),
-        "transferred_l2tp": len(l2tp),
         "transferred_certs": len(certs),
         "transferred_doh_files": len(doh_bundle),
         "transferred_tunnel": bool(tunnel_bundle.get("psk") and tunnel_bundle.get("token")),
@@ -2937,8 +2903,6 @@ def promote_payload(master_store_snapshot: dict, old_master_node: dict, extra_no
         "routes": snap.get("routes") or [],
         "balancers": snap.get("balancers") or {},
         "outbounds_custom": snap.get("outbounds_custom") or [],
-        "l2tp": snap.get("l2tp") or [],
-        "l2tp_secrets": snap.get("l2tp_secrets") or {},
         "dns": snap.get("dns") or {},
         "xray_settings": snap.get("xray_settings") or {},
         "settings": snap.get("settings") or {},
@@ -3225,7 +3189,7 @@ def promote_via_ssh(
         return {"ok": False, "error": f"SSH: {exc}"}
 
     try:
-        # Merge snapshot into remote store (clients/inbounds/routes/balancers/l2tp/settings/certs/doh/nodes)
+        # Merge snapshot into remote store (clients/inbounds/routes/balancers/settings/certs/doh/nodes)
         snap = {
             "clients": master_store_snapshot.get("clients") or [],
             "inbounds": master_store_snapshot.get("inbounds") or [],
@@ -3238,8 +3202,6 @@ def promote_via_ssh(
             "ip_bans": master_store_snapshot.get("ip_bans") or [],
             "certs": master_store_snapshot.get("certs") or [],
             "doh_bundle": master_store_snapshot.get("doh_bundle") or [],
-            "l2tp": master_store_snapshot.get("l2tp") or [],
-            "l2tp_secrets": master_store_snapshot.get("l2tp_secrets") or {},
             "tunnel_settings": master_store_snapshot.get("tunnel_settings") or {},
             "nodes": [old_master_node],
             "old_master_domain": old_master_node.get("domain") or "",
@@ -3255,18 +3217,18 @@ def promote_via_ssh(
             with sftp.file("/tmp/l2x_tunneld.yaml", "w") as f:
                 f.write(tun_yaml)
         promote_py = """
-import base64, hashlib, json, os, subprocess
+import base64, json, os, subprocess
 from pathlib import Path
-from cryptography.fernet import Fernet
 snap = json.loads(Path('/tmp/l2x_promote.json').read_text())
 store_path = Path('/var/lib/l2xpanel/store.json')
 store = json.loads(store_path.read_text()) if store_path.exists() else {}
 local_panel = dict((store.get('settings') or {}).get('panel') or {})
 keep_bp = local_panel.get('base_path')
 keep_host = local_panel.get('public_host')
-for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes','l2tp','ip_bans'):
+for k in ('clients','inbounds','routes','balancers','outbounds_custom','dns','xray_settings','nodes','ip_bans'):
     if k in snap:
         store[k] = snap[k]
+store.pop('l2tp', None)
 incoming = snap.get('settings') or {}
 if isinstance(incoming, dict) and incoming:
     cur = store.setdefault('settings', {})
@@ -3322,30 +3284,6 @@ if _ty.exists():
     except OSError:
         pass
     print('tunnel_yaml_installed')
-secrets = snap.get('l2tp_secrets') or {}
-if secrets:
-    sk = (os.environ.get('SECRET_KEY') or '').strip()
-    if not sk:
-        for _p in (Path('/var/lib/l2xpanel/secret_key'), Path('/opt/l2xpanel/data/secret_key')):
-            if _p.exists():
-                sk = _p.read_text(encoding='utf-8').strip()
-                if sk:
-                    break
-    if not sk:
-        raise SystemExit('SECRET_KEY missing for l2tp_secrets')
-    f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(sk.encode()).digest()))
-    d = Path('/var/lib/l2xpanel/l2tp_secrets')
-    d.mkdir(parents=True, exist_ok=True)
-    for name, sec in secrets.items():
-        if not isinstance(sec, dict):
-            continue
-        payload = {
-            'password': f.encrypt((sec.get('password') or '').encode()).decode() if sec.get('password') else '',
-            'psk': f.encrypt((sec.get('psk') or '').encode()).decode() if sec.get('psk') else '',
-        }
-        p = d / f'{name}.json'
-        p.write_text(json.dumps(payload))
-        os.chmod(p, 0o600)
 # TLS certs
 cert_dir = Path(os.environ.get('L2XPANEL_CERT_DIR', '/etc/l2xpanel/certs'))
 n_certs = 0
@@ -3397,7 +3335,7 @@ if n_doh and (doh_dir / 'docker-compose.yml').is_file():
                 break
         except Exception:
             pass
-print('promoted', 'l2tp', len(store.get('l2tp') or []), 'custom', len(store.get('outbounds_custom') or []),
+print('promoted', 'custom', len(store.get('outbounds_custom') or []),
       'certs', n_certs, 'doh_files', n_doh, 'doh_enabled', bool((store.get('settings') or {}).get('doh', {}).get('enabled')))
 """
         with sftp.file("/tmp/l2x_promote.py", "w") as f:
