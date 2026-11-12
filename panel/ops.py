@@ -224,6 +224,127 @@ def panel_latest(include_prerelease: bool = False) -> dict:
     }
 
 
+def tunnel_goarch() -> str:
+    m = platform.machine().lower()
+    if m in ("aarch64", "arm64"):
+        return "arm64"
+    return "amd64"
+
+
+def tunnel_release_asset_urls(tag: str = "", *, kind: str = "agent") -> list[str]:
+    """Ordered GitHub release asset URLs for l2x-tunnel-agent / l2x-tunneld."""
+    tag = normalize_tag(tag)
+    if not tag:
+        try:
+            raw = Path("/opt/l2xpanel/VERSION").read_text(encoding="utf-8").strip().splitlines()[0]
+            tag = normalize_tag(raw)
+        except OSError:
+            tag = ""
+    if not tag:
+        return []
+    arch = tunnel_goarch()
+    base = f"https://github.com/{PANEL_REPO}/releases/download/{tag}"
+    name = "l2x-tunnel-agent" if kind == "agent" else "l2x-tunneld"
+    urls = [
+        f"{base}/{name}-linux-{arch}",
+        f"{base}/{name}",  # amd64 stable alias from CI
+    ]
+    # Prefer arch-specific first; drop duplicate if same
+    out, seen = [], set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def install_tunnel_binaries_from_github(tag: str = "") -> dict:
+    """Download tunnel binaries from GitHub Release into /usr/local/bin + /var/www/l2x-public.
+
+    Assets (CI workflow tunnel-binaries.yml):
+      l2x-tunnel-agent / l2x-tunnel-agent-linux-amd64|arm64
+      l2x-tunneld / l2x-tunneld-linux-amd64|arm64
+    """
+    tag = normalize_tag(tag)
+    if not tag:
+        try:
+            tag = normalize_tag(
+                Path("/opt/l2xpanel/VERSION").read_text(encoding="utf-8").strip().splitlines()[0]
+            )
+        except OSError:
+            tag = ""
+    if not tag:
+        return {"ok": False, "error": "no VERSION/tag"}
+
+    pub = Path("/var/www/l2x-public")
+    try:
+        pub.mkdir(parents=True, exist_ok=True)
+        Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    # If this tag's assets are not ready yet (CI still running), try a few prior tags.
+    tags_try = [tag]
+    try:
+        for r in panel_releases(8):
+            t = normalize_tag(r.get("tag") or "")
+            if t and t not in tags_try:
+                tags_try.append(t)
+            if len(tags_try) >= 4:
+                break
+    except Exception:
+        pass
+
+    installed: list[str] = []
+    errors: list[str] = []
+    for kind, dest_name in (("agent", "l2x-tunnel-agent"), ("tunneld", "l2x-tunneld")):
+        blob = b""
+        used = ""
+        for try_tag in tags_try:
+            for url in tunnel_release_asset_urls(try_tag, kind=kind):
+                try:
+                    blob = _http(url, 180)
+                    if blob and len(blob) > 1000:
+                        used = url
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{url}: {exc}")
+                    blob = b""
+            if blob:
+                break
+        if not blob:
+            continue
+        for dest in (Path("/usr/local/bin") / dest_name, pub / dest_name):
+            try:
+                tmp = Path(str(dest) + ".new")
+                tmp.write_bytes(blob)
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, dest)
+            except OSError as exc:
+                errors.append(f"{dest}: {exc}")
+                continue
+        installed.append(f"{dest_name}←{used}")
+
+    # Restart portal if we refreshed it
+    if any(x.startswith("l2x-tunneld") for x in installed):
+        try:
+            subprocess.run(
+                ["systemctl", "restart", "l2x-tunneld"],
+                capture_output=True, timeout=30, check=False,
+            )
+        except Exception:
+            pass
+
+    ok = any(x.startswith("l2x-tunnel-agent") for x in installed)
+    return {
+        "ok": ok,
+        "tag": tag,
+        "installed": installed,
+        "error": "" if ok else ("; ".join(errors[-4:]) or "assets missing on GitHub release"),
+        "public": str(pub / "l2x-tunnel-agent"),
+    }
+
+
 def update_panel(version: str = "", *, skip_xray: bool | None = None, full: bool = False) -> dict:
     """Run install.sh --update/--update-full [TAG] (keeps data).
 
@@ -273,12 +394,24 @@ def update_panel(version: str = "", *, skip_xray: bool | None = None, full: bool
     except OSError:
         pass
     ok = bool(r.get("ok")) and not rolled
+    tunnel_bins: dict = {}
+    if ok:
+        try:
+            tunnel_bins = install_tunnel_binaries_from_github(normalize_tag(ver) or tag)
+            if tunnel_bins.get("installed"):
+                log += "\ntunnel bins: " + ", ".join(tunnel_bins["installed"])
+            elif tunnel_bins.get("error"):
+                log += f"\ntunnel bins: {tunnel_bins.get('error')}"
+        except Exception as exc:  # noqa: BLE001
+            tunnel_bins = {"ok": False, "error": str(exc)}
+            log += f"\ntunnel bins: {exc}"
     return {
         "ok": ok,
         "log": log or f"exit {r.get('code')}",
         "version": ver,
         "requested": tag or "latest",
         "rolled_back": rolled,
+        "tunnel_bins": tunnel_bins,
         "error": "" if ok else (r.get("stderr") or log[-500:] or "update failed"),
     }
 

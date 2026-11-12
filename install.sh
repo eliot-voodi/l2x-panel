@@ -766,11 +766,30 @@ cutover_blue_green() {
 
   scrub_env_password
   after=$(tr -d '[:space:]' <"$new_dir/VERSION" 2>/dev/null || echo '?')
+  # L2X tunnel binaries from GitHub Release → /usr/local/bin + /var/www/l2x-public
+  install_tunnel_bins "$after" || true
   ok "Панель: v$before → $after (dual-slot $old_slot→$new_slot, без простоя)"
   printf '\n  Адрес панели: %s%s%s\n  Активный слот: %s%s%s (:%s)\n  Меню: %sl2x%s\n\n' \
     "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" \
     "$W" "$new_slot" "$N" "$new_port" \
     "$W" "$N"
+}
+
+install_tunnel_bins() {
+  # Download l2x-tunnel-agent / l2x-tunneld from the panel GitHub Release into
+  # /usr/local/bin and /var/www/l2x-public (nginx serves /l2x-tunnel-agent).
+  local ver=${1:-}
+  ver=$(printf '%s' "$ver" | tr -d '[:space:]')
+  [ -n "$ver" ] || ver=$(tr -d '[:space:]' <"$(active_dir)/VERSION" 2>/dev/null || true)
+  [ -n "$ver" ] || return 0
+  case "$ver" in v*) ;; *) ver="v$ver" ;; esac
+  info "L2X tunnel binaries с GitHub Release $ver"
+  py "$ver" <<'EOF' || true
+import sys
+import ops
+r = ops.install_tunnel_binaries_from_github(sys.argv[1])
+print("tunnel_bins", r.get("ok"), ",".join(r.get("installed") or []) or r.get("error") or "")
+EOF
 }
 
 py() {
@@ -889,6 +908,7 @@ update_inplace_direct() {
     die "Обновление и откат не подняли панель: journalctl -u l2xpanel -n 80"
   fi
   after=$(tr -d '[:space:]' <"$LIVE_DIR/VERSION" 2>/dev/null || echo '?')
+  install_tunnel_bins "$after" || true
   ok "Панель: v$before → $after (direct, минимальный простой)"
   printf '\n  Адрес панели: %s%s%s\n  Меню: %sl2x%s\n\n' "$W" "$(/usr/local/bin/l2x url 2>/dev/null)" "$N" "$W" "$N"
 }
@@ -1104,4 +1124,5 @@ wait_panel
 setup_ssl
 [ "$SSL" != none ] && wait_panel
 open_firewall
+install_tunnel_bins || true
 summary

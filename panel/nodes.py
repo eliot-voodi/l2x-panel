@@ -325,6 +325,15 @@ def tunnel_agent_binary_url(store: dict, master_host: str = "") -> str:
     return f"https://{host}/l2x-tunnel-agent"
 
 
+def tunnel_agent_github_urls(tag: str = "") -> list[str]:
+    """Fallback download URLs from GitHub Release (arch-specific first)."""
+    try:
+        import ops as ops_mod
+        return ops_mod.tunnel_release_asset_urls(tag, kind="agent")
+    except Exception:
+        return []
+
+
 def fleet_needs_udp_tunnel(store: dict) -> bool:
     """True when any L2X node uses the UDP profile (portal must listen publicly)."""
     for n in ensure_list(store):
@@ -382,6 +391,7 @@ def build_tunnel_agent_config(store: dict, node: dict) -> dict | None:
         "ws_url": ws_url if transport in ("wss", "both") else "",
         "peer_udp": peer_udp if transport in ("udp", "both") else "",
         "binary_url": tunnel_agent_binary_url(store),
+        "github_urls": tunnel_agent_github_urls(),
         "force": True,
     }
     return out
@@ -472,21 +482,33 @@ def _download_tunnel_binary(url: str, dest: Path) -> bool:
 
 
 def ensure_tunnel_binaries(*, publish_agent: bool = True) -> dict:
-    """Build/refresh l2x-tunneld (+ agent) from panel tree when Go is available."""
+    """Prefer GitHub Release assets; fall back to local ``go build`` if needed."""
     import subprocess
     import shutil
 
-    out: dict = {"ok": False, "built": False, "published": False}
+    out: dict = {"ok": False, "built": False, "published": False, "source": ""}
+    # 1) GitHub release assets → /usr/local/bin + /var/www/l2x-public
+    try:
+        import ops as ops_mod
+        gh = ops_mod.install_tunnel_binaries_from_github()
+        out["github"] = gh
+        if gh.get("ok"):
+            out["ok"] = True
+            out["source"] = "github"
+            out["published"] = True
+            out["bins"] = gh.get("installed") or []
+            return out
+    except Exception as exc:  # noqa: BLE001
+        out["github_error"] = str(exc)
+
     src = Path("/opt/l2xpanel/tunnel")
     if not (src / "go.mod").exists():
-        out["error"] = "tunnel sources missing"
+        out["error"] = out.get("github", {}).get("error") or "tunnel sources missing"
         return out
     go = shutil.which("go")
     if not go:
-        # Best-effort one-shot install (dpi_lite / UDP need rebuilt tunneld).
         try:
-            import subprocess as _sp
-            _sp.run(
+            subprocess.run(
                 ["apt-get", "install", "-y", "golang-go"],
                 capture_output=True, text=True, timeout=600, check=False,
             )
@@ -494,7 +516,7 @@ def ensure_tunnel_binaries(*, publish_agent: bool = True) -> dict:
         except Exception:
             go = None
         if not go:
-            out["error"] = "go not installed"
+            out["error"] = out.get("github", {}).get("error") or "go not installed / GitHub assets missing"
             return out
     Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "CGO_ENABLED": "0", "GOOS": "linux"}
@@ -515,6 +537,7 @@ def ensure_tunnel_binaries(*, publish_agent: bool = True) -> dict:
         built.append(name)
     out["built"] = True
     out["bins"] = built
+    out["source"] = "go-build"
     if publish_agent:
         pub = Path("/var/www/l2x-public")
         try:
@@ -524,7 +547,6 @@ def ensure_tunnel_binaries(*, publish_agent: bool = True) -> dict:
             out["published"] = True
         except OSError as exc:
             out["publish_error"] = str(exc)
-    # Restart portal if unit exists
     try:
         subprocess.run(
             ["systemctl", "restart", "l2x-tunneld"],
@@ -560,9 +582,23 @@ def apply_tunnel_agent_local(cfg: dict | None) -> dict:
 
     bin_path = Path("/usr/local/bin/l2x-tunnel-agent")
     if not bin_path.exists():
-        url = str(cfg.get("binary_url") or "").strip()
-        if not _download_tunnel_binary(url, bin_path):
-            # Last resort: build from local panel tree (reverse nodes that are also masters-of-nothing)
+        urls: list[str] = []
+        u = str(cfg.get("binary_url") or "").strip()
+        if u:
+            urls.append(u)
+        for gu in (cfg.get("github_urls") or []):
+            g = str(gu or "").strip()
+            if g and g not in urls:
+                urls.append(g)
+        for gu in tunnel_agent_github_urls():
+            if gu not in urls:
+                urls.append(gu)
+        got = False
+        for url in urls:
+            if _download_tunnel_binary(url, bin_path):
+                got = True
+                break
+        if not got:
             ensure_tunnel_binaries(publish_agent=False)
     unit = Path("/etc/systemd/system/l2x-tunnel-agent.service")
     try:
@@ -573,7 +609,10 @@ def apply_tunnel_agent_local(cfg: dict | None) -> dict:
             return {
                 "ok": False,
                 "changed": changed,
-                "error": "l2x-tunnel-agent binary missing — положите в /var/www/l2x-public/ на мастере или установите Go",
+                "error": (
+                    "l2x-tunnel-agent binary missing — обновите мастер (assets с GitHub Release "
+                    "в /var/www/l2x-public/) или дождитесь CI tunnel-binaries"
+                ),
                 "has_binary": False,
             }
         subprocess.run(
