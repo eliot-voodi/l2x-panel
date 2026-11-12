@@ -8,11 +8,11 @@
 <div class="row">
   <div><label class="f">Домены (по строке)</label>
     <textarea name="domain" class="mono" placeholder="geosite:category-ru&#10;regexp:.*\.ru$&#10;regexp:.*\.su$&#10;regexp:.*\.xn--p1ai$&#10;regexp:.*\.рф$&#10;ext:geosite_RU.dat:ru&#10;geosite:category-ads-all&#10;domain:example.com"></textarea>
-    <div class="hint">geosite:tag · ext:file.dat:tag · regexp: · domain: · для РФ: <code>.ru</code> / <code>.su</code> / <code>.рф</code></div>
+    <div class="hint">geosite:tag · ext:file.dat:tag · regexp: · domain: · для РФ: <code>.ru</code> / <code>.su</code> / <code>.рф</code>. Вместе с IP ниже — логическое «или».</div>
   </div>
   <div><label class="f">IP / CIDR</label>
     <textarea name="ip" class="mono" placeholder="geoip:ru&#10;geoip:private&#10;ext:geoip_RU.dat:ru&#10;8.8.8.8/32"></textarea>
-    <div class="hint">geoip:cc · ext:geoip_XX.dat:tag · CIDR</div>
+    <div class="hint">geoip:cc · ext:geoip_XX.dat:tag · CIDR · вместе с доменами — «или», не «и»</div>
   </div>
 </div>
 <div class="row">

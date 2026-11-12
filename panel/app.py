@@ -2911,7 +2911,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     })
     ib["sniffing"] = {
         "enabled": form.get("sniff") == "1",
-        "dest": [d for d in ("http", "tls", "quic", "fakedns") if form.get(f"sniff_{d}") == "1"] or ["http", "tls", "quic"],
+        "dest": [d for d in ("http", "tls", "quic", "bittorrent", "fakedns") if form.get(f"sniff_{d}") == "1"] or ["http", "tls", "quic"],
         "route_only": form.get("sniff_route_only") == "1",
         "metadata_only": form.get("sniff_meta") == "1",
         "excluded_domains": _split_lines(str(form.get("sniff_excl") or "")),
@@ -4916,7 +4916,7 @@ def _route_rule_from_form(form) -> tuple[dict | None, str]:
     rule = {
         "name": name,
         "enabled": form.get("enabled") != "0",
-        "outbound": str(form.get("outbound") or "direct"),
+        "outbound": xray.normalize_outbound_tag(str(form.get("outbound") or "direct")),
         "domain": _split_lines(str(form.get("domain") or "")),
         "ip": _split_lines(str(form.get("ip") or "")),
         "user": _split_lines(str(form.get("user") or "")),

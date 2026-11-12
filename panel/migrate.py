@@ -1258,6 +1258,14 @@ def route_from_xray_rule(rule: dict, *, idx: int) -> dict | None:
     outbound = str(rule.get("outboundTag") or rule.get("balancerTag") or "").strip()
     if not outbound or outbound.lower() in ("api",):
         return None
+    try:
+        import xray_runtime as _xr
+        outbound = _xr.normalize_outbound_tag(outbound)
+    except Exception:
+        if outbound.lower() in ("blocked", "blackhole", "deny", "reject"):
+            outbound = "block"
+        elif outbound.lower() in ("freedom", "passthrough"):
+            outbound = "direct"
     # Skip the universal final catch-all — L2X already appends network→direct
     domain = rule.get("domain") or []
     ip = rule.get("ip") or []

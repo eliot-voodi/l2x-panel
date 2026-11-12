@@ -208,18 +208,18 @@ def test_missing_ext_geo_skipped():
                         "inbound_tags": ["vless"]}
             mixed = {"name": "mix", "enabled": True, "outbound": "direct",
                      "domain": ["ext:geosite_RU.dat:ru", "regexp:.*\\.ru$"]}
-            if xray._rule_from_route(store, only_ext) is not None:
+            if xray._rule_from_route(store, only_ext):
                 fail("ext skip", "rule with only missing ext domains must be skipped")
-            rule = xray._rule_from_route(store, mixed)
-            if not rule or rule.get("domain") != ["regexp:.*\\.ru$"]:
-                fail("ext partial", str(rule))
+            rules = xray._rule_from_route(store, mixed)
+            if not rules or rules[0].get("domain") != ["regexp:.*\\.ru$"]:
+                fail("ext partial", str(rules))
             store["routes"] = [only_ext, mixed]
             if xray.missing_ext_geo(store) != ["geosite_RU.dat"]:
                 fail("missing list", str(xray.missing_ext_geo(store)))
             (Path(td) / "geosite_RU.dat").write_bytes(b"x" * 2048)
-            rule = xray._rule_from_route(store, only_ext)
-            if not rule or rule.get("domain") != only_ext["domain"]:
-                fail("ext present", str(rule))
+            rules = xray._rule_from_route(store, only_ext)
+            if not rules or rules[0].get("domain") != only_ext["domain"]:
+                fail("ext present", str(rules))
             if xray.missing_ext_geo(store):
                 fail("missing after download", str(xray.missing_ext_geo(store)))
         finally:

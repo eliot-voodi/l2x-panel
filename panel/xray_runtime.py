@@ -1012,6 +1012,17 @@ def outbound_label(store: dict, tag: str) -> str:
     return tag
 
 
+def normalize_outbound_tag(tag: str | None) -> str:
+    """Map aliases (3x-ui / Xray) onto panel tags. Unknown tags kept as-is."""
+    t = (tag or "direct").strip() or "direct"
+    low = t.lower()
+    if low in ("block", "blocked", "blackhole", "deny", "reject"):
+        return "block"
+    if low in ("direct", "freedom", "passthrough"):
+        return "direct"
+    return t
+
+
 def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = None) -> dict:
     """Map a logical tag to a routing target.
 
@@ -1021,7 +1032,7 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
     Otherwise use the balancer's fallback outbound (``direct`` by default, ``block``
     when fallback is ``none``).
     """
-    tag = (tag or "direct").strip() or "direct"
+    tag = normalize_outbound_tag(tag)
     if _is_balancer_target(store, tag):
         for b in ensure_balancers(store).values():
             if b.get("tag") != tag or not b.get("enabled", True):
@@ -1031,6 +1042,9 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
             return {"outboundTag": balancer_fallback_tag(b)}
         return {"outboundTag": "direct"}
     if known_outbounds is not None and tag not in known_outbounds:
+        # Never "leak" intended blocks to freedom when the tag is missing
+        if tag == "block":
+            return {"outboundTag": "block"}
         return {"outboundTag": "direct"}
     return {"outboundTag": tag}
 
@@ -1723,32 +1737,65 @@ def missing_ext_geo(store: dict) -> list[str]:
     return sorted(out)
 
 
-def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None = None) -> dict | None:
+def _filter_geo_entries(vals: list) -> list | None:
+    """Drop ext:*.dat entries whose files are missing. None = nothing left (skip that arm)."""
+    kept = [v for v in vals if not ext_geo_file(v) or geo_file_present(ext_geo_file(v))]
+    return kept or None
+
+
+def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None = None) -> list[dict]:
+    """Build Xray field rule(s) from a panel route.
+
+    Xray ANDs attributes on one rule. Panel UI treats domain and IP as alternative
+    match arms (OR) — emit separate rules when both are set, sharing other filters.
+    """
     if not r.get("enabled", True):
-        return None
+        return []
     target = r.get("outbound") or r.get("outbound_tag") or "direct"
-    rule: dict[str, Any] = {"type": "field", **_route_target(store, target, known_outbounds=known_outbounds)}
-    for key, xkey in (("domain", "domain"), ("ip", "ip"), ("user", "user"), ("protocol", "protocol"),
+    base: dict[str, Any] = {"type": "field", **_route_target(store, target, known_outbounds=known_outbounds)}
+    for key, xkey in (("user", "user"), ("protocol", "protocol"),
                       ("source", "source"), ("inbound_tags", "inboundTag")):
         val = r.get(key)
         if not val:
             continue
-        vals = val if isinstance(val, list) else [val]
-        if key in ("domain", "ip"):
-            # Xray refuses to start if an ext:*.dat file is missing — drop those entries until downloaded
-            kept = [v for v in vals if not ext_geo_file(v) or geo_file_present(ext_geo_file(v))]
-            if not kept:
-                # Whole condition depended on a missing file: skip rule rather than widen its match
-                return None
-            vals = kept
-        rule[xkey] = vals
+        base[xkey] = val if isinstance(val, list) else [val]
     for key, xkey in (("network", "network"), ("port", "port"), ("source_port", "sourcePort")):
         if r.get(key):
-            rule[xkey] = str(r[key])
-    if r.get("name"):
-        rule["ruleTag"] = re.sub(r"[^A-Za-z0-9_.-]", "_", str(r["name"]))[:64]
+            base[xkey] = str(r[key])
+
+    raw_domain = r.get("domain") or []
+    raw_ip = r.get("ip") or []
+    if not isinstance(raw_domain, list):
+        raw_domain = [raw_domain]
+    if not isinstance(raw_ip, list):
+        raw_ip = [raw_ip]
+    raw_domain = [v for v in raw_domain if v]
+    raw_ip = [v for v in raw_ip if v]
+    domain_vals = _filter_geo_entries(raw_domain) if raw_domain else None
+    ip_vals = _filter_geo_entries(raw_ip) if raw_ip else None
+    # All geo entries missing (ext:*.dat not downloaded yet) → skip, don't widen match
+    if (raw_domain or raw_ip) and not domain_vals and not ip_vals:
+        return []
+
+    arms: list[dict[str, Any]] = []
+    if domain_vals:
+        arms.append({"domain": domain_vals})
+    if ip_vals:
+        arms.append({"ip": ip_vals})
+    if not arms:
+        # No domain/ip — rule may still match on user/protocol/source/inbound/network/port
+        arms.append({})
+
+    tag_base = re.sub(r"[^A-Za-z0-9_.-]", "_", str(r.get("name") or ""))[:56] if r.get("name") else ""
     keys = ("domain", "ip", "user", "protocol", "source", "inboundTag", "network", "port", "sourcePort")
-    return rule if any(k in rule for k in keys) else None
+    out: list[dict] = []
+    for i, arm in enumerate(arms):
+        rule = {**base, **arm}
+        if tag_base:
+            rule["ruleTag"] = tag_base if len(arms) == 1 else f"{tag_base}_{i + 1}"[:64]
+        if any(k in rule for k in keys):
+            out.append(rule)
+    return out
 
 
 # ---------------------------------------------------------------- dns / reverse / settings
@@ -1900,9 +1947,7 @@ def build_config(store: dict) -> dict:
         except Exception:
             pass
     for r in store.get("routes") or []:
-        rule = _rule_from_route(store, r, known_outbounds=known_outbounds)
-        if rule:
-            rules.append(rule)
+        rules.extend(_rule_from_route(store, r, known_outbounds=known_outbounds))
     for c in active_clients:
         for e in subscription_entries(store, c):
             rules.append({
@@ -1920,7 +1965,9 @@ def build_config(store: dict) -> dict:
     rules.extend(per_inbound_rules)
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})
 
-    routing: dict[str, Any] = {"domainStrategy": "AsIs", "rules": rules}
+    # IPIfNonMatch: domain rules first; if none hit, resolve and try geoip/CIDR.
+    # AsIs made pure IP blocks (geoip:private, geoip:ru, …) miss domain dials.
+    routing: dict[str, Any] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
     if bals_cfg:
         routing["balancers"] = bals_cfg
 

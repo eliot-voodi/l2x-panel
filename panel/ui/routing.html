@@ -198,7 +198,8 @@
     {% endif %}
   </div>
 </div>
-<div class="hint">Порядок итогового конфига: API → эти правила → маршруты подписок по странам → outbound клиента → outbound inbound'а → direct.</div>
+<div class="hint">Порядок итогового конфига: API → эти правила → маршруты подписок по странам → outbound клиента → outbound inbound'а → direct.
+  Domain и IP в одном правиле — это «или» (два правила в Xray). Для блокировки по домену на inbound включите sniffing (http/tls). Теги <code>blackhole</code>/<code>blocked</code> из 3x-ui нормализуются в <code>block</code>.</div>
 
 <dialog id="dlg-add" style="max-width:760px">
   <form method="post" action="{{ bp }}/routing" id="form-route-add">
