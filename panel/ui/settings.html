@@ -136,13 +136,15 @@
   {{ m.check('agent_enabled', ns.agent_enabled, 'Agent API включён (Bearer /agent/*) — должен быть на всех нодах, включая master') }}
   {{ m.check('allow_master_manage', ns.allow_master_manage, 'Разрешить remote /agent/manage на этом хосте, даже если role=master (опасно)') }}
   <label class="f">Agent token</label>
-  <input value="{{ ns.agent_token }}" class="mono" readonly>
+  <input value="{% if ns.agent_token %}••••••••{{ ns.agent_token[-4:] }}{% endif %}" class="mono" readonly
+         title="Полный token скрыт; при regen новый покажется один раз в истории/после генерации — скопируйте с нод">
   {{ m.check('regen_token', False, 'Сгенерировать новый token') }}
   <div class="hint">
     Agent API всегда онлайн после обновлений, перезапусков и promote (панель от root).
     Снять галочку = выключить вручную. Обычный config-push на master отклоняется; sync с флагом
     <code>demote_to_agent</code> (или manage <code>demote_to_agent</code>) сам переключает бывший master в agent — без переустановки.
     Promote поднимает agent в master. Опасные manage-действия на master по умолчанию запрещены — включайте allow_master_manage только если нужно удалённое управление.
+    Смена пароля админа через agent token отключена.
   </div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>

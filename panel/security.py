@@ -189,14 +189,22 @@ MANAGE_WRITE = frozenset({
     "save_panel", "enable_agent", "node_diag", "ensure_network_perf",
     "iperf3_ensure", "iperf3_client", "iperf3_serve",
 })
-# High-impact: need confirm + blocked on master by default
+# High-impact: need confirm + blocked on master by default.
+# set_admin_password removed from agent manage — password changes are local/UI only
+# (agent Bearer must not be cluster root for admin credentials).
 MANAGE_ADMIN = frozenset({
-    "set_admin_password", "update_panel", "rollback_panel", "restart_panel", "restore_master",
+    "update_panel", "rollback_panel", "restart_panel", "restore_master",
+})
+# Explicitly rejected (legacy clients may still send these)
+MANAGE_FORBIDDEN = frozenset({
+    "set_admin_password",
 })
 
 
 def manage_action_allowed(*, action: str, is_master: bool, allow_master_manage: bool) -> tuple[bool, str]:
     a = (action or "").strip()
+    if a in MANAGE_FORBIDDEN:
+        return False, "действие запрещено через agent token (смените пароль локально на ноде)"
     if a in MANAGE_READ:
         return True, ""
     # Recover stuck former masters without allow_master_manage / SSH reinstall.
@@ -207,10 +215,8 @@ def manage_action_allowed(*, action: str, is_master: bool, allow_master_manage: 
         if is_master and not allow_master_manage:
             return False, "remote manage на master отключён (nodes.allow_master_manage)"
         return True, ""
-    # unknown actions: allow only if master manage enabled (compat) else deny write-unknown on master
-    if is_master and not allow_master_manage:
-        return False, f"unknown/blocked action on master: {a}"
-    return True, ""
+    # Default deny unknown actions (prevents future-handler footguns)
+    return False, f"unknown/blocked action: {a or '(empty)'}"
 
 
 # ---------------------------------------------------------------- SSRF / URL allow

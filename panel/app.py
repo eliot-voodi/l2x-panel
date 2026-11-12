@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -65,9 +66,13 @@ ADMIN_USER_ENV = os.environ.get("PANEL_ADMIN_USER", "admin")
 ADMIN_PASSWORD_ENV = os.environ.get("PANEL_ADMIN_PASSWORD", "").strip()
 PUBLIC_HOST_ENV = os.environ.get("L2XPANEL_PUBLIC_HOST", "127.0.0.1")
 STORE = DATA / "store.json"
+STORE_BAK = DATA / "store.bak"
 CREDS_FILE = DATA / "initial_credentials.txt"
 STORE_LOCK = threading.RLock()
 STARTED_AT = time.time()
+# Fail-closed when store.json is corrupt and .bak cannot be recovered.
+STORE_OK = True
+STORE_ERR = ""
 
 
 def panel_version() -> str:
@@ -193,42 +198,169 @@ def _ensure_settings(store: dict) -> dict:
     return s
 
 
+def _is_legacy_l2tp_tag(tag: str) -> bool:
+    t = str(tag or "").strip()
+    return t == "l2tp" or t.startswith("l2tp_")
+
+
+def _purge_legacy_l2tp(data: dict) -> bool:
+    """One-shot: drop L2TP feature leftovers and remap outbound refs → direct."""
+    dirty = False
+    if "l2tp" in data:
+        data.pop("l2tp", None)
+        dirty = True
+    if "l2tp_auto_state" in data:
+        data.pop("l2tp_auto_state", None)
+        dirty = True
+    settings = data.get("settings")
+    if isinstance(settings, dict) and "l2tp_auto" in settings:
+        settings.pop("l2tp_auto", None)
+        dirty = True
+    for c in data.get("clients") or []:
+        if not isinstance(c, dict):
+            continue
+        if _is_legacy_l2tp_tag(c.get("outbound") or ""):
+            c["outbound"] = "direct"
+            dirty = True
+    for r in data.get("routes") or []:
+        if not isinstance(r, dict):
+            continue
+        ob = str(r.get("outbound") or r.get("outbound_tag") or "")
+        if _is_legacy_l2tp_tag(ob):
+            r["outbound"] = "direct"
+            r.pop("outbound_tag", None)
+            dirty = True
+    customs = data.get("outbounds_custom") or []
+    if isinstance(customs, list):
+        kept = [
+            o for o in customs
+            if isinstance(o, dict)
+            and not _is_legacy_l2tp_tag(o.get("tag") or "")
+            and o.get("kind") != "l2tp"
+        ]
+        if len(kept) != len(customs):
+            data["outbounds_custom"] = kept
+            dirty = True
+    bals = data.get("balancers") or {}
+    if isinstance(bals, dict):
+        for b in bals.values():
+            if not isinstance(b, dict):
+                continue
+            members = b.get("members") or []
+            if not isinstance(members, list):
+                continue
+            cleaned = [m for m in members if not _is_legacy_l2tp_tag(str(m))]
+            if cleaned != members:
+                b["members"] = cleaned
+                dirty = True
+    meta = data.setdefault("meta", {})
+    if isinstance(meta, dict) and meta.get("l2tp_purged") != 1:
+        meta["l2tp_purged"] = 1
+        dirty = True
+    return dirty
+
+
+def _backup_corrupt_store() -> Path | None:
+    try:
+        if not STORE.exists():
+            return None
+        dest = DATA / f"store.corrupt.{int(time.time())}.json"
+        shutil.copy2(STORE, dest)
+        try:
+            os.chmod(dest, 0o600)
+        except OSError:
+            pass
+        return dest
+    except OSError:
+        return None
+
+
+def _read_store_json(path: Path) -> dict:
+    raw = path.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("store root must be object")
+    return data
+
+
 def _load_store() -> dict:
+    global STORE_OK, STORE_ERR
     data: dict = {}
+    loaded_ok = False
     if STORE.exists():
         try:
-            data = json.loads(STORE.read_text(encoding="utf-8"))
-        except ValueError:
-            data = {}
+            data = _read_store_json(STORE)
+            loaded_ok = True
+            STORE_OK = True
+            STORE_ERR = ""
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            _backup_corrupt_store()
+            recovered = False
+            if STORE_BAK.exists():
+                try:
+                    data = _read_store_json(STORE_BAK)
+                    loaded_ok = True
+                    recovered = True
+                    STORE_OK = True
+                    STORE_ERR = f"store.json повреждён, загружен store.bak ({exc})"
+                except (ValueError, OSError, json.JSONDecodeError):
+                    recovered = False
+            if not recovered:
+                STORE_OK = False
+                STORE_ERR = f"store.json повреждён и store.bak недоступен: {exc}"
+                # Fail-closed: empty in-memory view, never persist until fixed.
+                data = {}
+    else:
+        STORE_OK = True
+        STORE_ERR = ""
+        loaded_ok = True
+
     for key, default in (("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
                          ("ip_ban_stats", {}), ("xray_update_state", {}),
                          ("panel_update_state", {}), ("nodes", []), ("groups", [])):
         data.setdefault(key, default)
-    # Drop legacy L2TP keys (feature removed)
-    data.pop("l2tp", None)
-    data.pop("l2tp_auto_state", None)
     data.setdefault("reverse", {"bridges": [], "portals": []})
+    data.setdefault("meta", {})
     xray.ensure_balancers(data)
     xray.ensure_inbounds(data)
     xray.ensure_groups(data)
     xray._ensure_section(data, "xray_settings", xray.default_xray_settings())
     xray._ensure_section(data, "dns", xray.default_dns())
     _ensure_settings(data)
-    dirty = False
+    dirty = _purge_legacy_l2tp(data)
     for c in data["clients"]:
         xray.ensure_client(c)
         if not c.get("sub_token"):
             c["sub_token"] = secrets.token_urlsafe(18)
             dirty = True
-    if dirty or "inbound" in data:
+    if "inbound" in data:
         data.pop("inbound", None)
+        dirty = True
+    # Never write an empty/default store over a corrupt file.
+    if dirty and STORE_OK and loaded_ok:
         _save_store(data)
     return data
 
 
 def _save_store(data: dict) -> None:
+    if not STORE_OK:
+        raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    if STORE.exists():
+        try:
+            shutil.copy2(STORE, STORE_BAK)
+            try:
+                os.chmod(STORE_BAK, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
     tmp = STORE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(payload, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     os.replace(tmp, STORE)
 
 
@@ -236,7 +368,11 @@ def _save_store(data: dict) -> None:
 def mutate(*, history_section: str = "", history_note: str = ""):
     """Yield store for edits. Auto-records version history for clients/inbounds/settings/…"""
     with STORE_LOCK:
+        if not STORE_OK:
+            raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
         store = _load_store()
+        if not STORE_OK:
+            raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
         before_state = shist.canonical_state(store)
         yield store
         after_state = shist.canonical_state(store)
@@ -492,6 +628,24 @@ def _verify_current_password(request: Request, current: str) -> bool:
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _set_agent_token(ns: dict, raw: str) -> None:
+    """Store plaintext (needed for outbound Bearer) + hash for verification."""
+    tok = str(raw or "").strip()
+    ns["agent_token"] = tok
+    ns["agent_token_hash"] = _hash_token(tok) if tok else ""
+
+
+def _agent_token_ok(ns: dict, got: str | None) -> bool:
+    got_s = str(got or "")
+    if not got_s:
+        return False
+    th = str(ns.get("agent_token_hash") or "")
+    if th and sec.token_eq(_hash_token(got_s), th):
+        return True
+    expected = str(ns.get("agent_token") or "")
+    return bool(expected) and sec.token_eq(got_s, expected)
 
 
 # ================================================================ app + middleware
@@ -1332,11 +1486,13 @@ def _watchdog_cycle() -> None:
         ban_min = _int(store["settings"]["iplimit"].get("ban_minutes"), 30)
         for b in xray.enforce_ip_limits(store, ONLINE, ban_min):
             events.append({"type": "ip_ban", **b})
-        _save_store(store)
-        if need_apply:
+        if STORE_OK:
+            _save_store(store)
+        if need_apply and STORE_OK:
             _apply_xray(store, xray_only=True)
-    _expiry_warnings(store)
-    _notify_events(events)
+    if STORE_OK:
+        _expiry_warnings(store)
+        _notify_events(events)
 
 
 OUTBOUND_PROBE_INTERVAL = int(os.environ.get("L2XPANEL_OB_PROBE_SEC", "300"))
@@ -1778,7 +1934,9 @@ def _ensure_agent_sticky() -> None:
                 ns["agent_enabled"] = True
             # Token must exist for manage/apply even before first provision push
             if not ns.get("agent_token"):
-                ns["agent_token"] = secrets.token_urlsafe(32)
+                _set_agent_token(ns, secrets.token_urlsafe(32))
+            elif not ns.get("agent_token_hash"):
+                _set_agent_token(ns, ns["agent_token"])
     except Exception:
         pass
 
@@ -2096,15 +2254,17 @@ def _health_detail_authorized(request: Request) -> bool:
         return False
     store = _load_store()
     ns = (store.get("settings") or {}).get("nodes") or {}
-    accepted = [ns.get("agent_token") or ""]
-    accepted += [n.get("token") or "" for n in (store.get("nodes") or [])]
-    return sec.any_token_eq(token, accepted)
+    if _agent_token_ok(ns, token):
+        return True
+    return sec.any_token_eq(token, [n.get("token") or "" for n in (store.get("nodes") or [])])
 
 
 @app.get("/health")
 def health(request: Request):
     # Public surface is minimal; version/role/xray only with agent Bearer or session
-    out = {"status": "ok"}
+    out = {"status": "ok" if STORE_OK else "degraded"}
+    if not STORE_OK:
+        out["store_ok"] = False
     if not _health_detail_authorized(request):
         return out
     store = _load_store()
@@ -2117,8 +2277,11 @@ def health(request: Request):
         "role": role,
         "agent": role == "agent",
         "agent_enabled": bool(ns.get("agent_enabled")),
+        "store_ok": STORE_OK,
         "time": datetime.now(timezone.utc).isoformat(),
     })
+    if STORE_ERR:
+        out["store_error"] = STORE_ERR[:200]
     try:
         xs = xray.xray_status()
         out["xray_version"] = xs.get("version") or ""
@@ -5505,7 +5668,11 @@ async def settings_save(request: Request):
                 if (ns.get("role") or "") == "agent":
                     ns["role"] = "master"
             if form.get("regen_token") == "1" or not ns.get("agent_token"):
-                ns["agent_token"] = secrets.token_urlsafe(32)
+                new_tok = secrets.token_urlsafe(32)
+                _set_agent_token(ns, new_tok)
+                request.session["_new_agent_token"] = new_tok
+            elif not ns.get("agent_token_hash"):
+                _set_agent_token(ns, ns["agent_token"])
         elif section == "tg":
             tg = s["tg"]
             new_token = str(form.get("token") or "").strip()
@@ -5583,6 +5750,12 @@ async def settings_save(request: Request):
     elif section == "tg":
         # Always refresh Xray so l2x-tg-proxy SOCKS appears/disappears with outbound mode.
         flash(request, *_ok_msg("Настройки сохранены", _apply_xray(_load_store(), xray_only=True)))
+    elif section == "nodes":
+        shown = str(request.session.pop("_new_agent_token", "") or "")
+        if shown:
+            flash(request, f"Новый agent token (скопируйте сейчас): {shown}", "info")
+        else:
+            flash(request, "Настройки сохранены", "info")
     else:
         flash(request, "Настройки сохранены", "info")
     return go(f"/settings?tab={section}")
@@ -7176,6 +7349,9 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 flash(request, f"{node['name']}: название у пользователя — {shown}", "info")
             else:
                 new_tok = str(form.get("token") or "").strip()
+                if not new_tok:
+                    flash(request, "Token не изменён (пустое поле)", "info")
+                    return go("/nodes")
                 if len(new_tok) < 8:
                     flash(request, "Token слишком короткий", "error")
                     return go("/nodes")
@@ -7621,8 +7797,7 @@ def _agent_auth(request: Request) -> tuple[dict | None, JSONResponse | None]:
         return None, JSONResponse({"ok": False, "error": "agent disabled"}, status_code=403)
     auth = request.headers.get("authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    expected = ns.get("agent_token") or ""
-    if not expected or not token or not sec.token_eq(token, expected):
+    if not _agent_token_ok(ns, token):
         return None, JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     return store, None
 
@@ -7635,8 +7810,7 @@ def _agent_manage_auth(request: Request) -> tuple[dict | None, JSONResponse | No
     ns = store["settings"].get("nodes") or {}
     auth = request.headers.get("authorization") or ""
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    expected = ns.get("agent_token") or ""
-    if not expected or not token or not sec.token_eq(token, expected):
+    if not _agent_token_ok(ns, token):
         return None, JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     return store, None
 
@@ -7720,7 +7894,9 @@ def _manage_action(action: str, payload: dict) -> dict:
             if (ns.get("role") or "master") != "master":
                 ns["role"] = "agent"
             if not ns.get("agent_token"):
-                ns["agent_token"] = secrets.token_urlsafe(32)
+                _set_agent_token(ns, secrets.token_urlsafe(32))
+            elif not ns.get("agent_token_hash"):
+                _set_agent_token(ns, ns["agent_token"])
             role_out = ns.get("role") or "agent"
         return {"ok": True, "error": "", "agent_enabled": True, "role": role_out}
 
@@ -7812,20 +7988,10 @@ def _manage_action(action: str, payload: dict) -> dict:
         return {"ok": True, "error": "", **_manage_snapshot(_load_store())}
 
     if action == "set_admin_password":
-        password = str(payload.get("password") or "")
-        uname = str(payload.get("username") or "").strip()
-        if uname:
-            rec = admins.get_by_username(uname)
-            if not rec:
-                return {"ok": False, "error": "администратор не найден"}
-            ok, err, _ = admins.update_account(rec["id"], new_password=password)
-            if not ok:
-                return {"ok": False, "error": err or "ошибка"}
-            return {"ok": True, "error": ""}
-        ok, err = admins.set_primary_password(password)
-        if not ok:
-            return {"ok": False, "error": err or "ошибка"}
-        return {"ok": True, "error": ""}
+        return {
+            "ok": False,
+            "error": "смена пароля через agent token отключена — смените локально в Settings → Admins",
+        }
 
     if action == "update_panel":
         running = PANEL_UPDATE_JOB.get("id")
@@ -8290,12 +8456,13 @@ async def agent_pull(request: Request):
     ns_local = (store.get("settings") or {}).get("nodes") or {}
     if err := _agent_rate_ok(request, "pull"):
         return err
-    accepted = [ns_local.get("agent_token") or ""]
-    accepted += [
+    node_tokens = [
         n.get("token") or "" for n in (store.get("nodes") or [])
         if n.get("id") == node_id
     ]
-    if not token or not sec.any_token_eq(token, accepted):
+    if not token or not (
+        _agent_token_ok(ns_local, token) or sec.any_token_eq(token, node_tokens)
+    ):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if not nodes_mod.is_master(store):
         # Demoted master: point the NAT agent at the new master. ok=True + update so agents

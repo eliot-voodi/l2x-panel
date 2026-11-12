@@ -171,10 +171,16 @@ def version_tuple(v: str) -> tuple[int, ...]:
     return tuple(nums)
 
 
+# Semver tags or main/master only — never shell metacharacters into update cmds.
+_TAG_RE = re.compile(r"^(?:main|master|v?\d+(?:\.\d+)*(?:[._-][A-Za-z0-9]+)*)$", re.I)
+
+
 def normalize_tag(version: str) -> str:
     v = str(version or "").strip()
-    if not v:
+    if not v or not _TAG_RE.fullmatch(v):
         return ""
+    if v.lower() in ("main", "master"):
+        return v.lower()
     return v if v.startswith("v") or v.startswith("V") else f"v{v}"
 
 
@@ -366,21 +372,21 @@ def update_panel(version: str = "", *, skip_xray: bool | None = None, full: bool
     elif "SKIP_XRAY" in env:
         env.pop("SKIP_XRAY", None)
 
-    flag = "--update-full" if full else "--update"
-    if Path("/usr/local/bin/l2x").exists():
-        # l2x update [TAG] → fast; l2x update --full [TAG] → full
-        cmd = ["/usr/local/bin/l2x", "update"]
-        if full:
-            cmd.append("--full")
-        if tag:
-            cmd.append(tag)
-    else:
-        args = flag + (f" {tag}" if tag else "")
-        script = (
-            "curl -fsSL https://raw.githubusercontent.com/eliot-voodi/l2x-panel/main/install.sh "
-            f"| bash -s -- {args}"
-        )
-        cmd = ["bash", "-lc", script]
+    if not Path("/usr/local/bin/l2x").exists():
+        return {
+            "ok": False,
+            "error": "нет /usr/local/bin/l2x — обновите панель через install.sh на хосте "
+                     "(curl|bash fallback отключён)",
+            "log": "",
+        }
+    if version and not tag:
+        return {"ok": False, "error": "недопустимый version tag", "log": ""}
+    # l2x update [TAG] → fast; l2x update --full [TAG] → full
+    cmd = ["/usr/local/bin/l2x", "update"]
+    if full:
+        cmd.append("--full")
+    if tag:
+        cmd.append(tag)
     if _in_panel_cgroup() and shutil.which("systemd-run"):
         r = _run_detached(cmd, env, timeout=900)
     else:
@@ -1030,6 +1036,32 @@ def _acme_webroot_ready() -> bool:
     return ACME_WEBROOT.is_dir() and _run(["systemctl", "is-active", "nginx"])["stdout"].strip() == "active"
 
 
+_ACME_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def _safe_acme_email(email: str | None) -> str:
+    e = str(email or "").strip()
+    return e if _ACME_EMAIL_RE.fullmatch(e) else ""
+
+
+def _install_acme_sh(email: str, env: dict) -> dict:
+    """Download get.acme.sh and run via argv — no shell=True / email interpolation."""
+    script = Path("/tmp/l2x-get-acme.sh")
+    try:
+        raw = _http("https://get.acme.sh", 60)
+        script.write_bytes(raw)
+        try:
+            os.chmod(script, 0o700)
+        except OSError:
+            pass
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": f"download get.acme.sh: {exc}"}
+    cmd = ["sh", str(script)]
+    if email:
+        cmd.append(f"email={email}")
+    return _run(cmd, 300, env=env)
+
+
 def issue_cert(domain: str, email: str) -> dict:
     """Let's Encrypt via acme.sh: nginx webroot when available, otherwise standalone on :80.
     Accepts a domain or a public IP."""
@@ -1043,11 +1075,10 @@ def issue_cert(domain: str, email: str) -> dict:
     # systemd starts the service without HOME, so acme.sh would otherwise install into /.acme.sh
     env = {**os.environ, "HOME": "/root"}
     acme = Path("/root/.acme.sh/acme.sh")
-    email = email.strip() if "@" in (email or "") else ""
+    email = _safe_acme_email(email)
     if not acme.exists():
-        r = _run("cd /tmp && curl -fsSL https://get.acme.sh | sh" + (f" -s email={email}" if email else ""), 300,
-                 shell=True, env=env)
-        log.append(r["stdout"][-1500:] + r["stderr"][-1500:])
+        r = _install_acme_sh(email, env)
+        log.append((r.get("stdout") or "")[-1500:] + (r.get("stderr") or "")[-1500:])
         if not acme.exists():
             return {"ok": False, "log": "\n".join(log), "error": "acme.sh install failed"}
     cmd = [str(acme), "--issue", "-d", domain, "--server", "letsencrypt", "--force"]

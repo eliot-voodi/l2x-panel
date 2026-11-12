@@ -184,7 +184,19 @@ def node_sync_due(node: dict, now: datetime | None = None) -> bool:
 def agent_token(store: dict) -> str:
     s = store.setdefault("settings", {}).setdefault("nodes", {})
     if not s.get("agent_token"):
-        s["agent_token"] = secrets.token_urlsafe(32)
+        tok = secrets.token_urlsafe(32)
+        s["agent_token"] = tok
+        try:
+            import hashlib
+            s["agent_token_hash"] = hashlib.sha256(tok.encode()).hexdigest()
+        except Exception:
+            pass
+    elif not s.get("agent_token_hash"):
+        try:
+            import hashlib
+            s["agent_token_hash"] = hashlib.sha256(str(s["agent_token"]).encode()).hexdigest()
+        except Exception:
+            pass
     s.setdefault("agent_enabled", True)  # Agent API on all nodes (incl. master)
     s.setdefault("role", "master")  # master | agent
     s.setdefault("agent_manual_off", False)

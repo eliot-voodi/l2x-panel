@@ -123,15 +123,13 @@
   <div class="actions mt"><button class="btn">Сохранить на ноде</button></div>
 </form>
 
-<form class="card" method="post" action="{{ bp }}/settings-node/{{ node.id }}/action" style="max-width:520px"
-      onsubmit="return confirm('Сменить пароль админа на ноде {{ node.name }}?')">
-  <input type="hidden" name="action" value="set_admin_password">
+<div class="card" style="max-width:520px">
   <h3>Пароль админа ноды</h3>
-  <div class="hint">Логин: <code>{{ snap.admin_user or 'admin' }}</code></div>
-  <label class="f">Новый пароль (≥8)</label>
-  <input name="password" type="password" minlength="8" required autocomplete="new-password">
-  <div class="actions mt"><button class="btn danger">Сменить пароль</button></div>
-</form>
+  <div class="hint">
+    Смена пароля через agent token отключена (безопасность). Зайдите на ноду локально:
+    Settings → Admins. Логин на ноде: <code>{{ snap.admin_user or 'admin' }}</code>
+  </div>
+</div>
 
 {% elif tab == 'system' %}
 {% set xr = snap.xray or {} %}
