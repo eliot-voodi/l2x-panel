@@ -174,7 +174,7 @@
     <h3 class="mt">Sniffing</h3>
     {{ m.check('sniff', sniff.enabled, 'Включить') }}
     <div>{% for d in ('http', 'tls', 'quic', 'bittorrent', 'fakedns') %}{{ m.check('sniff_' ~ d, d in (sniff.dest or []), d) }}{% endfor %}</div>
-    <div class="hint">Для блокировки по домену/рекламе нужны http+tls (+quic). Для block-torrent — <code>bittorrent</code>.</div>
+    <div class="hint">Для маршрутизации панель при apply принудительно включает http+tls+quic и <code>routeOnly</code> на user-inbound. Для block-torrent добавьте <code>bittorrent</code>.</div>
     <div>{{ m.check('sniff_route_only', sniff.route_only, 'routeOnly') }}{{ m.check('sniff_meta', sniff.metadata_only, 'metadataOnly') }}</div>
     <label class="f">Excluded domains</label>
     <textarea name="sniff_excl" class="mono" rows="2" placeholder="по одному на строку / через запятую">{{ (sniff.excluded_domains or [])|join('\n') }}</textarea>

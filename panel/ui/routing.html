@@ -198,8 +198,9 @@
     {% endif %}
   </div>
 </div>
-<div class="hint">Порядок итогового конфига: API → эти правила → маршруты подписок по странам → outbound клиента → outbound inbound'а → direct.
-  Domain и IP в одном правиле — это «или» (два правила в Xray). Для блокировки по домену на inbound включите sniffing (http/tls). Теги <code>blackhole</code>/<code>blocked</code> из 3x-ui нормализуются в <code>block</code>.</div>
+<div class="hint">Порядок: API → эти правила → подписки по странам → outbound клиента → outbound inbound → direct.
+  Domain и IP в одном правиле — «или». Sniffing (http/tls/quic, routeOnly) на user-inbound включается принудительно при apply — доменные правила не зависят от галочки в inbound.
+  Балансеры в правилах не переключаются на fallback из‑за probe health (это делает Xray observatory). Теги <code>blackhole</code>/<code>blocked</code> → <code>block</code>.</div>
 
 <dialog id="dlg-add" style="max-width:760px">
   <form method="post" action="{{ bp }}/routing" id="form-route-add">

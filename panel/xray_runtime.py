@@ -1026,18 +1026,18 @@ def normalize_outbound_tag(tag: str | None) -> str:
 def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = None) -> dict:
     """Map a logical tag to a routing target.
 
-    Balancers are only referenced when they have *healthy* members (same gate as
-    ``_balancers_cfg`` / observatory). Using the unfiltered member list here caused
-    ``balancer lb_* not found`` on mirrors/agents where every member failed health.
-    Otherwise use the balancer's fallback outbound (``direct`` by default, ``block``
-    when fallback is ``none``).
+    Balancer tags stay as ``balancerTag`` whenever the balancer is enabled and has
+    any selectable members (connected L2TP / enabled customs). Do **not** rewrite
+    to fallback based on momentary probe health — that made routes flip on every
+    watchdog apply. Dead members are handled by Xray observatory + ``fallbackTag``.
     """
     tag = normalize_outbound_tag(tag)
     if _is_balancer_target(store, tag):
         for b in ensure_balancers(store).values():
             if b.get("tag") != tag or not b.get("enabled", True):
                 continue
-            if balancer_member_tags(store, b, healthy_only=True):
+            # Pool without health gate — same set _balancers_cfg emits
+            if balancer_member_tags(store, b, healthy_only=False):
                 return {"balancerTag": tag}
             return {"outboundTag": balancer_fallback_tag(b)}
         return {"outboundTag": "direct"}
@@ -1912,6 +1912,10 @@ def build_config(store: dict) -> dict:
             if ib in client_inbounds(store, c):
                 identities.extend(client_identities(store, c, ib))
         built = P.build_inbound(ib, identities)
+        # Panel routes (domain / protocol / ads / geo) need sniffing every time —
+        # without it matches flap depending on whether the client dialed by IP or name.
+        if ib.get("protocol") in P.USER_PROTOCOLS:
+            _force_routing_sniff(built)
         if fake.get("enabled") and "sniffing" in built:
             dest = built["sniffing"]["destOverride"]
             if "fakedns" not in dest:
@@ -2025,9 +2029,13 @@ def build_config(store: dict) -> dict:
     rules.extend(per_inbound_rules)
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})
 
-    # IPIfNonMatch: domain rules first; if none hit, resolve and try geoip/CIDR.
-    # AsIs made pure IP blocks (geoip:private, geoip:ru, …) miss domain dials.
-    routing: dict[str, Any] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
+    # AsIs + forced sniffing/routeOnly: routing sees sniffed domain AND original IP
+    # without a second DNS pass (IPIfNonMatch was flaky when DNS/cache lagged).
+    routing: dict[str, Any] = {
+        "domainStrategy": "AsIs",
+        "domainMatcher": "hybrid",
+        "rules": rules,
+    }
     if bals_cfg:
         routing["balancers"] = bals_cfg
 
@@ -2087,13 +2095,12 @@ def build_config(store: dict) -> dict:
 
 
 def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
-    """Emit balancers only when they have live members.
+    """Emit enabled balancers with a stable selector (no probe-health filter).
 
-    leastPing/leastLoad require observatory/burstObservatory — emitting a balancer
-    with selector [direct] and no observatory makes Xray fail with
-    'not all dependencies are resolved'. ``random`` only needs a non-empty selector
-    of healthy members (panel drops dead L2TP / disabled customs on each apply).
-    Routes to empty balancers fall back via _route_target().
+    Health probes still update ``last_test`` / L2TP metrics for subscriptions, but
+    routing must not rebuild selector on every loss spike — that flipped user routes
+    between balancer and fallback. Observatory + ``fallbackTag`` handle dead peers.
+    Selector = connected L2TP + enabled customs (outbounds that exist in config).
     """
     bals = ensure_balancers(store)
     out: list[dict] = []
@@ -2102,7 +2109,7 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
 
     ping_b = bals.get("least_ping") or {}
     if ping_b.get("enabled", True):
-        members = balancer_member_tags(store, ping_b, healthy_only=True)
+        members = balancer_member_tags(store, ping_b, healthy_only=False)
         if members:
             entry = {
                 "tag": ping_b["tag"], "selector": members, "strategy": {"type": "leastPing"},
@@ -2119,7 +2126,7 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
 
     load_b = bals.get("least_load") or {}
     if load_b.get("enabled", True):
-        members = balancer_member_tags(store, load_b, healthy_only=True)
+        members = balancer_member_tags(store, load_b, healthy_only=False)
         if members:
             entry = {
                 "tag": load_b["tag"], "selector": members,
@@ -2138,18 +2145,15 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
                 },
             }
 
-    # Distribute connections across live outbounds (not “everyone → best ping”).
     rand_b = bals.get("random") or {}
     if rand_b.get("enabled", True):
-        members = balancer_member_tags(store, rand_b, healthy_only=True)
+        members = balancer_member_tags(store, rand_b, healthy_only=False)
         if members:
             entry = {
                 "tag": rand_b["tag"], "selector": members, "strategy": {"type": "random"},
                 "fallbackTag": balancer_fallback_tag(rand_b),
             }
             out.append(entry)
-            # Probe the same pool so leastPing (if on) sees them; random itself
-            # still picks only from the healthy selector rebuilt by the panel.
             if observatory is None:
                 observatory = {
                     "subjectSelector": sorted(set(members)),
@@ -2161,6 +2165,19 @@ def _balancers_cfg(store: dict) -> tuple[list[dict], dict | None, dict | None]:
                 observatory["subjectSelector"] = sorted(set(observatory["subjectSelector"]) | set(members))
 
     return out, observatory, burst
+
+
+def _force_routing_sniff(built: dict) -> None:
+    """Sniffing + routeOnly so domain/protocol panel routes always see SNI/Host + original IP."""
+    sn = built.setdefault("sniffing", {})
+    sn["enabled"] = True
+    dest = [d for d in (sn.get("destOverride") or []) if d]
+    for d in ("http", "tls", "quic"):
+        if d not in dest:
+            dest.append(d)
+    sn["destOverride"] = dest
+    sn["routeOnly"] = True
+    sn["metadataOnly"] = False
 
 
 def clean_xray_error(text: str) -> str:
