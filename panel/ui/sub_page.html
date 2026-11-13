@@ -83,11 +83,14 @@
   {% if masterdns_enabled and masterdns_link %}
   <div class="card">
     <h3>MasterDNS</h3>
-    <div class="hint">V2Box: <code>masterdns://</code>. Обход при жёсткой блокировке — медленнее VLESS.</div>
+    <div class="hint">V2Box: <code>masterdns://</code> = JSON MasterDnsVPN. Обход при жёсткой блокировке — медленнее VLESS.</div>
     <div class="flex mt" style="gap:1.25rem;align-items:flex-start;flex-wrap:wrap">
       {% if masterdns_qr %}<div class="qr">{{ masterdns_qr|safe }}</div>{% endif %}
       <div style="flex:1;min-width:220px">
         <div class="copy"><input id="mdlink" value="{{ masterdns_link }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('mdlink', this)">Копировать</button></div>
+        {% if masterdns_links and masterdns_links.masterdns_query %}
+        <div class="copy mt"><input id="mdlink_q" value="{{ masterdns_links.masterdns_query }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('mdlink_q', this)">query</button></div>
+        {% endif %}
         {% if masterdns_links and masterdns_links.dnst %}
         <div class="copy mt"><input id="mdlink_dnst" value="{{ masterdns_links.dnst }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('mdlink_dnst', this)">dnst://</button></div>
         {% endif %}

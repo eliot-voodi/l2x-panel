@@ -5748,7 +5748,14 @@ def settings_masterdns_link(request: Request):
     md = masterdns_mod.ensure_settings(store)
     title = str((store.get("settings") or {}).get("panel", {}).get("title") or "MasterDNS")
     links = masterdns_mod.share_links(md, name=title)
-    body = "\n".join(x for x in (links.get("masterdns"), links.get("stormdns"), links.get("dnst")) if x)
+    body = "\n".join(
+        x for x in (
+            links.get("masterdns"),
+            links.get("masterdns_query"),
+            links.get("stormdns"),
+            links.get("dnst"),
+        ) if x
+    )
     if not body:
         return PlainTextResponse("not configured", status_code=404)
     return PlainTextResponse(body + "\n", media_type="text/plain; charset=utf-8")
@@ -5783,7 +5790,14 @@ def sub_masterdns_link(token: str, request: Request):
     if not md.get("enabled") or not md.get("domain"):
         return PlainTextResponse("masterdns disabled", status_code=404)
     links = masterdns_mod.share_links(md, name=str(client.get("email") or "MasterDNS"))
-    body = "\n".join(x for x in (links.get("masterdns"), links.get("stormdns"), links.get("dnst")) if x)
+    body = "\n".join(
+        x for x in (
+            links.get("masterdns"),
+            links.get("masterdns_query"),
+            links.get("stormdns"),
+            links.get("dnst"),
+        ) if x
+    )
     if not body:
         return PlainTextResponse("not configured", status_code=404)
     return PlainTextResponse(body + "\n", media_type="text/plain; charset=utf-8")

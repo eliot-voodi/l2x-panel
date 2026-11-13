@@ -454,20 +454,69 @@ def _b64url_json(payload: dict) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _resolver_csv(md: dict) -> str:
+def _resolvers_list(md: dict) -> list[str]:
     resolvers = [str(x).strip() for x in (md.get("resolvers") or []) if str(x).strip()]
-    if not resolvers:
-        resolvers = list(DEFAULT_RESOLVERS)
-    return ",".join(resolvers)
+    return resolvers or list(DEFAULT_RESOLVERS)
+
+
+def _resolver_csv(md: dict) -> str:
+    return ",".join(_resolvers_list(md))
+
+
+def _client_json_payload(md: dict) -> dict:
+    """MasterDnsVPN client JSON (same keys as client_config.toml / -json_base64).
+
+    ``RESOLVERS`` is not a TOML key (resolvers live in a side file), but share-link
+    importers (V2Box / ray2sing) expect it inside the JSON body.
+    """
+    parts = _share_profile_parts(md, name="x")
+    if not parts:
+        return {}
+    domain, key, method, _ = parts
+    proto = str(md.get("protocol_type") or "SOCKS5").strip().upper() or "SOCKS5"
+    if proto not in ("SOCKS5", "TCP"):
+        proto = "SOCKS5"
+    return {
+        "DOMAINS": [domain],
+        "DATA_ENCRYPTION_METHOD": method,
+        "ENCRYPTION_KEY": key,
+        "PROTOCOL_TYPE": proto,
+        "RESOLVERS": _resolvers_list(md),
+        # Lossy-friendly defaults aligned with upstream sample / our TOML zip
+        "RESOLVER_BALANCING_STRATEGY": 3,
+        "PACKET_DUPLICATION_COUNT": 3,
+        "SETUP_PACKET_DUPLICATION_COUNT": 4,
+        "LISTEN_IP": str(md.get("client_listen_ip") or "127.0.0.1").strip() or "127.0.0.1",
+        "LISTEN_PORT": int(md.get("client_listen_port") or 18000),
+    }
 
 
 def share_link(md: dict, *, name: str = "") -> str:
-    """V2Box / Hiddify / sing-box ``masterdns://`` share link (query form).
+    """Primary ``masterdns://`` for V2Box: official MasterDnsVPN JSON as std-base64.
 
-    Format (ray2sing / V2Box)::
+    Same document the upstream client loads with ``-json_base64``, wrapped as::
 
-        masterdns://domain?key=…&encryption=xor&resolvers=8.8.8.8,1.1.1.1&mode=socks5#name
+        masterdns://<standard-base64(JSON)>#name
+
+    See https://github.com/masterking32/MasterDnsVPN (client ``-json_base64``)
+    and ray2sing ``masterdnsJSONLink``.
     """
+    parts = _share_profile_parts(md, name=name)
+    if not parts:
+        return ""
+    _, _, _, profile_name = parts
+    payload = _client_json_payload(md)
+    if not payload:
+        return ""
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # StdEncoding + padding: matches MasterDnsVPN decodeBase64ConfigJSON
+    b64 = base64.b64encode(raw).decode("ascii")
+    frag = quote(profile_name, safe="")
+    return f"masterdns://{b64}#{frag}"
+
+
+def share_link_query(md: dict, *, name: str = "") -> str:
+    """Alternate query form: ``masterdns://domain?key=…&encryption=xor&resolvers=…``."""
     parts = _share_profile_parts(md, name=name)
     if not parts:
         return ""
@@ -517,9 +566,10 @@ def share_link_dnst(md: dict, *, name: str = "") -> str:
 
 
 def share_links(md: dict, *, name: str = "") -> dict[str, str]:
-    """Client share URIs. ``masterdns`` is the V2Box query form (primary)."""
+    """Client share URIs. ``masterdns`` = official JSON-base64 (V2Box primary)."""
     return {
         "masterdns": share_link(md, name=name),
+        "masterdns_query": share_link_query(md, name=name),
         "stormdns": share_link_stormdns(md, name=name),
         "dnst": share_link_dnst(md, name=name),
     }
@@ -601,8 +651,8 @@ def build_client_zip(md: dict, *, name: str = "") -> bytes:
         zf.writestr(
             "README.txt",
             "L2X MasterDNS client pack\n"
-            "1. Prefer the masterdns:// link (masterdns.url) — paste/scan QR in WhiteDNS / compatible clients\n"
-            "2. Or use official MasterDnsVPN Client with client_config.toml + client_resolvers.txt\n"
+            "1. Prefer masterdns.url — V2Box / ray2sing: masterdns:// + std-base64(JSON) like Client -json_base64\n"
+            "2. Or run official MasterDnsVPN Client with client_config.toml + client_resolvers.txt\n"
             "3. Ensure DNS NS delegation for DOMAINS points to this server\n"
             + (f"\nShare link:\n{link}\n" if link else ""),
         )
