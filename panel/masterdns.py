@@ -12,7 +12,7 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import ops as ops_mod
 
@@ -407,15 +407,25 @@ def client_resolvers_text(md: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def share_link(md: dict, *, name: str = "") -> str:
-    """WhiteDNS / MasterDnsVPN-compatible profile URI: masterdns://<base64url(JSON)>."""
+def _share_profile_parts(md: dict, *, name: str = "") -> tuple[str, str, int, str] | None:
+    """Return (domain, key, method, profile_name) or None if incomplete."""
     domain = str(md.get("domain") or "").strip().lower().rstrip(".")
     key = str(md.get("encryption_key") or "").strip()
     method = int(md.get("encryption_method") or 2)
+    if method not in ENCRYPTION_METHODS:
+        method = 2
     if not domain or (method != 0 and not key):
-        return ""
+        return None
     profile_name = (name or domain or "MasterDNS").strip() or "MasterDNS"
-    payload = {
+    # WhiteDNS rejects control chars / whitespace in these fields
+    if any(ord(c) < 32 for c in domain + key + profile_name) or any(c.isspace() for c in domain):
+        return None
+    return domain, key, method, profile_name
+
+
+def _whitedns_payload(domain: str, key: str, method: int, profile_name: str) -> dict:
+    """Exact WhiteDNS Storm/Master profile JSON (no resolvers — those are Soar-only)."""
+    return {
         "schema": "whitedns.profile",
         "version": 1,
         "profile": {
@@ -427,13 +437,52 @@ def share_link(md: dict, *, name: str = "") -> str:
             },
         },
     }
-    # Optional resolvers (ignored by some clients; useful for Soar-style importers / future)
-    resolvers = [str(x).strip() for x in (md.get("resolvers") or []) if str(x).strip()]
-    if resolvers:
-        payload["profile"]["resolvers"] = resolvers
+
+
+def _b64url_json(payload: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return f"masterdns://{b64}"
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def share_link(md: dict, *, name: str = "", scheme: str = "masterdns") -> str:
+    """WhiteDNS-compatible profile URI: masterdns:// or stormdns:// + base64url(JSON).
+
+    Payload matches official WhiteDNS export for Storm/Master (no ``resolvers`` —
+    that field is Soar-only and breaks some importers).
+    """
+    parts = _share_profile_parts(md, name=name)
+    if not parts:
+        return ""
+    domain, key, method, profile_name = parts
+    sch = (scheme or "masterdns").strip().lower() or "masterdns"
+    if sch not in ("masterdns", "stormdns"):
+        sch = "masterdns"
+    return f"{sch}://{_b64url_json(_whitedns_payload(domain, key, method, profile_name))}"
+
+
+def share_link_stormdns(md: dict, *, name: str = "") -> str:
+    """Same profile as share_link, with stormdns:// (preferred by WhiteDNS UI)."""
+    return share_link(md, name=name, scheme="stormdns")
+
+
+def share_link_dnst(md: dict, *, name: str = "") -> str:
+    """Throne / Hiddify dnst:// URL (dnst URL spec §2 for MasterDNS + SOCKS)."""
+    parts = _share_profile_parts(md, name=name)
+    if not parts:
+        return ""
+    domain, key, method, profile_name = parts
+    q = urlencode({"mkey": key, "encryption": str(method)})
+    frag = quote(profile_name, safe="")
+    return f"dnst://{domain}/masterdns/socks?{q}#{frag}"
+
+
+def share_links(md: dict, *, name: str = "") -> dict[str, str]:
+    """All client-compatible share URIs for UI / subscription."""
+    return {
+        "masterdns": share_link(md, name=name, scheme="masterdns"),
+        "stormdns": share_link_stormdns(md, name=name),
+        "dnst": share_link_dnst(md, name=name),
+    }
 
 
 def share_link_import_url(link: str) -> str:

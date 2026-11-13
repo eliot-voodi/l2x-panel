@@ -83,11 +83,14 @@
   {% if masterdns_enabled and masterdns_link %}
   <div class="card">
     <h3>MasterDNS</h3>
-    <div class="hint">Ссылка <code>masterdns://</code> для WhiteDNS и совместимых клиентов. Обход при жёсткой блокировке — медленнее VLESS.</div>
+    <div class="hint">WhiteDNS: <code>stormdns://</code>. Throne/Hiddify: <code>dnst://</code>. Обход при жёсткой блокировке — медленнее VLESS.</div>
     <div class="flex mt" style="gap:1.25rem;align-items:flex-start;flex-wrap:wrap">
       {% if masterdns_qr %}<div class="qr">{{ masterdns_qr|safe }}</div>{% endif %}
       <div style="flex:1;min-width:220px">
         <div class="copy"><input id="mdlink" value="{{ masterdns_link }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('mdlink', this)">Копировать</button></div>
+        {% if masterdns_links and masterdns_links.dnst %}
+        <div class="copy mt"><input id="mdlink_dnst" value="{{ masterdns_links.dnst }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('mdlink_dnst', this)">dnst://</button></div>
+        {% endif %}
         <div class="actions mt">
           {% if masterdns_zip %}<a class="btn ghost sm" href="{{ masterdns_zip }}">{{ ic.icon('download') }}ZIP (toml)</a>{% endif %}
         </div>

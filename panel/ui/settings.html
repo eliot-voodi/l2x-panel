@@ -507,13 +507,24 @@
 <div>
   {% if md_link %}
   <div class="card">
-    <h3>Ссылка для клиентов · masterdns://</h3>
-    <div class="hint">WhiteDNS / совместимые клиенты: вставить ссылку или сканировать QR.</div>
+    <h3>Ссылка для клиентов</h3>
+    <div class="hint">WhiteDNS → <code>stormdns://</code> / <code>masterdns://</code>. Throne / Hiddify → <code>dnst://</code>. QR — stormdns (без лишних полей).</div>
     <div class="flex mt" style="gap:1.25rem;align-items:flex-start;flex-wrap:wrap">
       <div class="qr">{{ md_qr|safe }}</div>
       <div style="flex:1;min-width:220px">
-        <div class="copy"><input id="mdlink" value="{{ md_link }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink', this)">Копировать</button></div>
-        <div class="actions mt"><a class="btn ghost sm" href="{{ bp }}/settings/masterdns/link" target="_blank">Открыть .txt</a></div>
+        {% if md_links and md_links.stormdns %}
+        <label class="f">WhiteDNS · stormdns://</label>
+        <div class="copy"><input id="mdlink" value="{{ md_links.stormdns }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink', this)">Копировать</button></div>
+        {% endif %}
+        {% if md_links and md_links.masterdns %}
+        <label class="f mt">masterdns://</label>
+        <div class="copy"><input id="mdlink2" value="{{ md_links.masterdns }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink2', this)">Копировать</button></div>
+        {% endif %}
+        {% if md_links and md_links.dnst %}
+        <label class="f mt">Throne / Hiddify · dnst://</label>
+        <div class="copy"><input id="mdlink3" value="{{ md_links.dnst }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink3', this)">Копировать</button></div>
+        {% endif %}
+        <div class="actions mt"><a class="btn ghost sm" href="{{ bp }}/settings/masterdns/link" target="_blank">Все ссылки (.txt)</a></div>
       </div>
     </div>
   </div>
