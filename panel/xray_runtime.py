@@ -3288,7 +3288,14 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
             o.get("kind") == "node" and (o.get("config") or {}).get("protocol") == "socks"
         ):
             if not _tunnel_outbound_member_ok(store, o):
-                return {"ok": False, "error": "L2X tunnel offline (tunneld peer)", "ms": 0}
+                return {
+                    "ok": False,
+                    "error": (
+                        "L2X tunnel offline (tunneld peer) — Sync ноды / restart "
+                        "l2x-tunnel-agent / профиль NoDPI (WSS)"
+                    ),
+                    "ms": 0,
+                }
             t0 = time.time()
             cfg = o.get("config") or {}
             servers = ((cfg.get("settings") or {}).get("servers") or [{}])

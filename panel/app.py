@@ -7494,6 +7494,17 @@ def _node_push_job(node_id: str, label: str, host: str):
             for key in ("online", "fail_streak", "last_seen", "last_probe", "last_probe_error"):
                 if key in node_snap and not node_snap.get("nat"):
                     n[key] = node_snap[key]
+            if nodes_mod.uses_l2x_tunnel(n):
+                nodes_mod.refresh_tunnel_only_health(store, [n])
+                if n.get("tunnel_peer_online") is False:
+                    peer_tip = (
+                        "L2X tunneld peer offline — outbound не работает. "
+                        "Проверьте l2x-tunnel-agent на ноде или смените профиль на NoDPI (WSS)."
+                    )
+                    if peer_tip not in warns:
+                        warns.append(peer_tip)
+                    if "tunneld peer offline" not in str(n.get("last_warning") or ""):
+                        n["last_warning"] = peer_tip
             break
         webhooks.fire(store["settings"], "node.sync", {
             "node": name, "ok": res.get("ok"), "error": res.get("error"),
@@ -7588,15 +7599,15 @@ async def nodes_tunnel_profile(node_id: str, request: Request):
     flash(
         request,
         f"{name}: туннель → {spec['label']}{tip}. "
-        f"{'NAT: агент подхватит на ближайшем pull' if node_snap.get('nat') else 'Нажмите Sync (или SSH для tunnel-only)'}",
+        f"{'Запущен Sync (live push / pull)' if node_snap.get('token') else 'SSH retarget или Sync'}",
         "info",
     )
     _tg_admin(
         f"🔀 Нода <b>{tgbot.escape(name)}</b>: tunnel profile <code>{tgbot.escape(profile)}</code>",
         flag="notify_nodes",
     )
-    # Non-NAT with panel: kick sync so tunnel_agent applies soon
-    if node_snap.get("token") and not node_snap.get("nat"):
+    # Panel agent (incl. NAT with public HTTPS): kick sync so tunnel_agent applies soon
+    if node_snap.get("token"):
         running = NODES_JOB.get("id")
         if not (running and ops.JOBS.get(running, {}).get("status") == "running"):
             NODES_JOB["id"] = ops.start_job(

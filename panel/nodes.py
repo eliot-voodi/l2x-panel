@@ -1083,9 +1083,16 @@ def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> 
         n["tunnel_peer_online"] = peer_ok
         # Panel NAT agents keep online from /agent/pull — do not overwrite from tunneld
         if not is_tunnel_only_node(n):
-            if not peer_ok and n.get("online") is True:
-                n["last_warning"] = n.get("last_warning") or "tunneld peer offline (egress)"
-            elif peer_ok and str(n.get("last_warning") or "").startswith("tunneld peer offline"):
+            if not peer_ok:
+                tip = (
+                    "tunneld peer offline — egress/outbound мёртв. "
+                    "Sync ноды; на ноде: systemctl restart l2x-tunnel-agent; "
+                    "или профиль NoDPI (WSS). На мастере: UDP :4443 и WSS path открыты."
+                )
+                prev = str(n.get("last_warning") or "")
+                if "tunneld peer offline" not in prev:
+                    n["last_warning"] = tip
+            elif str(n.get("last_warning") or "").startswith("tunneld peer offline"):
                 n["last_warning"] = ""
             continue
         online = peer_ok
@@ -2672,9 +2679,6 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
     if is_tunnel_only_node(node):
         # Go tunnel-agent has no panel HTTP API — master only wires SOCKS outbound.
         return {"ok": True, "queued": False, "tunnel_only": True, "warnings": [], "error": ""}
-    if node.get("nat"):
-        # Node has no open ports — it pulls /agent/pull every ~20s; config is already queued.
-        return {"ok": True, "queued": True, "warnings": [], "error": ""}
     domain = (node.get("domain") or "").strip()
     if not domain:
         from urllib.parse import urlparse
@@ -2686,6 +2690,32 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             node["last_ok"] = False
             node["last_error"] = self_err
             return {"ok": False, "error": self_err}
+    # NAT egress nodes often still expose HTTPS for the panel agent (domain + token).
+    # Try a short live /agent/apply so Sync can refresh l2x-tunnel-agent immediately;
+    # fall back to pull-queue when the node is truly unreachable inbound.
+    if node.get("nat"):
+        can_try = bool((node.get("url") or domain) and str(node.get("token") or "").strip())
+        if can_try:
+            result = _push_once(node, payload, timeout=min(int(timeout or 60), 15))
+            if result.get("ok"):
+                warns = list(result.get("warnings") or [])
+                warns.append("NAT: live push OK (tunnel_agent/apply)")
+                result = {**result, "warnings": warns, "queued": False, "nat_live_push": True}
+                node["last_sync"] = now_iso()
+                node["last_ok"] = True
+                node["last_error"] = ""
+                node["last_warning"] = "; ".join(str(w) for w in warns if w)[:600]
+                return result
+            pull_warn = (
+                f"NAT live push fail ({str(result.get('error') or 'fail')[:120]}); "
+                "ждём /agent/pull (~20с)"
+            )
+            node["last_sync"] = now_iso()
+            node["last_ok"] = True
+            node["last_error"] = ""
+            node["last_warning"] = pull_warn[:600]
+            return {"ok": True, "queued": True, "warnings": [pull_warn], "error": ""}
+        return {"ok": True, "queued": True, "warnings": [], "error": ""}
     result = _push_once(node, payload, timeout=timeout)
     err = str(result.get("error") or "")
     # Transient network / busy agent / nginx reload mid-response: one retry
