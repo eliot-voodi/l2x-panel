@@ -8,6 +8,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -155,8 +156,7 @@ def write_config(md: dict) -> None:
         os.chmod(DNSD_CFG, 0o600)
     except OSError:
         pass
-    if not DNSD_UNIT.exists() or "l2x-dnsd" in DNSD_UNIT.read_text(encoding="utf-8", errors="ignore"):
-        DNSD_UNIT.write_text(unit_body(), encoding="utf-8")
+    DNSD_UNIT.write_text(unit_body(), encoding="utf-8")
 
 
 def dnsd_release_urls(tag: str = "") -> list[str]:
@@ -268,16 +268,29 @@ def _try_local_build() -> dict:
     return {"ok": True, "installed": "l2x-dnsd←local-build"}
 
 
-def apply(store: dict, *, install_bin: bool = False) -> dict:
+def journal_tail(lines: int = 40) -> str:
+    if not systemd_available():
+        return ""
+    r = _run(["journalctl", "-u", "l2x-dnsd", "-n", str(lines), "--no-pager", "-l"])
+    return ((r.stdout or "") + (r.stderr or "")).strip()[-2000:]
+
+
+def apply(store: dict, *, install_bin: bool = False, force_start: bool = False) -> dict:
     md = ensure_settings(store)
+    want = bool(md.get("enabled") or force_start)
+    if force_start:
+        md["enabled"] = True
     out: dict[str, Any] = {"ok": True, "enabled": bool(md.get("enabled"))}
-    if install_bin or (md.get("enabled") and not DNSD_BIN.exists()):
+    if install_bin or (want and not DNSD_BIN.exists()):
         bin_res = install_binary_from_github()
         out["binary"] = bin_res
-        if not bin_res.get("ok") and md.get("enabled"):
+        if not bin_res.get("ok") and want:
             out["ok"] = False
             out["error"] = bin_res.get("error") or "binary install failed"
             return out
+
+    if want and not str(md.get("domain") or "").strip():
+        return {"ok": False, "error": "укажите tunnel domain перед запуском"}
 
     try:
         write_config(md)
@@ -286,14 +299,26 @@ def apply(store: dict, *, install_bin: bool = False) -> dict:
 
     if not systemd_available():
         out["systemd"] = "unavailable"
+        out["ok"] = False
+        out["error"] = "systemd unavailable"
         return out
 
     _run(["systemctl", "daemon-reload"])
     if md.get("enabled"):
         _run(["systemctl", "enable", "l2x-dnsd"])
         r = _run(["systemctl", "restart", "l2x-dnsd"])
-        out["restart"] = (r.stderr or r.stdout or "")[-200:]
+        out["restart"] = (r.stderr or r.stdout or "")[-300:]
+        # Give the process a moment to bind / crash
+        import time as _time
+        _time.sleep(0.6)
         out["active"] = service_active()
+        if not out["active"]:
+            out["ok"] = False
+            j = journal_tail(30)
+            out["journal"] = j
+            out["error"] = "l2x-dnsd не запустился (см. journal). Часто порт :53 занят systemd-resolved."
+            if j:
+                out["error"] += "\n" + j[-500:]
     else:
         _run(["systemctl", "stop", "l2x-dnsd"])
         _run(["systemctl", "disable", "l2x-dnsd"])
@@ -312,10 +337,13 @@ def service_status() -> dict:
     st: dict[str, Any] = {
         "binary": DNSD_BIN.exists(),
         "config": DNSD_CFG.exists(),
+        "unit": DNSD_UNIT.exists(),
         "active": service_active(),
         "health": None,
         "resolved_conflict": False,
         "listen_hint": "",
+        "journal": "",
+        "status_text": "",
     }
     try:
         raw = ops_mod._http(DNSD_HEALTH, 2).decode("utf-8", "replace")
@@ -323,15 +351,20 @@ def service_status() -> dict:
     except Exception as exc:  # noqa: BLE001
         st["health_error"] = str(exc)[:200]
 
-    # systemd-resolved often owns :53
+    # Who owns :53
     try:
         r = _run(["ss", "-ulnp"])
         text = r.stdout or ""
-        if ":53 " in text and "systemd-resolved" in text:
+        st["listen53"] = "\n".join(
+            ln for ln in text.splitlines() if ":53 " in ln or ":53\n" in ln or ln.rstrip().endswith(":53")
+            or " *:53 " in ln or " 0.0.0.0:53 " in ln or " [::]:53 " in ln or ":53 " in ln
+        )[:800]
+        if ":53" in text and "systemd-resolve" in text:
             st["resolved_conflict"] = True
             st["listen_hint"] = (
-                "Порт 53 занят systemd-resolved. Отключите DNSStubListener "
-                "(DNSStubListener=no в resolved.conf) или слушайте другой порт + DNAT."
+                "Порт 53 занят systemd-resolved. В /etc/systemd/resolved.conf поставьте "
+                "DNSStubListener=no, затем systemctl restart systemd-resolved — "
+                "или смените Listen на :5353 и сделайте DNAT 53→5353."
             )
     except Exception:
         pass
@@ -339,6 +372,9 @@ def service_status() -> dict:
     if systemd_available():
         r = _run(["systemctl", "status", "l2x-dnsd", "--no-pager", "-l"])
         st["status_text"] = ((r.stdout or "") + (r.stderr or ""))[-1500:]
+        st["journal"] = journal_tail(40)
+        en = _run(["systemctl", "is-enabled", "l2x-dnsd"])
+        st["enabled"] = (en.stdout or "").strip()
     return st
 
 

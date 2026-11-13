@@ -5650,9 +5650,26 @@ def settings_masterdns_install(request: Request):
         masterdns_mod.ensure_settings(store)
         res = masterdns_mod.apply(store, install_bin=True)
     if res.get("ok"):
-        flash(request, f"l2x-dnsd установлен: {res.get('binary') or res}", "info")
+        msg = f"l2x-dnsd установлен: {res.get('binary') or 'ok'}"
+        if not res.get("enabled"):
+            msg += " — включите чекбокс «Включить сервер» и сохраните / Start"
+        flash(request, msg, "info")
     else:
         flash(request, f"Install: {res.get('error') or res}", "error")
+    return go("/settings?tab=masterdns")
+
+
+@app.post("/settings/masterdns/start")
+def settings_masterdns_start(request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate(history_section="masterdns", history_note="start l2x-dnsd") as store:
+        masterdns_mod.ensure_settings(store)
+        res = masterdns_mod.apply(store, install_bin=False, force_start=True)
+    if res.get("ok") and res.get("active"):
+        flash(request, "l2x-dnsd запущен", "info")
+    else:
+        flash(request, f"Start: {res.get('error') or 'не запустился'}", "error")
     return go("/settings?tab=masterdns")
 
 

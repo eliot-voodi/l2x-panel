@@ -522,12 +522,31 @@
     <div class="card-head"><h3>Статус</h3>
       <span class="badge {% if md_status.active %}ok{% else %}warn{% endif %}">{% if md_status.active %}active{% else %}stopped{% endif %}</span>
     </div>
-    <div class="small muted">binary: {% if md_status.binary %}есть{% else %}нет{% endif %} · config: {% if md_status.config %}есть{% else %}нет{% endif %}</div>
-    {% if md_status.health %}<pre class="mt" style="max-height:180px">{{ md_status.health }}</pre>{% elif md_status.health_error %}<div class="hint mt">health: {{ md_status.health_error }}</div>{% endif %}
-    {% if md_status.resolved_conflict %}<div class="hint mt" style="color:var(--warn)">{{ md_status.listen_hint }}</div>{% endif %}
-    <form method="post" action="{{ bp }}/settings/masterdns/install" class="actions mt">
-      <button class="btn ghost">Install / Update binary</button>
-    </form>
+    <div class="small muted">
+      binary: {% if md_status.binary %}есть{% else %}нет{% endif %}
+      · config: {% if md_status.config %}есть{% else %}нет{% endif %}
+      · unit: {% if md_status.unit %}есть{% else %}нет{% endif %}
+      {% if md_status.enabled %} · systemd: {{ md_status.enabled }}{% endif %}
+    </div>
+    {% if md_status.health %}<pre class="mt" style="max-height:180px">{{ md_status.health }}</pre>
+    {% elif md_status.health_error %}<div class="hint mt">health: {{ md_status.health_error }}
+      {% if not md_status.active %} — сервис не слушает :9111 (не запущен или упал).{% endif %}
+    </div>{% endif %}
+    {% if md_status.resolved_conflict or md_status.listen_hint %}
+    <div class="hint mt" style="color:var(--warn)">{{ md_status.listen_hint }}</div>
+    {% endif %}
+    {% if md_status.listen53 %}<pre class="mt small" style="max-height:100px">:53 → {{ md_status.listen53 }}</pre>{% endif %}
+    {% if not md_status.active and md_status.journal %}
+    <div class="hint mt">journalctl -u l2x-dnsd:</div>
+    <pre class="mt" style="max-height:220px">{{ md_status.journal }}</pre>
+    {% elif not md_status.active and md_status.status_text %}
+    <pre class="mt" style="max-height:180px">{{ md_status.status_text }}</pre>
+    {% endif %}
+    <div class="actions mt">
+      <form method="post" action="{{ bp }}/settings/masterdns/start"><button class="btn">Start / Restart</button></form>
+      <form method="post" action="{{ bp }}/settings/masterdns/install"><button class="btn ghost">Install / Update binary</button></form>
+    </div>
+    {% if not md.enabled %}<div class="hint mt">Чекбокс «Включить сервер» выключен — Start всё равно включит и запустит.</div>{% endif %}
   </div>
   <div class="card">
     <h3>DNS делегирование</h3>
