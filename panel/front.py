@@ -134,7 +134,7 @@ def normalize_host(value: str) -> str:
 
 
 def public_domain(store: dict) -> str:
-    """Single changeable HTTPS domain for panel, subscriptions and share links (port 443 only)."""
+    """Primary HTTPS domain for subscriptions and share links (port 443)."""
     panel = ((store.get("settings") or {}).get("panel") or {})
     sub = ((store.get("settings") or {}).get("sub") or {})
     for cand in (panel.get("public_host"), sub.get("domain"), os.environ.get("L2XPANEL_PUBLIC_HOST", "")):
@@ -142,6 +142,40 @@ def public_domain(store: dict) -> str:
         if is_domain(host):
             return host
     return ""
+
+
+def panel_extra_hosts(store: dict) -> list[str]:
+    """Additional domains that also serve the panel UI (same base_path /sub/health)."""
+    panel = ((store.get("settings") or {}).get("panel") or {})
+    raw = panel.get("extra_hosts")
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.replace(",", "\n").splitlines()]
+    elif isinstance(raw, list):
+        items = list(raw)
+    else:
+        items = []
+    primary = public_domain(store)
+    out: list[str] = []
+    seen: set[str] = {primary} if primary else set()
+    for cand in items:
+        host = normalize_host(str(cand or ""))
+        if not host or host in seen:
+            continue
+        if not (is_domain(host) or _is_ip(host)):
+            continue
+        seen.add(host)
+        out.append(host)
+    return out
+
+
+def panel_domains(store: dict) -> list[str]:
+    """All domains where the panel HTTPS site is published (primary first)."""
+    primary = public_domain(store)
+    out: list[str] = []
+    if primary:
+        out.append(primary)
+    out.extend(panel_extra_hosts(store))
+    return out
 
 
 def _nginx_version() -> tuple[int, ...]:
@@ -167,15 +201,17 @@ def raw_front_inbound(store: dict) -> dict | None:
 
 
 def plan(store: dict) -> dict:
-    """Routing table: SNI → Xray, HTTPS sites → panel/paths. Public domain always gets a panel site."""
+    """Routing table: SNI → Xray, HTTPS sites → panel/paths. Panel domains always get a site."""
     pub = public_domain(store)
+    panel_hosts = panel_domains(store)
+    panel_set = set(panel_hosts)
     sni: dict[str, int] = {}
     sites: dict[str, list[dict]] = {}
     problems: list[str] = []
     if not pub:
         problems.append("задайте публичный домен в Настройки → Панель (HTTPS :443 для панели, подписок и ссылок)")
-    else:
-        sites.setdefault(pub, [])
+    for d in panel_hosts:
+        sites.setdefault(d, [])
 
     base = re.sub(r"[^A-Za-z0-9_-]", "", str((((store.get("settings") or {}).get("panel") or {}).get("base_path") or ""))).strip("/")
     doh_prefix = re.sub(
@@ -218,15 +254,15 @@ def plan(store: dict) -> dict:
                 name = name.lower()
                 if _is_ip(name) and (ib["stream"].get("security") == "tls"):
                     name = '""'  # clients send no SNI for an IP address
-                # Public domain always terminates at nginx (panel + Path inbounds).
+                # Panel domains always terminate at nginx (panel + Path inbounds).
                 # TLS whose cert/SNI is that domain is published as empty-SNI (IP connect);
                 # Reality must use a *different* camouflage SNI (ya.ru, …).
-                if name == pub:
+                if name in panel_set:
                     if (ib.get("stream") or {}).get("security") == "tls":
                         name = '""'
                     else:
                         problems.append(
-                            f"{tag}: Reality SNI «{pub}» = публичный домен — этот SNI отдаётся nginx "
+                            f"{tag}: Reality SNI «{name}» = домен панели — этот SNI отдаётся nginx "
                             f"(панель и Path). Укажите другой serverName (например ya.ru)"
                         )
                         continue
@@ -240,7 +276,7 @@ def plan(store: dict) -> dict:
                 sni[name] = port
                 kept += 1
             if names and kept == 0 and (ib.get("stream") or {}).get("security") == "reality":
-                problems.append(f"{tag}: нет рабочего Reality SNI после исключения публичного домена")
+                problems.append(f"{tag}: нет рабочего Reality SNI после исключения доменов панели")
         elif mode == "http":
             domain = normalize_host(ib.get("share_host") or "") or pub
             if not is_domain(domain):
@@ -259,15 +295,16 @@ def plan(store: dict) -> dict:
                 continue
             locs.append({"path": path, "port": port, "net": ib["stream"].get("network"), "tag": tag})
     # Same hostname cannot be both stream-SNI passthrough and an HTTPS site.
-    # Public domain is always an HTTPS site; never steal it for Reality/TLS SNI.
+    # Panel domains are always HTTPS sites; never steal them for Reality/TLS SNI.
     for domain in list(sites):
-        if domain == pub:
+        if domain in panel_set:
             continue
         if domain in sni:
             problems.append(f"{domain}: домен используется и как SNI Reality/TLS, и для HTTPS Path — разведите их")
             del sites[domain]
-    if pub and pub in sni:
-        del sni[pub]
+    for d in panel_set:
+        if d in sni:
+            del sni[d]
     raw_ib = raw_front_inbound(store)
     raw = {"tag": raw_ib.get("tag"), "port": int(raw_ib.get("port") or 0)} if raw_ib else None
     for ib in store.get("inbounds") or []:
@@ -280,7 +317,10 @@ def plan(store: dict) -> dict:
                 f"{ib.get('tag')}: на :443 публикуется только один RAW-inbound "
                 f"({raw['tag'] if raw else '—'}) — этот доступен только локально"
             )
-    return {"sni": sni, "sites": sites, "problems": problems, "public_domain": pub, "raw": raw}
+    return {
+        "sni": sni, "sites": sites, "problems": problems,
+        "public_domain": pub, "panel_domains": panel_hosts, "raw": raw,
+    }
 
 
 # ---------------------------------------------------------------- certificates
@@ -306,6 +346,9 @@ def cert_for(domain: str) -> tuple[str, str, bool]:
 def domains_without_cert(store: dict) -> list[str]:
     p = plan(store)
     domains = set(p["sites"])
+    for d in p.get("panel_domains") or []:
+        if d:
+            domains.add(d)
     if p.get("public_domain"):
         domains.add(p["public_domain"])
     return [d for d in sorted(domains) if not cert_for(d)[2]]
@@ -414,14 +457,15 @@ def _panel_locations(store: dict | None = None) -> list[str]:
 def render(store: dict) -> tuple[str, str, list[str]]:
     p = plan(store)
     pub = p.get("public_domain") or ""
+    panel_set = set(p.get("panel_domains") or ([] if not pub else [pub]))
     internal = f"127.0.0.1:{P.FRONT_INTERNAL_PORT}"
     listen6 = "        listen [::]:443;\n" if _ipv6() else ""
     sni_lines = "".join(f"        {name} 127.0.0.1:{port};\n" for name, port in sorted(p["sni"].items()))
     raw = p.get("raw") if pub else None
     raw_upstream = ""
     if raw:
-        # Xray terminates TLS for the public domain (RAW + fallbacks to nginx). If Xray is down,
-        # the backup keeps the panel reachable via nginx TLS as before.
+        # Xray terminates TLS for the primary public domain (RAW + fallbacks to nginx).
+        # Extra panel domains stay on nginx (default upstream) so the panel opens on them too.
         sni_lines += f"        {pub} l2x_pub_raw;\n"
         raw_upstream = (
             "    upstream l2x_pub_raw {\n"
@@ -473,7 +517,7 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         ]
         for loc in sorted(locs, key=lambda x: x["path"]):
             body.append(_location(loc))
-        if domain == pub:
+        if domain in panel_set:
             body.extend(_panel_locations(store))
         else:
             body.append("    location / {\n        return 404;\n    }")

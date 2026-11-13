@@ -2030,6 +2030,7 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         # Never ship master public_host/base_path — agent nginx SNI breaks if overwritten
         if isinstance(settings_out.get("panel"), dict):
             settings_out["panel"].pop("public_host", None)
+            settings_out["panel"].pop("extra_hosts", None)
             settings_out["panel"].pop("base_path", None)
 
     reverse_bridge = None
@@ -3417,12 +3418,14 @@ def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
     local_panel = dict(local.get("panel") or {})
     keep_bp = local_panel.get("base_path")
     keep_host = local_panel.get("public_host")
+    keep_extras = local_panel.get("extra_hosts")
     merged = json.loads(json.dumps(incoming))
     merged.pop("nodes", None)  # role forced by caller
     # Incoming panel must never clobber this host's identity (mirror sync / promote)
     if isinstance(merged.get("panel"), dict):
         merged["panel"] = dict(merged["panel"])
         merged["panel"].pop("public_host", None)
+        merged["panel"].pop("extra_hosts", None)
         merged["panel"].pop("base_path", None)
     # Deep-ish replace of known sections
     for key, val in merged.items():
@@ -3435,6 +3438,8 @@ def apply_promoted_settings(store: dict, incoming: dict | None) -> None:
         panel["base_path"] = keep_bp
     if keep_host:
         panel["public_host"] = keep_host
+    if isinstance(keep_extras, list):
+        panel["extra_hosts"] = list(keep_extras)
 
 
 def node_public_domain(node: dict) -> str:
@@ -3450,18 +3455,28 @@ def master_public_domains(store: dict) -> set[str]:
     """Domains that identify the master — rewritten to the node domain on sync."""
     out: set[str] = set()
     settings = store.get("settings") or {}
+    panel = settings.get("panel") or {}
     for raw in (
-        (settings.get("panel") or {}).get("public_host"),
+        panel.get("public_host"),
         (settings.get("sub") or {}).get("domain"),
     ):
         d = _normalize_domain(str(raw or ""))
         if d:
             out.add(d)
+    extras = panel.get("extra_hosts")
+    if isinstance(extras, str):
+        extras = [x.strip() for x in extras.replace(",", "\n").splitlines()]
+    if isinstance(extras, list):
+        for raw in extras:
+            d = _normalize_domain(str(raw or ""))
+            if d:
+                out.add(d)
     try:
         import front as front_mod
-        d = _normalize_domain(front_mod.public_domain(store) or "")
-        if d:
-            out.add(d)
+        for d in front_mod.panel_domains(store):
+            dn = _normalize_domain(d or "")
+            if dn:
+                out.add(dn)
     except Exception:
         pass
     return out

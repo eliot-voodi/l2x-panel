@@ -131,6 +131,8 @@ def default_settings() -> dict:
         "panel": {
             "title": APP_NAME_DEFAULT, "session_hours": 12, "timezone": "Europe/Moscow", "lang": "ru",
             "theme": "dark", "base_path": "", "public_host": "",
+            # Extra HTTPS hostnames that also open the panel (same base_path); primary stays canonical for subs.
+            "extra_hosts": [],
             "extra_listen": {"enabled": False, "port": 2053, "cert_file": "", "key_file": ""},
         },
         "sub": {
@@ -573,6 +575,8 @@ def _ensure_base_path() -> None:
         bp = _clean_base_path(p.get("base_path") or "")
         if bp != p.get("base_path") or not bp:
             p["base_path"] = bp or _new_base_path()
+        if not isinstance(p.get("extra_hosts"), list):
+            p["extra_hosts"] = []
 
 
 def app_title() -> str:
@@ -5627,6 +5631,18 @@ async def settings_save(request: Request):
                 flash(request, "Публичный домен: укажите домен (рекомендуется) или IP", "error")
                 return go("/settings?tab=panel")
             p["public_host"] = host
+            extras: list[str] = []
+            seen_hosts = {host} if host else set()
+            for line in _split_lines(str(form.get("extra_hosts") or "")):
+                h = front.normalize_host(line)
+                if not h or h in seen_hosts:
+                    continue
+                if not (front.is_domain(h) or front._is_ip(h)):
+                    flash(request, f"Доп. домен «{line}»: нужен домен или IP", "error")
+                    return go("/settings?tab=panel")
+                seen_hosts.add(h)
+                extras.append(h)
+            p["extra_hosts"] = extras
             # Dedicated panel TLS port is unused — everything is on nginx :443
             p["extra_listen"] = {"enabled": False, "port": 2053, "cert_file": "", "key_file": ""}
             s["sub"]["domain"] = host if front.is_domain(host) else s["sub"].get("domain", "")

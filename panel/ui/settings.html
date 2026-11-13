@@ -21,9 +21,12 @@
   <input type="hidden" name="section" value="panel">
   <div class="row">
     <div><label class="f">Название панели</label><input name="title" value="{{ p.title }}"></div>
-    <div><label class="f">Публичный домен (HTTPS :443)</label><input name="public_host" value="{{ p.public_host }}" placeholder="test.gentle-den.cc" required></div>
+    <div><label class="f">Основной домен (HTTPS :443)</label><input name="public_host" value="{{ p.public_host }}" placeholder="test.gentle-den.cc" required></div>
   </div>
-  <div class="hint">Единственный адрес для клиентов: <code>https://домен/</code> — панель, подписки и коннекты только на порту <b>443</b>. A-запись домена → IP сервера; сертификат Let's Encrypt выпускается автоматически. Можно менять в любой момент.</div>
+  <div class="hint">Основной адрес для клиентов: <code>https://домен/</code> — подписки и share-ссылки. A-запись → IP сервера; сертификат Let's Encrypt выпускается автоматически.</div>
+  <label class="f">Дополнительные домены панели</label>
+  <textarea name="extra_hosts" rows="3" placeholder="panel2.example.com&#10;admin.example.net">{{ (p.extra_hosts or [])|join('\n') }}</textarea>
+  <div class="hint">По одному домену на строку. На каждом открывается та же панель (<code>/{{ p.base_path or '…' }}/</code>, <code>/sub/</code>, <code>/health</code>). Подписки по-прежнему канонически на основном домене. Для каждого доп. домена нужен DNS и сертификат (выпустится автоматически при apply).</div>
   <div class="row">
     <div><label class="f">Язык</label><select name="lang"><option value="ru">Русский</option><option value="en" {% if p.lang == 'en' %}selected{% endif %}>English</option></select></div>
     <div><label class="f">Тема по умолчанию</label><select name="theme"><option value="dark">Тёмная</option><option value="light" {% if p.theme == 'light' %}selected{% endif %}>Светлая</option></select></div>
@@ -33,7 +36,7 @@
   <datalist id="tzs">{% for z in ('Europe/Moscow', 'UTC', 'Europe/Berlin', 'Europe/Kiev', 'Asia/Tehran', 'Asia/Almaty', 'Asia/Yekaterinburg', 'Asia/Novosibirsk', 'Asia/Vladivostok') %}<option>{{ z }}</option>{% endfor %}</datalist>
   <label class="f">Секретный путь панели (обязателен)</label>
   <input name="base_path" value="{{ p.base_path }}" pattern="[A-Za-z0-9_-]+" placeholder="латиница, цифры, _ и -">
-  <div class="hint">Панель: <code>https://{{ public_host or 'домен' }}/{{ p.base_path }}/</code>. Всё остальное на домене (кроме подписок <code>/sub/</code>) уводит на ya.ru. Пустое поле — путь не меняется. Новый случайный путь и текущий адрес: CLI <code>l2x reset-path</code> / <code>l2x url</code>.</div>
+  <div class="hint">Панель: <code>https://{{ public_host or 'домен' }}/{{ p.base_path }}/</code> (и то же на доп. доменах). Всё остальное на домене (кроме подписок <code>/sub/</code>) уводит на ya.ru. Пустое поле — путь не меняется. Новый случайный путь и текущий адрес: CLI <code>l2x reset-path</code> / <code>l2x url</code>.</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 
