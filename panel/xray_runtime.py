@@ -288,16 +288,20 @@ def default_balancers() -> dict:
         "least_ping": {
             "tag": BALANCER_LEAST_PING, "enabled": True, "strategy": "leastPing", "members": [],
             "probe_url": "https://www.gstatic.com/generate_204", "probe_interval": "15s", "fallback": "direct",
+            "label": "", "sub_direct_pool": False,
         },
         "least_load": {
             "tag": BALANCER_LEAST_LOAD, "enabled": True, "strategy": "leastLoad", "members": [],
             "probe_url": "https://www.gstatic.com/generate_204", "probe_interval": "20s",
             "expected": 1, "max_rtt": "1s", "tolerance": 0.15, "fallback": "direct",
+            # One sub link → live Direct node with least online sessions (rename via label).
+            "label": "Зарубеж", "sub_direct_pool": True,
         },
         # Spreads connections across currently live outbounds (panel health gate + Xray random).
         "random": {
             "tag": BALANCER_RANDOM, "enabled": True, "strategy": "random", "members": [],
             "probe_url": "https://www.gstatic.com/generate_204", "probe_interval": "15s", "fallback": "direct",
+            "label": "", "sub_direct_pool": False,
         },
     }
 
@@ -323,6 +327,9 @@ def ensure_balancers(store: dict) -> dict:
             cur.setdefault(k, v)
         cur["tag"] = default["tag"]
         cur["strategy"] = default["strategy"]
+        if not isinstance(cur.get("label"), str):
+            cur["label"] = str(cur.get("label") or "")
+        cur["sub_direct_pool"] = bool(cur.get("sub_direct_pool"))
     return bals
 
 
@@ -331,8 +338,90 @@ def balancer_tags(store: dict) -> list[str]:
     return [b["tag"] for b in store["balancers"].values() if b.get("enabled", True) and b.get("tag")]
 
 
+def balancer_by_tag(store: dict, tag: str) -> dict | None:
+    tag = str(tag or "").strip()
+    if not tag:
+        return None
+    for b in ensure_balancers(store).values():
+        if b.get("tag") == tag:
+            return b
+    return None
+
+
+def balancer_display_label(store: dict, balancer: dict | None, *, tag: str = "") -> str:
+    """Subscription / UI name for a balancer (custom label overrides built-in)."""
+    b = balancer if isinstance(balancer, dict) else balancer_by_tag(store, tag)
+    tg = str((b or {}).get("tag") or tag or "").strip()
+    custom = str((b or {}).get("label") or "").strip()
+    if custom:
+        return custom
+    return BALANCER_LABELS.get(tg, tg or "balancer")
+
+
 def _is_balancer_target(store: dict, tag: str) -> bool:
     return tag in balancer_tags(store)
+
+
+def _direct_node_online_load(store: dict, tag: str) -> int:
+    """Approximate load: distinct online client IPs reported for ``email~tag``."""
+    tag = str(tag or "").strip()
+    if not tag:
+        return 0
+    suffix = f"~{tag}"
+    ips: set[str] = set()
+    bucket = store.get("_agent_online") if isinstance(store.get("_agent_online"), dict) else {}
+    for email, ipmap in bucket.items():
+        if not str(email).endswith(suffix) or not isinstance(ipmap, dict):
+            continue
+        for ip in ipmap:
+            if ip:
+                ips.add(str(ip))
+    return len(ips)
+
+
+def direct_pool_candidate_tags(store: dict, balancer: dict) -> list[str]:
+    """Enabled Direct-connect members suitable for a one-link subscription pool."""
+    out: list[str] = []
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return out
+    for tag in balancer_member_tags(store, balancer, healthy_only=False):
+        if not outbound_ok_for_sub(store, tag):
+            continue
+        node = nodes_mod.node_by_outbound_tag(store, tag)
+        if not nodes_mod.uses_direct_connect(node):
+            continue
+        if node is not None and node.get("online") is False:
+            continue
+        out.append(tag)
+    return out
+
+
+def pick_direct_pool_tag(store: dict, balancer: dict) -> str:
+    """Least-load Direct node for subscription: fewest reported online IPs, then tag."""
+    cands = direct_pool_candidate_tags(store, balancer)
+    if not cands:
+        return ""
+    return min(cands, key=lambda t: (_direct_node_online_load(store, t), t))
+
+
+def direct_pool_hidden_member_tags(store: dict) -> set[str]:
+    """Node tags covered by an enabled Direct-pool balancer — omit as separate sub links."""
+    hidden: set[str] = set()
+    for b in ensure_balancers(store).values():
+        if not b.get("enabled", True) or not b.get("sub_direct_pool"):
+            continue
+        hidden.update(direct_pool_candidate_tags(store, b))
+        # Also hide configured members even if currently offline (avoid stale solo links)
+        for tag in balancer_member_tags(store, b, healthy_only=False):
+            try:
+                import nodes as nodes_mod
+                if nodes_mod.uses_direct_connect(nodes_mod.node_by_outbound_tag(store, tag)):
+                    hidden.add(tag)
+            except Exception:
+                pass
+    return hidden
 
 
 def sub_health_settings(store: dict) -> dict:
@@ -1068,6 +1157,9 @@ def outbound_label(store: dict, tag: str) -> str:
     tag = str(tag or "").strip()
     if not tag or tag.lower() in ("none", "-", "off"):
         return "— none —"
+    b = balancer_by_tag(store, tag)
+    if b is not None:
+        return balancer_display_label(store, b, tag=tag)
     if tag in BALANCER_LABELS:
         return BALANCER_LABELS[tag]
     if tag == "direct":
@@ -1806,6 +1898,7 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
         master_hosts = nodes_mod.master_public_domains(store)
     except Exception:
         master_hosts = set()
+    pool_hidden = direct_pool_hidden_member_tags(store)
     for ib in ibs:
         prefix = f"[{ib.get('remark') or ib['tag']}] " if multi else ""
         for ident in client_identities(store, client, ib):
@@ -1817,11 +1910,74 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                     continue
                 if ob != "direct" and not outbound_ok_for_sub(store, ob):
                     continue
+                # Main link may itself be a Direct-pool balancer
+                bal_main = balancer_by_tag(store, ob) if ob != "direct" else None
+                if bal_main and bal_main.get("sub_direct_pool"):
+                    pick = pick_direct_pool_tag(store, bal_main)
+                    if pick:
+                        remark = (
+                            f"{prefix}{client['email']} · "
+                            f"{balancer_display_label(store, bal_main)}"
+                            f"{tag_quota_suffix(client, ob)}"
+                        )
+                        ident_use = {
+                            "uuid": P.identity_uuid(client["uuid"], pick),
+                            "email": f"{client['email']}~{pick}",
+                            "password": P.derived_password(P.identity_uuid(client["uuid"], pick)),
+                            "main": True,
+                            "tag": pick,
+                            "label": balancer_display_label(store, bal_main),
+                        }
+                        dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
+                        ib_use, host_use = ib, host
+                        if dc_host:
+                            host_use = dc_host
+                            try:
+                                import nodes as _nodes_dc
+                                remapped = _nodes_dc.remap_inbounds_for_host(
+                                    [ib], new_host=dc_host, old_hosts=master_hosts,
+                                )
+                                if remapped:
+                                    ib_use = remapped[0]
+                            except Exception:
+                                ib_use = ib
+                        ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
+                        if ep:
+                            eps.extend(P._apply_external_proxy(ep, ib_use))
+                        continue
                 remark = f"{prefix}{client['email']} · {outbound_label(store, ob)}{tag_quota_suffix(client, ob)}"
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
+                ident_use = ident
             else:
-                remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, ident['tag'])}"
-                dc_host, _dc_node = _direct_connect_endpoint_host(store, ident.get("tag") or "")
+                tag = str(ident.get("tag") or "")
+                # Covered by Direct-pool balancer → only the pool link is emitted
+                if tag in pool_hidden:
+                    continue
+                bal = balancer_by_tag(store, tag)
+                if bal and bal.get("sub_direct_pool"):
+                    pick = pick_direct_pool_tag(store, bal)
+                    if not pick:
+                        # No live Direct members — fall back to classic master balancer link
+                        remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, tag)}"
+                        dc_host, _dc_node = "", None
+                        ident_use = ident
+                    else:
+                        pool_label = balancer_display_label(store, bal)
+                        remark = f"{prefix}{pool_label}{tag_quota_suffix(client, tag)}"
+                        node_uuid = P.identity_uuid(client["uuid"], pick)
+                        ident_use = {
+                            "uuid": node_uuid,
+                            "email": f"{client['email']}~{pick}",
+                            "password": P.derived_password(node_uuid),
+                            "main": False,
+                            "tag": pick,
+                            "label": pool_label,
+                        }
+                        dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
+                else:
+                    remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, tag)}"
+                    dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
+                    ident_use = ident
             ib_use = ib
             host_use = host
             if dc_host:
@@ -1835,7 +1991,7 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                         ib_use = remapped[0]
                 except Exception:
                     ib_use = ib
-            ep = P.endpoint_for(ib_use, ident, host_use, remark)
+            ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
             if ep:
                 eps.extend(P._apply_external_proxy(ep, ib_use))
     return eps

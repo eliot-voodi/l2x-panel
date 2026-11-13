@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}{{ t('Балансировщики') }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ t('Балансировщики') }}{% endblock %}
-{% block page_sub %}Пинг / нагрузка / распределение по живым · watchdog каждые {{ watchdog_sec }} с{% endblock %}
+{% block page_sub %}Пинг / нагрузка / Direct-пул в подписке · watchdog каждые {{ watchdog_sec }} с{% endblock %}
 {% block top_actions %}<form method="post" action="{{ bp }}/xray/apply"><button class="btn ghost">{{ ic.icon('refresh') }}{{ t('Применить') }} Xray</button></form>{% endblock %}
 {% block content %}
 <div class="grid g2">
@@ -18,10 +18,17 @@
     {% if key == 'random' %}
     <div class="hint">Случайно распределяет соединения по <b>живым</b> участникам (включённые custom/node без превышения loss). Упавший выпадает при следующем apply/watchdog.</div>
     {% endif %}
+    {% if b.sub_direct_pool %}
+    <div class="hint">Direct-пул: в подписке <b>одна</b> ссылка «{{ outbound_label(store, b.tag) }}» → живая Direct-нода с наименьшей загрузкой (online). Участники-ноды отдельными строками не дублируются.</div>
+    {% endif %}
     {% if act %}<div class="mt">{% for tg in act %}<span class="badge accent" style="margin:0 .25rem .25rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}</div>
     {% else %}<div class="hint">Нет активных участников — {% if b.fallback == 'none' %}трафик режется (fallback none){% else %}трафик идёт в fallback{% endif %}.</div>{% endif %}
 
     <div class="mt">{{ m.check('enabled', b.enabled, t('Включён')) }}</div>
+    <label class="f">Название в подписке</label>
+    <input name="label" value="{{ b.label or '' }}" placeholder="{{ default_balancer_labels.get(b.tag) or b.tag }}" maxlength="80">
+    <div class="hint">Так клиент видит этот метод в подписке (например «Зарубеж»). Пусто — стандартное имя.</div>
+    <div class="mt">{{ m.check('sub_direct_pool', b.sub_direct_pool, 'Direct-пул в подписке (одна ссылка → least-load нода)') }}</div>
     {% if key != 'random' %}
     <div class="row">
       <div><label class="f">Probe URL</label><input name="probe_url" value="{{ b.probe_url }}"></div>
@@ -56,5 +63,5 @@
   </form>
 {% endfor %}
 </div>
-<div class="hint">Клиент выбирает балансировщик как outbound (или получает его строкой в подписке). <code>leastPing</code>/<code>leastLoad</code> — Observatory выбирает лучший; <code>random</code> (<code>lb_random</code>) — равномерно раскидывает по живым. Упавший выпадает из пула. Если все мертвы — Fallback.</div>
+<div class="hint">Без Direct-пула: клиент стучится на мастер, Xray выбирает outbound (<code>leastPing</code>/<code>leastLoad</code>/<code>random</code>). С Direct-пулом: при каждом обновлении подписки панель подставляет Direct-ноду с наименьшим online; имя задаётся полем «Название в подписке».</div>
 {% endblock %}

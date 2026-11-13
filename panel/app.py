@@ -4531,7 +4531,8 @@ def balancers_page(request: Request):
     bals = xray.ensure_balancers(store)
     active = {k: xray.balancer_member_tags(store, b) for k, b in bals.items()}
     return page(request, "balancers.html", active="balancers", balancers=bals, active_members=active,
-                custom=store["outbounds_custom"], watchdog_sec=WATCHDOG_INTERVAL, store=store)
+                custom=store["outbounds_custom"], watchdog_sec=WATCHDOG_INTERVAL, store=store,
+                default_balancer_labels=xray.BALANCER_LABELS)
 
 
 @app.post("/balancers/{key}")
@@ -4544,6 +4545,8 @@ async def balancers_save(key: str, request: Request):
     with mutate() as store:
         b = xray.ensure_balancers(store)[key]
         b["enabled"] = form.get("enabled") == "1"
+        b["label"] = str(form.get("label") or "").strip()[:80]
+        b["sub_direct_pool"] = form.get("sub_direct_pool") == "1"
         b["probe_url"] = str(form.get("probe_url") or b["probe_url"]).strip()
         b["probe_interval"] = str(form.get("probe_interval") or b["probe_interval"]).strip()
         raw_fb = str(form.get("fallback") or "direct").strip()
@@ -4562,8 +4565,11 @@ async def balancers_save(key: str, request: Request):
             b["tolerance"] = _float(form.get("tolerance"), 0.15)
     xr = _apply_xray(_load_store(), xray_only=True)
     with_state = "вкл" if form.get("enabled") == "1" else "выкл"
+    label_txt = str(form.get("label") or "").strip() or key
     _tg_change(
         f"⚖ Balancer <b>{tgbot.escape(key)}</b> сохранён ({with_state})",
+        f"label=<code>{tgbot.escape(label_txt)}</code> · "
+        f"direct_pool={'да' if form.get('sub_direct_pool') == '1' else 'нет'} · "
         f"fallback=<code>{tgbot.escape(str(form.get('fallback') or 'direct'))}</code>",
     )
     flash(request, *_ok_msg(f"{key} сохранён", xr))
