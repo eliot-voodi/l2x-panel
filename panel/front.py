@@ -392,7 +392,7 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         r"[^A-Za-z0-9_-]", "",
         str((((store or {}).get("settings") or {}).get("doh") or {}).get("path_prefix") or "doh"),
     ).strip("_-") or "doh"
-    # DoH (Pi-hole frontend): client → nginx :443 → panel → Pi-hole UDP/53
+    # DoH (Pi-hole frontend): client → nginx :443 → panel → Pi-hole UDP/5353
     doh_loc = (
         f"    location ^~ /{doh_prefix}/ {{\n"
         f"        proxy_pass http://{PANEL_UPSTREAM};\n"

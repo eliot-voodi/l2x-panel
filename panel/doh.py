@@ -38,6 +38,8 @@ PATH_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
 # One-time gate link TTL; session after redeem lasts longer
 PIHOLE_LINK_TTL_SEC = 15 * 60
 PIHOLE_SESSION_TTL_SEC = 2 * 3600
+# Host bind for Pi-hole DNS (container still listens on 53). Port 53 is reserved for MasterDNS (l2x-dnsd).
+PIHOLE_DNS_HOST_PORT = 5353
 
 
 def default_settings() -> dict:
@@ -45,7 +47,7 @@ def default_settings() -> dict:
         "enabled": False,
         "path_prefix": "doh",
         "upstream": "127.0.0.1",
-        "upstream_port": 53,
+        "upstream_port": PIHOLE_DNS_HOST_PORT,
         "pihole_web": "127.0.0.1:8089",
         "pihole_password": "",
         "timeout_sec": 4,
@@ -323,7 +325,7 @@ def top_doh_clients(limit: int = 10) -> list[dict]:
 def status(cfg: dict | None = None) -> dict:
     cfg = {**default_settings(), **(cfg or {})}
     up = str(cfg.get("upstream") or "127.0.0.1")
-    port = int(cfg.get("upstream_port") or 53)
+    port = int(cfg.get("upstream_port") or PIHOLE_DNS_HOST_PORT)
     dns_ok = False
     err = ""
     try:
@@ -354,8 +356,9 @@ def _probe_query() -> bytes:
     return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + name + b"\x00\x01\x00\x01"
 
 
-COMPOSE_YML = """\
+COMPOSE_YML = f"""\
 # Managed by L2X Panel — Pi-hole + UDP DNS for DoH frontend
+# Host DNS on 127.0.0.1:{PIHOLE_DNS_HOST_PORT} (not :53 — MasterDNS / l2x-dnsd owns :53).
 # Admin password is set by: docker exec l2x-pihole pihole setpassword <pwd>
 # (panel runs as root). Do not pin FTLCONF_webserver_api_password — it makes
 # setpassword read-only / ignored.
@@ -368,8 +371,8 @@ services:
       TZ: Europe/Moscow
       FTLCONF_dns_listeningMode: ALL
     ports:
-      - "127.0.0.1:53:53/tcp"
-      - "127.0.0.1:53:53/udp"
+      - "127.0.0.1:{PIHOLE_DNS_HOST_PORT}:53/tcp"
+      - "127.0.0.1:{PIHOLE_DNS_HOST_PORT}:53/udp"
       - "127.0.0.1:8089:80/tcp"
     volumes:
       - ./etc-pihole:/etc/pihole
@@ -398,6 +401,70 @@ def write_compose(*, password: str = "") -> Path:
     except OSError:
         pass
     return COMPOSE_DIR
+
+
+def migrate_doh_upstream_port(doh: dict) -> bool:
+    """If DoH points at local Pi-hole on host :53, move to PIHOLE_DNS_HOST_PORT."""
+    if not isinstance(doh, dict):
+        return False
+    up = str(doh.get("upstream") or "127.0.0.1").strip().lower()
+    if up not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    try:
+        port = int(doh.get("upstream_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if port != 53:
+        return False
+    doh["upstream_port"] = PIHOLE_DNS_HOST_PORT
+    return True
+
+
+def ensure_pihole_dns_host_port(*, recreate: bool = True) -> dict:
+    """Rewrite compose host bind 53→PIHOLE_DNS_HOST_PORT so MasterDNS can own :53."""
+    out: dict = {"ok": True, "changed": False, "port": PIHOLE_DNS_HOST_PORT}
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    if not yml.is_file():
+        return out
+    try:
+        text = yml.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "changed": False, "error": str(exc), "port": PIHOLE_DNS_HOST_PORT}
+    if "127.0.0.1:53:53/" not in text:
+        return out
+    new = text.replace(
+        "127.0.0.1:53:53/tcp", f"127.0.0.1:{PIHOLE_DNS_HOST_PORT}:53/tcp",
+    ).replace(
+        "127.0.0.1:53:53/udp", f"127.0.0.1:{PIHOLE_DNS_HOST_PORT}:53/udp",
+    )
+    if new == text:
+        return out
+    try:
+        yml.write_text(new, encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "changed": False, "error": str(exc), "port": PIHOLE_DNS_HOST_PORT}
+    out["changed"] = True
+    if not recreate:
+        return out
+    if not shutil.which("docker"):
+        out["ok"] = False
+        out["error"] = "compose обновлён, но docker недоступен для recreate"
+        return out
+    base = _compose_base()
+    if not base:
+        out["ok"] = False
+        out["error"] = "compose обновлён, но docker compose недоступен"
+        return out
+    up = _run([*base, "up", "-d", "--force-recreate", "pihole"], timeout=180, cwd=str(COMPOSE_DIR))
+    out["recreate"] = {
+        "ok": bool(up.get("ok")),
+        "stderr": (up.get("stderr") or "")[-500:],
+        "stdout": (up.get("stdout") or "")[-500:],
+    }
+    if not up.get("ok"):
+        out["ok"] = False
+        out["error"] = (up.get("stderr") or up.get("stdout") or "recreate failed").strip()[-400:]
+    return out
 
 
 def _compose_base() -> list[str] | None:

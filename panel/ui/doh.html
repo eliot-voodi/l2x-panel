@@ -99,7 +99,7 @@
     <div class="row">
       <div><label class="f">Path prefix</label><input name="path_prefix" value="{{ doh.path_prefix or 'doh' }}" pattern="[A-Za-z0-9_-]+" placeholder="doh"></div>
       <div><label class="f">Upstream DNS</label><input name="upstream" value="{{ doh.upstream or '127.0.0.1' }}" placeholder="127.0.0.1"></div>
-      <div style="max-width:110px"><label class="f">Порт</label><input name="upstream_port" type="number" min="1" max="65535" value="{{ doh.upstream_port or 53 }}"></div>
+      <div style="max-width:110px"><label class="f">Порт</label><input name="upstream_port" type="number" min="1" max="65535" value="{{ doh.upstream_port or 5353 }}"></div>
     </div>
     <div class="row">
       <div><label class="f">Pi-hole web (локально)</label><input name="pihole_web" value="{{ doh.pihole_web or '127.0.0.1:8089' }}"></div>
@@ -122,10 +122,10 @@
     </div>
     {% if status.error %}<div class="hint" style="color:var(--danger)">{{ status.error }}</div>{% endif %}
     <div class="actions mt">
-      <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:53 / :8089? Если Docker нет — он будет установлен автоматически.')"><button class="btn">Установить Pi-hole</button></form>
+      <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:5353 (DNS) / :8089 (web)? Порт 53 остаётся для MasterDNS. Если Docker нет — он будет установлен автоматически.')"><button class="btn">Установить Pi-hole</button></form>
       <form method="post" action="{{ bp }}/doh/stop"><button class="btn ghost">Остановить</button></form>
     </div>
-    <div class="hint mt">Web UI слушает только <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code> — снаружи через прокси панели.</div>
+    <div class="hint mt">DNS Pi-hole на хосте: <code>127.0.0.1:{{ doh.upstream_port or 5353 }}</code> (не :53 — он для MasterDNS). Web UI: <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code>.</div>
   </div>
 </div>
 

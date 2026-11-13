@@ -177,7 +177,8 @@ def default_settings() -> dict:
         "geo_custom": [],
         "geo_update": {"auto": True, "interval_hours": 168},
         "doh": {
-            "enabled": False, "path_prefix": "doh", "upstream": "127.0.0.1", "upstream_port": 53,
+            "enabled": False, "path_prefix": "doh", "upstream": "127.0.0.1",
+            "upstream_port": doh_mod.PIHOLE_DNS_HOST_PORT,
             "pihole_web": "127.0.0.1:8089", "pihole_password": "", "timeout_sec": 4,
         },
         "masterdns": {
@@ -1994,6 +1995,16 @@ def _startup():
         ops.ensure_network_perf()
     except Exception:
         pass
+    # Free host :53 for MasterDNS: move local Pi-hole bind 53 → 5353
+    def _bg_pihole_dns_port():
+        try:
+            doh_mod.ensure_pihole_dns_host_port(recreate=True)
+            with mutate() as st:
+                doh = st["settings"].setdefault("doh", {})
+                doh_mod.migrate_doh_upstream_port(doh)
+        except Exception:
+            pass
+    threading.Thread(target=_bg_pihole_dns_port, name="pihole-dns-port", daemon=True).start()
     for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
                    _geo_update_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
                    _agent_pull_loop, _tg_backup_loop):
@@ -5256,7 +5267,7 @@ async def doh_save(request: Request):
             "enabled": form.get("enabled") == "1",
             "path_prefix": doh_mod.normalize_prefix(str(form.get("path_prefix") or "doh")),
             "upstream": str(form.get("upstream") or "127.0.0.1").strip() or "127.0.0.1",
-            "upstream_port": max(1, _int(form.get("upstream_port"), 53)),
+            "upstream_port": max(1, _int(form.get("upstream_port"), doh_mod.PIHOLE_DNS_HOST_PORT)),
             "pihole_web": str(form.get("pihole_web") or "127.0.0.1:8089").strip(),
             "timeout_sec": max(1, _float(form.get("timeout_sec"), 4)),
         })
@@ -5299,7 +5310,7 @@ def doh_install(request: Request):
             st["settings"].setdefault("doh", {})["pihole_password"] = pwd
             st["settings"]["doh"]["enabled"] = True
             st["settings"]["doh"]["upstream"] = "127.0.0.1"
-            st["settings"]["doh"]["upstream_port"] = 53
+            st["settings"]["doh"]["upstream_port"] = doh_mod.PIHOLE_DNS_HOST_PORT
         _apply_xray(_load_store())
         extra = " Docker установлен автоматически." if res.get("docker_installed") else ""
         _tg_change(f"🛡 Pi-hole установлен на этой панели. DoH включён.{extra}")
@@ -5376,7 +5387,7 @@ async def doh_dns_query(token: str, request: Request):
         answer = doh_mod.resolve_wire(
             query,
             upstream=str(cfg.get("upstream") or "127.0.0.1"),
-            port=int(cfg.get("upstream_port") or 53),
+            port=int(cfg.get("upstream_port") or doh_mod.PIHOLE_DNS_HOST_PORT),
             timeout=float(cfg.get("timeout_sec") or 4),
         )
     except Exception as exc:  # noqa: BLE001
