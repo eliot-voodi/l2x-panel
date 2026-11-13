@@ -1226,6 +1226,21 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
             tag = nodes_mod.MASTER_EGRESS_TAG
         except Exception:
             return {"outboundTag": "direct"}
+    # Direct-pool balancers: clients keep email~lb_* UUID but dial a node host.
+    # On that agent, exit locally (local_direct) — do not re-enter Xray balancer.
+    bal_pool = balancer_by_tag(store, tag)
+    if bal_pool and bal_pool.get("sub_direct_pool"):
+        try:
+            import nodes as nodes_mod
+            if not nodes_mod.is_master(store):
+                ns = (store.get("settings") or {}).get("nodes") or {}
+                self_tag = str(ns.get("direct_connect_tag") or "").strip()
+                if ns.get("direct_connect") and self_tag:
+                    if known_outbounds is None or self_tag in known_outbounds:
+                        return {"outboundTag": self_tag}
+                    return {"outboundTag": "direct"}
+        except Exception:
+            pass
     if _is_balancer_target(store, tag):
         for b in ensure_balancers(store).values():
             if b.get("tag") != tag or not b.get("enabled", True):
@@ -1915,18 +1930,20 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 if bal_main and bal_main.get("sub_direct_pool"):
                     pick = pick_direct_pool_tag(store, bal_main)
                     if pick:
+                        # Keep balancer identity (email~lb_*) — node_* UUID is absent when
+                        # the client is only allowed the balancer tag.
+                        pool_label = balancer_display_label(store, bal_main)
                         remark = (
-                            f"{prefix}{client['email']} · "
-                            f"{balancer_display_label(store, bal_main)}"
+                            f"{prefix}{client['email']} · {pool_label}"
                             f"{tag_quota_suffix(client, ob)}"
                         )
                         ident_use = {
-                            "uuid": P.identity_uuid(client["uuid"], pick),
-                            "email": f"{client['email']}~{pick}",
-                            "password": P.derived_password(P.identity_uuid(client["uuid"], pick)),
+                            "uuid": P.identity_uuid(client["uuid"], ob),
+                            "email": f"{client['email']}~{ob}",
+                            "password": P.derived_password(P.identity_uuid(client["uuid"], ob)),
                             "main": True,
-                            "tag": pick,
-                            "label": balancer_display_label(store, bal_main),
+                            "tag": ob,
+                            "label": pool_label,
                         }
                         dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
                         ib_use, host_use = ib, host
@@ -1962,17 +1979,11 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                         dc_host, _dc_node = "", None
                         ident_use = ident
                     else:
+                        # Keep lb_* identity; only the dial host follows least-load pick.
                         pool_label = balancer_display_label(store, bal)
                         remark = f"{prefix}{pool_label}{tag_quota_suffix(client, tag)}"
-                        node_uuid = P.identity_uuid(client["uuid"], pick)
-                        ident_use = {
-                            "uuid": node_uuid,
-                            "email": f"{client['email']}~{pick}",
-                            "password": P.derived_password(node_uuid),
-                            "main": False,
-                            "tag": pick,
-                            "label": pool_label,
-                        }
+                        ident_use = dict(ident)
+                        ident_use["label"] = pool_label
                         dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
                 else:
                     remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, tag)}"
