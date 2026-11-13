@@ -423,6 +423,16 @@ def _share_profile_parts(md: dict, *, name: str = "") -> tuple[str, str, int, st
     return domain, key, method, profile_name
 
 
+_METHOD_NAMES = {
+    0: "none",
+    1: "xor",
+    2: "chacha20",
+    3: "aes-128-gcm",
+    4: "aes-192-gcm",
+    5: "aes-256-gcm",
+}
+
+
 def _whitedns_payload(domain: str, key: str, method: int, profile_name: str) -> dict:
     """Exact WhiteDNS Storm/Master profile JSON (no resolvers — those are Soar-only)."""
     return {
@@ -444,25 +454,55 @@ def _b64url_json(payload: dict) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def share_link(md: dict, *, name: str = "", scheme: str = "masterdns") -> str:
-    """WhiteDNS-compatible profile URI: masterdns:// or stormdns:// + base64url(JSON).
+def _resolver_csv(md: dict) -> str:
+    resolvers = [str(x).strip() for x in (md.get("resolvers") or []) if str(x).strip()]
+    if not resolvers:
+        resolvers = list(DEFAULT_RESOLVERS)
+    return ",".join(resolvers)
 
-    Payload matches official WhiteDNS export for Storm/Master (no ``resolvers`` —
-    that field is Soar-only and breaks some importers).
+
+def share_link(md: dict, *, name: str = "") -> str:
+    """V2Box / Hiddify / sing-box ``masterdns://`` share link (query form).
+
+    Format (ray2sing / V2Box)::
+
+        masterdns://domain?key=…&encryption=xor&resolvers=8.8.8.8,1.1.1.1&mode=socks5#name
     """
     parts = _share_profile_parts(md, name=name)
     if not parts:
         return ""
     domain, key, method, profile_name = parts
-    sch = (scheme or "masterdns").strip().lower() or "masterdns"
+    mode = str(md.get("protocol_type") or "SOCKS5").strip().lower() or "socks5"
+    if mode in ("socks5", "socks"):
+        mode = "socks5"
+    elif mode in ("tcp", "custom"):
+        mode = "tcp"
+    else:
+        mode = "socks5"
+    q = urlencode({
+        "key": key,
+        "encryption": _METHOD_NAMES.get(method, str(method)),
+        "resolvers": _resolver_csv(md),
+        "mode": mode,
+    })
+    frag = quote(profile_name, safe="")
+    return f"masterdns://{domain}?{q}#{frag}"
+
+
+def share_link_whitedns(md: dict, *, name: str = "", scheme: str = "stormdns") -> str:
+    """WhiteDNS app profile: stormdns:// or masterdns:// + base64url(JSON)."""
+    parts = _share_profile_parts(md, name=name)
+    if not parts:
+        return ""
+    domain, key, method, profile_name = parts
+    sch = (scheme or "stormdns").strip().lower() or "stormdns"
     if sch not in ("masterdns", "stormdns"):
-        sch = "masterdns"
+        sch = "stormdns"
     return f"{sch}://{_b64url_json(_whitedns_payload(domain, key, method, profile_name))}"
 
 
 def share_link_stormdns(md: dict, *, name: str = "") -> str:
-    """Same profile as share_link, with stormdns:// (preferred by WhiteDNS UI)."""
-    return share_link(md, name=name, scheme="stormdns")
+    return share_link_whitedns(md, name=name, scheme="stormdns")
 
 
 def share_link_dnst(md: dict, *, name: str = "") -> str:
@@ -477,9 +517,9 @@ def share_link_dnst(md: dict, *, name: str = "") -> str:
 
 
 def share_links(md: dict, *, name: str = "") -> dict[str, str]:
-    """All client-compatible share URIs for UI / subscription."""
+    """Client share URIs. ``masterdns`` is the V2Box query form (primary)."""
     return {
-        "masterdns": share_link(md, name=name, scheme="masterdns"),
+        "masterdns": share_link(md, name=name),
         "stormdns": share_link_stormdns(md, name=name),
         "dnst": share_link_dnst(md, name=name),
     }

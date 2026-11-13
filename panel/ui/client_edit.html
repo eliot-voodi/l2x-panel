@@ -262,12 +262,8 @@
     <div class="mt" style="padding-top:.75rem;border-top:1px solid var(--border)">
       <div class="flex between" style="align-items:flex-start;gap:1rem;flex-wrap:wrap">
         <div style="flex:1;min-width:200px">
-          <div class="small muted mb0">MasterDNS · WhiteDNS <code>stormdns://</code></div>
+          <div class="small muted mb0">MasterDNS · V2Box <code>masterdns://</code></div>
           <div class="copy mt"><input id="mdlink" value="{{ masterdns_link }}" readonly onclick="this.select()"><button type="button" class="btn sm" onclick="copyText('mdlink', this)">Копировать</button></div>
-          {% if masterdns_links and masterdns_links.dnst %}
-          <div class="small muted mt">Throne / Hiddify · <code>dnst://</code></div>
-          <div class="copy mt"><input id="mdlink_dnst" value="{{ masterdns_links.dnst }}" readonly onclick="this.select()"><button type="button" class="btn sm" onclick="copyText('mdlink_dnst', this)">Копировать</button></div>
-          {% endif %}
           <div class="actions mt">
             <button type="button" class="btn ghost sm" onclick="showQr('MasterDNS', 'mdlink')">{{ ic.icon('qr') }}QR</button>
             <a class="btn ghost sm" href="{{ bp }}/settings/masterdns/client.zip">{{ ic.icon('download') }}ZIP</a>

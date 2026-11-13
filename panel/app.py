@@ -2147,7 +2147,7 @@ def _sub_response(request: Request, token: str) -> Response:
         md_ok = bool(md.get("enabled") and md.get("domain"))
         md_name = str(client.get("email") or "MasterDNS")
         md_links = masterdns_mod.share_links(md, name=md_name) if md_ok else {}
-        md_link = md_links.get("stormdns") or md_links.get("masterdns") or ""
+        md_link = md_links.get("masterdns") or ""
         return templates.TemplateResponse("sub_page.html", {
             "request": request, "client": client, "links": list(zip(eps, links)), "sub_link": sub_url(client),
             "status": xray.client_status(client), "used": xray.client_used_bytes(client), "settings": s,
@@ -3511,7 +3511,7 @@ def client_edit(email: str, request: Request):
     md = masterdns_mod.ensure_settings(store)
     md_ok = bool(md.get("enabled") and md.get("domain"))
     md_links = masterdns_mod.share_links(md, name=str(c.get("email") or "MasterDNS")) if md_ok else {}
-    md_link = md_links.get("stormdns") or md_links.get("masterdns") or ""
+    md_link = md_links.get("masterdns") or ""
     return page(request, "client_edit.html", active="clients", c=c, row=_client_row(store, c), is_new=False,
                 store=store, tags=tags, inbounds=xray.client_capable_inbounds(store), bans=bans, links=links,
                 groups=xray.ensure_groups(store), group=grp,
@@ -5630,7 +5630,7 @@ def settings_page(request: Request):
         pub = str((s.get("panel") or {}).get("public_host") or "")
         md_name = str((s.get("panel") or {}).get("title") or "MasterDNS")
         md_links = masterdns_mod.share_links(md, name=md_name) if md.get("domain") else {}
-        md_link = md_links.get("stormdns") or md_links.get("masterdns") or ""
+        md_link = md_links.get("masterdns") or ""
         ctx["md"] = md
         ctx["md_status"] = masterdns_mod.service_status()
         ctx["md_hints"] = masterdns_mod.dns_setup_hints(md, public_ip=pub if front._is_ip(pub) else "")
@@ -5748,7 +5748,7 @@ def settings_masterdns_link(request: Request):
     md = masterdns_mod.ensure_settings(store)
     title = str((store.get("settings") or {}).get("panel", {}).get("title") or "MasterDNS")
     links = masterdns_mod.share_links(md, name=title)
-    body = "\n".join(x for x in (links.get("stormdns"), links.get("masterdns"), links.get("dnst")) if x)
+    body = "\n".join(x for x in (links.get("masterdns"), links.get("stormdns"), links.get("dnst")) if x)
     if not body:
         return PlainTextResponse("not configured", status_code=404)
     return PlainTextResponse(body + "\n", media_type="text/plain; charset=utf-8")
@@ -5783,7 +5783,7 @@ def sub_masterdns_link(token: str, request: Request):
     if not md.get("enabled") or not md.get("domain"):
         return PlainTextResponse("masterdns disabled", status_code=404)
     links = masterdns_mod.share_links(md, name=str(client.get("email") or "MasterDNS"))
-    body = "\n".join(x for x in (links.get("stormdns"), links.get("masterdns"), links.get("dnst")) if x)
+    body = "\n".join(x for x in (links.get("masterdns"), links.get("stormdns"), links.get("dnst")) if x)
     if not body:
         return PlainTextResponse("not configured", status_code=404)
     return PlainTextResponse(body + "\n", media_type="text/plain; charset=utf-8")
