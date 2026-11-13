@@ -185,19 +185,26 @@ def install_binary_from_github(tag: str = "") -> dict:
             )
         except OSError:
             tag = ""
-    if not tag:
-        return {"ok": False, "error": "no VERSION/tag"}
 
-    tags_try = [tag]
+    # Prefer newest GitHub releases first — l2x-dnsd assets exist only from v1.9.143+.
+    # Local panel VERSION may lag behind the release that actually has the binary.
+    tags_try: list[str] = []
     try:
-        for r in ops_mod.panel_releases(8):
+        for r in ops_mod.panel_releases(12):
             t = ops_mod.normalize_tag(r.get("tag") or "")
             if t and t not in tags_try:
                 tags_try.append(t)
-            if len(tags_try) >= 4:
+            if len(tags_try) >= 8:
                 break
     except Exception:
         pass
+    if tag and tag not in tags_try:
+        tags_try.append(tag)
+    if not tags_try:
+        local = _try_local_build()
+        if local.get("ok"):
+            return local
+        return {"ok": False, "error": "no VERSION/tag and no local go build"}
 
     blob = b""
     used = ""
@@ -218,7 +225,12 @@ def install_binary_from_github(tag: str = "") -> dict:
         local = _try_local_build()
         if local.get("ok"):
             return local
-        return {"ok": False, "error": "; ".join(errors[-4:]) or "l2x-dnsd asset missing", "tag": tag}
+        local_err = local.get("error") or "local build unavailable"
+        return {
+            "ok": False,
+            "error": "; ".join(errors[:4]) + (f" | {local_err}" if local_err else "") or "l2x-dnsd asset missing",
+            "tag": tag or (tags_try[0] if tags_try else ""),
+        }
 
     Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
     tmp = Path(str(DNSD_BIN) + ".new")
