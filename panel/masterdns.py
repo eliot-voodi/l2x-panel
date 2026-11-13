@@ -1,6 +1,7 @@
 """MasterDNS (l2x-dnsd) management: config, systemd, client TOML download."""
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import ops as ops_mod
 
@@ -370,6 +372,42 @@ def client_resolvers_text(md: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def share_link(md: dict, *, name: str = "") -> str:
+    """WhiteDNS / MasterDnsVPN-compatible profile URI: masterdns://<base64url(JSON)>."""
+    domain = str(md.get("domain") or "").strip().lower().rstrip(".")
+    key = str(md.get("encryption_key") or "").strip()
+    method = int(md.get("encryption_method") or 2)
+    if not domain or (method != 0 and not key):
+        return ""
+    profile_name = (name or domain or "MasterDNS").strip() or "MasterDNS"
+    payload = {
+        "schema": "whitedns.profile",
+        "version": 1,
+        "profile": {
+            "name": profile_name,
+            "server": {
+                "domain": domain,
+                "encryption_key": key,
+                "encryption_method": method,
+            },
+        },
+    }
+    # Optional resolvers (ignored by some clients; useful for Soar-style importers / future)
+    resolvers = [str(x).strip() for x in (md.get("resolvers") or []) if str(x).strip()]
+    if resolvers:
+        payload["profile"]["resolvers"] = resolvers
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"masterdns://{b64}"
+
+
+def share_link_import_url(link: str) -> str:
+    """Deep-link helpers for apps that wrap import URLs."""
+    if not link:
+        return ""
+    return f"masterdns://import/{quote(link, safe='')}"
+
+
 def client_config_toml(md: dict) -> str:
     domain = str(md.get("domain") or "").strip().lower().rstrip(".")
     method = int(md.get("encryption_method") or 2)
@@ -428,16 +466,20 @@ LOG_LEVEL = "INFO"
 '''
 
 
-def build_client_zip(md: dict) -> bytes:
+def build_client_zip(md: dict, *, name: str = "") -> bytes:
+    link = share_link(md, name=name)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("client_config.toml", client_config_toml(md))
         zf.writestr("client_resolvers.txt", client_resolvers_text(md))
+        if link:
+            zf.writestr("masterdns.url", link + "\n")
         zf.writestr(
             "README.txt",
             "L2X MasterDNS client pack\n"
-            "1. Install official MasterDnsVPN Client\n"
-            "2. Place client_config.toml and client_resolvers.txt next to the client binary\n"
-            "3. Ensure DNS NS delegation for DOMAINS points to this server\n",
+            "1. Prefer the masterdns:// link (masterdns.url) — paste/scan QR in WhiteDNS / compatible clients\n"
+            "2. Or use official MasterDnsVPN Client with client_config.toml + client_resolvers.txt\n"
+            "3. Ensure DNS NS delegation for DOMAINS points to this server\n"
+            + (f"\nShare link:\n{link}\n" if link else ""),
         )
     return buf.getvalue()

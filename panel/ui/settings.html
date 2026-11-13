@@ -505,6 +505,19 @@
   </div>
 </form>
 <div>
+  {% if md_link %}
+  <div class="card">
+    <h3>Ссылка для клиентов · masterdns://</h3>
+    <div class="hint">WhiteDNS / совместимые клиенты: вставить ссылку или сканировать QR.</div>
+    <div class="flex mt" style="gap:1.25rem;align-items:flex-start;flex-wrap:wrap">
+      <div class="qr">{{ md_qr|safe }}</div>
+      <div style="flex:1;min-width:220px">
+        <div class="copy"><input id="mdlink" value="{{ md_link }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink', this)">Копировать</button></div>
+        <div class="actions mt"><a class="btn ghost sm" href="{{ bp }}/settings/masterdns/link" target="_blank">Открыть .txt</a></div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
   <div class="card">
     <div class="card-head"><h3>Статус</h3>
       <span class="badge {% if md_status.active %}ok{% else %}warn{% endif %}">{% if md_status.active %}active{% else %}stopped{% endif %}</span>

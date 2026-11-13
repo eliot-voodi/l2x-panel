@@ -2133,6 +2133,8 @@ def _sub_response(request: Request, token: str) -> Response:
         rem_gb = xray.client_remaining_gb(client)
         rem_bytes = xray.client_remaining_bytes(client)
         md = store["settings"].get("masterdns") or {}
+        md_ok = bool(md.get("enabled") and md.get("domain"))
+        md_link = masterdns_mod.share_link(md, name=str(client.get("email") or "MasterDNS")) if md_ok else ""
         return templates.TemplateResponse("sub_page.html", {
             "request": request, "client": client, "links": list(zip(eps, links)), "sub_link": sub_url(client),
             "status": xray.client_status(client), "used": xray.client_used_bytes(client), "settings": s,
@@ -2144,8 +2146,10 @@ def _sub_response(request: Request, token: str) -> Response:
             "sub_token": client.get("sub_token") or token,
             "doh_url": doh_mod.public_url(store, client) if (store["settings"].get("doh") or {}).get("enabled") else "",
             "doh_in_tunnel": bool(client.get("doh_in_tunnel")),
-            "masterdns_enabled": bool(md.get("enabled") and md.get("domain")),
-            "masterdns_zip": f"/sub/{token}/masterdns.zip" if (md.get("enabled") and md.get("domain")) else "",
+            "masterdns_enabled": md_ok,
+            "masterdns_zip": f"/sub/{token}/masterdns.zip" if md_ok else "",
+            "masterdns_link": md_link,
+            "masterdns_qr": qr_svg(md_link, 4) if md_link else "",
         }, headers={"cache-control": "no-store"})
     if not xray.client_access_ok(client):
         return PlainTextResponse(xray.client_status(client), status_code=403, headers=headers)
@@ -3490,6 +3494,9 @@ def client_edit(email: str, request: Request):
     wg_confs = [(e, P.wireguard_conf(e)) for e in eps if e["protocol"] == "wireguard"]
     doh_mod.ensure_client_doh(c)
     grp = xray.client_group(store, c)
+    md = masterdns_mod.ensure_settings(store)
+    md_ok = bool(md.get("enabled") and md.get("domain"))
+    md_link = masterdns_mod.share_link(md, name=str(c.get("email") or "MasterDNS")) if md_ok else ""
     return page(request, "client_edit.html", active="clients", c=c, row=_client_row(store, c), is_new=False,
                 store=store, tags=tags, inbounds=xray.client_capable_inbounds(store), bans=bans, links=links,
                 groups=xray.ensure_groups(store), group=grp,
@@ -3498,7 +3505,9 @@ def client_edit(email: str, request: Request):
                 eff_outbound=xray.client_default_outbound(store, c) if grp else "",
                 wg_confs=wg_confs, hwids=hwid.public_list(c),
                 doh_url=doh_mod.public_url(store, c),
-                doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")))
+                doh_system_on=bool((store["settings"].get("doh") or {}).get("enabled")),
+                masterdns_link=md_link,
+                masterdns_qr=qr_svg(md_link, 4) if md_link else "")
 
 
 @app.post("/clients/save")
@@ -5572,10 +5581,14 @@ def settings_page(request: Request):
     if tab == "masterdns":
         md = masterdns_mod.ensure_settings(store)
         pub = str((s.get("panel") or {}).get("public_host") or "")
+        md_name = str((s.get("panel") or {}).get("title") or "MasterDNS")
+        md_link = masterdns_mod.share_link(md, name=md_name) if md.get("domain") else ""
         ctx["md"] = md
         ctx["md_status"] = masterdns_mod.service_status()
         ctx["md_hints"] = masterdns_mod.dns_setup_hints(md, public_ip=pub if front._is_ip(pub) else "")
         ctx["md_methods"] = masterdns_mod.ENCRYPTION_METHODS
+        ctx["md_link"] = md_link
+        ctx["md_qr"] = qr_svg(md_link, 5) if md_link else ""
     if tab == "tg":
         # Outbounds suitable for Telegram proxy (skip balancers/direct/block)
         skip = {"direct", "block", "dns-out", "api"}
@@ -5652,12 +5665,26 @@ def settings_masterdns_client_zip(request: Request):
     if not md.get("domain"):
         flash(request, "Сначала укажите tunnel domain", "error")
         return go("/settings?tab=masterdns")
-    data = masterdns_mod.build_client_zip(md)
+    title = str((store.get("settings") or {}).get("panel", {}).get("title") or "MasterDNS")
+    data = masterdns_mod.build_client_zip(md, name=title)
     return Response(
         content=data,
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="masterdns-client.zip"'},
     )
+
+
+@app.get("/settings/masterdns/link")
+def settings_masterdns_link(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    md = masterdns_mod.ensure_settings(store)
+    title = str((store.get("settings") or {}).get("panel", {}).get("title") or "MasterDNS")
+    link = masterdns_mod.share_link(md, name=title)
+    if not link:
+        return PlainTextResponse("not configured", status_code=404)
+    return PlainTextResponse(link, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/sub/{token}/masterdns.zip")
@@ -5670,12 +5697,28 @@ def sub_masterdns_zip(token: str, request: Request):
     md = masterdns_mod.ensure_settings(store)
     if not md.get("enabled") or not md.get("domain"):
         return PlainTextResponse("masterdns disabled", status_code=404)
-    data = masterdns_mod.build_client_zip(md)
+    data = masterdns_mod.build_client_zip(md, name=str(client.get("email") or "MasterDNS"))
     return Response(
         content=data,
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="masterdns-client.zip"'},
     )
+
+
+@app.get("/sub/{token}/masterdns.txt")
+def sub_masterdns_link(token: str, request: Request):
+    """Plain masterdns:// share link for subscription clients."""
+    store = _load_store()
+    client = next((c for c in store.get("clients") or [] if c.get("token") == token), None)
+    if not client or not client.get("enable", True):
+        return PlainTextResponse("not found", status_code=404)
+    md = masterdns_mod.ensure_settings(store)
+    if not md.get("enabled") or not md.get("domain"):
+        return PlainTextResponse("masterdns disabled", status_code=404)
+    link = masterdns_mod.share_link(md, name=str(client.get("email") or "MasterDNS"))
+    if not link:
+        return PlainTextResponse("not configured", status_code=404)
+    return PlainTextResponse(link + "\n", media_type="text/plain; charset=utf-8")
 
 
 @app.post("/settings/save")

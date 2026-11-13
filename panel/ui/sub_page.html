@@ -80,11 +80,19 @@
   </div>
   {% endif %}
 
-  {% if masterdns_enabled and masterdns_zip %}
+  {% if masterdns_enabled and masterdns_link %}
   <div class="card">
     <h3>MasterDNS</h3>
-    <div class="hint">Конфиг для официального клиента MasterDnsVPN (client_config.toml + resolvers). Обход при жёсткой блокировке обычных протоколов — медленнее VLESS.</div>
-    <div class="actions mt"><a class="btn" href="{{ masterdns_zip }}">{{ ic.icon('download') }}Скачать MasterDNS конфиг</a></div>
+    <div class="hint">Ссылка <code>masterdns://</code> для WhiteDNS и совместимых клиентов. Обход при жёсткой блокировке — медленнее VLESS.</div>
+    <div class="flex mt" style="gap:1.25rem;align-items:flex-start;flex-wrap:wrap">
+      {% if masterdns_qr %}<div class="qr">{{ masterdns_qr|safe }}</div>{% endif %}
+      <div style="flex:1;min-width:220px">
+        <div class="copy"><input id="mdlink" value="{{ masterdns_link }}" readonly onclick="this.select()"><button class="btn sm" onclick="copyText('mdlink', this)">Копировать</button></div>
+        <div class="actions mt">
+          {% if masterdns_zip %}<a class="btn ghost sm" href="{{ masterdns_zip }}">{{ ic.icon('download') }}ZIP (toml)</a>{% endif %}
+        </div>
+      </div>
+    </div>
   </div>
   {% endif %}
 
