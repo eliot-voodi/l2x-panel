@@ -1604,8 +1604,17 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         "config": node_outbound_config(node),
     }
     if existing:
+        keep = existing.get("last_test")
         existing.pop("reverse", None)
         existing.update(entry)
+        # Keep a fresh successful probe; drop stale failures when flipping to Direct
+        if uses_direct_connect(node):
+            if isinstance(keep, dict) and keep.get("ok") is True:
+                existing["last_test"] = keep
+            else:
+                existing.pop("last_test", None)
+        elif keep:
+            existing["last_test"] = keep
     else:
         customs.append(entry)
 

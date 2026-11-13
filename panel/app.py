@@ -7455,6 +7455,10 @@ async def nodes_action(node_id: str, action: str, request: Request):
                         node["direct_connect"] = False
                         flash(request, self_err, "error")
                         return go("/nodes")
+                # Stale bridge-probe fail must not hide Direct entries until next probe
+                for o in store.get("outbounds_custom") or []:
+                    if o.get("node_id") == node.get("id") or o.get("tag") == nodes_mod.node_outbound_tag(node):
+                        o.pop("last_test", None)
                 label = f"direct connect {'вкл' if node['direct_connect'] else 'выкл'}"
             elif action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")

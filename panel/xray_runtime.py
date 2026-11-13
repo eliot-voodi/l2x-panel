@@ -352,6 +352,9 @@ def custom_outbound_status(o: dict) -> str:
     """UI status: enabled + successful probe → connected; explicit fail → disconnected."""
     if not o.get("enabled", True):
         return "disabled"
+    # Direct-connect entries are judged by node reachability, not bridge hairpin probe
+    if o.get("direct_connect") or o.get("kind") == "local_direct":
+        return "connected"
     lt = o.get("last_test")
     if isinstance(lt, dict) and lt.get("ok") is True:
         return "connected"
@@ -508,6 +511,18 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
             continue
         if not o.get("in_sub", True):
             return False
+        # Direct-connect: clients dial the node host. Master bridge/hairpin probe
+        # must not hide the entry (probe can fail while public Path/Reality works).
+        if o.get("direct_connect") or o.get("kind") == "local_direct":
+            try:
+                import nodes as nodes_mod
+                node = nodes_mod.node_by_outbound_tag(store, tag)
+                if nodes_mod.uses_direct_connect(node):
+                    if node.get("online") is False:
+                        return False
+                    return True
+            except Exception:
+                return True
         return custom_outbound_healthy(o)
 
     for b in ensure_balancers(store).values():
