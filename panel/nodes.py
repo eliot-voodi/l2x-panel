@@ -36,6 +36,8 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("sync_clients", True)
         n.setdefault("sync_inbounds", True)
         n.setdefault("as_outbound", False)
+        # Public (non-NAT) node: clients dial the node host directly; quotas/routes stay on master
+        n.setdefault("direct_connect", False)
         # Name shown to end users in subscription / share links (falls back to name)
         n.setdefault("user_title", "")
         # Full standby copy of master (clients/outbounds/routes/…) while still acting as outbound
@@ -85,7 +87,25 @@ def ensure_list(store: dict) -> list[dict]:
         if n.get("nat") and not str(n.get("tunnel_mode") or "").strip():
             n["tunnel_mode"] = "l2x_udp"
         n["tunnel_profile"] = normalize_tunnel_profile(n.get("tunnel_profile"))
+        # Direct client→node is impossible behind NAT / reverse-only egress
+        if n.get("nat") or n.get("rv_mode") or uses_l2x_tunnel(n):
+            n["direct_connect"] = False
+        if n.get("direct_connect"):
+            n["as_outbound"] = True
+            n["sync_clients"] = True
+            n["sync_inbounds"] = True
     return nodes
+
+
+def uses_direct_connect(node: dict | None) -> bool:
+    """Clients get share links to the node's public host; traffic reported via agent."""
+    if not isinstance(node, dict):
+        return False
+    if not node.get("direct_connect") or not node.get("enabled", True):
+        return False
+    if node.get("nat") or node.get("rv_mode") or uses_l2x_tunnel(node):
+        return False
+    return bool(node.get("as_outbound"))
 
 
 # L2X tunnel profiles for NAT / +Reverse (agent → master datapath).
@@ -1192,6 +1212,214 @@ def pull_request(master_url: str, token: str, body: dict, timeout: int = 30) -> 
         return {"ok": False, "error": str(exc)}
 
 
+def report_request(master_url: str, token: str, body: dict, timeout: int = 20) -> dict:
+    """Agent side: POST /agent/report — traffic/online snapshot for direct_connect nodes."""
+    url = master_url.rstrip("/") + "/agent/report"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            parsed = json.loads(exc.read().decode("utf-8", "replace") or "{}")
+        except Exception:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        detail = parsed.get("error") or ""
+        return {**parsed, "ok": False, "status": exc.code, "error": f"HTTP {exc.code} {detail}".strip()}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def node_by_outbound_tag(store: dict, tag: str) -> dict | None:
+    tag = str(tag or "").strip()
+    if not tag:
+        return None
+    for n in ensure_list(store):
+        if node_outbound_tag(n) == tag:
+            return n
+    for o in store.get("outbounds_custom") or []:
+        if o.get("tag") != tag:
+            continue
+        nid = o.get("node_id")
+        if not nid:
+            break
+        return next((n for n in ensure_list(store) if n.get("id") == nid), None)
+    return None
+
+
+def _accumulate_agent_counters(row: dict, up: int, down: int) -> bool:
+    """Merge absolute agent StatsService counters into master by_email row.
+
+    Uses agent_last_* so master's own last_up/last_down (hairpin harvest) stay intact.
+    """
+    changed = False
+    for key, last_key, cur_v in (("up", "agent_last_up", up), ("down", "agent_last_down", down)):
+        cur_v = int(cur_v or 0)
+        last_v = int(row.get(last_key) or 0)
+        delta = cur_v - last_v if cur_v >= last_v else cur_v
+        if delta:
+            row[key] = int(row.get(key) or 0) + delta
+            changed = True
+        if cur_v != last_v:
+            row[last_key] = cur_v
+            changed = True
+    return changed
+
+
+def apply_agent_traffic_report(
+    store: dict,
+    node: dict,
+    traffic: dict | None,
+    online: dict | None = None,
+) -> bool:
+    """Merge direct_connect agent stats into master client traffic (+ optional online map).
+
+    Returns True if store mutated. Only emails for this node's tag (and main email when
+    default outbound is this node) are accepted.
+    """
+    if not uses_direct_connect(node):
+        return False
+    tag = node_outbound_tag(node)
+    suffix = f"~{tag}"
+    traffic = traffic if isinstance(traffic, dict) else {}
+    online = online if isinstance(online, dict) else {}
+    changed = False
+    try:
+        import xray_runtime as xray
+    except Exception:
+        xray = None  # type: ignore
+
+    for client in store.get("clients") or []:
+        if not isinstance(client, dict):
+            continue
+        if xray:
+            try:
+                xray.ensure_client(client)
+            except Exception:
+                pass
+        tr = client.setdefault("traffic", {})
+        if not isinstance(tr, dict):
+            client["traffic"] = {"up": 0, "down": 0, "by_email": {}}
+            tr = client["traffic"]
+        by = tr.setdefault("by_email", {})
+        if not isinstance(by, dict):
+            tr["by_email"] = {}
+            by = tr["by_email"]
+        base = str(client.get("email") or "")
+        if not base:
+            continue
+        default_ob = str(client.get("outbound") or "direct")
+        if xray:
+            try:
+                default_ob = xray.client_default_outbound(store, client)
+            except Exception:
+                pass
+
+        candidates = {f"{base}{suffix}"}
+        if default_ob == tag:
+            candidates.add(base)
+
+        for email in list(candidates):
+            cur = traffic.get(email)
+            if not isinstance(cur, dict) and email == base:
+                cur = traffic.get(f"{base}{suffix}")
+            if not isinstance(cur, dict):
+                continue
+            # Quotas for this outbound key off email~tag
+            store_email = email if email.endswith(suffix) else f"{base}{suffix}"
+            row = by.setdefault(store_email, {
+                "up": 0, "down": 0, "last_up": 0, "last_down": 0,
+                "agent_last_up": 0, "agent_last_down": 0,
+            })
+            if _accumulate_agent_counters(row, int(cur.get("up") or 0), int(cur.get("down") or 0)):
+                changed = True
+
+        if by:
+            up = sum(int(r.get("up") or 0) for r in by.values() if isinstance(r, dict))
+            down = sum(int(r.get("down") or 0) for r in by.values() if isinstance(r, dict))
+            if tr.get("up") != up or tr.get("down") != down:
+                tr["up"], tr["down"] = up, down
+                changed = True
+
+    # Stash online IPs for watchdog merge (email → {ip: ts})
+    if online:
+        bucket = store.setdefault("_agent_online", {})
+        # Drop previous IPs for this tag, then replace
+        for k in list(bucket.keys()):
+            if str(k).endswith(suffix):
+                bucket.pop(k, None)
+        for email, ips in online.items():
+            em = str(email or "")
+            if not em.endswith(suffix):
+                if "~" in em:
+                    continue
+                em = f"{em}{suffix}"
+            if isinstance(ips, dict):
+                bucket[em] = {str(k): int(v or 0) for k, v in ips.items()}
+            elif isinstance(ips, list):
+                bucket[em] = {str(ip): 0 for ip in ips}
+        changed = True
+
+    node["last_traffic_report"] = now_iso()
+    return changed
+
+
+def collect_direct_connect_report(store: dict) -> dict | None:
+    """On agent: build traffic/online payload for master /agent/report."""
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    if not ns.get("direct_connect"):
+        return None
+    tag = str(ns.get("direct_connect_tag") or "").strip()
+    node_id = str(ns.get("upstream_node_id") or "").strip()
+    if not tag or not node_id:
+        return None
+    try:
+        import xray_runtime as xray
+        users = xray.query_user_stats()
+        online_raw = xray.query_online()
+    except Exception:
+        return None
+    suffix = f"~{tag}"
+    traffic: dict[str, dict[str, int]] = {}
+    for email, cur in (users or {}).items():
+        em = str(email or "")
+        if not em or not isinstance(cur, dict):
+            continue
+        if em.endswith(suffix):
+            traffic[em] = {"up": int(cur.get("up") or 0), "down": int(cur.get("down") or 0)}
+        elif "~" not in em:
+            # Attribute bare main email on this node to the node identity bucket
+            key = f"{em}{suffix}"
+            prev = traffic.get(key) or {"up": 0, "down": 0}
+            traffic[key] = {
+                "up": int(prev["up"]) + int(cur.get("up") or 0),
+                "down": int(prev["down"]) + int(cur.get("down") or 0),
+            }
+    online: dict[str, dict[str, int]] = {}
+    for email, ips in (online_raw or {}).items():
+        em = str(email or "")
+        if not em or not isinstance(ips, dict):
+            continue
+        if em.endswith(suffix):
+            online[em] = {str(k): int(v or 0) for k, v in ips.items()}
+        elif "~" not in em:
+            online[f"{em}{suffix}"] = {str(k): int(v or 0) for k, v in ips.items()}
+    return {
+        "node_id": node_id,
+        "direct_connect_tag": tag,
+        "traffic": traffic,
+        "online": online,
+        "reported_at": now_iso(),
+    }
+
+
 def node_pull_base(node: dict) -> str:
     """https://host/base_path — what a NAT agent uses as master_url when this node is master."""
     base = (node.get("url") or "").rstrip("/")
@@ -1368,9 +1596,10 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
         "remark": title,
         "kind": "node",
         "node_id": node.get("id"),
+        "direct_connect": bool(uses_direct_connect(node)),
         "enabled": True,
         "in_sub": True,
-        "info": "bridge",
+        "info": "direct" if uses_direct_connect(node) else "bridge",
         "country": (node.get("country") or "")[:2].upper(),
         "config": node_outbound_config(node),
     }
@@ -1392,32 +1621,46 @@ def sync_all_node_outbounds(store: dict) -> None:
     ]
 
 
-def _agent_safe_clients(clients: list[dict], *, keep_node: bool = False) -> list[dict]:
+def _agent_safe_clients(
+    clients: list[dict], *, keep_node: bool = False, keep_tags: set[str] | None = None,
+) -> list[dict]:
     """Remap dangling legacy/foreign outbound tags to direct on an agent."""
+    keep = {t for t in (keep_tags or set()) if t}
     out = []
     for c in clients or []:
         c = dict(c)
         ob = (c.get("outbound") or "direct").strip()
-        if ob.startswith("l2tp_") or (ob.startswith("node_") and not keep_node):
+        if ob.startswith("l2tp_"):
+            c["outbound"] = "direct"
+        elif ob.startswith("node_") and not keep_node and ob not in keep:
             c["outbound"] = "direct"
         out.append(c)
     return out
 
 
-def _agent_safe_routes(routes: list[dict], *, keep_node: bool = False) -> list[dict]:
+def _agent_safe_routes(
+    routes: list[dict], *, keep_node: bool = False, keep_tags: set[str] | None = None,
+) -> list[dict]:
+    keep = {t for t in (keep_tags or set()) if t}
     out = []
     for r in routes or []:
         r = dict(r)
         ob = (r.get("outbound") or r.get("outbound_tag") or "direct").strip()
-        if ob.startswith("l2tp_") or (ob.startswith("node_") and not keep_node):
+        if ob.startswith("l2tp_"):
+            r["outbound"] = "direct"
+            r.pop("outbound_tag", None)
+        elif ob.startswith("node_") and not keep_node and ob not in keep:
             r["outbound"] = "direct"
             r.pop("outbound_tag", None)
         out.append(r)
     return out
 
 
-def _agent_safe_balancers(balancers: dict, *, keep_node: bool = False) -> dict:
+def _agent_safe_balancers(
+    balancers: dict, *, keep_node: bool = False, keep_tags: set[str] | None = None,
+) -> dict:
     """Drop legacy l2tp_* and non-mirrored node_* members from balancer pools."""
+    keep = {t for t in (keep_tags or set()) if t}
     bals = json.loads(json.dumps(balancers or {}))  # deep copy
     for b in bals.values():
         if not isinstance(b, dict):
@@ -1428,7 +1671,7 @@ def _agent_safe_balancers(balancers: dict, *, keep_node: bool = False) -> dict:
             s = str(m)
             if s.startswith("l2tp_"):
                 continue
-            if s.startswith("node_") and not keep_node:
+            if s.startswith("node_") and not keep_node and s not in keep:
                 continue
             cleaned.append(m)
         b["members"] = cleaned
@@ -1439,7 +1682,7 @@ def _peer_node_export(n: dict) -> dict:
     """Registry fields safe to push to a mirror (no secrets beyond agent token)."""
     keys = (
         "id", "name", "user_title", "url", "token", "enabled", "sync_clients", "sync_inbounds",
-        "as_outbound", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
+        "as_outbound", "direct_connect", "mirror", "domain", "base_path", "ssh_user", "ssh_port",
         "ssh_hostkey_fp", "bridge_uuid", "bridge_path", "role", "panel_version", "nat", "rv_mode",
         "rv_uuid", "rv_domain", "rv_tag", "country", "tunnel_mode", "tunnel_profile", "tunnel_node_id",
     )
@@ -1451,6 +1694,7 @@ def agent_runtime_store(store: dict) -> dict:
 
     - runtime_preserve: keep full config (former master just demoted)
     - mirror: keep peer node_* outbounds
+    - direct_connect: keep local_direct stub for this node's tag
     - always drop legacy l2tp_* tags/members (feature removed)
     """
     s = json.loads(json.dumps(store))
@@ -1458,16 +1702,31 @@ def agent_runtime_store(store: dict) -> dict:
     if ns.get("runtime_preserve"):
         return s
     keep_node = bool(ns.get("mirror"))
+    keep_tags: set[str] = set()
+    dc_tag = str(ns.get("direct_connect_tag") or "").strip()
+    if ns.get("direct_connect") and dc_tag:
+        keep_tags.add(dc_tag)
     s.pop("l2tp", None)
-    s["clients"] = _agent_safe_clients(s.get("clients") or [], keep_node=keep_node)
-    s["routes"] = _agent_safe_routes(s.get("routes") or [], keep_node=keep_node)
-    s["balancers"] = _agent_safe_balancers(s.get("balancers") or {}, keep_node=keep_node)
+    s["clients"] = _agent_safe_clients(
+        s.get("clients") or [], keep_node=keep_node, keep_tags=keep_tags,
+    )
+    s["routes"] = _agent_safe_routes(
+        s.get("routes") or [], keep_node=keep_node, keep_tags=keep_tags,
+    )
+    s["balancers"] = _agent_safe_balancers(
+        s.get("balancers") or {}, keep_node=keep_node, keep_tags=keep_tags,
+    )
     customs = []
     for o in s.get("outbounds_custom") or []:
         tag = str(o.get("tag") or "")
         if tag.startswith("l2tp_") or o.get("kind") == "l2tp":
             continue
+        if o.get("kind") == "local_direct":
+            customs.append(o)
+            continue
         if not keep_node and (o.get("kind") == "node" or tag.startswith("node_")):
+            if tag in keep_tags:
+                customs.append(o)
             continue
         customs.append(o)
     s["outbounds_custom"] = customs
@@ -1492,13 +1751,34 @@ def probe_role(node: dict, timeout: int = 10) -> dict:
     }
 
 
+def _local_direct_outbound(node: dict) -> dict:
+    """Freedom stub on the agent so email~node_tag identities egress locally."""
+    tag = node_outbound_tag(node)
+    return {
+        "tag": tag,
+        "remark": node_user_title(node),
+        "kind": "local_direct",
+        "enabled": True,
+        "in_sub": True,
+        "info": "direct connect",
+        "country": (node.get("country") or "")[:2].upper(),
+        "config": {
+            "protocol": "freedom",
+            "tag": tag,
+            "settings": {"domainStrategy": "AsIs"},
+        },
+        "stream": {},
+    }
+
+
 def build_payload(store: dict, node: dict, build_config) -> dict:
     """Config push for a remote agent. mirror=True → full master copy for fast failover."""
     mirror = bool(node.get("mirror"))
     nat = bool(node.get("nat"))
     rv_on = uses_reverse(node)
     tunnel_on = uses_l2x_tunnel(node)
-    if mirror:
+    dc = uses_direct_connect(node)
+    if mirror or dc:
         node["sync_clients"] = True
         node["sync_inbounds"] = True
     # NAT/reverse/l2x tunnel: no bridge inbound — egress is reverse portal or SOCKS tunnel.
@@ -1506,7 +1786,7 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     inbounds = list(store.get("inbounds") or []) if not nat else []
     # Path/TLS share domains must be the node hostname, not the master
     node_dom = node_public_domain(node)
-    if inbounds and node_dom and (node.get("sync_inbounds", True) or mirror or bridge_on):
+    if inbounds and node_dom and (node.get("sync_inbounds", True) or mirror or bridge_on or dc):
         inbounds = remap_inbounds_for_host(
             inbounds,
             new_host=node_dom,
@@ -1527,6 +1807,7 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             "sub_enabled": False, "comment": "node bridge (auto)",
         }]
 
+    keep_tags = {self_tag} if dc else set()
     if mirror:
         # Full copy: keep outbound tags and all custom/node outbounds (except this node itself)
         clients = list(store.get("clients") or [])
@@ -1535,15 +1816,18 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         balancers = json.loads(json.dumps(store.get("balancers") or {}))
         peers = [_peer_node_export(n) for n in ensure_list(store) if n.get("id") != node.get("id")]
     else:
-        clients = _agent_safe_clients(store.get("clients") or [])
+        clients = _agent_safe_clients(store.get("clients") or [], keep_tags=keep_tags)
         customs = []
         for o in store.get("outbounds_custom") or []:
             if o.get("tag") == self_tag or o.get("kind") == "node":
                 continue
             customs.append(o)
-        routes = _agent_safe_routes(store.get("routes") or [])
-        balancers = _agent_safe_balancers(store.get("balancers") or {})
+        routes = _agent_safe_routes(store.get("routes") or [], keep_tags=keep_tags)
+        balancers = _agent_safe_balancers(store.get("balancers") or {}, keep_tags=keep_tags)
         peers = None
+    if dc:
+        customs = [o for o in customs if o.get("tag") != self_tag]
+        customs.append(_local_direct_outbound(node))
 
     settings_out = None
     if mirror:
@@ -1592,11 +1876,13 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     out = {
         "mirror": mirror,
         "nat": nat,
+        "direct_connect": dc,
+        "direct_connect_tag": self_tag if dc else "",
         "master_url": master_url,
         # Former masters accept this push as demotion→agent (no SSH reinstall).
         "demote_to_agent": True,
-        "clients": (clients if node.get("sync_clients", True) and not nat else []) + bridge_clients,
-        "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on else [],
+        "clients": (clients if (node.get("sync_clients", True) or dc) and not nat else []) + bridge_clients,
+        "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on or dc else [],
         "outbounds_custom": customs,
         "routes": routes,
         "balancers": balancers,

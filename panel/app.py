@@ -1493,6 +1493,31 @@ def _watchdog_cycle() -> None:
     if STORE_OK:
         _expiry_warnings(store)
         _notify_events(events)
+        # Public direct_connect agents push traffic counters to master
+        try:
+            _agent_direct_connect_report(store)
+        except Exception:
+            pass
+
+
+def _agent_direct_connect_report(store: dict | None = None) -> None:
+    """Agent → master traffic/online for clients that dial this node directly."""
+    store = store or _load_store()
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    if (ns.get("role") or "") != "agent" or not ns.get("direct_connect"):
+        return
+    body = nodes_mod.collect_direct_connect_report(store)
+    if not body:
+        return
+    master_url = (
+        str(ns.get("upstream_master_url") or "").rstrip("/")
+        or str(ns.get("master_pull_url") or "").rstrip("/")
+        or str((ns.get("pull") or {}).get("master_url") or "").rstrip("/")
+    )
+    token = str(ns.get("agent_token") or "").strip()
+    if not master_url or not token:
+        return
+    nodes_mod.report_request(master_url, token, body, timeout=15)
 
 
 OUTBOUND_PROBE_INTERVAL = int(os.environ.get("L2XPANEL_OB_PROBE_SEC", "300"))
@@ -6995,12 +7020,14 @@ async def nodes_add(request: Request):
         return go("/nodes")
     with mutate() as store:
         mirror = form.get("mirror") == "1"
+        direct_connect = form.get("direct_connect") == "1" and form.get("nat") != "1"
         node = {
             "id": str(uuid.uuid4()), "name": name, "url": origin, "token": token, "enabled": True,
             "user_title": str(form.get("user_title") or "").strip()[:80],
-            "sync_clients": True if mirror else form.get("sync_clients") == "1",
-            "sync_inbounds": True if mirror else form.get("sync_inbounds") == "1",
-            "as_outbound": True if mirror or form.get("nat") == "1" else form.get("as_outbound") == "1",
+            "sync_clients": True if mirror or direct_connect else form.get("sync_clients") == "1",
+            "sync_inbounds": True if mirror or direct_connect else form.get("sync_inbounds") == "1",
+            "as_outbound": True if mirror or direct_connect or form.get("nat") == "1" else form.get("as_outbound") == "1",
+            "direct_connect": direct_connect,
             "mirror": mirror and form.get("nat") != "1",
             "nat": form.get("nat") == "1",
             "domain": host, "base_path": base_path,
@@ -7011,6 +7038,7 @@ async def nodes_add(request: Request):
         if node["nat"]:
             node["as_outbound"] = True
             node["mirror"] = False
+            node["direct_connect"] = False
             node["sync_clients"] = False
             node["sync_inbounds"] = False
             node["tunnel_mode"] = "l2x_udp"
@@ -7046,11 +7074,13 @@ async def nodes_provision(request: Request):
     as_outbound = form.get("as_outbound") == "1"
     mirror = form.get("mirror") == "1"
     nat = form.get("nat") == "1"
+    direct_connect = form.get("direct_connect") == "1" and not nat
     sync_interval_min = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
     if nat:
         as_outbound = True
         mirror = False
-    if mirror:
+        direct_connect = False
+    if mirror or direct_connect:
         as_outbound = True
     if not domain or not password:
         flash(request, "Нужны domain и SSH-пароль", "error")
@@ -7094,12 +7124,18 @@ async def nodes_provision(request: Request):
         node["sync_interval_min"] = sync_interval_min
         if user_title:
             node["user_title"] = user_title
+        if direct_connect and not nat:
+            node["direct_connect"] = True
+            node["as_outbound"] = True
+            node["sync_clients"] = True
+            node["sync_inbounds"] = True
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
             # replace same domain if re-provisioning
             nodes[:] = [n for n in nodes if (n.get("domain") or "") != node["domain"] and n.get("url") != node["url"]]
             if nat:
                 node["tunnel_mode"] = node.get("tunnel_mode") or "l2x_udp"
+                node["direct_connect"] = False
             nodes.append(node)
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
@@ -7368,7 +7404,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
         return go("/nodes")
 
     # --- outbound / mirror / sync: flip flags under lock, push in background ---
-    if action in ("outbound", "mirror", "sync", "reverse"):
+    if action in ("outbound", "mirror", "sync", "reverse", "direct"):
         host = public_host()
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
@@ -7388,6 +7424,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 node.pop("reverse_ok", None)
                 if node["rv_mode"]:
                     node["as_outbound"] = True
+                    node["direct_connect"] = False
                     # +Reverse → L2X agent tunnel (same profiles as NAT), not Xray reverse
                     node["tunnel_mode"] = "l2x_udp"
                     node["tunnel_profile"] = nodes_mod.normalize_tunnel_profile(
@@ -7400,6 +7437,25 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     nodes_mod.ensure_bridge(node)
                     nodes_mod.sync_tunneld_for_fleet(store)
                 label = f"reverse/L2X {'вкл' if node['rv_mode'] else 'выкл'}"
+            elif action == "direct":
+                if node.get("nat") or node.get("rv_mode") or nodes_mod.uses_l2x_tunnel(node):
+                    flash(request, "Direct connect только для публичной ноды (не NAT / не Reverse)", "error")
+                    return go("/nodes")
+                if not nodes_mod.is_master(store):
+                    flash(request, "Только мастер может включать direct connect", "error")
+                    return go("/nodes")
+                node["direct_connect"] = not node.get("direct_connect")
+                if node["direct_connect"]:
+                    node["as_outbound"] = True
+                    node["sync_clients"] = True
+                    node["sync_inbounds"] = True
+                    nodes_mod.ensure_bridge(node)
+                    self_err = nodes_mod.same_host_as_master(node.get("domain") or "", host)
+                    if self_err:
+                        node["direct_connect"] = False
+                        flash(request, self_err, "error")
+                        return go("/nodes")
+                label = f"direct connect {'вкл' if node['direct_connect'] else 'выкл'}"
             elif action == "outbound":
                 node["as_outbound"] = not node.get("as_outbound")
                 if node["as_outbound"]:
@@ -7411,6 +7467,8 @@ async def nodes_action(node_id: str, action: str, request: Request):
                             )
                     elif not nodes_mod.uses_l2x_tunnel(node):
                         nodes_mod.ensure_bridge(node)
+                else:
+                    node["direct_connect"] = False
                 label = f"outbound {'вкл' if node['as_outbound'] else 'выкл'}"
             elif action == "mirror":
                 if node.get("nat"):
@@ -7434,7 +7492,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 label = "sync"
             nodes_mod.upsert_node_outbound(store, node)
             name = node["name"]
-            if action in ("outbound", "mirror", "reverse"):
+            if action in ("outbound", "mirror", "reverse", "direct"):
                 _tg_admin(
                     f"🖥 Нода <b>{tgbot.escape(name)}</b>: {tgbot.escape(label)}",
                     flag="notify_nodes",
@@ -8325,6 +8383,14 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
             ns["role"] = "agent"
         ns["mirror"] = mirror
         ns["runtime_preserve"] = False
+        ns["direct_connect"] = bool(payload.get("direct_connect"))
+        dc_tag = str(payload.get("direct_connect_tag") or "").strip()
+        if dc_tag:
+            ns["direct_connect_tag"] = dc_tag
+        elif not ns.get("direct_connect"):
+            ns.pop("direct_connect_tag", None)
+        if payload.get("node_id"):
+            ns["upstream_node_id"] = str(payload.get("node_id"))
         master_url = str(payload.get("master_url") or "").rstrip("/")
         if master_url:
             ns["upstream_master_url"] = master_url
@@ -8438,6 +8504,48 @@ async def agent_apply(request: Request, background_tasks: BackgroundTasks):
         except Exception:
             pass
     return out
+
+
+@app.post("/agent/report")
+async def agent_report(request: Request):
+    """Direct-connect agent reports traffic/online to master (Bearer = node token)."""
+    store = _load_store()
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    node_id = str(body.get("node_id") or "").strip()
+    auth = request.headers.get("authorization") or ""
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    if err := _agent_rate_ok(request, "report"):
+        return err
+    if not nodes_mod.is_master(store):
+        return JSONResponse({"ok": False, "error": "not master"}, status_code=403)
+    if not node_id or not token:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    err_code, err_msg = 0, ""
+    changed = False
+    with mutate() as st:
+        node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
+        if not node or not node.get("enabled", True):
+            err_code, err_msg = 404, "unknown node"
+        elif not sec.any_token_eq(token, [node.get("token") or ""]):
+            err_code, err_msg = 401, "unauthorized"
+        elif not nodes_mod.uses_direct_connect(node):
+            err_code, err_msg = 400, "direct_connect disabled"
+        else:
+            changed = nodes_mod.apply_agent_traffic_report(
+                st, node,
+                body.get("traffic") if isinstance(body.get("traffic"), dict) else {},
+                body.get("online") if isinstance(body.get("online"), dict) else {},
+            )
+            node["last_ok"] = True
+            node["last_seen"] = nodes_mod.now_iso()
+    if err_code:
+        return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
+    return {"ok": True, "changed": bool(changed)}
 
 
 @app.post("/agent/pull")

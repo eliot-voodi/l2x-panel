@@ -934,7 +934,7 @@ def outbound_label(store: dict, tag: str) -> str:
     for o in store.get("outbounds_custom") or []:
         if o["tag"] == tag:
             cc = o.get("country") or ""
-            if o.get("kind") == "node":
+            if o.get("kind") in ("node", "local_direct") or o.get("direct_connect"):
                 icon = flag_emoji(cc) if cc else "🖥️"
                 title = ""
                 nid = o.get("node_id")
@@ -1607,6 +1607,21 @@ def tag_quota_suffix(client: dict, tag: str) -> str:
     return (" · " + " · ".join(bits)) if bits else ""
 
 
+def _direct_connect_endpoint_host(store: dict, tag: str) -> tuple[str, dict | None]:
+    """If tag is a direct_connect node outbound, return (node_host, remapped_ib_helper_node)."""
+    tag = str(tag or "").strip()
+    if not tag:
+        return "", None
+    try:
+        import nodes as nodes_mod
+        node = nodes_mod.node_by_outbound_tag(store, tag)
+        if nodes_mod.uses_direct_connect(node):
+            return nodes_mod.node_public_domain(node) or "", node
+    except Exception:
+        pass
+    return "", None
+
+
 def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
     if not client_access_ok(client):
         return []
@@ -1619,6 +1634,12 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
     ibs = [i for i in client_inbounds(store, client) if inbound_access_ok(i)]
     multi = len(ibs) > 1
     eps = []
+    master_hosts: set[str] = set()
+    try:
+        import nodes as nodes_mod
+        master_hosts = nodes_mod.master_public_domains(store)
+    except Exception:
+        master_hosts = set()
     for ib in ibs:
         prefix = f"[{ib.get('remark') or ib['tag']}] " if multi else ""
         for ident in client_identities(store, client, ib):
@@ -1631,11 +1652,26 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 if ob != "direct" and not outbound_ok_for_sub(store, ob):
                     continue
                 remark = f"{prefix}{client['email']} · {outbound_label(store, ob)}{tag_quota_suffix(client, ob)}"
+                dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
             else:
                 remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, ident['tag'])}"
-            ep = P.endpoint_for(ib, ident, host, remark)
+                dc_host, _dc_node = _direct_connect_endpoint_host(store, ident.get("tag") or "")
+            ib_use = ib
+            host_use = host
+            if dc_host:
+                host_use = dc_host
+                try:
+                    import nodes as nodes_mod
+                    remapped = nodes_mod.remap_inbounds_for_host(
+                        [ib], new_host=dc_host, old_hosts=master_hosts,
+                    )
+                    if remapped:
+                        ib_use = remapped[0]
+                except Exception:
+                    ib_use = ib
+            ep = P.endpoint_for(ib_use, ident, host_use, remark)
             if ep:
-                eps.extend(P._apply_external_proxy(ep, ib))
+                eps.extend(P._apply_external_proxy(ep, ib_use))
     return eps
 
 
@@ -2666,6 +2702,17 @@ def enforce_quotas(store: dict) -> bool:
 def update_online(store: dict, online: dict[str, dict[str, int]]) -> dict[str, list[str]]:
     """Attach online IPs to clients. Returns {client_email: [ips]}."""
     now = now_utc()
+    # Merge direct_connect agent reports (email~node_tag → ips) into local stats
+    agent_online = store.get("_agent_online") if isinstance(store.get("_agent_online"), dict) else {}
+    if agent_online:
+        merged = dict(online or {})
+        for email, ips in agent_online.items():
+            if not isinstance(ips, dict):
+                continue
+            row = merged.setdefault(str(email), {})
+            for ip, ts in ips.items():
+                row[str(ip)] = max(int(row.get(str(ip)) or 0), int(ts or 0))
+        online = merged
     result: dict[str, list[str]] = {}
     for client in store.get("clients") or []:
         ensure_client(client)
