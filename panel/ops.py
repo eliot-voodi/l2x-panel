@@ -238,7 +238,7 @@ def tunnel_goarch() -> str:
 
 
 def tunnel_release_asset_urls(tag: str = "", *, kind: str = "agent") -> list[str]:
-    """Ordered GitHub release asset URLs for l2x-tunnel-agent / l2x-tunneld."""
+    """Ordered GitHub release asset URLs for l2x-tunnel-agent / l2x-tunneld / l2x-dnsd."""
     tag = normalize_tag(tag)
     if not tag:
         try:
@@ -250,7 +250,12 @@ def tunnel_release_asset_urls(tag: str = "", *, kind: str = "agent") -> list[str
         return []
     arch = tunnel_goarch()
     base = f"https://github.com/{PANEL_REPO}/releases/download/{tag}"
-    name = "l2x-tunnel-agent" if kind == "agent" else "l2x-tunneld"
+    if kind == "agent":
+        name = "l2x-tunnel-agent"
+    elif kind == "dnsd":
+        name = "l2x-dnsd"
+    else:
+        name = "l2x-tunneld"
     urls = [
         f"{base}/{name}-linux-{arch}",
         f"{base}/{name}",  # amd64 stable alias from CI
@@ -270,6 +275,7 @@ def install_tunnel_binaries_from_github(tag: str = "") -> dict:
     Assets (CI workflow tunnel-binaries.yml):
       l2x-tunnel-agent / l2x-tunnel-agent-linux-amd64|arm64
       l2x-tunneld / l2x-tunneld-linux-amd64|arm64
+      l2x-dnsd / l2x-dnsd-linux-amd64|arm64
     """
     tag = normalize_tag(tag)
     if not tag:
@@ -303,7 +309,11 @@ def install_tunnel_binaries_from_github(tag: str = "") -> dict:
 
     installed: list[str] = []
     errors: list[str] = []
-    for kind, dest_name in (("agent", "l2x-tunnel-agent"), ("tunneld", "l2x-tunneld")):
+    for kind, dest_name in (
+        ("agent", "l2x-tunnel-agent"),
+        ("tunneld", "l2x-tunneld"),
+        ("dnsd", "l2x-dnsd"),
+    ):
         blob = b""
         used = ""
         for try_tag in tags_try:
@@ -336,6 +346,14 @@ def install_tunnel_binaries_from_github(tag: str = "") -> dict:
         try:
             subprocess.run(
                 ["systemctl", "restart", "l2x-tunneld"],
+                capture_output=True, timeout=30, check=False,
+            )
+        except Exception:
+            pass
+    if any(x.startswith("l2x-dnsd") for x in installed):
+        try:
+            subprocess.run(
+                ["systemctl", "restart", "l2x-dnsd"],
                 capture_output=True, timeout=30, check=False,
             )
         except Exception:

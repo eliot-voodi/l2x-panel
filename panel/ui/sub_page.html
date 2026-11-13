@@ -80,6 +80,14 @@
   </div>
   {% endif %}
 
+  {% if masterdns_enabled and masterdns_zip %}
+  <div class="card">
+    <h3>MasterDNS</h3>
+    <div class="hint">Конфиг для официального клиента MasterDnsVPN (client_config.toml + resolvers). Обход при жёсткой блокировке обычных протоколов — медленнее VLESS.</div>
+    <div class="actions mt"><a class="btn" href="{{ masterdns_zip }}">{{ ic.icon('download') }}Скачать MasterDNS конфиг</a></div>
+  </div>
+  {% endif %}
+
   <div class="card">
     <h3>Добавить в приложение</h3>
     <div class="flex" style="align-items:flex-start;gap:1.25rem;flex-wrap:wrap">

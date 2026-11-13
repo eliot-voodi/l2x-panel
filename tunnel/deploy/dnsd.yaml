@@ -1,0 +1,14 @@
+# l2x-dnsd sample config (panel renders this from settings.masterdns)
+domain: v.example.com
+domains:
+  - v.example.com
+listen_udp: ":53"
+listen_tcp: ":53"
+encryption_method: 2
+encryption_key_file: /etc/l2x-dnsd/encrypt_key.txt
+protocol_type: SOCKS5
+health_listen: "127.0.0.1:9111"
+ns_hostname: ns.example.com
+ns_ip: "203.0.113.10"
+connect_timeout_sec: 30
+session_timeout_sec: 300

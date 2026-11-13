@@ -6,6 +6,7 @@ UDP L4 tunnel agent/portal per [docs/TZ_TUNNEL_AGENT.md](../docs/TZ_TUNNEL_AGENT
 
 - `l2x-tunneld` — portal on master (UDP + local TCP proxy)
 - `l2x-tunnel-agent` — NAT node agent (egress dials)
+- `l2x-dnsd` — MasterDNS DNS-tunnel server (UDP/TCP :53, health `:9111`)
 
 ## Quick lab (same host)
 

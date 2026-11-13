@@ -39,6 +39,7 @@ import nodes as nodes_mod
 import ops
 import protocols as P
 import doh as doh_mod
+import masterdns as masterdns_mod
 import settings_history as shist
 import sysmon
 import tgbot
@@ -179,6 +180,13 @@ def default_settings() -> dict:
             "enabled": False, "path_prefix": "doh", "upstream": "127.0.0.1", "upstream_port": 53,
             "pihole_web": "127.0.0.1:8089", "pihole_password": "", "timeout_sec": 4,
         },
+        "masterdns": {
+            "enabled": False, "domain": "", "ns_hostname": "", "ns_ip": "",
+            "listen": ":53", "encryption_method": 2, "encryption_key": "",
+            "resolvers": ["8.8.8.8", "1.1.1.1", "9.9.9.9", "8.8.4.4", "1.0.0.1"],
+            "client_listen_ip": "127.0.0.1", "client_listen_port": 18000,
+            "protocol_type": "SOCKS5",
+        },
     }
 
 
@@ -197,6 +205,7 @@ def _ensure_settings(store: dict) -> dict:
         else:
             s.setdefault(k, v)
     s.pop("l2tp_auto", None)
+    masterdns_mod.ensure_settings(store)
     return s
 
 
@@ -2123,6 +2132,7 @@ def _sub_response(request: Request, token: str) -> Response:
         tg_ready = bool(tg_s.get("enabled") and tg_s.get("token") and tg_bot)
         rem_gb = xray.client_remaining_gb(client)
         rem_bytes = xray.client_remaining_bytes(client)
+        md = store["settings"].get("masterdns") or {}
         return templates.TemplateResponse("sub_page.html", {
             "request": request, "client": client, "links": list(zip(eps, links)), "sub_link": sub_url(client),
             "status": xray.client_status(client), "used": xray.client_used_bytes(client), "settings": s,
@@ -2134,6 +2144,8 @@ def _sub_response(request: Request, token: str) -> Response:
             "sub_token": client.get("sub_token") or token,
             "doh_url": doh_mod.public_url(store, client) if (store["settings"].get("doh") or {}).get("enabled") else "",
             "doh_in_tunnel": bool(client.get("doh_in_tunnel")),
+            "masterdns_enabled": bool(md.get("enabled") and md.get("domain")),
+            "masterdns_zip": f"/sub/{token}/masterdns.zip" if (md.get("enabled") and md.get("domain")) else "",
         }, headers={"cache-control": "no-store"})
     if not xray.client_access_ok(client):
         return PlainTextResponse(xray.client_status(client), status_code=403, headers=headers)
@@ -5557,6 +5569,13 @@ def settings_page(request: Request):
         ctx["bbr"] = ops.bbr_status()
         ctx["store"] = store
         ctx["panel_releases"] = ops.panel_releases(20)
+    if tab == "masterdns":
+        md = masterdns_mod.ensure_settings(store)
+        pub = str((s.get("panel") or {}).get("public_host") or "")
+        ctx["md"] = md
+        ctx["md_status"] = masterdns_mod.service_status()
+        ctx["md_hints"] = masterdns_mod.dns_setup_hints(md, public_ip=pub if front._is_ip(pub) else "")
+        ctx["md_methods"] = masterdns_mod.ENCRYPTION_METHODS
     if tab == "tg":
         # Outbounds suitable for Telegram proxy (skip balancers/direct/block)
         skip = {"direct", "block", "dns-out", "api"}
@@ -5608,6 +5627,55 @@ def settings_version_restore(vid: str, request: Request):
     except Exception as exc:  # noqa: BLE001
         flash(request, f"Откат: {exc}", "error")
     return go(f"/settings/versions/{vid}")
+
+
+@app.post("/settings/masterdns/install")
+def settings_masterdns_install(request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate(history_section="masterdns", history_note="install l2x-dnsd") as store:
+        masterdns_mod.ensure_settings(store)
+        res = masterdns_mod.apply(store, install_bin=True)
+    if res.get("ok"):
+        flash(request, f"l2x-dnsd установлен: {res.get('binary') or res}", "info")
+    else:
+        flash(request, f"Install: {res.get('error') or res}", "error")
+    return go("/settings?tab=masterdns")
+
+
+@app.get("/settings/masterdns/client.zip")
+def settings_masterdns_client_zip(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    md = masterdns_mod.ensure_settings(store)
+    if not md.get("domain"):
+        flash(request, "Сначала укажите tunnel domain", "error")
+        return go("/settings?tab=masterdns")
+    data = masterdns_mod.build_client_zip(md)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="masterdns-client.zip"'},
+    )
+
+
+@app.get("/sub/{token}/masterdns.zip")
+def sub_masterdns_zip(token: str, request: Request):
+    """Public subscription download of MasterDNS client pack (shared key MVP)."""
+    store = _load_store()
+    client = next((c for c in store.get("clients") or [] if c.get("token") == token), None)
+    if not client or not client.get("enable", True):
+        return PlainTextResponse("not found", status_code=404)
+    md = masterdns_mod.ensure_settings(store)
+    if not md.get("enabled") or not md.get("domain"):
+        return PlainTextResponse("masterdns disabled", status_code=404)
+    data = masterdns_mod.build_client_zip(md)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="masterdns-client.zip"'},
+    )
 
 
 @app.post("/settings/save")
@@ -5796,6 +5864,34 @@ async def settings_save(request: Request):
             tg["backup_hours"] = _float(form.get("backup_hours"), float(tg.get("backup_hours") or 24))
         elif section == "iplimit":
             s["iplimit"]["ban_minutes"] = _int(form.get("ban_minutes"), 30)
+        elif section == "masterdns":
+            md = masterdns_mod.ensure_settings(store)
+            md["enabled"] = form.get("enabled") == "1"
+            md["domain"] = str(form.get("domain") or "").strip().lower().rstrip(".")
+            md["ns_hostname"] = str(form.get("ns_hostname") or "").strip().lower().rstrip(".")
+            md["ns_ip"] = str(form.get("ns_ip") or "").strip()
+            md["listen"] = str(form.get("listen") or ":53").strip() or ":53"
+            method = _int(form.get("encryption_method"), int(md.get("encryption_method") or 2))
+            if method not in masterdns_mod.ENCRYPTION_METHODS:
+                method = 2
+            md["encryption_method"] = method
+            if form.get("regen_key") == "1":
+                md["encryption_key"] = masterdns_mod.generate_key(method)
+            else:
+                key = str(form.get("encryption_key") or "").strip()
+                if key:
+                    md["encryption_key"] = key
+            resolvers = []
+            for line in _split_lines(str(form.get("resolvers") or "")):
+                line = line.strip()
+                if line:
+                    resolvers.append(line)
+            md["resolvers"] = resolvers or list(masterdns_mod.DEFAULT_RESOLVERS)
+            md["client_listen_ip"] = str(form.get("client_listen_ip") or "127.0.0.1").strip() or "127.0.0.1"
+            md["client_listen_port"] = _int(form.get("client_listen_port"), 18000)
+            md["protocol_type"] = "SOCKS5"
+            apply_res = masterdns_mod.apply(store, install_bin=False)
+            request.session["_masterdns_apply"] = apply_res
     _refresh_settings_cache()
     _sync_servers()
     if section == "tg":
@@ -5816,6 +5912,12 @@ async def settings_save(request: Request):
             flash(request, f"Новый agent token (скопируйте сейчас): {shown}", "info")
         else:
             flash(request, "Настройки сохранены", "info")
+    elif section == "masterdns":
+        apply_res = request.session.pop("_masterdns_apply", {}) or {}
+        if apply_res.get("ok"):
+            flash(request, "MasterDNS сохранён и применён", "info")
+        else:
+            flash(request, f"MasterDNS сохранён, apply: {apply_res.get('error') or apply_res}", "warn")
     else:
         flash(request, "Настройки сохранены", "info")
     return go(f"/settings?tab={section}")

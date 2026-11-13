@@ -10,7 +10,7 @@
 {%- endmacro %}
 {% block content %}
 <div class="tabs">
-  {% for k, l in [('panel', t('Панель')), ('sub', t('Подписки')), ('tg', 'Telegram'), ('webhooks', 'Webhooks'), ('nodes', 'Nodes agent'), ('security', t('Безопасность')), ('api', 'API'), ('certs', t('Сертификаты')), ('backup', t('Бэкап')), ('system', t('Система')), ('iplimit', 'IP limit')] %}
+  {% for k, l in [('panel', t('Панель')), ('sub', t('Подписки')), ('tg', 'Telegram'), ('webhooks', 'Webhooks'), ('nodes', 'Nodes agent'), ('masterdns', 'MasterDNS'), ('security', t('Безопасность')), ('api', 'API'), ('certs', t('Сертификаты')), ('backup', t('Бэкап')), ('system', t('Система')), ('iplimit', 'IP limit')] %}
   <a href="?tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
   {% endfor %}
   <a href="{{ bp }}/settings/versions" class="{% if tab == 'versions' %}active{% endif %}">Версии</a>
@@ -469,6 +469,61 @@
   </div>
 </div>
 
+{% elif tab == 'masterdns' %}{% set md = md or s.masterdns %}
+<div class="grid g2" style="align-items:start">
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:720px">
+  <input type="hidden" name="section" value="masterdns">
+  <h3>MasterDNS · l2x-dnsd</h3>
+  <div class="hint">Свой DNS-tunnel сервер (wire-совместим с клиентом MasterDnsVPN). Не зависит от их бинарников — панель ставит <code>l2x-dnsd</code> из релизов L2X.</div>
+  <label class="check mt"><input type="checkbox" name="enabled" value="1" {% if md.enabled %}checked{% endif %}> Включить сервер</label>
+  <label class="f mt">Tunnel domain</label>
+  <input name="domain" value="{{ md.domain or '' }}" placeholder="v.example.com" required>
+  <div class="grid g2 mt">
+    <div><label class="f">NS hostname</label><input name="ns_hostname" value="{{ md.ns_hostname or '' }}" placeholder="ns.example.com"></div>
+    <div><label class="f">NS A / IP сервера</label><input name="ns_ip" value="{{ md.ns_ip or '' }}" placeholder="203.0.113.10"></div>
+  </div>
+  <label class="f mt">Listen</label>
+  <input name="listen" value="{{ md.listen or ':53' }}" placeholder=":53">
+  <label class="f mt">Шифрование</label>
+  <select name="encryption_method">
+    {% for mid, mname in md_methods.items() %}
+    <option value="{{ mid }}" {% if md.encryption_method == mid %}selected{% endif %}>{{ mid }} — {{ mname }}</option>
+    {% endfor %}
+  </select>
+  <label class="f mt">Ключ (ENCRYPTION_KEY)</label>
+  <input name="encryption_key" value="{{ md.encryption_key or '' }}" class="mono">
+  <label class="check mt"><input type="checkbox" name="regen_key" value="1"> Сгенерировать новый ключ при сохранении</label>
+  <label class="f mt">Резолверы для клиента (по одному в строке)</label>
+  <textarea name="resolvers" rows="5">{{ (md.resolvers or [])|join('\n') }}</textarea>
+  <div class="grid g2 mt">
+    <div><label class="f">Client SOCKS listen IP</label><input name="client_listen_ip" value="{{ md.client_listen_ip or '127.0.0.1' }}"></div>
+    <div><label class="f">Client SOCKS port</label><input name="client_listen_port" type="number" value="{{ md.client_listen_port or 18000 }}"></div>
+  </div>
+  <div class="actions mt">
+    <button class="btn">{{ t('Сохранить') }}</button>
+    <a class="btn ghost" href="{{ bp }}/settings/masterdns/client.zip">Скачать client zip</a>
+  </div>
+</form>
+<div>
+  <div class="card">
+    <div class="card-head"><h3>Статус</h3>
+      <span class="badge {% if md_status.active %}ok{% else %}warn{% endif %}">{% if md_status.active %}active{% else %}stopped{% endif %}</span>
+    </div>
+    <div class="small muted">binary: {% if md_status.binary %}есть{% else %}нет{% endif %} · config: {% if md_status.config %}есть{% else %}нет{% endif %}</div>
+    {% if md_status.health %}<pre class="mt" style="max-height:180px">{{ md_status.health }}</pre>{% elif md_status.health_error %}<div class="hint mt">health: {{ md_status.health_error }}</div>{% endif %}
+    {% if md_status.resolved_conflict %}<div class="hint mt" style="color:var(--warn)">{{ md_status.listen_hint }}</div>{% endif %}
+    <form method="post" action="{{ bp }}/settings/masterdns/install" class="actions mt">
+      <button class="btn ghost">Install / Update binary</button>
+    </form>
+  </div>
+  <div class="card">
+    <h3>DNS делегирование</h3>
+    <ul class="hint" style="padding-left:1.1rem">
+      {% for h in md_hints %}<li><code>{{ h }}</code></li>{% endfor %}
+    </ul>
+  </div>
+</div>
+</div>
 {% elif tab == 'iplimit' %}
 <form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:640px">
   <input type="hidden" name="section" value="iplimit">

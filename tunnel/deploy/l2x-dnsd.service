@@ -1,0 +1,18 @@
+[Unit]
+Description=L2X MasterDNS tunnel server (l2x-dnsd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/l2x-dnsd -config /etc/l2x-dnsd/dnsd.yaml
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
