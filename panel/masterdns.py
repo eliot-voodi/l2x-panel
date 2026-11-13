@@ -23,7 +23,23 @@ DNSD_KEY = DNSD_DIR / "encrypt_key.txt"
 DNSD_UNIT = Path("/etc/systemd/system/l2x-dnsd.service")
 DNSD_HEALTH = "http://127.0.0.1:9111/health"
 
-DEFAULT_RESOLVERS = ["8.8.8.8", "1.1.1.1", "9.9.9.9", "8.8.4.4", "1.0.0.1"]
+# Broader set (aligned with common V2Box/MasterDNS share profiles) for lossy paths.
+DEFAULT_RESOLVERS = [
+    "8.8.8.8",
+    "8.8.4.4",
+    "1.1.1.1",
+    "1.0.0.1",
+    "9.9.9.9",
+    "149.112.112.112",
+    "77.88.8.8",
+    "77.88.8.1",
+    "94.140.14.14",
+    "94.140.15.15",
+    "208.67.222.222",
+    "208.67.220.220",
+    "84.200.69.80",
+    "84.200.70.40",
+]
 
 ENCRYPTION_METHODS = {
     0: "None",
@@ -463,6 +479,30 @@ def _resolver_csv(md: dict) -> str:
     return ",".join(_resolvers_list(md))
 
 
+def _v2box_profile_payload(md: dict, *, name: str = "") -> dict:
+    """V2Box compact MasterDNS profile (same shape as working kprf share links).
+
+    Keys: domain, key, method, port, protocol, ps, resolvers, v.
+    """
+    parts = _share_profile_parts(md, name=name)
+    if not parts:
+        return {}
+    domain, key, method, profile_name = parts
+    proto = str(md.get("protocol_type") or "SOCKS5").strip().upper() or "SOCKS5"
+    if proto not in ("SOCKS5", "TCP"):
+        proto = "SOCKS5"
+    return {
+        "domain": domain,
+        "key": key,
+        "method": method,
+        "port": int(md.get("client_listen_port") or 18000),
+        "protocol": proto,
+        "ps": profile_name,
+        "resolvers": _resolvers_list(md),
+        "v": "1",
+    }
+
+
 def _client_json_payload(md: dict) -> dict:
     """MasterDnsVPN client JSON (same keys as client_config.toml / -json_base64).
 
@@ -491,16 +531,28 @@ def _client_json_payload(md: dict) -> dict:
     }
 
 
+def _std_b64_json(payload: dict, *, pretty: bool = False) -> str:
+    if pretty:
+        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    else:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
 def share_link(md: dict, *, name: str = "") -> str:
-    """Primary ``masterdns://`` for V2Box: official MasterDnsVPN JSON as std-base64.
+    """Primary ``masterdns://`` for V2Box: compact profile JSON (kprf-compatible).
 
-    Same document the upstream client loads with ``-json_base64``, wrapped as::
-
-        masterdns://<standard-base64(JSON)>#name
-
-    See https://github.com/masterking32/MasterDnsVPN (client ``-json_base64``)
-    and ray2sing ``masterdnsJSONLink``.
+        masterdns://<standard-base64({domain,key,method,port,protocol,ps,resolvers,v})>
     """
+    payload = _v2box_profile_payload(md, name=name)
+    if not payload:
+        return ""
+    # Pretty JSON + padding matches known-good V2Box imports (kprf style).
+    return f"masterdns://{_std_b64_json(payload, pretty=True)}"
+
+
+def share_link_official(md: dict, *, name: str = "") -> str:
+    """Alternate: official MasterDnsVPN ``-json_base64`` document."""
     parts = _share_profile_parts(md, name=name)
     if not parts:
         return ""
@@ -508,11 +560,8 @@ def share_link(md: dict, *, name: str = "") -> str:
     payload = _client_json_payload(md)
     if not payload:
         return ""
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    # StdEncoding + padding: matches MasterDnsVPN decodeBase64ConfigJSON
-    b64 = base64.b64encode(raw).decode("ascii")
     frag = quote(profile_name, safe="")
-    return f"masterdns://{b64}#{frag}"
+    return f"masterdns://{_std_b64_json(payload)}#{frag}"
 
 
 def share_link_query(md: dict, *, name: str = "") -> str:
@@ -566,9 +615,10 @@ def share_link_dnst(md: dict, *, name: str = "") -> str:
 
 
 def share_links(md: dict, *, name: str = "") -> dict[str, str]:
-    """Client share URIs. ``masterdns`` = official JSON-base64 (V2Box primary)."""
+    """Client share URIs. ``masterdns`` = V2Box compact (kprf); ``masterdns_official`` = upstream JSON."""
     return {
         "masterdns": share_link(md, name=name),
+        "masterdns_official": share_link_official(md, name=name),
         "masterdns_query": share_link_query(md, name=name),
         "stormdns": share_link_stormdns(md, name=name),
         "dnst": share_link_dnst(md, name=name),
@@ -651,9 +701,9 @@ def build_client_zip(md: dict, *, name: str = "") -> bytes:
         zf.writestr(
             "README.txt",
             "L2X MasterDNS client pack\n"
-            "1. Prefer masterdns.url — V2Box / ray2sing: masterdns:// + std-base64(JSON) like Client -json_base64\n"
+            "1. Prefer masterdns.url — V2Box compact profile (domain/key/method/port/resolvers)\n"
             "2. Or run official MasterDnsVPN Client with client_config.toml + client_resolvers.txt\n"
-            "3. Ensure DNS NS delegation for DOMAINS points to this server\n"
+            "3. Ensure DNS NS delegation for the tunnel domain points to this server\n"
             + (f"\nShare link:\n{link}\n" if link else ""),
         )
     return buf.getvalue()

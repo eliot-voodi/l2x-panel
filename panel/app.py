@@ -5751,6 +5751,7 @@ def settings_masterdns_link(request: Request):
     body = "\n".join(
         x for x in (
             links.get("masterdns"),
+            links.get("masterdns_official"),
             links.get("masterdns_query"),
             links.get("stormdns"),
             links.get("dnst"),
@@ -5793,6 +5794,7 @@ def sub_masterdns_link(token: str, request: Request):
     body = "\n".join(
         x for x in (
             links.get("masterdns"),
+            links.get("masterdns_official"),
             links.get("masterdns_query"),
             links.get("stormdns"),
             links.get("dnst"),

@@ -508,13 +508,17 @@
   {% if md_link %}
   <div class="card">
     <h3>Ссылка для клиентов</h3>
-    <div class="hint">V2Box: <code>masterdns://</code> = JSON конфиг MasterDnsVPN (<code>-json_base64</code>). WhiteDNS → <code>stormdns://</code>. Throne → <code>dnst://</code>.</div>
+    <div class="hint">V2Box: компактный JSON (<code>domain/key/method/port</code>, как kprf). Официальный клиент → MasterDnsVPN JSON. WhiteDNS → <code>stormdns://</code>.</div>
     <div class="flex mt" style="gap:1.25rem;align-items:flex-start;flex-wrap:wrap">
       <div class="qr">{{ md_qr|safe }}</div>
       <div style="flex:1;min-width:220px">
         {% if md_links and md_links.masterdns %}
-        <label class="f">V2Box · masterdns:// (JSON base64)</label>
+        <label class="f">V2Box · masterdns://</label>
         <div class="copy"><input id="mdlink" value="{{ md_links.masterdns }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink', this)">Копировать</button></div>
+        {% endif %}
+        {% if md_links and md_links.masterdns_official %}
+        <label class="f mt">MasterDnsVPN · JSON</label>
+        <div class="copy"><input id="mdlink_off" value="{{ md_links.masterdns_official }}" readonly onclick="this.select()"><button class="btn sm" type="button" onclick="copyText('mdlink_off', this)">Копировать</button></div>
         {% endif %}
         {% if md_links and md_links.masterdns_query %}
         <label class="f mt">Альтернатива · query</label>
