@@ -4623,7 +4623,10 @@ def _route_rule_from_form(form) -> tuple[dict | None, str]:
         "user": _split_lines(str(form.get("user") or "")),
         "source": _split_lines(str(form.get("source") or "")),
         "protocol": [p for p in ("http", "tls", "quic", "bittorrent") if form.get(f"proto_{p}") == "1"],
-        "inbound_tags": [str(x) for x in form.getlist("inbound_tags")],
+        "inbound_tags": [
+            str(x) for x in form.getlist("inbound_tags")
+            if str(x) and str(x) not in nodes_mod._SYSTEM_INBOUND_TAGS
+        ],
         "network": str(form.get("network") or ""),
         "port": str(form.get("port") or "").strip(),
     }
@@ -4641,7 +4644,13 @@ def routing_page(request: Request):
                 route_missing={r.get("name"): xray.route_missing_geo(r) for r in store["routes"]},
                 ext_missing=xray.missing_ext_geo(store),
                 outbounds=xray.all_outbound_tags(store), presets=xray.ROUTE_PRESETS,
-                inbound_tags=[i["tag"] for i in store["inbounds"]],
+                inbound_tags=[
+                    i["tag"] for i in store["inbounds"]
+                    if i.get("tag") and not i.get("_system")
+                    and i.get("tag") not in (
+                        nodes_mod.MASTER_BACKHAUL_TAG, "rv-in", "api", "node-bridge",
+                    )
+                ],
                 geo=ops.geo_files(), geo_missing=ops.geo_missing_core(),
                 geo_cfg=store["settings"].get("geo_update") or {},
                 geo_state=store.get("geo_update_state") or {},
@@ -8384,10 +8393,21 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
                     kept.append(o)
                 st["outbounds_custom"] = kept
         if payload.get("routes") is not None:
-            st["routes"] = (
-                list(payload["routes"]) if mirror
-                else nodes_mod._agent_safe_routes(payload["routes"], keep_tags=keep_tags)
-            )
+            if mirror and not payload.get("direct_connect"):
+                st["routes"] = list(payload["routes"])
+            else:
+                routes = nodes_mod._agent_safe_routes(payload["routes"], keep_tags=keep_tags)
+                if payload.get("direct_connect"):
+                    try:
+                        bals = set(xray.balancer_tags({"balancers": payload.get("balancers") or st.get("balancers") or {}}))
+                    except Exception:
+                        bals = set()
+                    routes = nodes_mod.sanitize_direct_agent_routes(
+                        routes,
+                        self_tag=str(payload.get("direct_connect_tag") or "").strip(),
+                        balancer_tags=bals,
+                    )
+                st["routes"] = routes
         if payload.get("balancers") is not None:
             st["balancers"] = (
                 payload["balancers"] if mirror

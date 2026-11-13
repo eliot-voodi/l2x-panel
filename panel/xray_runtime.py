@@ -1147,6 +1147,15 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
         # Never "leak" intended blocks to freedom when the tag is missing
         if tag == "block":
             return {"outboundTag": "block"}
+        # Keep "master" even if dial outbound was not synced yet — falling back to
+        # direct silently exits via the node IP instead of the panel IP.
+        try:
+            import nodes as nodes_mod
+            if tag == nodes_mod.MASTER_EGRESS_TAG:
+                return {"outboundTag": tag}
+        except Exception:
+            if tag == "master":
+                return {"outboundTag": "master"}
         return {"outboundTag": "direct"}
     return {"outboundTag": tag}
 
@@ -1963,8 +1972,18 @@ def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None =
         raw_domain = [raw_domain]
     if not isinstance(raw_ip, list):
         raw_ip = [raw_ip]
-    raw_domain = [v for v in raw_domain if v]
+    raw_domain = [_normalize_route_domain(v) for v in raw_domain if v]
     raw_ip = [v for v in raw_ip if v]
+    # Drop master-only system inbounds from inboundTag (agents don't have them)
+    if isinstance(base.get("inboundTag"), list):
+        try:
+            import nodes as nodes_mod
+            sys_tags = {nodes_mod.MASTER_BACKHAUL_TAG, "rv-in", "api", "node-bridge"}
+        except Exception:
+            sys_tags = {"master-backhaul", "rv-in", "api", "node-bridge"}
+        base["inboundTag"] = [t for t in base["inboundTag"] if t and t not in sys_tags]
+        if not base["inboundTag"]:
+            base.pop("inboundTag", None)
     domain_vals = _filter_geo_entries(raw_domain) if raw_domain else None
     ip_vals = _filter_geo_entries(raw_ip) if raw_ip else None
     # All geo entries missing (ext:*.dat not downloaded yet) → skip, don't widen match
@@ -1990,6 +2009,31 @@ def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None =
         if any(k in rule for k in keys):
             out.append(rule)
     return out
+
+
+_ROUTE_DOMAIN_PREFIXES = (
+    "domain:", "full:", "keyword:", "regexp:", "geosite:", "ext:", "dotless:", "root:",
+)
+
+
+def _normalize_route_domain(entry: Any) -> str:
+    """Bare hostnames → domain:host so SNI matches the site and its subdomains.
+
+    Legacy 3x-ui imports often store plain ``2ip.ru`` (Xray keyword/substring).
+    Prefixed entries and geosite/regexp/ext are left unchanged.
+    """
+    s = str(entry or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    if any(low.startswith(p) for p in _ROUTE_DOMAIN_PREFIXES):
+        return s
+    # geosite: / ext: without going through lower for unicode hosts
+    if ":" in s and not re.match(r"^[A-Za-z0-9*._-]+$", s):
+        return s
+    if re.match(r"^[A-Za-z0-9*._-]+$", s):
+        return f"domain:{s}"
+    return s
 
 
 # ---------------------------------------------------------------- dns / reverse / settings
@@ -2143,7 +2187,24 @@ def build_config(store: dict) -> dict:
             })
         except Exception:
             pass
-    for r in store.get("routes") or []:
+    # Domain/ip/user rules before inbound-only catch-alls (first match wins).
+    # Prevents a misplaced ``inbound → balancer`` from stealing destinations that
+    # have an earlier-intended panel route when the admin reorders the list.
+    try:
+        import nodes as _nodes_rt
+        _has_sel = _nodes_rt._route_has_selector
+    except Exception:
+        def _has_sel(r: dict) -> bool:  # type: ignore[misc]
+            for key in ("domain", "ip", "user", "source", "protocol"):
+                val = r.get(key)
+                if isinstance(val, list) and any(str(x).strip() for x in val):
+                    return True
+                if isinstance(val, str) and val.strip():
+                    return True
+            return False
+    _routes = list(store.get("routes") or [])
+    _routes = [r for r in _routes if _has_sel(r)] + [r for r in _routes if not _has_sel(r)]
+    for r in _routes:
         rules.extend(_rule_from_route(store, r, known_outbounds=known_outbounds))
     for c in active_clients:
         for e in subscription_entries(store, c):

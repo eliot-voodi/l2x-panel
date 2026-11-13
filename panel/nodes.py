@@ -1749,6 +1749,62 @@ def _agent_safe_routes(
     return out
 
 
+_SYSTEM_INBOUND_TAGS = frozenset({MASTER_BACKHAUL_TAG, "rv-in", "api", "node-bridge"})
+
+
+def _route_has_selector(r: dict) -> bool:
+    """True if the route matches on domain/ip/user/source/protocol (not inbound-only)."""
+    for key in ("domain", "ip", "user", "source", "protocol"):
+        val = r.get(key)
+        if isinstance(val, list) and any(str(x).strip() for x in val):
+            return True
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
+
+
+def sanitize_direct_agent_routes(
+    routes: list[dict],
+    *,
+    self_tag: str,
+    balancer_tags: set[str] | list[str] | None = None,
+) -> list[dict]:
+    """Direct agents: keep master/block/direct/self; never let balancers/other nodes steal traffic.
+
+    Master catch-alls like ``inboundTag → lb_*`` sit in ``routes`` *before*
+    ``email~node_* → local_direct``. On a Direct agent they would send clients through
+    foreign outbounds (or a balancer) instead of the node IP / master backhaul.
+    Inbound-only rules are dropped here; domain/ip/user rules stay (with safe remaps).
+    """
+    bals = {str(t) for t in (balancer_tags or []) if t}
+    self_tag = str(self_tag or "").strip()
+    out: list[dict] = []
+    for r in routes or []:
+        r = dict(r)
+        ob = (r.get("outbound") or r.get("outbound_tag") or "direct").strip()
+        if ob.startswith("lb_") or ob in bals:
+            r["outbound"] = "direct"
+            r.pop("outbound_tag", None)
+            ob = "direct"
+        elif ob.startswith("l2tp_"):
+            r["outbound"] = "direct"
+            r.pop("outbound_tag", None)
+            ob = "direct"
+        elif ob.startswith("node_") and ob != self_tag:
+            r["outbound"] = "direct"
+            r.pop("outbound_tag", None)
+            ob = "direct"
+        tags = r.get("inbound_tags")
+        if isinstance(tags, list) and tags:
+            cleaned = [t for t in tags if t and str(t) not in _SYSTEM_INBOUND_TAGS]
+            r["inbound_tags"] = cleaned
+        # Drop inbound-only catch-alls (and empty shells) — identity + final rules cover default
+        if not _route_has_selector(r):
+            continue
+        out.append(r)
+    return out
+
+
 def _agent_safe_balancers(
     balancers: dict, *, keep_node: bool = False, keep_tags: set[str] | None = None,
 ) -> dict:
@@ -1805,9 +1861,24 @@ def agent_runtime_store(store: dict) -> dict:
     s["clients"] = _agent_safe_clients(
         s.get("clients") or [], keep_node=keep_node, keep_tags=keep_tags,
     )
-    s["routes"] = _agent_safe_routes(
+    routes = _agent_safe_routes(
         s.get("routes") or [], keep_node=keep_node, keep_tags=keep_tags,
     )
+    if ns.get("direct_connect"):
+        try:
+            import xray_runtime as _xray
+            bals = set(_xray.balancer_tags(s))
+        except Exception:
+            bals = {
+                str((b or {}).get("tag") or "")
+                for b in (s.get("balancers") or {}).values()
+                if isinstance(b, dict)
+            }
+            bals.discard("")
+        routes = sanitize_direct_agent_routes(
+            routes, self_tag=dc_tag, balancer_tags=bals,
+        )
+    s["routes"] = routes
     s["balancers"] = _agent_safe_balancers(
         s.get("balancers") or {}, keep_node=keep_node, keep_tags=keep_tags,
     )
@@ -1936,6 +2007,20 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         me = master_egress_outbound(store, node)
         if me:
             customs.append(me)
+        # Live Direct traffic: balancers/other nodes must not preempt local_direct / master
+        try:
+            import xray_runtime as _xray
+            bals = set(_xray.balancer_tags(store))
+        except Exception:
+            bals = {
+                str((b or {}).get("tag") or "")
+                for b in (store.get("balancers") or {}).values()
+                if isinstance(b, dict)
+            }
+            bals.discard("")
+        routes = sanitize_direct_agent_routes(
+            routes, self_tag=self_tag, balancer_tags=bals,
+        )
 
     settings_out = None
     if mirror:
