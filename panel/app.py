@@ -4521,7 +4521,12 @@ def outbound_action(tag: str, action: str, request: Request):
         with mutate() as store:
             o = next((x for x in store["outbounds_custom"] if x["tag"] == tag), None)
             if o:
-                o["last_test"] = {"ok": res["ok"], "ms": res.get("ms"), "at": xray.now_utc().isoformat()}
+                o["last_test"] = {
+                    "ok": res["ok"],
+                    "ms": res.get("ms"),
+                    "at": xray.now_utc().isoformat(),
+                    "error": str(res.get("error") or "")[:300],
+                }
         flash(request, f"{tag}: {'OK ' + str(res.get('ms')) + ' мс' if res['ok'] else 'ошибка ' + str(res.get('error'))}",
               "info" if res["ok"] else "error")
         return go("/outbounds")

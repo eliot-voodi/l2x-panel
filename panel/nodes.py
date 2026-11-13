@@ -1063,19 +1063,32 @@ def tunnel_agent_online(health: dict, node: dict) -> bool:
 
 
 def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> None:
-    """Mark tunnel-only (no panel token) nodes online from local l2x-tunneld /health."""
+    """Refresh l2x-tunneld peer flags; tunnel-only nodes also get online from /health."""
     try:
         import json
         import urllib.request
         with urllib.request.urlopen("http://127.0.0.1:9109/health", timeout=1.5) as resp:
             data = json.loads(resp.read().decode() or "{}")
     except Exception:
-        return
+        data = None
     for n in nodes if nodes is not None else ensure_list(store):
+        if not uses_l2x_tunnel(n):
+            n.pop("tunnel_peer_online", None)
+            continue
+        tunnel_agent_id(n)
+        if data is None:
+            # Keep last known peer flag if metrics briefly unreachable
+            continue
+        peer_ok = tunnel_agent_online(data, n)
+        n["tunnel_peer_online"] = peer_ok
         # Panel NAT agents keep online from /agent/pull — do not overwrite from tunneld
         if not is_tunnel_only_node(n):
+            if not peer_ok and n.get("online") is True:
+                n["last_warning"] = n.get("last_warning") or "tunneld peer offline (egress)"
+            elif peer_ok and str(n.get("last_warning") or "").startswith("tunneld peer offline"):
+                n["last_warning"] = ""
             continue
-        online = tunnel_agent_online(data, n)
+        online = peer_ok
         n["online"] = online
         n["last_probe"] = now_iso()
         n["last_probe_error"] = "" if online else "tunneld peer offline"
@@ -1086,7 +1099,6 @@ def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> 
             n["fail_streak"] = 0
         n["tunnel_transport"] = "wss"
         n["panel_version"] = n.get("panel_version") or "l2x-tunnel-agent"
-        tunnel_agent_id(n)
 
 
 def tunnel_node_outbound_config(store: dict, node: dict) -> dict:

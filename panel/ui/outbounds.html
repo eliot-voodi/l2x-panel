@@ -68,7 +68,7 @@
         <td>{{ m.status_badge(o.status if o.status else 'active') }}</td>
         <td class="small mono">{{ o.info or '' }}{% if o.via %}<div class="dim">via {{ o.via }}</div>{% endif %}</td>
         <td class="small nowrap">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</td>
-        <td class="small">{% if o.last_test %}{% if o.last_test.ok %}<span class="badge ok">{{ o.last_test.ms }} мс</span>{% else %}<span class="badge err">ошибка</span>{% endif %}<div class="dim">{{ ago(o.last_test.at) }}</div>{% endif %}</td>
+        <td class="small">{% if o.last_test %}{% if o.last_test.ok %}<span class="badge ok">{{ o.last_test.ms }} мс</span>{% else %}<span class="badge err" title="{{ o.last_test.error or '' }}">ошибка</span>{% if o.last_test.error %}<div class="dim" style="color:var(--danger);max-width:14rem;white-space:normal">{{ o.last_test.error }}</div>{% endif %}{% endif %}<div class="dim">{{ ago(o.last_test.at) }}</div>{% endif %}</td>
         <td>
           <div class="actions" style="justify-content:flex-end">
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm" title="Проверить через временный Xray">{{ t('Тест') }}</button></form>
@@ -110,7 +110,7 @@
             {% if o.info %}<div><span class="lbl">Инфо</span><span class="val mono">{{ o.info }}</span></div>{% endif %}
             {% if o.via %}<div><span class="lbl">Via</span><span class="val mono">{{ o.via }}</span></div>{% endif %}
             <div><span class="lbl">Трафик</span><span class="val">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</span></div>
-            <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
+            <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% if o.last_test.error %}: {{ o.last_test.error }}{% endif %}{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
           </div>
           <div class="actions">
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm">{{ t('Тест') }}</button></form>
