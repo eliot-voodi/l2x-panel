@@ -4685,7 +4685,14 @@ def _route_rule_from_form(form) -> tuple[dict | None, str]:
         "network": str(form.get("network") or ""),
         "port": str(form.get("port") or "").strip(),
     }
-    if not any(rule[k] for k in ("domain", "ip", "user", "source", "protocol", "inbound_tags", "network", "port")):
+    # «all» → no inboundTag filter in Xray (matches every inbound, including future ones)
+    if form.get("inbound_all") == "1":
+        rule["inbound_all"] = True
+        rule["inbound_tags"] = []
+    else:
+        rule["inbound_all"] = False
+    has_cond = any(rule[k] for k in ("domain", "ip", "user", "source", "protocol", "inbound_tags", "network", "port"))
+    if not has_cond and not rule.get("inbound_all"):
         return None, "Нужно хотя бы одно условие"
     return rule, ""
 
@@ -4865,9 +4872,14 @@ async def xray_settings_save(request: Request):
         try:
             if section == "general":
                 xs = store["xray_settings"]
-                xs["log_level"] = str(form.get("log_level") or "warning")
-                xs["access_log"] = form.get("access_log") == "1"
-                xs["dns_log"] = form.get("dns_log") == "1"
+                if form.get("disable_logs") == "1":
+                    xs["log_level"] = "none"
+                    xs["access_log"] = False
+                    xs["dns_log"] = False
+                else:
+                    xs["log_level"] = str(form.get("log_level") or "warning")
+                    xs["access_log"] = form.get("access_log") == "1"
+                    xs["dns_log"] = form.get("dns_log") == "1"
             elif section == "dns":
                 d = store["dns"]
                 d["enabled"] = form.get("enabled") == "1"

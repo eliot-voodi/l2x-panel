@@ -34,7 +34,8 @@
       <option value="{{ o.ip }}">{{ o.label }}</option>
       {% endfor %}
     </select>
-    <div class="hint">Формат <code>name-ip</code>. Доп. CIDR вручную:</div>
+    <div class="hint">Реальные IP клиентов, с которых они подключались к панели (внешний адрес до VPN). Правило сработает только для трафика с этих адресов — удобно ограничить маршрут конкретным устройством/сетью, даже если у клиента несколько IP. Формат в списке: <code>name-ip</code>.</div>
+    <div class="hint">Доп. CIDR вручную (если IP ещё нет в списке):</div>
     <textarea name="source_extra" class="mono" style="min-height:2.4rem;margin-top:.35rem" placeholder="10.0.0.0/8&#10;203.0.113.0/24"></textarea>
   </div>
 </div>
@@ -45,4 +46,8 @@
 <label class="f">Протокол (sniffing)</label>
 <div>{% for p in ('http', 'tls', 'quic', 'bittorrent') %}{{ m.check('proto_' ~ p, False, p) }}{% endfor %}</div>
 <label class="f">Inbounds</label>
-<div>{% for tg in inbound_tags %}<label class="check"><input type="checkbox" name="inbound_tags" value="{{ tg }}"> {{ tg }}</label>{% endfor %}</div>
+<div class="route-inbounds">
+  <label class="check"><input type="checkbox" name="inbound_all" value="1" onchange="toggleRouteInboundAll(this)"> all</label>
+  {% for tg in inbound_tags %}<label class="check"><input type="checkbox" name="inbound_tags" value="{{ tg }}" onchange="syncRouteInboundAll(this.form)"> {{ tg }}</label>{% endfor %}
+</div>
+<div class="hint">«all» — правило на все inbound (в т.ч. новые). Без выбора inbound-фильтра нет — тоже все.</div>

@@ -22,14 +22,52 @@
 </div>
 
 {% if tab == 'general' %}
-<form class="card" method="post" action="{{ bp }}/xray/settings" style="max-width:640px">
+<form class="card" method="post" action="{{ bp }}/xray/settings" style="max-width:640px" id="xray-general-form">
   <input type="hidden" name="section" value="general">
-  <label class="f">Уровень логов</label>
-  <select name="log_level">{% for l in ('debug', 'info', 'warning', 'error', 'none') %}<option {% if xs_.log_level == l %}selected{% endif %}>{{ l }}</option>{% endfor %}</select>
+  {% set logs_off = (xs_.log_level == 'none') and (not xs_.access_log) and (not xs_.dns_log) %}
+  <div>{{ m.check('disable_logs', logs_off, 'Отключить логи Xray') }}</div>
+  <div class="hint">Полностью гасит journal/error (loglevel=none) и access/DNS-логи. Меньше диск I/O и шума; для диагностики снимите галку.</div>
+  <label class="f mt">Уровень логов</label>
+  <select name="log_level" id="xray-log-level" {% if logs_off %}disabled{% endif %}>{% for l in ('debug', 'info', 'warning', 'error', 'none') %}<option {% if xs_.log_level == l %}selected{% endif %}>{{ l }}</option>{% endfor %}</select>
   <div class="mt">{{ m.check('access_log', xs_.access_log, 'Access log (/var/log/xray/access.log) — нужен для просмотра посещений') }}</div>
   <div>{{ m.check('dns_log', xs_.dns_log, 'DNS log') }}</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
+<script>
+(function () {
+  var form = document.getElementById('xray-general-form');
+  if (!form) return;
+  var dis = form.querySelector('[name="disable_logs"]');
+  var lvl = form.querySelector('[name="log_level"]');
+  var acc = form.querySelector('[name="access_log"]');
+  var dns = form.querySelector('[name="dns_log"]');
+  function sync() {
+    var off = dis && dis.checked;
+    if (lvl) {
+      lvl.disabled = !!off;
+      if (off) lvl.value = 'none';
+    }
+    if (off) {
+      if (acc) acc.checked = false;
+      if (dns) dns.checked = false;
+    }
+    if (acc) acc.disabled = !!off;
+    if (dns) dns.disabled = !!off;
+  }
+  if (dis) dis.addEventListener('change', sync);
+  form.addEventListener('submit', function () {
+    if (lvl && lvl.disabled) lvl.disabled = false;
+    if (acc && acc.disabled) acc.disabled = false;
+    if (dns && dns.disabled) dns.disabled = false;
+    if (dis && dis.checked) {
+      if (lvl) lvl.value = 'none';
+      if (acc) acc.checked = false;
+      if (dns) dns.checked = false;
+    }
+  });
+  sync();
+})();
+</script>
 
 {% elif tab == 'dns' %}
 <form class="card" method="post" action="{{ bp }}/xray/settings">
