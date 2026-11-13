@@ -1046,11 +1046,14 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         })
     elif mode == "http":
         domain = ib.get("share_host") or host
+        # Keep explicit transport Host (ws/xhttp/httpupgrade) for client links.
+        # Only fall back to the public domain when the inbound Host field is empty.
+        transport_host = str(ep.get("host") or "").strip()
         ep.update({
             "address": domain,
             "security": "tls",
             "sni": domain,
-            "host": domain,
+            "host": transport_host or domain,
             "fp": fp,
             "alpn": "h2,http/1.1" if net in ("grpc", "xhttp") else "http/1.1",
             "allow_insecure": False,
