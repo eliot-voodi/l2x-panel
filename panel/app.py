@@ -436,11 +436,15 @@ def _apply_xray(
         xray.ensure_inbounds(runtime)
         staged = {"ok": True, "skipped": True, "changed": False, "problems": [], "error": ""}
         if not xray_only:
-            # Register rv-in Path in store before nginx stage (otherwise first reverse
-            # enable ships nginx without the location and agents dial into a 404).
+            # Register rv-in / master-backhaul Path in store before nginx stage
+            # (otherwise first enable ships nginx without the location → 404 dial).
             if not is_agent:
                 try:
                     xray.ensure_reverse_front_inbound(store)
+                except Exception:
+                    pass
+                try:
+                    xray.ensure_master_backhaul_front_inbound(store)
                 except Exception:
                     pass
             # Front/certs use the real store (domains, base_path); Xray uses runtime
@@ -8333,11 +8337,17 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
     after the HTTP response is sent (avoids "Remote end closed without response").
     """
     mirror = bool(payload.get("mirror"))
+    keep_tags: set[str] = set()
+    if payload.get("direct_connect"):
+        keep_tags.add(nodes_mod.MASTER_EGRESS_TAG)
+        dc_tag0 = str(payload.get("direct_connect_tag") or "").strip()
+        if dc_tag0:
+            keep_tags.add(dc_tag0)
     with mutate() as st:
         if payload.get("clients") is not None:
             st["clients"] = (
                 list(payload["clients"]) if mirror
-                else nodes_mod._agent_safe_clients(payload["clients"])
+                else nodes_mod._agent_safe_clients(payload["clients"], keep_tags=keep_tags)
             )
         if payload.get("inbounds") is not None:
             inbounds = payload["inbounds"]
@@ -8360,18 +8370,28 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
             if mirror:
                 st["outbounds_custom"] = list(payload["outbounds_custom"] or [])
             else:
-                st["outbounds_custom"] = [
-                    o for o in (payload["outbounds_custom"] or []) if o.get("kind") != "node"
-                ]
+                kept: list = []
+                for o in (payload["outbounds_custom"] or []):
+                    kind = o.get("kind")
+                    tag = str(o.get("tag") or "")
+                    if kind == "node":
+                        continue
+                    if kind in ("local_direct", "master_egress") or tag == nodes_mod.MASTER_EGRESS_TAG:
+                        kept.append(o)
+                        continue
+                    if tag.startswith("node_"):
+                        continue
+                    kept.append(o)
+                st["outbounds_custom"] = kept
         if payload.get("routes") is not None:
             st["routes"] = (
                 list(payload["routes"]) if mirror
-                else nodes_mod._agent_safe_routes(payload["routes"])
+                else nodes_mod._agent_safe_routes(payload["routes"], keep_tags=keep_tags)
             )
         if payload.get("balancers") is not None:
             st["balancers"] = (
                 payload["balancers"] if mirror
-                else nodes_mod._agent_safe_balancers(payload["balancers"])
+                else nodes_mod._agent_safe_balancers(payload["balancers"], keep_tags=keep_tags)
             )
         if payload.get("dns") is not None:
             st["dns"] = payload["dns"]

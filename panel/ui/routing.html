@@ -200,7 +200,8 @@
 </div>
 <div class="hint">Порядок: API → эти правила → подписки по странам → outbound клиента → outbound inbound → direct.
   Domain и IP в одном правиле — «или». Sniffing (http/tls/quic, routeOnly) на user-inbound включается принудительно при apply — доменные правила не зависят от галочки в inbound.
-  Балансеры в правилах не переключаются на fallback из‑за probe health (это делает Xray observatory). Теги <code>blackhole</code>/<code>blocked</code> → <code>block</code>.</div>
+  Балансеры в правилах не переключаются на fallback из‑за probe health (это делает Xray observatory). Теги <code>blackhole</code>/<code>blocked</code> → <code>block</code>.
+  Outbound <b>Мастер</b>: для клиентов Direct (подключение сразу к ноде) трафик уходит на панель и выходит в интернет с IP мастера; на самом мастере это обычный direct.</div>
 
 <dialog id="dlg-add" style="max-width:760px">
   <form method="post" action="{{ bp }}/routing" id="form-route-add">

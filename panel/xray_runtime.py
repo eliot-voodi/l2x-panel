@@ -847,6 +847,129 @@ def clear_reverse_front_inbound(store: dict) -> None:
     store["inbounds"] = [i for i in panel_ibs if i.get("tag") != "rv-in"]
 
 
+def clear_master_backhaul_front_inbound(store: dict) -> None:
+    try:
+        import nodes as nodes_mod
+        tag = nodes_mod.MASTER_BACKHAUL_TAG
+    except Exception:
+        tag = "master-backhaul"
+    store["inbounds"] = [i for i in (store.get("inbounds") or []) if i.get("tag") != tag]
+
+
+def ensure_master_backhaul_front_inbound(store: dict) -> dict | None:
+    """Panel-shaped inbound so nginx publishes the master-backhaul Path for Direct agents."""
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return None
+    nodes = nodes_mod.direct_connect_nodes(store)
+    if not nodes:
+        clear_master_backhaul_front_inbound(store)
+        return None
+    mb = nodes_mod.ensure_master_backhaul(store)
+    for n in nodes:
+        nodes_mod.ensure_node_master_egress(n)
+    path = mb.get("path") or "/mb-backhaul"
+    port = int(mb.get("port") or nodes_mod.MASTER_BACKHAUL_PORT)
+    panel_ibs = store.setdefault("inbounds", [])
+    tag = nodes_mod.MASTER_BACKHAUL_TAG
+    existing = next((i for i in panel_ibs if i.get("tag") == tag), None)
+    share = ""
+    try:
+        import front as front_mod
+        share = front_mod.public_domain(store) or ""
+    except Exception:
+        pass
+    shape = {
+        "id": existing.get("id") if existing else 9150,
+        "tag": tag,
+        "remark": "Direct → master egress",
+        "enabled": True,
+        "listen": "127.0.0.1",
+        "port": port,
+        "protocol": "vless",
+        "share_host": share,
+        "settings": {"flow": "", "decryption": "none", "encryption": ""},
+        "stream": {
+            "network": "ws",
+            "security": "none",
+            "fingerprint": "chrome",
+            "ws": {
+                "path": path, "host": "", "headers": "", "heartbeat": 10,
+                "accept_proxy_protocol": False,
+            },
+            "tls": {}, "reality": {}, "raw": {"header": "none"}, "grpc": {},
+            "httpupgrade": {}, "xhttp": {}, "kcp": {}, "sockopt": {"enabled": False},
+        },
+        "sniffing": {
+            "enabled": True, "dest": ["http", "tls", "quic"],
+            "route_only": False, "metadata_only": False,
+        },
+        "fallbacks": [],
+        "outbound": "direct",
+        "_system": True,
+    }
+    if existing:
+        existing.update(shape)
+        return existing
+    panel_ibs.append(shape)
+    return shape
+
+
+def _inject_master_backhaul(store: dict, cfg: dict) -> None:
+    """Master: VLESS/WS inbound accepting Direct agents; traffic exits via freedom."""
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return
+    if not nodes_mod.is_master(store):
+        return
+    nodes = nodes_mod.direct_connect_nodes(store)
+    tag = nodes_mod.MASTER_BACKHAUL_TAG
+    if not nodes:
+        cfg["inbounds"] = [i for i in cfg.get("inbounds") or [] if i.get("tag") != tag]
+        clear_master_backhaul_front_inbound(store)
+        return
+    mb = nodes_mod.ensure_master_backhaul(store)
+    path = mb.get("path") or "/mb-backhaul"
+    port = int(mb.get("port") or nodes_mod.MASTER_BACKHAUL_PORT)
+    clients = []
+    for n in nodes:
+        nodes_mod.ensure_node_master_egress(n)
+        clients.append({
+            "id": n["master_egress_uuid"],
+            "email": f"mb@{nodes_mod.slugify(n.get('name') or 'node')}",
+            "level": 0,
+            "flow": "",
+        })
+    ensure_master_backhaul_front_inbound(store)
+    ib = {
+        "tag": tag,
+        "listen": "127.0.0.1",
+        "port": port,
+        "protocol": "vless",
+        "settings": {"clients": clients, "decryption": "none"},
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": path, "heartbeatPeriod": 10},
+        },
+    }
+    inbounds = [i for i in cfg.setdefault("inbounds", []) if i.get("tag") != tag]
+    inbounds.append(ib)
+    cfg["inbounds"] = inbounds
+    # Traffic from backhaul always exits locally (master IP)
+    rules = cfg.setdefault("routing", {}).setdefault("rules", [])
+    rules[:] = [
+        r for r in rules
+        if not (r.get("inboundTag") == [tag] and r.get("outboundTag") in ("direct", "master"))
+    ]
+    insert_at = 1 if rules else 0
+    rules.insert(insert_at, {
+        "type": "field", "inboundTag": [tag], "outboundTag": "direct",
+    })
+
+
 def ensure_reverse_front_inbound(store: dict) -> dict | None:
     """Register/update the panel-shaped rv-in inbound so nginx publishes its Path on :443.
 
@@ -930,7 +1053,12 @@ def ensure_reverse_front_inbound(store: dict) -> dict | None:
 
 def all_outbound_tags(store: dict) -> list[str]:
     tags = ["direct", "block"]
-    tags += [o["tag"] for o in store.get("outbounds_custom") or []]
+    try:
+        import nodes as nodes_mod
+        tags.append(nodes_mod.MASTER_EGRESS_TAG)
+    except Exception:
+        tags.append("master")
+    tags += [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("tag") not in tags]
     tags += reverse_portal_tags(store)
     tags += balancer_tags(store)
     return tags
@@ -944,6 +1072,8 @@ def outbound_label(store: dict, tag: str) -> str:
         return BALANCER_LABELS[tag]
     if tag == "direct":
         return "🏠 Direct"
+    if tag in ("master", "master_egress"):
+        return "🏠 Мастер (IP панели)"
     if tag == "block":
         return "⛔ Block"
     for o in store.get("outbounds_custom") or []:
@@ -980,6 +1110,8 @@ def normalize_outbound_tag(tag: str | None) -> str:
         return "block"
     if low in ("direct", "freedom", "passthrough"):
         return "direct"
+    if low in ("master", "master_egress", "panel"):
+        return "master"
     return t
 
 
@@ -992,6 +1124,16 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
     watchdog apply. Dead members are handled by Xray observatory + ``fallbackTag``.
     """
     tag = normalize_outbound_tag(tag)
+    # On master, "master" means local freedom (panel IP). On Direct agents a real
+    # master_egress dial outbound is present in known_outbounds.
+    if tag in ("master", "master_egress"):
+        try:
+            import nodes as nodes_mod
+            if nodes_mod.is_master(store):
+                return {"outboundTag": "direct"}
+            tag = nodes_mod.MASTER_EGRESS_TAG
+        except Exception:
+            return {"outboundTag": "direct"}
     if _is_balancer_target(store, tag):
         for b in ensure_balancers(store).values():
             if b.get("tag") != tag or not b.get("enabled", True):
@@ -2076,6 +2218,10 @@ def build_config(store: dict) -> dict:
         _inject_reverse(store, cfg)
     except Exception:
         cfg.pop("reverse", None)
+    try:
+        _inject_master_backhaul(store, cfg)
+    except Exception:
+        pass
 
     patch = xs.get("template_patch") or {}
     if patch:

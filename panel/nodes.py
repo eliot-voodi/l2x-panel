@@ -108,6 +108,89 @@ def uses_direct_connect(node: dict | None) -> bool:
     return bool(node.get("as_outbound"))
 
 
+# Routing tag: on Direct agents dials master backhaul; on master resolves to local freedom.
+MASTER_EGRESS_TAG = "master"
+MASTER_BACKHAUL_TAG = "master-backhaul"
+MASTER_BACKHAUL_PORT = 19150
+
+
+def direct_connect_nodes(store: dict) -> list[dict]:
+    return [n for n in ensure_list(store) if uses_direct_connect(n)]
+
+
+def ensure_node_master_egress(node: dict) -> dict:
+    """Per-node UUID for dialing master's backhaul (Direct → egress via master IP)."""
+    if not node.get("master_egress_uuid"):
+        node["master_egress_uuid"] = str(uuid.uuid4())
+    return node
+
+
+def ensure_master_backhaul(store: dict) -> dict:
+    """Shared VLESS/WS path on master that Direct agents dial for master-IP egress."""
+    ns = store.setdefault("settings", {}).setdefault("nodes", {})
+    mb = ns.setdefault("master_backhaul", {})
+    if not mb.get("path") or not str(mb.get("path") or "").startswith("/"):
+        mb["path"] = "/mb-" + secrets.token_urlsafe(8).replace("_", "").replace("-", "")[:12]
+    mb["port"] = int(mb.get("port") or MASTER_BACKHAUL_PORT)
+    mb["network"] = "ws"
+    return mb
+
+
+def master_egress_outbound(store: dict, node: dict) -> dict | None:
+    """Outbound pushed to a Direct agent: dial master backhaul → exit with master IP."""
+    if not uses_direct_connect(node):
+        return None
+    ensure_node_master_egress(node)
+    mb = ensure_master_backhaul(store)
+    master_host = ""
+    try:
+        import front as front_mod
+        master_host = _normalize_domain(front_mod.public_domain(store) or "")
+    except Exception:
+        pass
+    if not master_host:
+        master_host = next(iter(sorted(master_public_domains(store))), "")
+    if not master_host:
+        return None
+    path = str(mb.get("path") or "")
+    return {
+        "tag": MASTER_EGRESS_TAG,
+        "remark": "Мастер",
+        "kind": "master_egress",
+        "enabled": True,
+        "in_sub": False,
+        "info": "egress via master IP",
+        "config": {
+            "protocol": "vless",
+            "tag": MASTER_EGRESS_TAG,
+            "settings": {
+                "vnext": [{
+                    "address": master_host,
+                    "port": 443,
+                    "users": [{
+                        "id": node["master_egress_uuid"],
+                        "encryption": "none",
+                        "flow": "",
+                    }],
+                }],
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"path": path, "headers": {}},
+                "tlsSettings": {
+                    "serverName": master_host,
+                    "allowInsecure": False,
+                    "fingerprint": "chrome",
+                    "alpn": ["http/1.1"],
+                },
+                "sockopt": {"tcpCongestion": "bbr", "tcpNoDelay": True, "tcpFastOpen": True},
+            },
+        },
+        "stream": {},
+    }
+
+
 # L2X tunnel profiles for NAT / +Reverse (agent → master datapath).
 TUNNEL_PROFILES = {
     "no_dpi": {
@@ -1651,6 +1734,7 @@ def _agent_safe_routes(
     routes: list[dict], *, keep_node: bool = False, keep_tags: set[str] | None = None,
 ) -> list[dict]:
     keep = {t for t in (keep_tags or set()) if t}
+    keep.add(MASTER_EGRESS_TAG)
     out = []
     for r in routes or []:
         r = dict(r)
@@ -1715,6 +1799,8 @@ def agent_runtime_store(store: dict) -> dict:
     dc_tag = str(ns.get("direct_connect_tag") or "").strip()
     if ns.get("direct_connect") and dc_tag:
         keep_tags.add(dc_tag)
+    if ns.get("direct_connect"):
+        keep_tags.add(MASTER_EGRESS_TAG)
     s.pop("l2tp", None)
     s["clients"] = _agent_safe_clients(
         s.get("clients") or [], keep_node=keep_node, keep_tags=keep_tags,
@@ -1730,7 +1816,7 @@ def agent_runtime_store(store: dict) -> dict:
         tag = str(o.get("tag") or "")
         if tag.startswith("l2tp_") or o.get("kind") == "l2tp":
             continue
-        if o.get("kind") == "local_direct":
+        if o.get("kind") in ("local_direct", "master_egress") or tag == MASTER_EGRESS_TAG:
             customs.append(o)
             continue
         if not keep_node and (o.get("kind") == "node" or tag.startswith("node_")):
@@ -1793,6 +1879,13 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     # NAT/reverse/l2x tunnel: no bridge inbound — egress is reverse portal or SOCKS tunnel.
     bridge_on = bool(node.get("as_outbound")) and not rv_on and not tunnel_on
     inbounds = list(store.get("inbounds") or []) if not nat else []
+    # Never ship master-only system inbounds (reverse / master-backhaul) to agents
+    inbounds = [
+        i for i in inbounds
+        if isinstance(i, dict)
+        and not i.get("_system")
+        and i.get("tag") not in (MASTER_BACKHAUL_TAG, "rv-in", "node-bridge")
+    ]
     # Path/TLS share domains must be the node hostname, not the master
     node_dom = node_public_domain(node)
     if inbounds and node_dom and (node.get("sync_inbounds", True) or mirror or bridge_on or dc):
@@ -1816,11 +1909,14 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             "sub_enabled": False, "comment": "node bridge (auto)",
         }]
 
-    keep_tags = {self_tag} if dc else set()
+    keep_tags = {self_tag, MASTER_EGRESS_TAG} if dc else {MASTER_EGRESS_TAG}
     if mirror:
         # Full copy: keep outbound tags and all custom/node outbounds (except this node itself)
         clients = list(store.get("clients") or [])
-        customs = [o for o in (store.get("outbounds_custom") or []) if o.get("tag") != self_tag]
+        customs = [
+            o for o in (store.get("outbounds_custom") or [])
+            if o.get("tag") != self_tag and o.get("kind") != "master_egress" and o.get("tag") != MASTER_EGRESS_TAG
+        ]
         routes = list(store.get("routes") or [])
         balancers = json.loads(json.dumps(store.get("balancers") or {}))
         peers = [_peer_node_export(n) for n in ensure_list(store) if n.get("id") != node.get("id")]
@@ -1828,15 +1924,18 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         clients = _agent_safe_clients(store.get("clients") or [], keep_tags=keep_tags)
         customs = []
         for o in store.get("outbounds_custom") or []:
-            if o.get("tag") == self_tag or o.get("kind") == "node":
+            if o.get("tag") in (self_tag, MASTER_EGRESS_TAG) or o.get("kind") in ("node", "master_egress", "local_direct"):
                 continue
             customs.append(o)
         routes = _agent_safe_routes(store.get("routes") or [], keep_tags=keep_tags)
         balancers = _agent_safe_balancers(store.get("balancers") or {}, keep_tags=keep_tags)
         peers = None
     if dc:
-        customs = [o for o in customs if o.get("tag") != self_tag]
+        customs = [o for o in customs if o.get("tag") not in (self_tag, MASTER_EGRESS_TAG)]
         customs.append(_local_direct_outbound(node))
+        me = master_egress_outbound(store, node)
+        if me:
+            customs.append(me)
 
     settings_out = None
     if mirror:
