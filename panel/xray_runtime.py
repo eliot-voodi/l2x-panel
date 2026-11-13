@@ -2113,6 +2113,78 @@ def _filter_geo_entries(vals: list) -> list | None:
     return kept or None
 
 
+def expand_route_users(store: dict, users: list) -> list[str]:
+    """Expand selected client emails to all Xray emails (main + email~tag)."""
+    if not users:
+        return []
+    wanted = {str(u).strip() for u in users if str(u).strip()}
+    if not wanted:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for client in store.get("clients") or []:
+        ensure_client(client)
+        main = str(client.get("email") or "").strip()
+        if not main:
+            continue
+        emails = [main]
+        try:
+            for e in subscription_entries(store, client, ignore_quota=True):
+                em = str(e.get("email") or "").strip()
+                if em and em not in emails:
+                    emails.append(em)
+        except Exception:
+            pass
+        if main in wanted or any(em in wanted for em in emails):
+            for em in emails:
+                if em not in seen:
+                    seen.add(em)
+                    out.append(em)
+    for u in users:
+        u = str(u).strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def route_picker_clients(store: dict) -> list[dict]:
+    """Clients for routing multi-select: email + known IPs as name-ip labels."""
+    rows: list[dict] = []
+    for client in store.get("clients") or []:
+        ensure_client(client)
+        email = str(client.get("email") or "").strip()
+        if not email:
+            continue
+        ips_map = client.get("ips") or {}
+        ips: list[dict] = []
+        if isinstance(ips_map, dict):
+            # newest first
+            ordered = sorted(ips_map.items(), key=lambda kv: str(kv[1] or ""), reverse=True)
+            for ip, _seen in ordered:
+                ip = str(ip or "").strip()
+                if not ip:
+                    continue
+                ips.append({"ip": ip, "label": f"{email}-{ip}"})
+        rows.append({"email": email, "label": email, "ips": ips})
+    rows.sort(key=lambda r: r["label"].lower())
+    return rows
+
+
+def route_picker_source_ips(store: dict) -> list[dict]:
+    """Flat IP options for routing source multi-select (label = name-ip)."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for row in route_picker_clients(store):
+        for item in row.get("ips") or []:
+            ip = item.get("ip") or ""
+            if not ip or ip in seen:
+                continue
+            seen.add(ip)
+            out.append({"ip": ip, "label": item.get("label") or f"{row['email']}-{ip}", "email": row["email"]})
+    return out
+
+
 def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None = None) -> list[dict]:
     """Build Xray field rule(s) from a panel route.
 
@@ -2128,7 +2200,12 @@ def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None =
         val = r.get(key)
         if not val:
             continue
-        base[xkey] = val if isinstance(val, list) else [val]
+        vals = val if isinstance(val, list) else [val]
+        if key == "user":
+            vals = expand_route_users(store, vals)
+        if not vals:
+            continue
+        base[xkey] = vals
     for key, xkey in (("network", "network"), ("port", "port"), ("source_port", "sourcePort")):
         if r.get(key):
             base[xkey] = str(r[key])

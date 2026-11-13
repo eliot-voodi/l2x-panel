@@ -4645,14 +4645,27 @@ def schema_apply(request: Request):
 def _route_rule_from_form(form) -> tuple[dict | None, str]:
     """Parse routing form → (rule, error). Name may be empty for callers that set it."""
     name = str(form.get("name") or "").strip()
+    users = [str(x).strip() for x in form.getlist("user") if str(x).strip()]
+    # Backward compat: old textarea posted as a single multi-line field
+    if not users and form.get("user"):
+        users = _split_lines(str(form.get("user") or ""))
+    sources = [str(x).strip() for x in form.getlist("source") if str(x).strip()]
+    sources += _split_lines(str(form.get("source_extra") or ""))
+    # Dedupe preserving order
+    seen_src: set[str] = set()
+    source_out: list[str] = []
+    for ip in sources:
+        if ip not in seen_src:
+            seen_src.add(ip)
+            source_out.append(ip)
     rule = {
         "name": name,
         "enabled": form.get("enabled") != "0",
         "outbound": xray.normalize_outbound_tag(str(form.get("outbound") or "direct")),
         "domain": _split_lines(str(form.get("domain") or "")),
         "ip": _split_lines(str(form.get("ip") or "")),
-        "user": _split_lines(str(form.get("user") or "")),
-        "source": _split_lines(str(form.get("source") or "")),
+        "user": users,
+        "source": source_out,
         "protocol": [p for p in ("http", "tls", "quic", "bittorrent") if form.get(f"proto_{p}") == "1"],
         "inbound_tags": [
             str(x) for x in form.getlist("inbound_tags")
@@ -4671,10 +4684,16 @@ def routing_page(request: Request):
     if redir := _require(request):
         return redir
     store = _load_store()
+    route_clients = xray.route_picker_clients(store)
+    route_source_ips = xray.route_picker_source_ips(store)
     return page(request, "routing.html", active="routing", routes=store["routes"], store=store,
                 route_missing={r.get("name"): xray.route_missing_geo(r) for r in store["routes"]},
                 ext_missing=xray.missing_ext_geo(store),
                 outbounds=xray.all_outbound_tags(store), presets=xray.ROUTE_PRESETS,
+                route_clients=route_clients,
+                route_source_ips=route_source_ips,
+                route_ip_labels={o["ip"]: o["label"] for o in route_source_ips},
+
                 inbound_tags=[
                     i["tag"] for i in store["inbounds"]
                     if i.get("tag") and not i.get("_system")

@@ -45,6 +45,12 @@
     .rt-detail .actions .btn { flex: 1 1 calc(25% - .35rem); min-width: 0 }
     #dlg-add { width: calc(100% - 1rem); margin: .5rem; max-height: calc(100dvh - 1rem) }
   }
+  select.route-multi {
+    width: 100%; min-height: 9.5rem; font: inherit;
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px; padding: .35rem .45rem;
+  }
+  select.route-multi option { padding: .2rem .25rem }
 </style>
 {% endblock %}
 {% block content %}
@@ -132,7 +138,10 @@
           {% if route_missing.get(r.name) %}<div><span class="badge warn" title="Правило пропущено, пока файл не скачан">ждёт {{ route_missing[r.name]|join(', ') }}</span></div>{% endif %}</td>
         <td class="small">
           {% for key, label in [('domain', 'domain'), ('ip', 'ip'), ('user', 'user'), ('source', 'source'), ('protocol', 'protocol'), ('inbound_tags', 'inbound')] %}
-            {% set v = r.get(key) %}{% if v %}<div><span class="dim">{{ label }}:</span> <span class="mono">{{ (v if v is string else v|join(', '))|truncate(120) }}</span></div>{% endif %}
+            {% set v = r.get(key) %}
+            {% if v %}
+            <div><span class="dim">{{ label }}:</span> <span class="mono">{% if key == 'source' and v is not string %}{% for ip in v %}{{ route_ip_labels.get(ip, ip) }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}{{ (v if v is string else v|join(', '))|truncate(120) }}{% endif %}</span></div>
+            {% endif %}
           {% endfor %}
           {% if r.network %}<div><span class="dim">network:</span> {{ r.network }}</div>{% endif %}
           {% if r.port %}<div><span class="dim">port:</span> {{ r.port }}</div>{% endif %}
@@ -174,7 +183,10 @@
         <div class="rt-detail" hidden>
           <div class="cond">
             {% for key, label in [('domain', 'domain'), ('ip', 'ip'), ('user', 'user'), ('source', 'source'), ('protocol', 'protocol'), ('inbound_tags', 'inbound')] %}
-              {% set v = r.get(key) %}{% if v %}<div><span class="dim">{{ label }}:</span> <span class="mono">{{ (v if v is string else v|join(', '))|truncate(160) }}</span></div>{% endif %}
+              {% set v = r.get(key) %}
+              {% if v %}
+              <div><span class="dim">{{ label }}:</span> <span class="mono">{% if key == 'source' and v is not string %}{% for ip in v %}{{ route_ip_labels.get(ip, ip) }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}{{ (v if v is string else v|join(', '))|truncate(160) }}{% endif %}</span></div>
+              {% endif %}
             {% endfor %}
             {% if r.network %}<div><span class="dim">network:</span> {{ r.network }}</div>{% endif %}
             {% if r.port %}<div><span class="dim">port:</span> {{ r.port }}</div>{% endif %}
@@ -243,13 +255,38 @@
     if (!v) return '';
     return Array.isArray(v) ? v.join('\n') : String(v);
   }
+  function _list(v) {
+    if (!v) return [];
+    if (Array.isArray(v)) return v.map(String);
+    return String(v).split(/[\n,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+  function _selectMulti(sel, values) {
+    if (!sel) return;
+    var want = {};
+    _list(values).forEach(function (v) { want[v] = true; });
+    Array.prototype.forEach.call(sel.options, function (opt) {
+      opt.selected = !!want[opt.value];
+    });
+  }
   function fillRouteForm(form, r) {
     form.querySelector('[name="name"]').value = r.name || '';
     form.querySelector('[name="outbound"]').value = r.outbound || r.outbound_tag || 'direct';
     form.querySelector('[name="domain"]').value = _lines(r.domain);
     form.querySelector('[name="ip"]').value = _lines(r.ip);
-    form.querySelector('[name="user"]').value = _lines(r.user);
-    form.querySelector('[name="source"]').value = _lines(r.source);
+    _selectMulti(form.querySelector('select[name="user"]'), r.user);
+    var known = {};
+    var srcSel = form.querySelector('select[name="source"]');
+    if (srcSel) {
+      Array.prototype.forEach.call(srcSel.options, function (opt) { known[opt.value] = true; });
+    }
+    var picked = [];
+    var extra = [];
+    _list(r.source).forEach(function (ip) {
+      if (known[ip]) picked.push(ip); else extra.push(ip);
+    });
+    _selectMulti(srcSel, picked);
+    var extraEl = form.querySelector('[name="source_extra"]');
+    if (extraEl) extraEl.value = extra.join('\n');
     form.querySelector('[name="network"]').value = r.network || '';
     form.querySelector('[name="port"]').value = r.port || '';
     var en = form.querySelector('[name="enabled"]');
@@ -270,6 +307,21 @@
     form.action = {{ bp|tojson }} + '/routing/' + encodeURIComponent(name) + '/save';
     fillRouteForm(form, r || {});
     document.getElementById('dlg-edit').showModal();
+  }
+  function openDlg(id) {
+    var dlg = document.getElementById(id);
+    if (!dlg) return;
+    if (id === 'dlg-add') {
+      var form = document.getElementById('form-route-add');
+      if (form) {
+        form.reset();
+        _selectMulti(form.querySelector('select[name="user"]'), []);
+        _selectMulti(form.querySelector('select[name="source"]'), []);
+        var extra = form.querySelector('[name="source_extra"]');
+        if (extra) extra.value = '';
+      }
+    }
+    dlg.showModal();
   }
 </script>
 {% endblock %}

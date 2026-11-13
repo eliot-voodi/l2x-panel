@@ -309,8 +309,7 @@ def apply(store: dict, *, install_bin: bool = False, force_start: bool = False) 
         r = _run(["systemctl", "restart", "l2x-dnsd"])
         out["restart"] = (r.stderr or r.stdout or "")[-300:]
         # Give the process a moment to bind / crash
-        import time as _time
-        _time.sleep(0.6)
+        time.sleep(0.6)
         out["active"] = service_active()
         if not out["active"]:
             out["ok"] = False
