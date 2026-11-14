@@ -449,8 +449,9 @@ func (s *Server) dialSocksTarget(sess *session, streamID uint16, seq uint16, add
 		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlive(true)
 	}
-	// Data sequences continue after the SOCKS SYN sequence number.
-	st := &stream{id: streamID, conn: conn, sendSeq: 1, recvExpect: seq + 1}
+	// Official client: SOCKS5_SYN uses control seq 0; STREAM_DATA also starts at
+	// sndNxt=0 (control and data share numbers but not the data rcvNxt lane).
+	st := &stream{id: streamID, conn: conn, sendSeq: 0, recvExpect: 0}
 	sess.putStream(st)
 	sess.startReader(st)
 	sess.enqueue(Packet{
