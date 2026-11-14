@@ -521,13 +521,10 @@ func (s *Server) replyBuilt(req []byte, name string, opts BuildOptions, baseEnco
 	if err != nil {
 		return nil
 	}
-	// MasterDnsVPN clients encrypt QNAME uploads and expect encrypted TXT downloads.
-	// Previously we put plaintext frames in TXT → client decrypt fails → «Тайм-аут».
-	framed, err := s.codec.Encrypt(raw)
-	if err != nil {
-		return nil
-	}
-	out, err := buildTXTVPNResponse(req, name, framed, baseEncode)
+	// Upstream MasterDnsVPN: QNAME is EncryptAndEncode; TXT carries the raw VPN
+	// frame (or base64 of it when BASE_ENCODE_DATA). ExtractVPNResponse does not
+	// decrypt TXT — encrypting here breaks MTU probes (UPLOAD_MTU=0).
+	out, err := buildTXTVPNResponse(req, name, raw, baseEncode)
 	if err != nil {
 		return nil
 	}
