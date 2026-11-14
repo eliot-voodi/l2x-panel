@@ -445,6 +445,10 @@ func (s *Server) dialSocksTarget(sess *session, streamID uint16, seq uint16, add
 		})
 		return
 	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+	}
 	st := &stream{id: streamID, conn: conn, sendSeq: 1, recvExpect: seq + 1}
 	sess.putStream(st)
 	sess.startReader(st)
@@ -472,8 +476,19 @@ func (s *Server) handleStreamData(sess *session, vpn Packet) *Packet {
 			SequenceNum:    vpn.SequenceNum,
 		}
 	}
-	if len(vpn.Payload) > 0 {
-		_, _ = st.conn.Write(vpn.Payload)
+	total := vpn.TotalFragments
+	if total == 0 {
+		total = 1
+	}
+	payload, ready := st.takeAssembledPayload(vpn.SequenceNum, vpn.FragmentID, total, vpn.Payload)
+	if ready && len(payload) > 0 {
+		st.mu.Lock()
+		conn := st.conn
+		st.mu.Unlock()
+		if conn != nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			_, _ = conn.Write(payload)
+		}
 	}
 	return &Packet{
 		SessionID:      sess.id,

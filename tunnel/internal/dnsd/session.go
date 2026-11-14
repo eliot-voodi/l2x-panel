@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -28,12 +27,16 @@ type session struct {
 }
 
 type stream struct {
-	id        uint16
-	conn      net.Conn
-	sendSeq   uint16
+	id         uint16
+	conn       net.Conn
+	sendSeq    uint16
 	recvExpect uint16
-	closed    bool
-	mu        sync.Mutex
+	closed     bool
+	mu         sync.Mutex
+	// VPN-level fragment reassembly for one in-flight sequence.
+	fragSeq   uint16
+	fragTotal uint8
+	fragParts map[uint8][]byte
 }
 
 type sessionStore struct {
@@ -170,8 +173,19 @@ func (sess *session) closeAll() {
 func (sess *session) enqueue(p Packet) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if len(sess.txQueue) > 256 {
-		sess.txQueue = sess.txQueue[1:]
+	if len(sess.txQueue) >= maxTxQueue {
+		// Prefer dropping oldest STREAM_DATA, keep control/SOCKS signals.
+		dropped := false
+		for i, q := range sess.txQueue {
+			if q.PacketType == pktStreamData || q.PacketType == pktStreamResend {
+				sess.txQueue = append(sess.txQueue[:i], sess.txQueue[i+1:]...)
+				dropped = true
+				break
+			}
+		}
+		if !dropped {
+			sess.txQueue = sess.txQueue[1:]
+		}
 	}
 	sess.txQueue = append(sess.txQueue, p)
 }
@@ -227,6 +241,36 @@ func (st *stream) nextSendSeq() uint16 {
 	return seq
 }
 
+// takeAssembledPayload merges VPN-level fragments for one sequence.
+// Returns (payload, ready). ready=false means more fragments are needed.
+func (st *stream) takeAssembledPayload(seq uint16, fragID, total uint8, part []byte) ([]byte, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if total <= 1 {
+		st.fragParts = nil
+		return part, true
+	}
+	if st.fragParts == nil || st.fragSeq != seq || st.fragTotal != total {
+		st.fragSeq = seq
+		st.fragTotal = total
+		st.fragParts = make(map[uint8][]byte, total)
+	}
+	st.fragParts[fragID] = append([]byte(nil), part...)
+	if len(st.fragParts) < int(total) {
+		return nil, false
+	}
+	out := make([]byte, 0, len(part)*int(total))
+	for i := uint8(0); i < total; i++ {
+		p, ok := st.fragParts[i]
+		if !ok {
+			return nil, false
+		}
+		out = append(out, p...)
+	}
+	st.fragParts = nil
+	return out, true
+}
+
 func randomByte() uint8 {
 	var b [1]byte
 	_, _ = rand.Read(b[:])
@@ -270,65 +314,4 @@ func parseSocksTarget(payload []byte) (host string, port uint16, err error) {
 	}
 	port = binary.BigEndian.Uint16(payload[offset : offset+2])
 	return host, port, nil
-}
-
-func (sess *session) startReader(st *stream) {
-	go func() {
-		buf := make([]byte, 1200)
-		for {
-			st.mu.Lock()
-			conn := st.conn
-			closed := st.closed
-			st.mu.Unlock()
-			if closed || conn == nil {
-				return
-			}
-			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			n, err := conn.Read(buf)
-			if n > 0 {
-				payload := append([]byte(nil), buf[:n]...)
-				seq := st.nextSendSeq()
-				sess.enqueue(Packet{
-					SessionID:       sess.id,
-					PacketType:      pktStreamData,
-					SessionCookie:   sess.cookie,
-					HasStreamID:     true,
-					StreamID:        st.id,
-					HasSequenceNum:  true,
-					SequenceNum:     seq,
-					HasFragmentInfo: true,
-					FragmentID:      0,
-					TotalFragments:  1,
-					HasCompression:  true,
-					CompressionType: 0,
-					Payload:         payload,
-				})
-			}
-			if err != nil {
-				if err != io.EOF && !errors.Is(err, net.ErrClosed) {
-					sess.enqueue(Packet{
-						SessionID:      sess.id,
-						PacketType:     pktStreamRST,
-						SessionCookie:  sess.cookie,
-						HasStreamID:    true,
-						StreamID:       st.id,
-						HasSequenceNum: true,
-						SequenceNum:    st.nextSendSeq(),
-					})
-				} else {
-					sess.enqueue(Packet{
-						SessionID:      sess.id,
-						PacketType:     pktStreamCloseWrite,
-						SessionCookie:  sess.cookie,
-						HasStreamID:    true,
-						StreamID:       st.id,
-						HasSequenceNum: true,
-						SequenceNum:    st.nextSendSeq(),
-					})
-				}
-				sess.removeStream(st.id)
-				return
-			}
-		}
-	}()
 }
