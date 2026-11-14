@@ -184,8 +184,8 @@ def default_settings() -> dict:
         "masterdns": {
             "enabled": False, "domain": "", "ns_hostname": "", "ns_ip": "",
             "listen": ":53", "encryption_method": 2, "encryption_key": "",
-            "resolvers": ["8.8.8.8", "1.1.1.1", "9.9.9.9", "8.8.4.4", "1.0.0.1"],
-            "client_listen_ip": "127.0.0.1", "client_listen_port": 18000,
+            "resolvers": list(masterdns_mod.DEFAULT_RESOLVERS),
+            "client_listen_ip": "127.0.0.1", "client_listen_port": 52301,
             "protocol_type": "SOCKS5",
         },
     }

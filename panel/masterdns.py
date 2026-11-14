@@ -23,18 +23,19 @@ DNSD_KEY = DNSD_DIR / "encrypt_key.txt"
 DNSD_UNIT = Path("/etc/systemd/system/l2x-dnsd.service")
 DNSD_HEALTH = "http://127.0.0.1:9111/health"
 
-# Broader set (aligned with common V2Box/MasterDNS share profiles) for lossy paths.
+# Same resolver set as working V2Box / kprf MasterDNS share profiles (lossy-friendly).
 DEFAULT_RESOLVERS = [
     "8.8.8.8",
     "8.8.4.4",
-    "1.1.1.1",
-    "1.0.0.1",
-    "9.9.9.9",
-    "149.112.112.112",
     "77.88.8.8",
     "77.88.8.1",
+    "77.88.8.2",
+    "9.9.9.9",
+    "149.112.112.112",
     "94.140.14.14",
     "94.140.15.15",
+    "195.46.39.39",
+    "195.46.39.40",
     "208.67.222.222",
     "208.67.220.220",
     "84.200.69.80",
@@ -62,7 +63,8 @@ def default_settings() -> dict:
         "encryption_key": "",
         "resolvers": list(DEFAULT_RESOLVERS),
         "client_listen_ip": "127.0.0.1",
-        "client_listen_port": 18000,
+        # High local SOCKS port — same idea as working kprf V2Box profiles (~52xxx).
+        "client_listen_port": 52301,
         "protocol_type": "SOCKS5",
     }
 
@@ -74,6 +76,19 @@ def ensure_settings(store: dict) -> dict:
         md.setdefault(k, v if not isinstance(v, list) else list(v))
     if not isinstance(md.get("resolvers"), list):
         md["resolvers"] = list(DEFAULT_RESOLVERS)
+    else:
+        # Pad short legacy lists so V2Box gets the same coverage as working kprf profiles.
+        cur = [str(x).strip() for x in md["resolvers"] if str(x).strip()]
+        if len(cur) < 10:
+            seen = set(cur)
+            for r in DEFAULT_RESOLVERS:
+                if r not in seen:
+                    cur.append(r)
+                    seen.add(r)
+            md["resolvers"] = cur
+    # Migrate old default SOCKS port 18000 → kprf-like high port (only if still default).
+    if int(md.get("client_listen_port") or 0) == 18000:
+        md["client_listen_port"] = 52301
     method = int(md.get("encryption_method") or 2)
     if method not in ENCRYPTION_METHODS:
         method = 2
@@ -515,8 +530,41 @@ def _resolvers_list(md: dict) -> list[str]:
     return resolvers or list(DEFAULT_RESOLVERS)
 
 
+def _v2box_resolvers(md: dict) -> list[str]:
+    """Resolvers embedded in V2Box masterdns:// — prefer panel list, pad with kprf defaults."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in _resolvers_list(md) + list(DEFAULT_RESOLVERS):
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
 def _resolver_csv(md: dict) -> str:
     return ",".join(_resolvers_list(md))
+
+
+def _v2box_pretty_json(payload: dict) -> str:
+    """Pretty JSON with ``\"key\" : value`` spacing — exact style of working kprf links."""
+    lines = ["{"]
+    items = list(payload.items())
+    for i, (k, v) in enumerate(items):
+        comma = "," if i < len(items) - 1 else ""
+        if isinstance(v, list):
+            lines.append(f'  "{k}" : [')
+            for j, x in enumerate(v):
+                c2 = "," if j < len(v) - 1 else ""
+                lines.append(f'    {json.dumps(str(x), ensure_ascii=False)}{c2}')
+            lines.append(f"  ]{comma}")
+        elif isinstance(v, bool):
+            lines.append(f'  "{k}" : {json.dumps(v)}{comma}')
+        elif isinstance(v, int):
+            lines.append(f'  "{k}" : {v}{comma}')
+        else:
+            lines.append(f'  "{k}" : {json.dumps(str(v), ensure_ascii=False)}{comma}')
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def _v2box_profile_payload(md: dict, *, name: str = "") -> dict:
@@ -531,14 +579,17 @@ def _v2box_profile_payload(md: dict, *, name: str = "") -> dict:
     proto = str(md.get("protocol_type") or "SOCKS5").strip().upper() or "SOCKS5"
     if proto not in ("SOCKS5", "TCP"):
         proto = "SOCKS5"
+    port = int(md.get("client_listen_port") or 52301)
+    if port <= 0:
+        port = 52301
     return {
         "domain": domain,
         "key": key,
         "method": method,
-        "port": int(md.get("client_listen_port") or 18000),
+        "port": port,
         "protocol": proto,
         "ps": profile_name,
-        "resolvers": _resolvers_list(md),
+        "resolvers": _v2box_resolvers(md),
         "v": "1",
     }
 
@@ -567,7 +618,7 @@ def _client_json_payload(md: dict) -> dict:
         "PACKET_DUPLICATION_COUNT": 3,
         "SETUP_PACKET_DUPLICATION_COUNT": 4,
         "LISTEN_IP": str(md.get("client_listen_ip") or "127.0.0.1").strip() or "127.0.0.1",
-        "LISTEN_PORT": int(md.get("client_listen_port") or 18000),
+        "LISTEN_PORT": int(md.get("client_listen_port") or 52301),
     }
 
 
@@ -587,8 +638,8 @@ def share_link(md: dict, *, name: str = "") -> str:
     payload = _v2box_profile_payload(md, name=name)
     if not payload:
         return ""
-    # Pretty JSON + padding matches known-good V2Box imports (kprf style).
-    return f"masterdns://{_std_b64_json(payload, pretty=True)}"
+    # Exact kprf pretty layout (\"key\" : value) — V2Box imports this form reliably.
+    return f"masterdns://{base64.b64encode(_v2box_pretty_json(payload).encode('utf-8')).decode('ascii')}"
 
 
 def share_link_official(md: dict, *, name: str = "") -> str:
@@ -677,7 +728,7 @@ def client_config_toml(md: dict) -> str:
     method = int(md.get("encryption_method") or 2)
     key = str(md.get("encryption_key") or "").strip()
     listen_ip = str(md.get("client_listen_ip") or "127.0.0.1").strip() or "127.0.0.1"
-    listen_port = int(md.get("client_listen_port") or 18000)
+    listen_port = int(md.get("client_listen_port") or 52301)
     proto = str(md.get("protocol_type") or "SOCKS5").strip() or "SOCKS5"
     # Lossy-friendly defaults aligned with upstream sample
     return f'''# Generated by L2X Panel for MasterDnsVPN Client (wire-compatible)
