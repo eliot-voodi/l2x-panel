@@ -72,8 +72,23 @@ def test_warp_register_applies_license():
     assert res.get("ok"), res
     assert res.get("warp_plus") is True
     assert res["config"]["protocol"] == "wireguard"
+    assert res["config"]["settings"].get("noKernelTun") is True
+    assert res["config"]["settings"].get("domainStrategy") == "ForceIPv4"
     assert any(c[0] == "PUT" and "/account" in c[1] for c in calls)
     ok("warp_register applies license via PUT")
+
+
+def test_warp_endpoint_and_keys():
+    import ops
+
+    assert ops._warp_peer_endpoint({"v4": "162.159.192.8:0", "host": "engage.cloudflareclient.com:2408",
+                                    "ports": [2408, 500]}) == "162.159.192.8:2408"
+    assert ops._warp_reserved("G/qV") == [27, 250, 149]
+    priv, pub = ops._parse_xray_wg_keys(
+        "PrivateKey: aaa=\nPassword (PublicKey): bbb=\nHash32: ccc=\n"
+    )
+    assert priv == "aaa=" and pub == "bbb="
+    ok("warp endpoint/reserved/wg parse")
 
 
 def test_warp_register_free_no_put():
@@ -105,6 +120,7 @@ def main():
     test_source()
     test_warp_register_applies_license()
     test_warp_register_free_no_put()
+    test_warp_endpoint_and_keys()
     print("ALL PASSED")
 
 

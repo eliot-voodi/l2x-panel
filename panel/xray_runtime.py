@@ -154,11 +154,15 @@ def _parse_keypair(r: dict) -> dict:
     text = f"{r['stdout']}\n{r['stderr']}"
     priv = pub = ""
     for line in text.splitlines():
+        if ":" not in line:
+            continue
         low = line.lower()
-        if "private" in low and ":" in line:
-            priv = line.split(":", 1)[1].strip()
-        elif "public" in low and ":" in line:
-            pub = line.split(":", 1)[1].strip()
+        val = line.split(":", 1)[1].strip()
+        if "private" in low:
+            priv = val
+        elif "public" in low or low.startswith("password"):
+            # xray wg (new): "Password (PublicKey): …"
+            pub = val
     if not priv or not pub:
         return {"ok": False, "error": text or "keygen failed"}
     return {"ok": True, "private_key": priv, "public_key": pub}
@@ -3673,21 +3677,59 @@ def test_outbound(store: dict, tag: str, url: str = "https://www.gstatic.com/gen
         ob = {"tag": "direct", "protocol": "freedom"}
     if not ob:
         return {"ok": False, "error": "outbound не найден или не активен"}
-    ob["tag"] = "out"
+    # Include dialerProxy chain targets so sockopt.dialerProxy resolves in the throwaway Xray.
+    outs: list[dict] = []
+    seen_tags: set[str] = set()
+
+    def _add_ob(o: dict) -> None:
+        t = str(o.get("tag") or "")
+        if not t or t in seen_tags:
+            return
+        seen_tags.add(t)
+        outs.append(o)
+
+    probe = copy.deepcopy(ob)
+    probe["tag"] = "out"
+    # WireGuard userspace stack (WARP) — kernel TUN often fails / needs CAP_NET_ADMIN.
+    if str(probe.get("protocol") or "").lower() == "wireguard":
+        stg = probe.setdefault("settings", {})
+        if isinstance(stg, dict) and "noKernelTun" not in stg:
+            stg["noKernelTun"] = True
+    _add_ob(probe)
+    via = str(((probe.get("streamSettings") or {}).get("sockopt") or {}).get("dialerProxy") or "").strip()
+    pending = [via] if via else []
+    custom_by_tag = {o["tag"]: copy.deepcopy(o) for o in _custom_outbounds(store) if o.get("tag")}
+    while pending:
+        dep = pending.pop(0)
+        if not dep or dep in seen_tags or dep == "out":
+            continue
+        if dep == "direct":
+            _add_ob({"tag": "direct", "protocol": "freedom"})
+            continue
+        dep_ob = custom_by_tag.get(dep)
+        if not dep_ob:
+            return {"ok": False, "error": f"dialerProxy «{dep}» не найден / выключен", "ms": 0}
+        _add_ob(dep_ob)
+        nxt = str(((dep_ob.get("streamSettings") or {}).get("sockopt") or {}).get("dialerProxy") or "").strip()
+        if nxt and nxt not in seen_tags:
+            pending.append(nxt)
+    if "direct" not in seen_tags:
+        _add_ob({"tag": "direct", "protocol": "freedom"})
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     cfg = {
         "log": {"loglevel": "error"},
         "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": False}}],
-        "outbounds": [ob],
+        "outbounds": outs,
     }
     path = Path(f"/tmp/l2x-obtest-{port}.json")
     path.write_text(json.dumps(cfg), encoding="utf-8")
     proc = subprocess.Popen([XRAY_BIN, "run", "-c", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        # Xray socks inbound is usually ready in <300ms; 0.8s stacked serially across tags
-        time.sleep(0.35)
+        # WireGuard handshake (~1–2s) needs longer boot than plain VLESS/freedom.
+        boot = 1.8 if str(probe.get("protocol") or "").lower() == "wireguard" else 0.35
+        time.sleep(boot)
         r = _run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "--max-time", str(timeout),
                   "--socks5-hostname", f"127.0.0.1:{port}", url], timeout=timeout + 5)
         parts = (r["stdout"] or "").split()

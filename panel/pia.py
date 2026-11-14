@@ -213,12 +213,15 @@ def _wg_keys(xray_bin: Path) -> dict:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": str(exc)}
     priv = pub = ""
-    for line in (p.stdout or "").splitlines():
+    for line in f"{p.stdout or ''}\n{p.stderr or ''}".splitlines():
+        if ":" not in line:
+            continue
         low = line.lower()
-        if "private" in low and ":" in line:
-            priv = line.split(":", 1)[1].strip()
-        elif "public" in low and ":" in line:
-            pub = line.split(":", 1)[1].strip()
+        val = line.split(":", 1)[1].strip()
+        if "private" in low:
+            priv = val
+        elif "public" in low or low.startswith("password"):
+            pub = val
     if not priv or not pub:
         return {"ok": False, "error": "xray wg: нет ключей"}
     return {"ok": True, "private_key": priv, "public_key": pub}

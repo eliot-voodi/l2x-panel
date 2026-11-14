@@ -1467,6 +1467,61 @@ def import_doh_bundle(items: list | None, *, recreate: bool = True) -> dict:
 
 # ---------------------------------------------------------------- WARP / NordVPN
 
+def _parse_xray_wg_keys(stdout: str, stderr: str = "") -> tuple[str, str]:
+    """Parse ``xray wg`` output (PrivateKey / Public key / Password (PublicKey))."""
+    priv = pub = ""
+    for line in f"{stdout}\n{stderr}".splitlines():
+        if ":" not in line:
+            continue
+        low = line.lower()
+        val = line.split(":", 1)[1].strip()
+        if "private" in low:
+            priv = val
+        elif "public" in low or low.startswith("password"):
+            # Xray ≥26.x: "Password (PublicKey): …" (Password alone on some builds)
+            pub = val
+    return priv, pub
+
+
+def _warp_peer_endpoint(peer_endpoint: dict | None) -> str:
+    """Pick a usable WARP endpoint. API often returns v4 as ``IP:0`` — use ports[]."""
+    ep = peer_endpoint if isinstance(peer_endpoint, dict) else {}
+    ports_raw = ep.get("ports") or [2408]
+    port = 2408
+    for p in ports_raw:
+        try:
+            n = int(p)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            port = n
+            break
+    v4 = str(ep.get("v4") or "").strip()
+    if v4:
+        ip = v4.rsplit(":", 1)[0].strip()
+        if ip and not ip.startswith("["):
+            return f"{ip}:{port}"
+    host = str(ep.get("host") or "").strip()
+    if host:
+        if ":" in host.rsplit("%", 1)[0]:
+            return host
+        return f"{host}:{port}"
+    return f"engage.cloudflareclient.com:{port}"
+
+
+def _warp_reserved(client_id: str) -> list[int]:
+    import base64
+
+    cid = str(client_id or "").strip()
+    if not cid:
+        return []
+    try:
+        raw = base64.b64decode(cid + "===")
+    except Exception:
+        return []
+    return list(raw)[:3] if len(raw) >= 3 else list(raw)
+
+
 def warp_register(license_key: str = "") -> dict:
     """Register a Cloudflare WARP device; optionally attach a WARP+ license key.
 
@@ -1474,13 +1529,8 @@ def warp_register(license_key: str = "") -> dict:
     Returns Xray wireguard outbound config + account meta (warp_plus / quota).
     """
     keys = _run([str(XRAY_BIN), "wg"])
-    priv = pub = ""
-    for line in keys["stdout"].splitlines():
-        if "private" in line.lower():
-            priv = line.split(":", 1)[1].strip()
-        elif "public" in line.lower():
-            pub = line.split(":", 1)[1].strip()
-    if not priv:
+    priv, pub = _parse_xray_wg_keys(keys.get("stdout") or "", keys.get("stderr") or "")
+    if not priv or not pub:
         return {"ok": False, "error": "xray wg failed"}
     api = "https://api.cloudflareclient.com/v0a2158"
     hdr = {
@@ -1533,23 +1583,23 @@ def warp_register(license_key: str = "") -> dict:
     cfg = resp.get("config") or {}
     peer = (cfg.get("peers") or [{}])[0]
     iface = (cfg.get("interface") or {}).get("addresses") or {}
-    client_id = cfg.get("client_id") or ""
-    reserved = []
-    if client_id:
-        import base64
-        reserved = list(base64.b64decode(client_id))[:3]
-    endpoint = (peer.get("endpoint") or {}).get("host") or "engage.cloudflareclient.com:2408"
+    reserved = _warp_reserved(str(cfg.get("client_id") or ""))
+    endpoint = _warp_peer_endpoint(peer.get("endpoint") if isinstance(peer, dict) else None)
+    # IPv4-only tunnel address: dual-stack WG + broken host IPv6 often blackholes handshakes
+    # when endpoint is a hostname (Xray may still dial AAAA despite ForceIPv4).
+    addrs = [f"{iface.get('v4', '172.16.0.2')}/32"]
     outbound = {
         "protocol": "wireguard",
         "settings": {
             "secretKey": priv,
-            "address": [f"{iface.get('v4', '172.16.0.2')}/32", f"{iface.get('v6', '')}/128"] if iface.get("v6") else [f"{iface.get('v4', '172.16.0.2')}/32"],
+            "address": addrs,
             "peers": [{"publicKey": peer.get("public_key") or "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
                        "endpoint": endpoint, "allowedIPs": ["0.0.0.0/0", "::/0"]}],
             "mtu": 1280,
             "noKernelTun": True,
             **({"reserved": reserved} if reserved else {}),
-            "domainStrategy": "ForceIPv4v6",
+            # Prefer IPv4: many VPS have broken/partial IPv6 to Cloudflare anycast.
+            "domainStrategy": "ForceIPv4",
         },
     }
     label = "Cloudflare WARP+" if (warp_plus or license_key) else "Cloudflare WARP"

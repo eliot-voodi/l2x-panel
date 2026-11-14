@@ -4276,6 +4276,10 @@ def _apply_outbound_wrap(config: dict, *, wrap_on: bool, wrap_via: str, self_tag
             return "Выберите outbound для заворачивания трафика"
         if self_tag and via == self_tag:
             return "Нельзя заворачивать outbound через самого себя"
+        # WireGuard (WARP/Nord/PIA) needs UDP to the peer; dialerProxy via VLESS/WS/TCP
+        # breaks the handshake (EOF / no outbound handler in tests).
+        if str(config.get("protocol") or "").lower() == "wireguard":
+            return "WireGuard/WARP нельзя заворачивать через dialerProxy (нужен прямой UDP)"
         ss = config.setdefault("streamSettings", {})
         if not isinstance(ss, dict):
             return "streamSettings повреждён"
