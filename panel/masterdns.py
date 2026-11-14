@@ -209,24 +209,73 @@ def dnsd_release_urls(tag: str = "") -> list[str]:
     ]
 
 
-def _find_dnsd_asset_url(prefer_tag: str = "") -> tuple[str, str, list[str]]:
-    """Return (download_url, tag, errors) for the newest release that has l2x-dnsd assets.
+def _dnsd_candidate_tags(prefer_tag: str = "") -> list[str]:
+    """VERSION / prefer_tag plus prior patch tags — no GitHub API required."""
+    prefer_tag = ops_mod.normalize_tag(prefer_tag)
+    if not prefer_tag:
+        try:
+            prefer_tag = ops_mod.normalize_tag(
+                Path("/opt/l2xpanel/VERSION").read_text(encoding="utf-8").strip().splitlines()[0]
+            )
+        except OSError:
+            prefer_tag = ""
+    tags: list[str] = []
+    if prefer_tag:
+        tags.append(prefer_tag)
+    vt = ops_mod.version_tuple(prefer_tag)
+    if len(vt) >= 3:
+        major, minor, patch = vt[0], vt[1], vt[2]
+        for i in range(0 if not prefer_tag else 1, 16):
+            if patch - i < 0:
+                break
+            t = f"v{major}.{minor}.{patch - i}"
+            if t not in tags:
+                tags.append(t)
+    return tags
 
-    Many panel releases ship notes-only (no binaries). Probe GitHub API asset lists
-    instead of blindly downloading from VERSION / latest tag (404 storm).
+
+def _url_has_binary(url: str, timeout: int = 20) -> bool:
+    """Cheap existence probe for release assets (avoids GitHub Releases API)."""
+    try:
+        ops_mod._http(url, timeout, method="HEAD")
+        return True
+    except Exception:
+        pass
+    try:
+        blob = ops_mod._http(url, timeout, headers={"Range": "bytes=0-1023"})
+        return bool(blob) and len(blob) > 0
+    except Exception:
+        return False
+
+
+def _find_dnsd_asset_url(prefer_tag: str = "") -> tuple[str, str, list[str]]:
+    """Return (download_url, tag, errors) for a release that has l2x-dnsd assets.
+
+    Direct ``releases/download/...`` URLs are tried first so Install works when the
+    unauthenticated GitHub API is rate-limited (403). API listing is optional.
     """
     arch = ops_mod.tunnel_goarch()
     want = [f"l2x-dnsd-linux-{arch}", "l2x-dnsd"]
     errors: list[str] = []
     prefer_tag = ops_mod.normalize_tag(prefer_tag)
+
+    for try_tag in _dnsd_candidate_tags(prefer_tag):
+        for url in dnsd_release_urls(try_tag):
+            if _url_has_binary(url):
+                return url, try_tag, errors
+        errors.append(f"{try_tag}: no direct l2x-dnsd asset")
+
+    # Optional: API discovery when token / quota allows.
     try:
         data = json.loads(
             ops_mod._http(f"https://api.github.com/repos/{ops_mod.PANEL_REPO}/releases?per_page=40", 25)
         )
     except Exception as exc:  # noqa: BLE001
-        return "", "", [f"releases api: {exc}"]
+        errors.append(f"releases api: {exc}")
+        return "", "", errors
     if not isinstance(data, list):
-        return "", "", ["releases api: unexpected payload"]
+        errors.append("releases api: unexpected payload")
+        return "", "", errors
 
     def pick(rel: dict) -> tuple[str, str] | None:
         if rel.get("draft"):
@@ -248,24 +297,12 @@ def _find_dnsd_asset_url(prefer_tag: str = "") -> tuple[str, str, list[str]]:
                 hit = pick(rel)
                 if hit:
                     return hit[0], hit[1], errors
-                errors.append(f"{prefer_tag}: no l2x-dnsd asset")
+                errors.append(f"{prefer_tag}: no l2x-dnsd asset in api")
                 break
     for rel in data:
         hit = pick(rel)
         if hit:
             return hit[0], hit[1], errors
-    # Last resort: guessed URLs for prefer_tag / a few known older tags.
-    for try_tag in ([prefer_tag] if prefer_tag else []) + ["v1.9.143"]:
-        if not try_tag:
-            continue
-        for url in dnsd_release_urls(try_tag):
-            try:
-                blob = ops_mod._http(url, 30)
-                if blob and len(blob) > 1000:
-                    # Caller will re-download; return URL for consistency.
-                    return url, try_tag, errors
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url}: {exc}")
     return "", "", errors or ["no release with l2x-dnsd asset"]
 
 
@@ -279,20 +316,37 @@ def install_binary_from_github(tag: str = "") -> dict:
         except OSError:
             tag = ""
 
-    url, used_tag, errors = _find_dnsd_asset_url(tag)
+    errors: list[str] = []
     blob = b""
     used = ""
-    if url:
-        try:
-            blob = ops_mod._http(url, 180)
-            if blob and len(blob) > 1000:
-                used = url
-            else:
-                blob = b""
+    used_tag = ""
+
+    # Download via direct asset URLs first (no API — survives rate limits).
+    for try_tag in _dnsd_candidate_tags(tag):
+        for url in dnsd_release_urls(try_tag):
+            try:
+                cand = ops_mod._http(url, 180)
+                if cand and len(cand) > 1000:
+                    blob, used, used_tag = cand, url, try_tag
+                    break
                 errors.append(f"{url}: empty/short body")
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{url}: {exc}")
-            blob = b""
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url}: {exc}")
+        if blob:
+            break
+
+    if not blob:
+        url, api_tag, api_errs = _find_dnsd_asset_url(tag)
+        errors.extend(api_errs)
+        if url:
+            try:
+                cand = ops_mod._http(url, 180)
+                if cand and len(cand) > 1000:
+                    blob, used, used_tag = cand, url, api_tag
+                else:
+                    errors.append(f"{url}: empty/short body")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url}: {exc}")
 
     if not blob:
         local = _try_local_build()

@@ -108,7 +108,13 @@ def _run(
 
 
 def _http(url: str, timeout: int = 30, data: bytes | None = None, headers: dict | None = None, method: str | None = None) -> bytes:
-    req = urllib.request.Request(url, data=data, headers={**UA, **(headers or {})}, method=method)
+    hdr = {**UA, **(headers or {})}
+    # Authenticated GitHub API raises the unauthenticated 60 req/h ceiling.
+    if "api.github.com" in url and "Authorization" not in hdr and "authorization" not in hdr:
+        tok = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        if tok:
+            hdr["Authorization"] = f"Bearer {tok}"
+    req = urllib.request.Request(url, data=data, headers=hdr, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -295,14 +301,24 @@ def install_tunnel_binaries_from_github(tag: str = "") -> dict:
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
 
-    # If this tag's assets are not ready yet (CI still running), try a few prior tags.
+    # Prefer direct download URLs (no API). Walk a few prior patch tags if CI
+    # has not published assets for VERSION yet, or API is rate-limited.
     tags_try = [tag]
+    vt = version_tuple(tag)
+    if len(vt) >= 3:
+        major, minor, patch = vt[0], vt[1], vt[2]
+        for i in range(1, 12):
+            if patch - i < 0:
+                break
+            t = f"v{major}.{minor}.{patch - i}"
+            if t not in tags_try:
+                tags_try.append(t)
     try:
         for r in panel_releases(8):
             t = normalize_tag(r.get("tag") or "")
             if t and t not in tags_try:
                 tags_try.append(t)
-            if len(tags_try) >= 4:
+            if len(tags_try) >= 16:
                 break
     except Exception:
         pass
