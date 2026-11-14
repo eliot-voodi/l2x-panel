@@ -3126,43 +3126,45 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     client["group_id"] = gid
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
-    # Always save personal lists (optional extras when grouped; sole source without group).
-    if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib:
-        client["inbounds"] = []
-    else:
-        client["inbounds"] = sel_ib
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
-    if form.get("select_mode", "all") == "all":
-        client["allowed_tags"] = []
-        # Primary among all selectable; keep previous if still valid.
-        if outbound and outbound in known:
-            client["outbound"] = outbound
-        elif gid:
-            client["outbound"] = ""  # use group
-        else:
-            client["outbound"] = outbound if outbound in known or outbound == "direct" else "direct"
-    elif selected:
-        client["allowed_tags"] = selected
-        if outbound and outbound in selected:
-            client["outbound"] = outbound
-        elif outbound == "direct" and "direct" in selected:
-            client["outbound"] = "direct"
-        else:
-            client["outbound"] = selected[0]
-    elif gid:
-        client["allowed_tags"] = []
-        client["outbound"] = ""  # group owns primary
-    else:
-        return "Выберите хотя бы одно подключение в таблице «Подключения в подписке»"
     if gid:
-        # Personal primary optional — empty means inherit group.
-        if client.get("outbound") and client["outbound"] not in known and client["outbound"] != "direct":
-            return f"Неизвестный outbound {client['outbound']}"
+        # Group owns base inbounds/outbounds. Personal lists are optional extras only.
+        if form.get("ib_mode", "all") == "all":
+            client["inbounds"] = []
+        else:
+            client["inbounds"] = sel_ib  # may be empty = no extras
+        if form.get("select_mode", "all") == "all" or not selected:
+            client["allowed_tags"] = []
+        else:
+            client["allowed_tags"] = selected
+        # Primary always from group when assigned.
+        client["outbound"] = ""
     else:
+        if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib:
+            client["inbounds"] = []
+        else:
+            client["inbounds"] = sel_ib
+        if form.get("select_mode", "all") == "all":
+            client["allowed_tags"] = []
+            client["outbound"] = outbound if outbound in known or outbound == "direct" else "direct"
+        elif selected:
+            client["allowed_tags"] = selected
+            if outbound and outbound in selected:
+                client["outbound"] = outbound
+            elif outbound == "direct" and "direct" in selected:
+                client["outbound"] = "direct"
+            else:
+                client["outbound"] = selected[0]
+        else:
+            return "Выберите хотя бы одно подключение в таблице «Подключения в подписке»"
         ob = client.get("outbound") or "direct"
         if ob != xray.NONE_TAG and ob not in known and ob != "direct":
             return f"Неизвестный outbound {ob}"
         client["outbound"] = ob
+    # Optional manual WireGuard tunnel IP (empty → auto from inbound pool on ensure_wg_peer).
+    if "wg_ip" in form:
+        raw_wg = str(form.get("wg_ip") or "").strip().split("/")[0]
+        client["wg_ip"] = raw_wg
     limits = {}
     daily_limits = {}
     for tag in known:

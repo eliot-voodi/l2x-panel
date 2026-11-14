@@ -86,11 +86,13 @@
     <div class="mt">{{ m.check('propagate_users', False, 'Раздать всем клиентам / группам') }}</div>
     <div class="hint">Без галочки новый inbound не попадёт к тем, у кого список inbound = «все» (список зафиксируется без него). С галочкой — как раньше: пустой список = все, включая этот.</div>
     {% endif %}
-    <div class="mt flex gap" style="flex-wrap:wrap;align-items:center">
-      <button type="button" class="btn sm" id="btn_max_speed">Профиль: макс. скорость</button>
-      {% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}
+    <div id="max_speed_block" class="mt" hidden>
+      <div class="flex gap" style="flex-wrap:wrap;align-items:center">
+        <button type="button" class="btn sm" id="btn_max_speed">Профиль: макс. скорость</button>
+        {% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}
+      </div>
+      <div class="hint">VLESS + raw/TCP + REALITY + Vision, порт напрямую, TFO + BBR, без Mux/XHTTP. Это максимальная скорость клиента (как inbound <code>speed</code>).</div>
     </div>
-    <div class="hint">VLESS + raw/TCP + REALITY + Vision, порт напрямую, TFO + BBR, без Mux/XHTTP. Это максимальная скорость клиента (как inbound <code>speed</code>).</div>
   </div>
 
   <div class="card">
@@ -455,6 +457,8 @@
     if (transport) transport.hidden = !userProto;
     var enc = document.getElementById('vless-enc');
     if (enc) enc.hidden = p !== 'vless' || sec === 'reality';
+    var maxSp = document.getElementById('max_speed_block');
+    if (maxSp) maxSp.hidden = p !== 'vless';
     syncAuthSelect();
     syncFront();
   }

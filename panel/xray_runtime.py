@@ -1552,6 +1552,10 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("group_id", "")
     client.setdefault("outbound_limits", {})
     client.setdefault("daily_outbound_limits", {})
+    client.setdefault("wg_private", "")
+    client.setdefault("wg_public", "")
+    client.setdefault("wg_ip", "")
+    client.setdefault("wg_index", 0)
     client.setdefault("sub_enabled", True)
     client.setdefault("doh_enabled", False)
     client.setdefault("doh_in_tunnel", False)
@@ -1571,14 +1575,93 @@ def ensure_client(client: dict) -> dict:
 ensure_client_quota = ensure_client  # backward compat
 
 
+def _wg_pool(ib: dict) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    try:
+        return ipaddress.ip_network(
+            (ib.get("settings") or {}).get("address_pool") or "10.66.0.0/24",
+            strict=False,
+        )
+    except ValueError:
+        return None
+
+
+def _wg_used_ips(store: dict, ib: dict, *, skip_email: str = "") -> set[str]:
+    """IPs already assigned to other clients on this WireGuard inbound's pool."""
+    used: set[str] = set()
+    tag = str(ib.get("tag") or "")
+    for c in store.get("clients") or []:
+        if skip_email and c.get("email") == skip_email:
+            continue
+        on_ib = any(
+            i.get("tag") == tag
+            for i in client_inbounds(store, c)
+            if i.get("protocol") == "wireguard"
+        )
+        if not on_ib:
+            continue
+        ip = str(c.get("wg_ip") or "").strip()
+        if ip:
+            used.add(ip.split("/")[0])
+            continue
+        derived = wg_ip(ib, c, allocate=False)
+        if derived:
+            used.add(derived)
+    return used
+
+
+def _wg_alloc_ip(store: dict, ib: dict, client: dict) -> str:
+    """Pick first free host in inbound address_pool (skip network/broadcast/.1 gateway)."""
+    net = _wg_pool(ib)
+    if net is None:
+        return ""
+    used = _wg_used_ips(store, ib, skip_email=str(client.get("email") or ""))
+    hosts = list(net.hosts())
+    # Prefer .2+ — .1 is conventionally the server/gateway in the pool.
+    for host in hosts:
+        if int(host) == int(net.network_address) + 1:
+            continue
+        s = str(host)
+        if s not in used:
+            return s
+    for host in hosts:
+        s = str(host)
+        if s not in used:
+            return s
+    return ""
+
+
 def ensure_wg_peer(store: dict, client: dict) -> None:
-    if not any(i["protocol"] == "wireguard" for i in client_inbounds(store, client)):
+    """Generate WG keys + unique tunnel IP from each WG inbound pool (unless set manually)."""
+    wgs = [i for i in client_inbounds(store, client) if i.get("protocol") == "wireguard"]
+    if not wgs:
         return
     if not client.get("wg_private") or not client.get("wg_public"):
         keys = generate_wg_keys()
         if keys.get("ok"):
             client["wg_private"], client["wg_public"] = keys["private_key"], keys["public_key"]
-    if not client.get("wg_index"):
+    manual = str(client.get("wg_ip") or "").strip()
+    if manual:
+        # Keep index in sync when possible (first WG inbound).
+        try:
+            net = _wg_pool(wgs[0])
+            if net is not None:
+                idx = int(ipaddress.ip_address(manual.split("/")[0])) - int(net.network_address)
+                if idx > 0:
+                    client["wg_index"] = idx
+        except ValueError:
+            pass
+        return
+    # Allocate unique IP in the primary WG inbound pool.
+    ip = _wg_alloc_ip(store, wgs[0], client)
+    if ip:
+        client["wg_ip"] = ip
+        try:
+            net = _wg_pool(wgs[0])
+            if net is not None:
+                client["wg_index"] = int(ipaddress.ip_address(ip)) - int(net.network_address)
+        except ValueError:
+            pass
+    elif not client.get("wg_index"):
         used = {int(c.get("wg_index") or 0) for c in store.get("clients") or []}
         idx = 2
         while idx in used:
@@ -1586,10 +1669,21 @@ def ensure_wg_peer(store: dict, client: dict) -> None:
         client["wg_index"] = idx
 
 
-def wg_ip(ib: dict, client: dict) -> str:
+def wg_ip(ib: dict, client: dict, *, allocate: bool = True) -> str:
+    """Client tunnel IP for this WireGuard inbound.
+
+    Prefer explicit client.wg_ip (manual or previously allocated). Otherwise derive
+    from wg_index within the inbound address_pool.
+    """
+    manual = str(client.get("wg_ip") or "").strip()
+    if manual:
+        return manual.split("/")[0]
     try:
         net = ipaddress.ip_network((ib.get("settings") or {}).get("address_pool") or "10.66.0.0/24", strict=False)
-        return str(net.network_address + int(client.get("wg_index") or 2))
+        idx = int(client.get("wg_index") or 0)
+        if idx <= 0:
+            return ""
+        return str(net.network_address + idx)
     except ValueError:
         return ""
 

@@ -30,8 +30,8 @@
       <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.allowed_tags %} · {{ g.allowed_tags|length }} подкл.{% endif %}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
       {% endfor %}
     </select>
-    <div class="hint">{% if groups %}Группа задаёт подключения и inbounds.
-      Конфиги/основная ссылка — только в блоке «Подключения в подписке» ниже.
+    <div class="hint">{% if groups %}Группа задаёт inbounds, подключения и основную ссылку.
+      Ручной выбор ниже не обязателен — можно только дописать личные extras.
       <a href="{{ bp }}/groups">Управление группами</a>.
       {% else %}Групп пока нет — <a href="{{ bp }}/groups/new">создайте</a>, чтобы назначать наборы подключений.{% endif %}
       {% if group %} Сейчас основная: <b>{{ outbound_label(store, eff_outbound or group.outbound or (eff_tags[0] if eff_tags else 'direct')) }}</b> (группа).{% endif %}</div>
@@ -146,27 +146,36 @@
   {% endif %}
 
   <div class="card" id="card-inbounds">
-    <div class="card-head"><h3>Inbounds{% if group %} <span class="badge">группа + личные</span>{% endif %}</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if not c.inbounds %}checked{% endif %}> {% if group %}не дописывать{% else %}все{% endif %}</label>
+    <div class="card-head"><h3>Inbounds{% if group %} <span class="badge">из группы</span>{% endif %}</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if not c.inbounds %}checked{% endif %}> {% if group %}только группа{% else %}все{% endif %}</label>
         <label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="select" {% if c.inbounds %}checked{% endif %}> {% if group %}дописать{% else %}выбранные{% endif %}</label></div>
     </div>
+    {% if group %}
+    <div class="hint">{% if group.inbounds %}Группа: {% for t in group.inbounds %}<span class="badge">{{ t }}</span> {% endfor %}{% else %}Группа: <span class="badge">все inbounds</span>{% endif %}</div>
+    {% endif %}
     <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
       <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
       <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
     </div>
     {% for ib in inbounds %}
-      <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if not c.inbounds or ib.tag in c.inbounds %}checked{% endif %}>
+      <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if group %}{% if ib.tag in (c.inbounds or []) %}checked{% endif %}{% else %}{% if not c.inbounds or ib.tag in c.inbounds %}checked{% endif %}{% endif %}>
         <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }} <span class="dim small">:{{ ib.port }}</span></label><br>
     {% else %}<div class="dim">Нет inbounds для клиентов</div>{% endfor %}
-    {% if group %}<div class="hint">При группе поле необязательно: пусто = только inbounds группы; «дописать» — union с группой.</div>{% endif %}
+    {% if group %}<div class="hint">По умолчанию — inbounds группы. «Дописать» добавляет личные поверх группы.</div>{% endif %}
   </div>
 
   <div class="card" id="card-allowed">
-    <div class="card-head"><h3>Подключения в подписке и лимиты по ним{% if group %} <span class="badge">группа + личные</span>{% endif %}</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if not c.allowed_tags %}checked{% endif %}> {% if group %}не дописывать{% else %}все{% endif %}</label>
+    <div class="card-head"><h3>Подключения в подписке и лимиты по ним{% if group %} <span class="badge">из группы</span>{% endif %}</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if not c.allowed_tags %}checked{% endif %}> {% if group %}только группа{% else %}все{% endif %}</label>
         <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if c.allowed_tags %}checked{% endif %}> {% if group %}дописать{% else %}выбранные{% endif %}</label></div>
     </div>
+    {% if group %}
+    <div class="hint mb0">Основная и список конфигов — из группы
+      (<b>{{ outbound_label(store, eff_outbound or group.outbound or 'direct') }}</b>{% if group.allowed_tags %}: {% for t in group.allowed_tags %}{{ outbound_label(store, t) }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}: все{% endif %}).
+      Ручной выбор необязателен.</div>
+    {% else %}
     <div class="hint mb0">Единственное место выбора конфигов. Колонка «основная» — ссылка по умолчанию в подписке.</div>
+    {% endif %}
     <div class="flex" style="gap:.4rem;margin:.6rem 0">
       <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
       <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
@@ -184,8 +193,8 @@
       {% set main_ob = c.outbound or (group.outbound if group else '') or (eff_outbound or '') %}
       {% for tg in tags %}
         <tr>
-          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if not c.allowed_tags or tg.tag in c.allowed_tags %}checked{% endif %}></td>
-          <td><input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if main_ob == tg.tag or (not main_ob and loop.first and not group) %}checked{% endif %} title="Основная ссылка"></td>
+          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if group %}{% if tg.tag in (c.allowed_tags or []) %}checked{% endif %}{% else %}{% if not c.allowed_tags or tg.tag in c.allowed_tags %}checked{% endif %}{% endif %}></td>
+          <td>{% if group %}<span class="dim" title="Основная из группы">—</span>{% else %}<input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if main_ob == tg.tag or (not main_ob and loop.first) %}checked{% endif %} title="Основная ссылка">{% endif %}</td>
           <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
           {% if not is_new %}
           <td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>
@@ -198,7 +207,14 @@
       </tbody>
     </table>
     <div class="hint">Лимиты по outbound отдельно от общего. Дневной — сброс в 00:00 UTC. Исчерпанный outbound пропадает из подписки до обновления лимита.
-      {% if group %}При группе выбор подключений необязателен: пусто = только группа; «дописать» — добавит отмеченные к группе.{% endif %}</div>
+      {% if group %}«Дописать» добавит отмеченные к группе; основная ссылка всегда из группы.{% endif %}</div>
+  </div>
+
+  <div class="card" id="card-wg">
+    <h3>WireGuard</h3>
+    <label class="f">IP в туннеле</label>
+    <input name="wg_ip" value="{{ c.wg_ip or '' }}" placeholder="авто из пула inbound" class="mono" style="max-width:14rem">
+    <div class="hint">Пусто — при сохранении выдаётся уникальный адрес из address_pool WireGuard inbound (не повторяется среди клиентов). Ключи генерируются сами.</div>
   </div>
 
   <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/clients">{{ t('Отмена') }}</a></div>
@@ -252,7 +268,9 @@
         <input id="lnk{{ loop.index }}" value="{{ link }}" readonly class="mono small" style="margin-top:.3rem">
       </div>
     {% else %}<div class="dim">Нет активных конфигураций (клиент выключен, истёк или нет подключённых туннелей)</div>{% endfor %}
-    {% if wg_confs %}<div class="mt"><a class="btn ghost sm" href="{{ bp }}/clients/{{ c.email }}/wg.conf">{{ ic.icon('download') }}WireGuard .conf</a></div>{% endif %}
+    {% if wg_confs %}<div class="mt"><a class="btn ghost sm" href="{{ bp }}/clients/{{ c.email }}/wg.conf">{{ ic.icon('download') }}WireGuard .conf</a>
+      {% if c.wg_ip %}<span class="dim small mono" style="margin-left:.5rem">{{ c.wg_ip }}</span>{% endif %}
+    </div>{% endif %}
     {% if masterdns_link %}
     <div class="mt" style="padding-top:.75rem;border-top:1px solid var(--border)">
       <div class="flex between" style="align-items:flex-start;gap:1rem;flex-wrap:wrap">
@@ -366,9 +384,18 @@
       syncMaster(m.dataset.master);
     });
     boxes('inbounds').forEach(function (x) { x.addEventListener('change', function () { setMode('ib_mode', 'select'); }); });
+    var groupEl = document.getElementById('client-group');
+    function onGroupChange() {
+      if (!groupEl || !groupEl.value) return;
+      setMode('ib_mode', 'all');
+      setMode('select_mode', 'all');
+      boxes('inbounds').forEach(function (x) { x.checked = false; });
+      boxes('allowed_tags').forEach(function (x) { x.checked = false; });
+      syncMaster('allowed_tags');
+    }
+    if (groupEl) groupEl.addEventListener('change', onGroupChange);
     form.addEventListener('submit', function (e) {
-      var groupEl = document.getElementById('client-group');
-      if (groupEl && groupEl.value) return; // with group: tags optional
+      if (groupEl && groupEl.value) return; // group owns inbounds/outbounds; extras optional
       var sel = form.querySelector('input[name="select_mode"][value="select"]');
       if (sel && sel.checked && boxes('allowed_tags').length && !boxes('allowed_tags').some(function (x) { return x.checked; })) {
         e.preventDefault();

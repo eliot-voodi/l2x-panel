@@ -194,6 +194,66 @@ def dnsd_release_urls(tag: str = "") -> list[str]:
     ]
 
 
+def _find_dnsd_asset_url(prefer_tag: str = "") -> tuple[str, str, list[str]]:
+    """Return (download_url, tag, errors) for the newest release that has l2x-dnsd assets.
+
+    Many panel releases ship notes-only (no binaries). Probe GitHub API asset lists
+    instead of blindly downloading from VERSION / latest tag (404 storm).
+    """
+    arch = ops_mod.tunnel_goarch()
+    want = [f"l2x-dnsd-linux-{arch}", "l2x-dnsd"]
+    errors: list[str] = []
+    prefer_tag = ops_mod.normalize_tag(prefer_tag)
+    try:
+        data = json.loads(
+            ops_mod._http(f"https://api.github.com/repos/{ops_mod.PANEL_REPO}/releases?per_page=40", 25)
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "", "", [f"releases api: {exc}"]
+    if not isinstance(data, list):
+        return "", "", ["releases api: unexpected payload"]
+
+    def pick(rel: dict) -> tuple[str, str] | None:
+        if rel.get("draft"):
+            return None
+        assets = {
+            str(a.get("name") or ""): str(a.get("browser_download_url") or "")
+            for a in (rel.get("assets") or [])
+            if isinstance(a, dict)
+        }
+        for name in want:
+            url = assets.get(name) or ""
+            if url:
+                return url, ops_mod.normalize_tag(rel.get("tag_name") or "")
+        return None
+
+    if prefer_tag:
+        for rel in data:
+            if ops_mod.normalize_tag(rel.get("tag_name") or "") == prefer_tag:
+                hit = pick(rel)
+                if hit:
+                    return hit[0], hit[1], errors
+                errors.append(f"{prefer_tag}: no l2x-dnsd asset")
+                break
+    for rel in data:
+        hit = pick(rel)
+        if hit:
+            return hit[0], hit[1], errors
+    # Last resort: guessed URLs for prefer_tag / a few known older tags.
+    for try_tag in ([prefer_tag] if prefer_tag else []) + ["v1.9.143"]:
+        if not try_tag:
+            continue
+        for url in dnsd_release_urls(try_tag):
+            try:
+                blob = ops_mod._http(url, 30)
+                if blob and len(blob) > 1000:
+                    # Caller will re-download; return URL for consistency.
+                    return url, try_tag, errors
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url}: {exc}")
+    return "", "", errors or ["no release with l2x-dnsd asset"]
+
+
 def install_binary_from_github(tag: str = "") -> dict:
     tag = ops_mod.normalize_tag(tag)
     if not tag:
@@ -204,41 +264,21 @@ def install_binary_from_github(tag: str = "") -> dict:
         except OSError:
             tag = ""
 
-    # Prefer newest GitHub releases first — l2x-dnsd assets exist only from v1.9.143+.
-    # Local panel VERSION may lag behind the release that actually has the binary.
-    tags_try: list[str] = []
-    try:
-        for r in ops_mod.panel_releases(12):
-            t = ops_mod.normalize_tag(r.get("tag") or "")
-            if t and t not in tags_try:
-                tags_try.append(t)
-            if len(tags_try) >= 8:
-                break
-    except Exception:
-        pass
-    if tag and tag not in tags_try:
-        tags_try.append(tag)
-    if not tags_try:
-        local = _try_local_build()
-        if local.get("ok"):
-            return local
-        return {"ok": False, "error": "no VERSION/tag and no local go build"}
-
+    url, used_tag, errors = _find_dnsd_asset_url(tag)
     blob = b""
     used = ""
-    errors: list[str] = []
-    for try_tag in tags_try:
-        for url in dnsd_release_urls(try_tag):
-            try:
-                blob = ops_mod._http(url, 180)
-                if blob and len(blob) > 1000:
-                    used = url
-                    break
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{url}: {exc}")
+    if url:
+        try:
+            blob = ops_mod._http(url, 180)
+            if blob and len(blob) > 1000:
+                used = url
+            else:
                 blob = b""
-        if blob:
-            break
+                errors.append(f"{url}: empty/short body")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url}: {exc}")
+            blob = b""
+
     if not blob:
         local = _try_local_build()
         if local.get("ok"):
@@ -247,7 +287,7 @@ def install_binary_from_github(tag: str = "") -> dict:
         return {
             "ok": False,
             "error": "; ".join(errors[:4]) + (f" | {local_err}" if local_err else "") or "l2x-dnsd asset missing",
-            "tag": tag or (tags_try[0] if tags_try else ""),
+            "tag": used_tag or tag,
         }
 
     Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
@@ -255,7 +295,7 @@ def install_binary_from_github(tag: str = "") -> dict:
     tmp.write_bytes(blob)
     os.chmod(tmp, 0o755)
     os.replace(tmp, DNSD_BIN)
-    return {"ok": True, "tag": tag, "installed": f"l2x-dnsd←{used}"}
+    return {"ok": True, "tag": used_tag or tag, "installed": f"l2x-dnsd←{used}"}
 
 
 def _try_local_build() -> dict:
@@ -668,13 +708,14 @@ MIN_DOWNLOAD_MTU = 200
 MAX_UPLOAD_MTU = 150
 MAX_DOWNLOAD_MTU = 4000
 AUTO_REMOVE_LOW_MTU_SERVERS = true
-MTU_TEST_RETRIES = 2
-MTU_TEST_TIMEOUT = 2.0
+MTU_TEST_RETRIES = 3
+MTU_TEST_TIMEOUT = 3.0
 MTU_TEST_PARALLELISM = 32
 RX_TX_WORKERS = 4
 TUNNEL_PROCESS_WORKERS = 6
-TUNNEL_PACKET_TIMEOUT_SECONDS = 10.0
-SESSION_INIT_RACING_COUNT = 3
+TUNNEL_PACKET_TIMEOUT_SECONDS = 15.0
+SESSION_INIT_RACING_COUNT = 4
+DNS_RESPONSE_FRAGMENT_TIMEOUT_SECONDS = 90.0
 ARQ_WINDOW_SIZE = 1000
 ARQ_INITIAL_RTO_SECONDS = 0.5
 ARQ_MAX_RTO_SECONDS = 3.0
