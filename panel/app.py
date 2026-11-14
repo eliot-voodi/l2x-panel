@@ -438,8 +438,10 @@ def _apply_xray(
     defer_front_reload: legacy Timer-based delay inside commit (prefer hold_front_commit).
     xray_only: clients / outbounds / routing / Xray DNS — skip nginx stage/reload,
     cert jobs, and iptables (front unchanged). Still rebuilds+tests+restarts Xray.
-    clients_only: alias of xray_only (kept for older call sites).
+    clients_only: prefer HandlerService hot user sync when structure unchanged
+    (still implies xray_only for nginx/iptables skip).
     """
+    prefer_clients_only = bool(clients_only)
     xray_only = bool(xray_only or clients_only)
     ns = (store.get("settings") or {}).get("nodes") or {}
     is_agent = bool(ns.get("agent_enabled") and (ns.get("role") or "") == "agent")
@@ -463,7 +465,9 @@ def _apply_xray(
             staged = front.stage(store)
             if not staged["ok"]:
                 return {"ok": False, "error": staged["error"], "verified": False}
-        result = xray.apply_config(runtime, xray_only=xray_only)
+        result = xray.apply_config(
+            runtime, xray_only=xray_only, clients_only=prefer_clients_only,
+        )
         if not result.get("ok"):
             if not xray_only:
                 front.rollback(staged)
@@ -1032,6 +1036,8 @@ def _ok_msg(prefix: str, result: dict) -> tuple[str, str]:
         # Soft front/routing notes (other inbounds still published) — not a hard failure
         return f"{prefix}. Замечание: {result['warning']}", "info"
     if result.get("ok"):
+        if result.get("hot_clients") and not result.get("restarted"):
+            return f"{prefix} (без перезапуска Xray)", "info"
         return prefix, "info"
     return f"{prefix} / Xray: {result.get('error')}", "error"
 
@@ -3065,18 +3071,9 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     gid = str(form.get("group_id") or "").strip()
     if gid and not xray.get_group(store, gid):
         return "Неизвестная группа"
-    allowed_obs = _allowed_outbounds(store)
-    outbound = str(form.get("outbound") or "").strip()
-    if gid:
-        # Personal outbound optional while grouped (effective main link comes from group).
-        if outbound and outbound not in allowed_obs:
-            return f"Неизвестный outbound {outbound}"
-        client["outbound"] = outbound  # empty = use group
-    else:
-        outbound = outbound or "direct"
-        if outbound != xray.NONE_TAG and outbound not in allowed_obs:
-            return f"Неизвестный outbound {outbound}"
-        client["outbound"] = outbound
+    known = {t_["tag"] for t_ in xray.selectable_outbound_tags(store)}
+    # Primary link is chosen only in «Подключения в подписке» (radio main_outbound).
+    outbound = str(form.get("main_outbound") or form.get("outbound") or "").strip()
     old_email = client.get("email")
     client["email"] = email
     client["enabled"] = form.get("enabled", "1") == "1"
@@ -3134,18 +3131,38 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         client["inbounds"] = []
     else:
         client["inbounds"] = sel_ib
-    known = {t_["tag"] for t_ in xray.selectable_outbound_tags(store)}
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
     if form.get("select_mode", "all") == "all":
         client["allowed_tags"] = []
+        # Primary among all selectable; keep previous if still valid.
+        if outbound and outbound in known:
+            client["outbound"] = outbound
+        elif gid:
+            client["outbound"] = ""  # use group
+        else:
+            client["outbound"] = outbound if outbound in known or outbound == "direct" else "direct"
     elif selected:
         client["allowed_tags"] = selected
+        if outbound and outbound in selected:
+            client["outbound"] = outbound
+        elif outbound == "direct" and "direct" in selected:
+            client["outbound"] = "direct"
+        else:
+            client["outbound"] = selected[0]
     elif gid:
         client["allowed_tags"] = []
-    elif client["outbound"] == xray.NONE_TAG:
-        return "Выберите основную ссылку или хотя бы одно подключение"
+        client["outbound"] = ""  # group owns primary
     else:
-        client["allowed_tags"] = [xray.NONE_TAG]  # only the main link
+        return "Выберите хотя бы одно подключение в таблице «Подключения в подписке»"
+    if gid:
+        # Personal primary optional — empty means inherit group.
+        if client.get("outbound") and client["outbound"] not in known and client["outbound"] != "direct":
+            return f"Неизвестный outbound {client['outbound']}"
+    else:
+        ob = client.get("outbound") or "direct"
+        if ob != xray.NONE_TAG and ob not in known and ob != "direct":
+            return f"Неизвестный outbound {ob}"
+        client["outbound"] = ob
     limits = {}
     daily_limits = {}
     for tag in known:
@@ -3547,7 +3564,7 @@ async def client_save(request: Request):
         if not original:
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
-    result = _apply_xray(_load_store(), xray_only=True)
+    result = _apply_xray(_load_store(), clients_only=True)
     act = "создан" if not original else "обновлён"
     bits = []
     if c.get("limit_gb"):
@@ -3559,6 +3576,8 @@ async def client_save(request: Request):
     ibs = c.get("inbounds") or []
     if ibs:
         bits.append("inbounds: " + ", ".join(f"<code>{tgbot.escape(str(x))}</code>" for x in ibs[:8]))
+    if result.get("hot_clients") and not result.get("restarted"):
+        bits.append("xray hot-apply")
     _tg_change(
         f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}",
         " · ".join(bits),
@@ -3638,7 +3657,7 @@ async def clients_bulk(request: Request):
         else:
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
-    result = _apply_xray(_load_store(), xray_only=True)
+    result = _apply_xray(_load_store(), clients_only=True)
     _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
@@ -3658,10 +3677,18 @@ def _group_form(form, store: dict, group: dict) -> str | None:
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
     group["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
-    outbound = str(form.get("outbound") or "").strip()
-    if outbound and outbound != "direct" and outbound not in known:
-        return f"Неизвестный outbound {outbound}"
-    group["outbound"] = outbound
+    outbound = str(form.get("main_outbound") or form.get("outbound") or "").strip()
+    if form.get("select_mode", "all") == "all":
+        if outbound and outbound != "direct" and outbound not in known:
+            return f"Неизвестный outbound {outbound}"
+        group["outbound"] = outbound
+    elif selected:
+        if outbound in selected or outbound == "direct":
+            group["outbound"] = outbound
+        else:
+            group["outbound"] = selected[0]
+    else:
+        group["outbound"] = outbound if outbound in known or outbound in ("", "direct") else ""
     return None
 
 
@@ -3736,7 +3763,7 @@ async def groups_save(request: Request):
         if err:
             flash(request, err, "error")
             return go(f"/groups/{g['id']}/edit" if gid else "/groups/new")
-    result = _apply_xray(_load_store(), xray_only=True)
+    result = _apply_xray(_load_store(), clients_only=True)
     _tg_change(f"👥 Группа <b>{tgbot.escape(g['name'])}</b> сохранена")
     flash(request, *_ok_msg(f"Группа «{g['name']}» сохранена", result))
     return go(f"/groups/{g['id']}/edit")
@@ -3802,7 +3829,7 @@ def client_action(email: str, action: str, request: Request):
             flash(request, "Неизвестное действие", "error")
             return go("/clients")
     need_xray = action not in ("regen_sub", "clear_ips", "clear_hwids")
-    result = _apply_xray(_load_store(), xray_only=True) if need_xray else {"ok": True}
+    result = _apply_xray(_load_store(), clients_only=True) if need_xray else {"ok": True}
     _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
@@ -4707,6 +4734,19 @@ def _route_rule_from_form(form) -> tuple[dict | None, str]:
     return rule, ""
 
 
+def _routing_lint_or_flash(request: Request, store: dict) -> str | None:
+    """Return error flash text if lint blocks apply; otherwise None (warns soft-flashed)."""
+    import route_lint as route_lint_mod
+    issues = route_lint_mod.lint_routes(store)
+    errs = [i for i in issues if i.get("level") == "error"]
+    warns = [i for i in issues if i.get("level") == "warn"]
+    if errs:
+        return route_lint_mod.format_issues(errs)
+    if warns:
+        flash(request, "Routing WARN:\n" + route_lint_mod.format_issues(warns), "info")
+    return None
+
+
 @app.get("/routing", response_class=HTMLResponse)
 def routing_page(request: Request):
     if redir := _require(request):
@@ -4714,6 +4754,11 @@ def routing_page(request: Request):
     store = _load_store()
     route_clients = xray.route_picker_clients(store)
     route_source_ips = xray.route_picker_source_ips(store)
+    import route_lint as route_lint_mod
+    route_issues = route_lint_mod.lint_routes(store)
+    issues_by_name: dict[str, list] = {}
+    for iss in route_issues:
+        issues_by_name.setdefault(str(iss.get("name") or ""), []).append(iss)
     return page(request, "routing.html", active="routing", routes=store["routes"], store=store,
                 route_missing={r.get("name"): xray.route_missing_geo(r) for r in store["routes"]},
                 ext_missing=xray.missing_ext_geo(store),
@@ -4721,6 +4766,8 @@ def routing_page(request: Request):
                 route_clients=route_clients,
                 route_source_ips=route_source_ips,
                 route_ip_labels={o["ip"]: o["label"] for o in route_source_ips},
+                route_issues=route_issues,
+                route_issues_by_name=issues_by_name,
 
                 inbound_tags=[
                     i["tag"] for i in store["inbounds"]
@@ -4752,6 +4799,11 @@ async def routing_add(request: Request):
             return go("/routing")
         rule["enabled"] = True
         store["routes"].append(rule)
+        lint_err = _routing_lint_or_flash(request, store)
+        if lint_err:
+            store["routes"].pop()
+            flash(request, lint_err, "error")
+            return go("/routing")
     xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(
         f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> добавлено",
@@ -4782,8 +4834,14 @@ async def routing_save(name: str, request: Request):
         if new_name != name and any(r.get("name") == new_name for r in routes):
             flash(request, f"Имя «{new_name}» уже занято", "error")
             return go("/routing")
+        prev = routes[idx]
         rule["enabled"] = form.get("enabled") == "1"
         routes[idx] = rule
+        lint_err = _routing_lint_or_flash(request, store)
+        if lint_err:
+            routes[idx] = prev
+            flash(request, lint_err, "error")
+            return go("/routing")
     xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(
         f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> изменено"
@@ -4806,6 +4864,11 @@ def routing_preset(key: str, request: Request):
             flash(request, f"{preset['name']} уже есть", "error")
             return go("/routing")
         store["routes"].insert(0, {"enabled": True, **json.loads(json.dumps(preset))})
+        lint_err = _routing_lint_or_flash(request, store)
+        if lint_err:
+            store["routes"].pop(0)
+            flash(request, lint_err, "error")
+            return go("/routing")
     xr = _apply_xray(_load_store(), xray_only=True)
     _tg_change(f"🗺 Routing: preset <b>{tgbot.escape(preset['name'])}</b> добавлен")
     flash(request, *_ok_msg(f"Добавлено {preset['name']}", xr))

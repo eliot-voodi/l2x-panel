@@ -2684,6 +2684,147 @@ def _restore_prev_config() -> str:
     return restart["stderr"] or restart["stdout"] or "xray still inactive after rollback"
 
 
+def _inbound_users_map(cfg: dict) -> dict[str, dict[str, dict]]:
+    """tag → {email → client dict} for user-protocol inbounds."""
+    out: dict[str, dict[str, dict]] = {}
+    for ib in cfg.get("inbounds") or []:
+        tag = str(ib.get("tag") or "")
+        if not tag or tag in ("api",):
+            continue
+        clients = ((ib.get("settings") or {}).get("clients")) or []
+        if not isinstance(clients, list):
+            continue
+        bucket: dict[str, dict] = {}
+        for c in clients:
+            if not isinstance(c, dict):
+                continue
+            email = str(c.get("email") or "").strip()
+            if email:
+                bucket[email] = c
+        if bucket:
+            out[tag] = bucket
+    return out
+
+
+def _user_routing_fingerprint(cfg: dict) -> str:
+    """Stable fingerprint of per-user routing rules (email → target)."""
+    rows: list[str] = []
+    for r in (cfg.get("routing") or {}).get("rules") or []:
+        if not isinstance(r, dict):
+            continue
+        users = r.get("user")
+        if not isinstance(users, list) or not users:
+            continue
+        target = r.get("outboundTag") or r.get("balancerTag") or ""
+        rows.append(json.dumps([sorted(str(u) for u in users), target], sort_keys=True))
+    return "\n".join(sorted(rows))
+
+
+def _structure_fingerprint(cfg: dict) -> str:
+    """Config without inbound clients and without per-user routing rules."""
+    c = copy.deepcopy(cfg)
+    for ib in c.get("inbounds") or []:
+        settings = ib.get("settings")
+        if isinstance(settings, dict) and "clients" in settings:
+            settings["clients"] = []
+    routing = c.get("routing")
+    if isinstance(routing, dict) and isinstance(routing.get("rules"), list):
+        routing["rules"] = [
+            r for r in routing["rules"]
+            if not (isinstance(r, dict) and isinstance(r.get("user"), list) and r.get("user"))
+        ]
+    return json.dumps(c, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _api_rmu(tag: str, emails: list[str]) -> dict:
+    if not emails:
+        return {"ok": True, "removed": 0}
+    cmd = [XRAY_BIN, "api", "rmu", f"--server={XRAY_API}", f"-tag={tag}", *emails]
+    r = _run(cmd, timeout=20)
+    return {"ok": r["exit_code"] == 0, "stderr": (r.get("stderr") or "")[-300:], "stdout": (r.get("stdout") or "")[-300:]}
+
+
+def _api_adu_inbound(tag: str, protocol: str, clients: list[dict], listen: str = "0.0.0.0", port: int = 0) -> dict:
+    """Add users via ``xray api adu`` using a minimal inbound stub JSON."""
+    if not clients:
+        return {"ok": True, "added": 0}
+    stub = {
+        "inbounds": [{
+            "tag": tag,
+            "protocol": protocol or "vless",
+            "listen": listen or "0.0.0.0",
+            "port": int(port or 0),
+            "settings": {"clients": clients, "decryption": "none"} if (protocol or "vless") == "vless"
+            else {"clients": clients},
+        }],
+    }
+    if (protocol or "") == "trojan":
+        stub["inbounds"][0]["settings"] = {"clients": clients}
+    elif (protocol or "") in ("shadowsocks", "ss"):
+        stub["inbounds"][0]["settings"] = {"clients": clients}
+    elif (protocol or "") == "vmess":
+        stub["inbounds"][0]["settings"] = {"clients": clients}
+    tmp = XRAY_CONFIG.parent / f".l2x-adu-{secrets.token_hex(4)}.json"
+    try:
+        tmp.write_text(json.dumps(stub, ensure_ascii=False), encoding="utf-8")
+        r = _run([XRAY_BIN, "api", "adu", f"--server={XRAY_API}", str(tmp)], timeout=30)
+        ok = r["exit_code"] == 0 or "already exists" in ((r.get("stderr") or "") + (r.get("stdout") or "")).lower()
+        return {"ok": ok, "stderr": (r.get("stderr") or "")[-400:], "stdout": (r.get("stdout") or "")[-400:]}
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def sync_clients_via_api(live_cfg: dict, new_cfg: dict) -> dict:
+    """Diff inbound users and apply via HandlerService (adu/rmu). No restart."""
+    live_users = _inbound_users_map(live_cfg)
+    new_users = _inbound_users_map(new_cfg)
+    tags = set(live_users) | set(new_users)
+    proto_by_tag = {
+        str(ib.get("tag") or ""): str(ib.get("protocol") or "vless")
+        for ib in (new_cfg.get("inbounds") or [])
+        if ib.get("tag")
+    }
+    listen_port = {
+        str(ib.get("tag") or ""): (
+            str(ib.get("listen") or "0.0.0.0"),
+            int(ib.get("port") or 0),
+        )
+        for ib in (new_cfg.get("inbounds") or [])
+        if ib.get("tag")
+    }
+    added = removed = 0
+    errors: list[str] = []
+    for tag in sorted(tags):
+        old = live_users.get(tag) or {}
+        new = new_users.get(tag) or {}
+        to_rm = [e for e in old if e not in new]
+        to_add = [new[e] for e in new if e not in old]
+        # Changed credentials (same email, different id/password): remove then add
+        for e in list(new.keys()):
+            if e in old and old[e] != new[e]:
+                if e not in to_rm:
+                    to_rm.append(e)
+                if new[e] not in to_add:
+                    to_add.append(new[e])
+        if to_rm:
+            res = _api_rmu(tag, to_rm)
+            if not res.get("ok"):
+                errors.append(f"rmu {tag}: {res.get('stderr') or res.get('stdout') or 'fail'}")
+            else:
+                removed += len(to_rm)
+        if to_add:
+            listen, port = listen_port.get(tag, ("0.0.0.0", 0))
+            res = _api_adu_inbound(tag, proto_by_tag.get(tag, "vless"), to_add, listen=listen, port=port)
+            if not res.get("ok"):
+                errors.append(f"adu {tag}: {res.get('stderr') or res.get('stdout') or 'fail'}")
+            else:
+                added += len(to_add)
+    return {"ok": not errors, "added": added, "removed": removed, "errors": errors}
+
+
 def apply_config(store: dict, *, xray_only: bool = False, clients_only: bool = False) -> dict:
     """Build, verify, then atomically install Xray config. Never skips verification.
 
@@ -2697,8 +2838,13 @@ def apply_config(store: dict, *, xray_only: bool = False, clients_only: bool = F
     xray_only / clients_only: skip traffic harvest and iptables port-ban refresh
     (inbound ports / nginx front are unchanged). Still builds, tests, and restarts
     Xray so routing/clients/outbounds go live.
+
+    clients_only hot path: when inbounds/outbounds/dns/routing *structure* matches live
+    and only users / per-user rules differ — sync users via HandlerService (adu/rmu).
+    Restart only when per-user routing fingerprint changes (new emails need new rules).
     """
     xray_only = bool(xray_only or clients_only)
+    prefer_hot = bool(clients_only)
     if not xray_only:
         try:
             harvest_traffic(store)
@@ -2742,6 +2888,62 @@ def apply_config(store: dict, *, xray_only: bool = False, clients_only: bool = F
         if not xray_only:
             ban_inbound_ports(store)
         return {"ok": True, "error": "", "config": cfg, "verified": True, "unchanged": True}
+
+    # Hot client sync: structure same, only users (± routing user rules) differ.
+    live_cfg: dict | None = None
+    if prefer_hot and _xray_active() and isinstance(live_text, str) and new_text:
+        try:
+            live_cfg = json.loads(live_text)
+            new_cfg_obj = json.loads(new_text)
+        except (TypeError, ValueError):
+            live_cfg = None
+            new_cfg_obj = None
+        if live_cfg is not None and new_cfg_obj is not None:
+            if _structure_fingerprint(live_cfg) == _structure_fingerprint(new_cfg_obj):
+                hot = sync_clients_via_api(live_cfg, new_cfg_obj)
+                routing_same = _user_routing_fingerprint(live_cfg) == _user_routing_fingerprint(new_cfg_obj)
+                # Always persist the verified config so disk matches store.
+                if XRAY_CONFIG.is_file():
+                    try:
+                        shutil.copy2(XRAY_CONFIG, XRAY_CONFIG_PREV)
+                    except OSError:
+                        pass
+                os.replace(t["tmp"], XRAY_CONFIG)
+                try:
+                    os.chmod(XRAY_CONFIG, 0o644)
+                except OSError:
+                    pass
+                if routing_same and hot.get("ok"):
+                    return {
+                        "ok": True, "error": "", "config": cfg, "verified": True,
+                        "hot_clients": True, "added": hot.get("added", 0), "removed": hot.get("removed", 0),
+                    }
+                if routing_same and not hot.get("ok"):
+                    # API failed — fall through to full restart with config already on disk.
+                    pass
+                elif not routing_same:
+                    # Need restart so new per-user routing rules load; users already synced when possible.
+                    pass
+                else:
+                    pass
+                # Config already replaced; just restart (skip second replace below).
+                restart = _restart_xray()
+                if _xray_active():
+                    note = ""
+                    if not hot.get("ok") and hot.get("errors"):
+                        note = "; hot-api: " + "; ".join(hot["errors"][:3])
+                    return {
+                        "ok": True, "error": "", "config": cfg, "verified": True,
+                        "hot_clients": bool(hot.get("ok")), "restarted": True,
+                        "warning": note.lstrip("; ").strip() or None,
+                    }
+                rb = _restore_prev_config()
+                detail = restart["stderr"] or restart["stdout"] or "xray not active after restart"
+                return {
+                    "ok": False,
+                    "error": f"{detail}" + (f"; rollback failed: {rb}" if rb else "; previous config restored"),
+                    "config": cfg, "verified": True, "rolled_back": not bool(rb),
+                }
 
     # Snapshot the currently running config before we touch it.
     if XRAY_CONFIG.is_file():
