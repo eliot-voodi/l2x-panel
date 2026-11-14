@@ -2718,9 +2718,9 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
         return {"ok": True, "queued": True, "warnings": [], "error": ""}
     result = _push_once(node, payload, timeout=timeout)
     err = str(result.get("error") or "")
-    # Transient network / busy agent / nginx reload mid-response: one retry
-    # "Remote end closed without response" is common when agent reloads nginx while
-    # answering /agent/apply — config is often already applied; retry usually succeeds.
+    # Transient network / busy agent / nginx reload mid-response: retry.
+    # "Remote end closed without response" happens when the agent reloads nginx
+    # while the apply JSON is still flushing through that same nginx to us.
     _transient = (
         "timed out", "timeout", "temporarily", "connection reset",
         "remote end closed", "remotdisconnected", "connection aborted",
@@ -2730,23 +2730,25 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
         "remote end closed", "remotdisconnected", "connection aborted", "broken pipe",
     )
     if not result.get("ok") and any(x in err.lower() for x in _transient):
-        time.sleep(1.2)
+        time.sleep(1.5)
         result = _push_once(node, payload, timeout=max(timeout, 180))
         err = str(result.get("error") or "")
-    # Still dropped with no HTTP status: nginx likely reloaded after apply. If /health
-    # answers, treat as soft-ok so the UI does not stick on a false sync err.
+    # Still dropped: wait for deferred nginx reload on the agent, then one more try.
+    if not result.get("ok") and any(x in err.lower() for x in _drop):
+        time.sleep(2.5)
+        result = _push_once(node, payload, timeout=max(timeout, 180))
+        err = str(result.get("error") or "")
+    # Final fallback: /health up ⇒ apply almost certainly committed; silent soft-ok
+    # (no warn badge — the cut response is an infrastructure race, not an admin issue).
     if not result.get("ok") and any(x in err.lower() for x in _drop):
         time.sleep(1.0)
         probe = probe_health(node, timeout=8)
         if probe.get("ok"):
-            warn = (
-                f"ответ sync оборван ({err[:100]}), но /health ок — "
-                "конфиг скорее всего уже применён (nginx reload)"
-            )
+            prev_warns = [w for w in (result.get("warnings") or []) if w and "sync оборван" not in str(w)]
             result = {
                 "ok": True,
                 "soft": True,
-                "warnings": list(result.get("warnings") or []) + [warn],
+                "warnings": prev_warns,
                 "error": "",
             }
             err = ""

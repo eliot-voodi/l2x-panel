@@ -402,14 +402,20 @@ FRONT_CERT_RETRY = 3600
 _front_cert_tried: dict[str, float] = {}
 
 
-def _commit_front_safe(staged: dict) -> None:
-    """Background nginx reload after /agent/apply response has been sent."""
+def _commit_front_safe(staged: dict, *, defer_sec: float = 2.0) -> None:
+    """Reload nginx after /agent/apply — deferred so the sync response can leave this host.
+
+    BackgroundTasks run after ASGI writes the response to the local nginx reverse
+    proxy, but that proxy may still be flushing bytes to the master. An immediate
+    ``nginx reload`` then yields ``Remote end closed connection without response``
+    on the master even though apply already succeeded. Defer the reload briefly.
+    """
     try:
-        fr = front.commit(staged)
+        fr = front.commit(staged, defer_reload_sec=max(0.0, float(defer_sec or 0)))
         if not fr.get("ok"):
             try:
                 front.rollback(staged)
-                front.commit(staged)
+                front.commit(staged, defer_reload_sec=max(0.5, float(defer_sec or 0)))
             except Exception:
                 pass
     except Exception:
@@ -8876,15 +8882,17 @@ async def agent_apply(request: Request, background_tasks: BackgroundTasks):
     out = await run_in_threadpool(_run)
     staged = out.pop("_front_staged", None)
     if staged is not None and out.get("ok"):
-        # Reload nginx only after the response bytes are on the wire.
-        background_tasks.add_task(_commit_front_safe, staged)
+        # Reload nginx after response is handed to ASGI, plus a short defer so the
+        # local front proxy can finish proxying the JSON body to the master.
+        background_tasks.add_task(_commit_front_safe, staged, defer_sec=2.5)
         background_tasks.add_task(lambda: _issue_front_certs(_load_store()))
     elif staged is not None:
         try:
             front.rollback(staged)
         except Exception:
             pass
-    return out
+    # Connection: close nudges nginx to finish this upstream response before reuse.
+    return JSONResponse(out, headers={"Connection": "close"})
 
 
 @app.post("/agent/report")
