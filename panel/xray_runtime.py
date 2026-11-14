@@ -1791,16 +1791,19 @@ def client_access_ok(client: dict) -> bool:
 def tag_allowed_for_client(store: dict, client: dict, tag: str) -> bool:
     if tag == NONE_TAG:
         return False
-    allowed = client_effective_allowed_tags(store, client)
-    if NONE_TAG in allowed:
-        # Only the main link: extra connections are off, main outbound stays usable
-        allowed = [t for t in allowed if t != NONE_TAG]
-        if tag == client_default_outbound(store, client):
-            allowed.append(tag)
-        if tag not in allowed:
+    default = client_default_outbound(store, client)
+    # «Основная» всегда допустима, даже если чекбокс extras не отмечен.
+    if tag == default and default and default != NONE_TAG:
+        pass
+    else:
+        allowed = client_effective_allowed_tags(store, client)
+        if NONE_TAG in allowed:
+            # Only the main link: extra connections are off
+            allowed = [t for t in allowed if t != NONE_TAG]
+            if tag not in allowed:
+                return False
+        elif allowed and tag not in allowed:
             return False
-    elif allowed and tag not in allowed:
-        return False
     if client_tag_exceeded(client, tag):
         return False
     if client_daily_tag_exceeded(client, tag):
@@ -1918,10 +1921,10 @@ def apply_tag_to_users(store: dict, *, kind: str, tag: str, propagate: bool) -> 
 
 
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
-    """One identity per balancer / enabled custom outbound.
+    """Extra subscription identities (balancers / custom outbounds).
 
-    Unhealthy outbounds (failed custom probe) are omitted so clients do not keep
-    dead links until the next refresh.
+    Primary («основная») is emitted separately as the main identity — skipped here
+    so the same outbound does not appear twice. Unhealthy outbounds omitted.
     """
     if not client.get("uuid") or not client.get("sub_enabled", True):
         return []
@@ -1929,8 +1932,12 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
         return []
     tags = [b["tag"] for b in ensure_balancers(store).values() if b.get("enabled", True)]
     tags += [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
+    # Main («основная») is already emitted as the primary identity — do not duplicate it.
+    default = client_default_outbound(store, client)
     entries = []
     for tag in tags:
+        if tag == default:
+            continue
         if not ignore_quota and not tag_allowed_for_client(store, client, tag):
             continue
         if not outbound_ok_for_sub(store, tag):

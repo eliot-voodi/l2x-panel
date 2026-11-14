@@ -3127,6 +3127,9 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
+    # «Основная» идёт отдельно — не держим её в extras (иначе дубль в подписке).
+    if outbound and outbound in selected:
+        selected = [t for t in selected if t != outbound]
     if gid:
         # Group owns base inbounds/outbounds. Personal lists are optional extras only.
         if form.get("ib_mode", "all") == "all":
@@ -3147,16 +3150,16 @@ def _client_form(form, store: dict, client: dict) -> str | None:
         if form.get("select_mode", "all") == "all":
             client["allowed_tags"] = []
             client["outbound"] = outbound if outbound in known or outbound == "direct" else "direct"
+        elif outbound and (outbound in known or outbound == "direct"):
+            # Primary alone is enough; checkboxes are optional extras.
+            # Store [primary] when no extras so empty list still means «все».
+            client["outbound"] = outbound
+            client["allowed_tags"] = selected if selected else [outbound]
         elif selected:
             client["allowed_tags"] = selected
-            if outbound and outbound in selected:
-                client["outbound"] = outbound
-            elif outbound == "direct" and "direct" in selected:
-                client["outbound"] = "direct"
-            else:
-                client["outbound"] = selected[0]
+            client["outbound"] = selected[0]
         else:
-            return "Выберите хотя бы одно подключение в таблице «Подключения в подписке»"
+            return "Выберите основную ссылку или хотя бы одно подключение"
         ob = client.get("outbound") or "direct"
         if ob != xray.NONE_TAG and ob not in known and ob != "direct":
             return f"Неизвестный outbound {ob}"
@@ -3675,22 +3678,21 @@ def _group_form(form, store: dict, group: dict) -> str | None:
     group["comment"] = str(form.get("comment") or "").strip()
     known = {t["tag"] for t in xray.selectable_outbound_tags(store)}
     selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
+    outbound = str(form.get("main_outbound") or form.get("outbound") or "").strip()
+    # Primary is always in the subscription via group.outbound — drop it from extras
+    # so the same tag is not listed twice.
+    if outbound and outbound in selected:
+        selected = [t for t in selected if t != outbound]
     group["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
     group["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
-    outbound = str(form.get("main_outbound") or form.get("outbound") or "").strip()
-    if form.get("select_mode", "all") == "all":
-        if outbound and outbound != "direct" and outbound not in known:
-            return f"Неизвестный outbound {outbound}"
-        group["outbound"] = outbound
-    elif selected:
-        if outbound in selected or outbound == "direct":
-            group["outbound"] = outbound
-        else:
-            group["outbound"] = selected[0]
-    else:
-        group["outbound"] = outbound if outbound in known or outbound in ("", "direct") else ""
+    if outbound and outbound != "direct" and outbound not in known:
+        return f"Неизвестный outbound {outbound}"
+    if not outbound:
+        # Fallback: first extra, else empty (= first selectable / direct at resolve time)
+        outbound = selected[0] if selected else ""
+    group["outbound"] = outbound
     return None
 
 

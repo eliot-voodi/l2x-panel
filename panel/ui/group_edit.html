@@ -48,18 +48,19 @@
       <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
     </div>
     <table>
-      <thead><tr><th></th><th>Основная</th><th>Подключение</th></tr></thead>
+      <thead><tr><th>Доп.</th><th>Основная</th><th>Подключение</th></tr></thead>
       <tbody>
       {% for tg in tags %}
+        {% set is_main = g.outbound == tg.tag or (not g.outbound and loop.first) %}
         <tr>
-          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if not g.allowed_tags or tg.tag in g.allowed_tags %}checked{% endif %}></td>
-          <td><input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if g.outbound == tg.tag or (not g.outbound and loop.first) %}checked{% endif %}></td>
+          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if is_main %}disabled{% elif not g.allowed_tags or tg.tag in g.allowed_tags %}checked{% endif %} data-extra="1"></td>
+          <td><input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if is_main %}checked{% endif %}></td>
           <td>{{ tg.label }}{% if tg.kind == 'balancer' %} <span class="badge">авто</span>{% endif %}</td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
-    <div class="hint mt">Клиенты группы получат отмеченные подключения; «Основная» — ссылка по умолчанию.</div>
+    <div class="hint mt">«Основная» всегда в подписке (без галочки). Галочка «Доп.» — только дополнительные конфиги; иначе основная дублируется.</div>
   </div>
 
   <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/groups">{{ t('Отмена') }}</a></div>
@@ -70,11 +71,30 @@
     var radios = document.querySelectorAll('input[name="' + mode + '"]');
     radios.forEach(function (r) { if (r.value === 'select') r.checked = true; });
   }
+  function syncMainExtras(form) {
+    var main = form.querySelector('input[name="main_outbound"]:checked');
+    var mainTag = main ? main.value : '';
+    form.querySelectorAll('input[name="allowed_tags"]').forEach(function (c) {
+      if (c.value === mainTag) {
+        c.checked = false;
+        c.disabled = true;
+      } else {
+        c.disabled = false;
+      }
+    });
+  }
   document.querySelectorAll('[data-check-all]').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var name = btn.getAttribute('data-check-all');
       var mode = btn.getAttribute('data-mode');
-      document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) { c.checked = true; });
+      var form = btn.closest('form');
+      var main = form && form.querySelector('input[name="main_outbound"]:checked');
+      var mainTag = main ? main.value : '';
+      document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) {
+        if (c.value === mainTag) { c.checked = false; c.disabled = true; return; }
+        c.disabled = false;
+        c.checked = true;
+      });
       if (mode) setMode(name, mode);
     });
   });
@@ -82,18 +102,28 @@
     btn.addEventListener('click', function () {
       var name = btn.getAttribute('data-uncheck-all');
       var mode = btn.getAttribute('data-mode');
-      document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) { c.checked = false; });
+      document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) {
+        if (c.disabled) return;
+        c.checked = false;
+      });
       if (mode) setMode(name, mode);
     });
   });
   var form = document.querySelector('form[action$="/groups/save"]');
   if (form) {
+    form.querySelectorAll('input[name="main_outbound"]').forEach(function (r) {
+      r.addEventListener('change', function () { syncMainExtras(form); setMode('select_mode', 'select'); });
+    });
+    syncMainExtras(form);
     form.addEventListener('submit', function (e) {
       var main = form.querySelector('input[name="main_outbound"]:checked');
       if (!main) {
         e.preventDefault();
         alert('Выберите основную ссылку в колонке «Основная»');
+        return;
       }
+      // Disabled checkboxes are not submitted — fine (primary is separate).
+      syncMainExtras(form);
     });
   }
 })();
