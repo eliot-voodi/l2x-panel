@@ -69,6 +69,31 @@ func TestCodecChaChaRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCodecEncryptDecryptTXT(t *testing.T) {
+	c, err := NewCodec(2, "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := BuildRaw(BuildOptions{PacketType: pktSessionAccept, Payload: make([]byte, 20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := c.Encrypt(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(enc, raw) {
+		t.Fatal("Encrypt must change ciphertext for ChaCha20")
+	}
+	dec, err := c.Decrypt(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dec, raw) {
+		t.Fatalf("TXT encrypt/decrypt mismatch")
+	}
+}
+
 func TestHeaderCheck(t *testing.T) {
 	raw, err := BuildRaw(BuildOptions{PacketType: pktSessionInit, Payload: make([]byte, 10)})
 	if err != nil {

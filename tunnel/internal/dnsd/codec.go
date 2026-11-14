@@ -47,6 +47,26 @@ func (c *Codec) EncryptAndEncode(data []byte) ([]byte, error) {
 	return encodeBase36(enc), nil
 }
 
+// Encrypt returns ciphertext for TXT answers (no base36 — that is QNAME-only).
+func (c *Codec) Encrypt(data []byte) ([]byte, error) {
+	if c.method == 0 {
+		out := make([]byte, len(data))
+		copy(out, data)
+		return out, nil
+	}
+	return c.encrypt(data)
+}
+
+// Decrypt reverses Encrypt (binary TXT payload).
+func (c *Codec) Decrypt(data []byte) ([]byte, error) {
+	if c.method == 0 {
+		out := make([]byte, len(data))
+		copy(out, data)
+		return out, nil
+	}
+	return c.decrypt(data)
+}
+
 func (c *Codec) DecodeAndDecrypt(data []byte) ([]byte, error) {
 	decoded, err := decodeBase36(data)
 	if err != nil {
