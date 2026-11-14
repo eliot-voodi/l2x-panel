@@ -23,6 +23,7 @@ type session struct {
 	mu               sync.Mutex
 	streams          map[uint16]*stream
 	txQueue          []Packet
+	pending          map[uint64]*pendingDown
 	closed           bool
 }
 
@@ -37,6 +38,8 @@ type stream struct {
 	fragSeq   uint16
 	fragTotal uint8
 	fragParts map[uint8][]byte
+	// TCP write reordering (DNS answers arrive out of order).
+	reorder map[uint16][]byte
 }
 
 type sessionStore struct {
@@ -168,6 +171,7 @@ func (sess *session) closeAll() {
 	}
 	sess.streams = map[uint16]*stream{}
 	sess.txQueue = nil
+	sess.pending = nil
 }
 
 func (sess *session) enqueue(p Packet) {

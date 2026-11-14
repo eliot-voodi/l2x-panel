@@ -237,8 +237,8 @@ func (s *Server) handleDNS(pkt []byte) []byte {
 	if out != nil {
 		return s.replyPacket(pkt, q.Name, out, base64)
 	}
-	// Poll: return queued downlink if any
-	if queued, ok := sess.dequeue(); ok {
+	// Poll / control ACKs: return queued or retransmit unacked downlink.
+	if queued, ok := sess.dequeueForReply(); ok {
 		return s.replyPacket(pkt, q.Name, &queued, base64)
 	}
 	if vpn.PacketType == pktPing {
@@ -327,7 +327,7 @@ func (s *Server) handleMTUDown(req []byte, name string, vpn Packet) []byte {
 func (s *Server) handleSessionPacket(sess *session, vpn Packet) *Packet {
 	switch vpn.PacketType {
 	case pktPing:
-		if queued, ok := sess.dequeue(); ok {
+		if queued, ok := sess.dequeueForReply(); ok {
 			return &queued
 		}
 		return &Packet{
@@ -342,7 +342,11 @@ func (s *Server) handleSessionPacket(sess *session, vpn Packet) *Packet {
 		return nil
 	case pktStreamData, pktStreamResend:
 		return s.handleStreamData(sess, vpn)
-	case pktStreamDataAck, pktStreamDataNack:
+	case pktStreamDataAck:
+		sess.ackDownlink(vpn.StreamID, vpn.SequenceNum)
+		return nil
+	case pktStreamDataNack:
+		sess.nackDownlink(vpn.StreamID, vpn.SequenceNum)
 		return nil
 	case pktStreamCloseWrite:
 		if st, ok := sess.getStream(vpn.StreamID); ok {
@@ -386,7 +390,7 @@ func (s *Server) handleSessionPacket(sess *session, vpn Packet) *Packet {
 		pktSocks5NetworkUnreachA, pktSocks5AddrTypeUnsuppA:
 		return nil
 	default:
-		if queued, ok := sess.dequeue(); ok {
+		if queued, ok := sess.dequeueForReply(); ok {
 			return &queued
 		}
 		return nil
@@ -395,8 +399,6 @@ func (s *Server) handleSessionPacket(sess *session, vpn Packet) *Packet {
 
 func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
 	// ACK immediately — never block the DNS UDP reply on dial.
-	// Recursive resolvers drop the auth response if we wait for TCP connect
-	// (default connect timeout is tens of seconds → client «Тайм-аут»).
 	ack := &Packet{
 		SessionID:      sess.id,
 		PacketType:     pktSocks5SYNAck,
@@ -421,9 +423,7 @@ func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	timeout := time.Duration(s.cfg.ConnectTimeoutSec) * time.Second
-	streamID := vpn.StreamID
-	seq := vpn.SequenceNum
-	go s.dialSocksTarget(sess, streamID, seq, addr, timeout)
+	go s.dialSocksTarget(sess, vpn.StreamID, vpn.SequenceNum, addr, timeout)
 	return ack
 }
 
@@ -449,6 +449,7 @@ func (s *Server) dialSocksTarget(sess *session, streamID uint16, seq uint16, add
 		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlive(true)
 	}
+	// Data sequences continue after the SOCKS SYN sequence number.
 	st := &stream{id: streamID, conn: conn, sendSeq: 1, recvExpect: seq + 1}
 	sess.putStream(st)
 	sess.startReader(st)
@@ -481,13 +482,16 @@ func (s *Server) handleStreamData(sess *session, vpn Packet) *Packet {
 		total = 1
 	}
 	payload, ready := st.takeAssembledPayload(vpn.SequenceNum, vpn.FragmentID, total, vpn.Payload)
-	if ready && len(payload) > 0 {
-		st.mu.Lock()
-		conn := st.conn
-		st.mu.Unlock()
-		if conn != nil {
+	if ready {
+		for _, chunk := range st.acceptOrdered(vpn.SequenceNum, payload) {
+			st.mu.Lock()
+			conn := st.conn
+			st.mu.Unlock()
+			if conn == nil {
+				break
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			_, _ = conn.Write(payload)
+			_, _ = conn.Write(chunk)
 		}
 	}
 	return &Packet{
