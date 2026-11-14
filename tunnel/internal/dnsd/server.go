@@ -394,8 +394,9 @@ func (s *Server) handleSessionPacket(sess *session, vpn Packet) *Packet {
 }
 
 func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
-	// Always ACK SYN first path: dial then CONNECTED
-	host, port, err := parseSocksTarget(vpn.Payload)
+	// ACK immediately — never block the DNS UDP reply on dial.
+	// Recursive resolvers drop the auth response if we wait for TCP connect
+	// (default connect timeout is tens of seconds → client «Тайм-аут»).
 	ack := &Packet{
 		SessionID:      sess.id,
 		PacketType:     pktSocks5SYNAck,
@@ -405,6 +406,7 @@ func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
 		HasSequenceNum: true,
 		SequenceNum:    vpn.SequenceNum,
 	}
+	host, port, err := parseSocksTarget(vpn.Payload)
 	if err != nil {
 		sess.enqueue(Packet{
 			SessionID:      sess.id,
@@ -419,6 +421,13 @@ func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	timeout := time.Duration(s.cfg.ConnectTimeoutSec) * time.Second
+	streamID := vpn.StreamID
+	seq := vpn.SequenceNum
+	go s.dialSocksTarget(sess, streamID, seq, addr, timeout)
+	return ack
+}
+
+func (s *Server) dialSocksTarget(sess *session, streamID uint16, seq uint16, addr string, timeout time.Duration) {
 	conn, dialErr := net.DialTimeout("tcp", addr, timeout)
 	if dialErr != nil {
 		failType := uint8(pktSocks5HostUnreachable)
@@ -430,13 +439,13 @@ func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
 			PacketType:     failType,
 			SessionCookie:  sess.cookie,
 			HasStreamID:    true,
-			StreamID:       vpn.StreamID,
+			StreamID:       streamID,
 			HasSequenceNum: true,
-			SequenceNum:    vpn.SequenceNum,
+			SequenceNum:    seq,
 		})
-		return ack
+		return
 	}
-	st := &stream{id: vpn.StreamID, conn: conn, sendSeq: 1, recvExpect: vpn.SequenceNum + 1}
+	st := &stream{id: streamID, conn: conn, sendSeq: 1, recvExpect: seq + 1}
 	sess.putStream(st)
 	sess.startReader(st)
 	sess.enqueue(Packet{
@@ -444,11 +453,10 @@ func (s *Server) handleSocks5SYN(sess *session, vpn Packet) *Packet {
 		PacketType:     pktSocks5Connected,
 		SessionCookie:  sess.cookie,
 		HasStreamID:    true,
-		StreamID:       vpn.StreamID,
+		StreamID:       streamID,
 		HasSequenceNum: true,
-		SequenceNum:    vpn.SequenceNum,
+		SequenceNum:    seq,
 	})
-	return ack
 }
 
 func (s *Server) handleStreamData(sess *session, vpn Packet) *Packet {

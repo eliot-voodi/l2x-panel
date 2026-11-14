@@ -98,7 +98,7 @@ func (s *sessionStore) findOrCreate(payload []byte, base64 bool) (*session, bool
 		signature:      sig,
 		responseBase64: base64,
 		uploadMTU:      150,
-		downloadMTU:    4096,
+		downloadMTU:    500,
 		lastSeen:       time.Now(),
 		streams:        make(map[uint16]*stream),
 	}

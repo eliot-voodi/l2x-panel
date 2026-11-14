@@ -339,7 +339,9 @@ func defaultPolicy() sessionAcceptPolicy {
 		MaxPacketDuplicationCount: 5,
 		MaxSetupDuplicationCount:  6,
 		MaxUploadMTU:              150,
-		MaxDownloadMTU:            4096,
+		// ChaCha/AES TXT answers over public resolvers need EDNS; keep a
+		// conservative cap so probes stay under typical UDP paths.
+		MaxDownloadMTU:            500,
 		MaxRxTxWorkers:            255,
 		MinPingAggressiveInterval: 0.05,
 		MaxPacketsPerBatch:        20,
