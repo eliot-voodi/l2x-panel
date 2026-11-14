@@ -1297,6 +1297,8 @@ def ensure_inbounds(store: dict) -> list[dict]:
         if not ib.get("id"):
             ib["id"] = next_id
             next_id += 1
+        # Inbound→outbound binding removed; routing uses client/group outbound only.
+        ib["outbound"] = ""
         ensure_inbound_keys(ib)
         ib["listen"] = P.inbound_listen(ib)
         P.normalize_http_inbound(ib)

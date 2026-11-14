@@ -2577,9 +2577,8 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["share_host"] = share
     ib["total_gb"] = _float(form.get("total_gb"))
     ib["expire_at"] = local_to_iso(str(form.get("expire_at") or ""))
-    raw_ob = str(form.get("outbound") or "").strip()
-    # empty / none = no per-inbound route (avoids Direct loops); explicit tags keep working
-    ib["outbound"] = "" if raw_ob.lower() in ("", "none", "-", "off") else raw_ob
+    # Inbound→outbound binding removed from UI; never pin traffic here.
+    ib["outbound"] = ""
     reset = str(form.get("traffic_reset") or "never")
     ib["traffic_reset"] = reset if reset in P.TRAFFIC_RESETS else "never"
     ext = []
@@ -2880,7 +2879,7 @@ def inbound_new(request: Request):
     except Exception:
         lint_issues = []
     return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=True, store=store,
-                outbounds=xray.all_outbound_tags(store), certs=ops.list_certs(), lint_issues=lint_issues)
+                certs=ops.list_certs(), lint_issues=lint_issues)
 
 
 @app.get("/inbounds/{ib_id}/edit", response_class=HTMLResponse)
@@ -2897,7 +2896,7 @@ def inbound_edit(ib_id: int, request: Request):
     except Exception:
         lint_issues = []
     return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=False, store=store,
-                outbounds=xray.all_outbound_tags(store), certs=ops.list_certs(), lint_issues=lint_issues)
+                certs=ops.list_certs(), lint_issues=lint_issues)
 
 
 @app.post("/inbounds/save")

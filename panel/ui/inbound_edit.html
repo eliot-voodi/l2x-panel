@@ -75,12 +75,6 @@
       </div>
     </div>
     <div class="hint" id="front_hint"></div>
-    <label class="f">Outbound по умолчанию</label>
-    <select name="outbound">
-      <option value="" {% if not ib.outbound or ib.outbound == 'none' %}selected{% endif %}>— none —</option>
-      {% for tag in outbounds %}<option value="{{ tag }}" {% if tag == ib.outbound %}selected{% endif %}>{{ outbound_label(store, tag) }}</option>{% endfor %}
-    </select>
-    <div class="hint">По умолчанию <b>none</b> — без привязки inbound→outbound (нет петли через Direct). Для socks/http/dokodemo/wireguard выбранный outbound принимает весь трафик inbound. Для vless/vmess/trojan/ss outbound клиента важнее; none здесь безопаснее, чем Direct.</div>
     <div class="mt">{{ m.check('enabled', ib.enabled, t('Включён')) }}</div>
     {% if is_new %}
     <div class="mt">{{ m.check('propagate_users', False, 'Раздать всем клиентам / группам') }}</div>
@@ -537,7 +531,6 @@
     var nd = document.querySelector('input[name="so_nodelay"]'); if (nd) nd.checked = true;
     var cong = document.querySelector('select[name="so_cong"]'); if (cong) cong.value = 'bbr';
     var rawH = document.querySelector('select[name="raw_header"]'); if (rawH) rawH.value = 'none';
-    var out = document.querySelector('select[name="outbound"]'); if (out) out.value = 'direct';
     sync();
   });
   sync();
