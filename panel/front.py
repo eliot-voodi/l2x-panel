@@ -422,6 +422,16 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         doh_loc,
         # REST API only under secret base_path (not at site root)
         f"    location = /health {{\n{proxy}    }}",
+        # NAT agents download the Go binary via https://master/l2x-tunnel-agent
+        # (must be on public :443, not only on dedicated WSS port :8000).
+        "    location = /l2x-tunnel-agent {\n"
+        "        default_type application/octet-stream;\n"
+        "        alias /var/www/l2x-public/l2x-tunnel-agent;\n"
+        "    }",
+        "    location = /install-l2x-agent.sh {\n"
+        "        default_type application/octet-stream;\n"
+        "        alias /var/www/l2x-public/install-l2x-agent.sh;\n"
+        "    }",
     ]
     if base:
         out.append(f"    location = /{base} {{\n        return 302 https://$host/{base}/;\n    }}")

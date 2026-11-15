@@ -433,11 +433,48 @@ def tunnel_public_udp(store: dict, master_host: str = "") -> str:
 
 
 def tunnel_agent_binary_url(store: dict, master_host: str = "") -> str:
-    """HTTPS URL to download l2x-tunnel-agent binary from master front."""
+    """HTTPS URL to download l2x-tunnel-agent binary from master front.
+
+    Prefer the dedicated WSS TLS port (nginx serves the asset there reliably).
+    Public :443 often terminates in Xray first and may 404 the alias path.
+    """
     host = _normalize_domain(master_host) or next(iter(sorted(master_public_domains(store))), "")
     if not host:
         return ""
+    try:
+        tun = ensure_tunnel_settings(store)
+        port = int(tun.get("ws_public_port") or 0)
+    except Exception:
+        port = 0
+    if port and port not in (443, 80):
+        return f"https://{host}:{port}/l2x-tunnel-agent"
     return f"https://{host}/l2x-tunnel-agent"
+
+
+def tunnel_agent_binary_urls(store: dict, master_host: str = "") -> list[str]:
+    """Ordered download candidates for l2x-tunnel-agent (master ports, then GitHub)."""
+    host = _normalize_domain(master_host) or next(iter(sorted(master_public_domains(store))), "")
+    out: list[str] = []
+    primary = tunnel_agent_binary_url(store, host)
+    if primary:
+        out.append(primary)
+    if host:
+        bare = f"https://{host}/l2x-tunnel-agent"
+        if bare not in out:
+            out.append(bare)
+        try:
+            tun = ensure_tunnel_settings(store)
+            port = int(tun.get("ws_public_port") or 0)
+        except Exception:
+            port = 0
+        if port and port not in (443, 80):
+            alt = f"https://{host}:{port}/l2x-tunnel-agent"
+            if alt not in out:
+                out.append(alt)
+    for gu in tunnel_agent_github_urls():
+        if gu not in out:
+            out.append(gu)
+    return out
 
 
 def tunnel_agent_github_urls(tag: str = "") -> list[str]:
@@ -496,6 +533,7 @@ def build_tunnel_agent_config(store: dict, node: dict) -> dict | None:
         if not ws_url:
             return None
         transport = "wss"
+    urls = tunnel_agent_binary_urls(store)
     out = {
         "profile": spec["id"],
         "transport": transport,
@@ -505,8 +543,9 @@ def build_tunnel_agent_config(store: dict, node: dict) -> dict | None:
         "node_id": tunnel_agent_id(node),
         "ws_url": ws_url if transport in ("wss", "both") else "",
         "peer_udp": peer_udp if transport in ("udp", "both") else "",
-        "binary_url": tunnel_agent_binary_url(store),
-        "github_urls": tunnel_agent_github_urls(),
+        "binary_url": urls[0] if urls else tunnel_agent_binary_url(store),
+        # Extra master mirrors before GitHub (GitHub assets often lag VERSION tags).
+        "github_urls": urls[1:] if len(urls) > 1 else tunnel_agent_github_urls(),
         "force": True,
     }
     return out
