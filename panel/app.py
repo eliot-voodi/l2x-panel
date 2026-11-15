@@ -8781,9 +8781,16 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
         master_url = str(payload.get("master_url") or "").rstrip("/")
         if master_url:
             ns["upstream_master_url"] = master_url
-            # Mirror/public agents keep an explicit pointer even without NAT pull cycle
-            if not isinstance(ns.get("pull"), dict):
-                ns["master_pull_url"] = master_url
+            ns["master_pull_url"] = master_url
+            # NAT heartbeat requires settings.nodes.pull{master_url,node_id}.
+            # Older applies only set master_pull_url → agent looked "offline" forever.
+            nid = str(payload.get("node_id") or ns.get("upstream_node_id") or "").strip()
+            if nid:
+                p = ns.get("pull") if isinstance(ns.get("pull"), dict) else {}
+                p = dict(p)
+                p["master_url"] = master_url
+                p["node_id"] = nid
+                ns["pull"] = p
         masters = payload.get("masters")
         if isinstance(masters, list) and isinstance(ns.get("pull"), dict):
             ns["pull"]["fallbacks"] = [str(m).rstrip("/") for m in masters if m][:8]
@@ -9153,8 +9160,26 @@ def _agent_pull_cycle() -> None:
     if (ns.get("role") or "") != "agent":
         return
     pull = ns.get("pull") if isinstance(ns.get("pull"), dict) else None
+    # Survive apply/sync that only set master_pull_url / upstream_* without rebuild of pull{}.
     if not pull or not pull.get("master_url") or not pull.get("node_id"):
-        return
+        master = (
+            str((pull or {}).get("master_url") or "").rstrip("/")
+            or str(ns.get("master_pull_url") or "").rstrip("/")
+            or str(ns.get("upstream_master_url") or "").rstrip("/")
+        )
+        nid = (
+            str((pull or {}).get("node_id") or "").strip()
+            or str(ns.get("upstream_node_id") or "").strip()
+        )
+        if master and nid:
+            rebuilt = dict(pull or {})
+            rebuilt["master_url"] = master
+            rebuilt["node_id"] = nid
+            with mutate() as st:
+                st.setdefault("settings", {}).setdefault("nodes", {})["pull"] = rebuilt
+            pull = rebuilt
+        else:
+            return
     token = ns.get("agent_token") or ""
     if not token:
         return
