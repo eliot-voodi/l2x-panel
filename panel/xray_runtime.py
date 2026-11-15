@@ -1567,6 +1567,8 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("doh_in_tunnel", False)
     if not client.get("doh_token"):
         client["doh_token"] = secrets.token_urlsafe(18)
+    # Cosmetic per-user path for WS/HTTPUpgrade/XHTTP (nginx rewrites to inbound path).
+    ensure_client_link_token(client)
     client.setdefault("last_online", "")
     client.setdefault("ips", {})
     client.setdefault("created_at", now_utc().isoformat())
@@ -1579,6 +1581,54 @@ def ensure_client(client: dict) -> dict:
 
 
 ensure_client_quota = ensure_client  # backward compat
+
+
+def ensure_client_link_token(client: dict) -> str:
+    """Stable random token for per-user subscription paths (``/u-<token>``)."""
+    tok = re.sub(r"[^A-Za-z0-9]", "", str(client.get("link_token") or ""))
+    if len(tok) < 8:
+        tok = re.sub(r"[^A-Za-z0-9]", "", secrets.token_urlsafe(16))[:16]
+        client["link_token"] = tok
+    else:
+        client["link_token"] = tok[:32]
+    return client["link_token"]
+
+
+def client_cosmetic_path(store: dict, client: dict, ib: dict) -> str:
+    """Unique path for the client link; nginx rewrites it to the inbound's real path.
+
+    No extra Xray inbound — only subscription cosmetics + front regex location.
+    """
+    st = ib.get("stream") or {}
+    net = st.get("network") or "raw"
+    if P.front_mode(ib) != "http" or net not in ("ws", "httpupgrade", "xhttp"):
+        return P.front_http_path(ib)
+    token = ensure_client_link_token(client)
+    domain = ""
+    try:
+        import front as front_mod
+        domain = front_mod.normalize_host(ib.get("share_host") or "") or front_mod.public_domain(store) or ""
+    except Exception:
+        domain = str(ib.get("share_host") or "").strip().lower()
+    # Multiple path inbounds on one host need distinct prefixes so regex locations do not clash.
+    peers = 0
+    for other in store.get("inbounds") or []:
+        if not other.get("enabled", True) or P.front_mode(other) != "http":
+            continue
+        onet = ((other.get("stream") or {}).get("network") or "")
+        if onet not in ("ws", "httpupgrade", "xhttp"):
+            continue
+        try:
+            import front as front_mod
+            od = front_mod.normalize_host(other.get("share_host") or "") or front_mod.public_domain(store) or ""
+        except Exception:
+            od = str(other.get("share_host") or "").strip().lower()
+        if od and domain and od == domain:
+            peers += 1
+    if peers > 1:
+        tag = re.sub(r"[^A-Za-z0-9]", "", str(ib.get("tag") or "x"))[:12] or "x"
+        return f"/u-{tag}-{token}"
+    return f"/u-{token}"
 
 
 def _wg_pool(ib: dict) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
@@ -2002,6 +2052,19 @@ def _direct_connect_endpoint_host(store: dict, tag: str) -> tuple[str, dict | No
     return "", None
 
 
+def _apply_cosmetic_path(store: dict, client: dict, ib: dict, ep: dict) -> None:
+    """Swap subscription path to per-user /u-… (nginx rewrites to the real inbound path)."""
+    if not ep:
+        return
+    net = str(ep.get("net") or ((ib.get("stream") or {}).get("network") or ""))
+    if P.front_mode(ib) != "http" or net not in ("ws", "httpupgrade", "xhttp"):
+        return
+    real = str(ep.get("path") or P.front_http_path(ib) or "/")
+    _base, sep, query = real.partition("?")
+    cosmetic = client_cosmetic_path(store, client, ib)
+    ep["path"] = f"{cosmetic}?{query}" if sep and query else cosmetic
+
+
 def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
     if not client_access_ok(client):
         return []
@@ -2067,6 +2130,7 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                                 ib_use = ib
                         ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
                         if ep:
+                            _apply_cosmetic_path(store, client, ib_use, ep)
                             eps.extend(P._apply_external_proxy(ep, ib_use))
                         continue
                 remark = f"{prefix}{client['email']} · {outbound_label(store, ob)}{tag_quota_suffix(client, ob)}"
@@ -2111,6 +2175,7 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                     ib_use = ib
             ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
             if ep:
+                _apply_cosmetic_path(store, client, ib_use, ep)
                 eps.extend(P._apply_external_proxy(ep, ib_use))
     return eps
 

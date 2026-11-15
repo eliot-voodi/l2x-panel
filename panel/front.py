@@ -317,6 +317,16 @@ def plan(store: dict) -> dict:
                 f"{ib.get('tag')}: на :443 публикуется только один RAW-inbound "
                 f"({raw['tag'] if raw else '—'}) — этот доступен только локально"
             )
+    # Per-user cosmetic paths: one regex gate per path-inbound rewrites /u-… → real path.
+    for _domain, locs in sites.items():
+        http_locs = [loc for loc in locs if loc.get("net") in ("ws", "httpupgrade", "xhttp")]
+        multi = len(http_locs) > 1
+        for loc in http_locs:
+            if multi:
+                safe = re.sub(r"[^A-Za-z0-9]", "", str(loc.get("tag") or "x"))[:12] or "x"
+                loc["user_path_re"] = rf"^/u-{safe}-[A-Za-z0-9_-]+$"
+            else:
+                loc["user_path_re"] = r"^/u-[A-Za-z0-9_-]+$"
     return {
         "sni": sni, "sites": sites, "problems": problems,
         "public_domain": pub, "panel_domains": panel_hosts, "raw": raw,
@@ -517,6 +527,9 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         ]
         for loc in sorted(locs, key=lambda x: x["path"]):
             body.append(_location(loc))
+            user_loc = _location_user_path(loc)
+            if user_loc:
+                body.append(user_loc)
         if domain in panel_set:
             body.extend(_panel_locations(store))
         else:
@@ -750,6 +763,51 @@ def _location(loc: dict) -> str:
     return (
         f"    location = {path} {{\n"
         "        if ($http_upgrade = \"\") { return 404; }\n"
+        f"        proxy_pass http://127.0.0.1:{port};\n"
+        "        proxy_http_version 1.1;\n"
+        "        proxy_set_header Upgrade $http_upgrade;\n"
+        "        proxy_set_header Connection $l2x_connection_upgrade;\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Real-IP $remote_addr;\n"
+        "        proxy_set_header X-Forwarded-For $remote_addr;\n"
+        "        proxy_read_timeout 1d;\n"
+        "        proxy_send_timeout 1d;\n"
+        "        proxy_buffering off;\n"
+        "        proxy_request_buffering off;\n"
+        "        tcp_nodelay on;\n"
+        "    }"
+    )
+
+
+def _location_user_path(loc: dict) -> str:
+    """Regex gate: /u-<token> → rewrite to inbound path (per-user cosmetic paths)."""
+    re_pat = str(loc.get("user_path_re") or "").strip()
+    if not re_pat:
+        return ""
+    path, port, net = loc["path"], loc["port"], loc["net"]
+    if net == "xhttp":
+        return (
+            f"    location ~ {re_pat} {{\n"
+            "        client_max_body_size 0;\n"
+            "        client_body_buffer_size 1m;\n"
+            "        client_body_timeout 52w;\n"
+            "        grpc_socket_keepalive on;\n"
+            "        grpc_buffer_size 4m;\n"
+            f"        rewrite ^ {path} break;\n"
+            f"        grpc_pass grpc://127.0.0.1:{port};\n"
+            "        grpc_read_timeout 52w;\n"
+            "        grpc_send_timeout 52w;\n"
+            "        grpc_set_header Host $host;\n"
+            "        grpc_set_header X-Real-IP $remote_addr;\n"
+            "        grpc_set_header X-Forwarded-For $remote_addr;\n"
+            "    }"
+        )
+    if net not in ("ws", "httpupgrade"):
+        return ""
+    return (
+        f"    location ~ {re_pat} {{\n"
+        "        if ($http_upgrade = \"\") { return 404; }\n"
+        f"        rewrite ^ {path} break;\n"
         f"        proxy_pass http://127.0.0.1:{port};\n"
         "        proxy_http_version 1.1;\n"
         "        proxy_set_header Upgrade $http_upgrade;\n"
