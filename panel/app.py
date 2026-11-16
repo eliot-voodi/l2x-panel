@@ -2,6 +2,7 @@
 """L2X Panel — Xray (multi-inbound) control panel."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -24,13 +25,15 @@ from urllib.error import HTTPError, URLError
 import bcrypt
 import yaml
 from cryptography.fernet import Fernet
-from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 import admins
+import console_term
 import front
 import hwid
 import inbound_lint
@@ -719,7 +722,7 @@ class BasePathMiddleware:
         return f"/doh/{token}"
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        if scope["type"] in ("http", "websocket"):
             bp = base_path()
             path = scope.get("path") or "/"
             if bp:
@@ -727,14 +730,20 @@ class BasePathMiddleware:
                     scope = dict(scope)
                     scope["path"] = path[len(bp):] or "/"
                     path = scope["path"]
-                elif not self._public(path):
+                elif scope["type"] == "http" and not self._public(path):
                     resp = PlainTextResponse("404 page not found", status_code=404)
                     await resp(scope, receive, send)
                     return
-            rewritten = self._rewrite_doh(path)
-            if rewritten and rewritten != path:
-                scope = dict(scope)
-                scope["path"] = rewritten
+                elif scope["type"] == "websocket" and not (
+                    self._public(path) or path.startswith("/agent/") or path.startswith("/console/")
+                ):
+                    await send({"type": "websocket.close", "code": 4404})
+                    return
+            if scope["type"] == "http":
+                rewritten = self._rewrite_doh(path)
+                if rewritten and rewritten != path:
+                    scope = dict(scope)
+                    scope["path"] = rewritten
         await self.inner(scope, receive, send)
 
 
@@ -842,6 +851,10 @@ app.add_middleware(
 )
 app.add_middleware(BasePathMiddleware)
 templates = Jinja2Templates(directory=str(ROOT / "ui"))
+
+_STATIC_DIR = ROOT / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 # ================================================================ i18n / template helpers
 
@@ -5309,6 +5322,264 @@ def xray_geo_pack(key: str, request: Request):
     return go(_next(request, "/routing"))
 
 
+# ================================================================ console (interactive shell)
+
+def _console_targets(store: dict) -> list[dict]:
+    """Selectable hosts for Console UI: local master + panel agents."""
+    items = []
+    for n in nodes_mod.ensure_list(store):
+        nid = str(n.get("id") or "")
+        name = str(n.get("name") or n.get("domain") or nid or "node")
+        tunnel_only = nodes_mod.is_tunnel_only_node(n)
+        online = n.get("online") is True or (
+            bool(n.get("nat")) and bool(n.get("last_pull") or n.get("last_seen"))
+        )
+        disabled = False
+        reason = ""
+        if tunnel_only:
+            disabled, reason = True, "tunnel-only (нет panel agent)"
+        elif not (n.get("token") or "").strip() and not n.get("nat"):
+            disabled, reason = True, "нет agent token"
+        elif n.get("enabled") is False:
+            disabled, reason = True, "выключена"
+        items.append({
+            "id": nid,
+            "name": name,
+            "nat": bool(n.get("nat")),
+            "online": bool(online),
+            "disabled": disabled,
+            "reason": reason,
+            "label": f"{name}" + (" · NAT" if n.get("nat") else "") + (" · offline" if not online and not disabled else ""),
+        })
+    return items
+
+
+def _signal_node_console(node: dict, *, sid: str, cols: int, rows: int) -> dict:
+    """Ask a node to dial master's /agent/console (manage for Direct, pull field for NAT)."""
+    ws_url = nodes_mod.master_console_ws_url(
+        public_https_base(), session_id=sid, base_path=base_path().lstrip("/"),
+    )
+    exp = time.time() + console_term.SESSION_TTL_SEC
+    payload = {
+        "id": sid,
+        "ws_url": ws_url,
+        "exp": exp,
+        "cols": cols,
+        "rows": rows,
+    }
+    with mutate() as st:
+        for n in nodes_mod.ensure_list(st):
+            if n.get("id") == node.get("id"):
+                n["console_session"] = dict(payload)
+                break
+    if node.get("nat"):
+        return {"ok": True, "via": "pull", "ws_url": ws_url, "session_id": sid}
+    res = nodes_mod.manage_request(
+        node,
+        action="console_connect",
+        params={"ws_url": ws_url, "session_id": sid, "cols": cols, "rows": rows},
+        timeout=20,
+    )
+    return {
+        "ok": bool(res.get("ok")),
+        "via": "manage",
+        "ws_url": ws_url,
+        "session_id": sid,
+        "error": "" if res.get("ok") else (res.get("error") or "manage failed"),
+        "manage": res,
+    }
+
+
+@app.get("/console", response_class=HTMLResponse)
+def console_page(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    console_term.sweep_expired()
+    return page(
+        request, "console.html", active="console",
+        targets=_console_targets(store),
+        is_master=nodes_mod.is_master(store),
+    )
+
+
+@app.websocket("/console/ws")
+async def console_browser_ws(ws: WebSocket):
+    """Browser ↔ master console. target=master|node_id. Panel session cookie required."""
+    await ws.accept()
+    try:
+        sess_data = ws.scope.get("session") or {}
+        user = sess_data.get("user")
+        exp = float(sess_data.get("exp") or 0)
+        if not user or (exp and time.time() > exp):
+            await ws.send_text(console_term.msg_error("не авторизован — обновите страницу"))
+            await ws.close(code=4401)
+            return
+    except Exception:
+        await ws.send_text(console_term.msg_error("сессия недоступна"))
+        await ws.close(code=4401)
+        return
+
+    target = (ws.query_params.get("target") or "master").strip() or "master"
+    cols = max(20, min(500, _int(ws.query_params.get("cols"), 120)))
+    rows = max(5, min(200, _int(ws.query_params.get("rows"), 32)))
+    sid = console_term.new_session_id()
+    sess = console_term.ConsoleSession(
+        sid=sid,
+        target=target,
+        expires=time.time() + console_term.SESSION_TTL_SEC,
+        browser_ws=ws,
+        node_id="" if target == "master" else target,
+    )
+    console_term.register_session(sess)
+    loop = asyncio.get_running_loop()
+
+    async def _to_browser(text: str) -> None:
+        await console_term.ws_send_safe(ws, text)
+
+    try:
+        if target == "master":
+            try:
+                console_term.start_local_pty(sess, cols=cols, rows=rows)
+            except Exception as exc:
+                await ws.send_text(console_term.msg_error(f"PTY: {exc}"))
+                return
+            console_term.start_pty_reader(sess, loop, _to_browser)
+            await ws.send_text(console_term.msg_status(f"local shell · {user}"))
+            await ws.send_text(console_term.msg_ready())
+            while True:
+                raw = await ws.receive_text()
+                await console_term.relay_browser_to_local(sess, raw)
+        else:
+            store = _load_store()
+            node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == target), None)
+            if not node:
+                await ws.send_text(console_term.msg_error("нода не найдена"))
+                return
+            if nodes_mod.is_tunnel_only_node(node):
+                await ws.send_text(console_term.msg_error("tunnel-only агент — Console недоступен"))
+                return
+            sig = _signal_node_console(node, sid=sid, cols=cols, rows=rows)
+            if not sig.get("ok") and sig.get("via") == "manage":
+                # Still waiting possible if NAT mis-flagged; keep session for pull
+                await ws.send_text(console_term.msg_status(
+                    f"manage: {sig.get('error') or 'ошибка'}; ждём dial…",
+                ))
+            else:
+                via = sig.get("via") or "?"
+                await ws.send_text(console_term.msg_status(
+                    f"ожидание агента ({via})… session {sid[:8]}",
+                ))
+            # Relay browser → agent once attached; buffer until then
+            pending: list[str] = []
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.receive_text(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    raw = None
+                agent = sess.agent_ws
+                if raw is not None:
+                    sess.touch()
+                    if agent is None:
+                        if len(pending) < 200:
+                            pending.append(raw)
+                    else:
+                        if pending:
+                            buf, pending = pending, []
+                            for item in buf:
+                                await console_term.relay_peer_text(agent, item)
+                        await console_term.relay_peer_text(agent, raw)
+                elif agent is not None and pending:
+                    buf, pending = pending, []
+                    for item in buf:
+                        await console_term.relay_peer_text(agent, item)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        try:
+            await console_term.ws_send_safe(ws, console_term.msg_error(str(exc)[:200]))
+        except Exception:
+            pass
+    finally:
+        console_term.drop_session(sid)
+        # Clear pending signal on node
+        if target != "master":
+            try:
+                with mutate() as st:
+                    for n in nodes_mod.ensure_list(st):
+                        if n.get("id") == target:
+                            cs = n.get("console_session") or {}
+                            if isinstance(cs, dict) and cs.get("id") == sid:
+                                n.pop("console_session", None)
+                            break
+            except Exception:
+                pass
+
+
+@app.websocket("/agent/console")
+async def console_agent_ws(ws: WebSocket):
+    """Agent attaches its local PTY to an existing browser console session."""
+    sid = (ws.query_params.get("session_id") or "").strip()
+    token_q = (ws.query_params.get("token") or "").strip()
+    await ws.accept()
+    # Auth: Authorization Bearer or ?token=
+    headers = {k.decode().lower(): v.decode() for k, v in (ws.scope.get("headers") or [])}
+    auth = headers.get("authorization") or ""
+    token = auth.removeprefix("Bearer ").strip() if auth.lower().startswith("bearer ") else token_q
+    store = _load_store()
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    node_tokens = [n.get("token") or "" for n in (store.get("nodes") or [])]
+    if not token or not (_agent_token_ok(ns, token) or sec.any_token_eq(token, node_tokens)):
+        await ws.send_text(console_term.msg_error("unauthorized"))
+        await ws.close(code=4401)
+        return
+    if not sid:
+        await ws.send_text(console_term.msg_error("session_id required"))
+        await ws.close(code=4400)
+        return
+    sess = console_term.get_session(sid)
+    if not sess or sess.target == "master":
+        await ws.send_text(console_term.msg_error("unknown session"))
+        await ws.close(code=4404)
+        return
+    if sess.agent_ws is not None:
+        await ws.send_text(console_term.msg_error("session already attached"))
+        await ws.close(code=4409)
+        return
+    sess.agent_ws = ws
+    sess.status = "ready"
+    sess.touch()
+    # Drop pull signal — agent is connected
+    try:
+        with mutate() as st:
+            for n in nodes_mod.ensure_list(st):
+                if n.get("id") == sess.node_id:
+                    cs = n.get("console_session") or {}
+                    if isinstance(cs, dict) and cs.get("id") == sid:
+                        n.pop("console_session", None)
+                    break
+    except Exception:
+        pass
+    browser = sess.browser_ws
+    await console_term.ws_send_safe(browser, console_term.msg_status("агент подключён"))
+    await console_term.ws_send_safe(browser, console_term.msg_ready())
+    try:
+        while True:
+            raw = await ws.receive_text()
+            sess.touch()
+            # Agent sends PTY output (and ready/status); forward to browser.
+            # Resize/data from agent are unusual — still forward.
+            await console_term.relay_peer_text(browser, raw)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if sess.agent_ws is ws:
+            sess.agent_ws = None
+        await console_term.ws_send_safe(browser, console_term.msg_status("агент отключился"))
+
+
 # ================================================================ logs
 
 @app.get("/logs", response_class=HTMLResponse)
@@ -8360,6 +8631,20 @@ def _manage_action(action: str, payload: dict) -> dict:
             out = nodes_mod.demote_store_to_agent(st)
         return out
 
+    if action == "console_connect":
+        # Master asked this agent to dial back a console WebSocket (Direct/reachable path).
+        ws_url = str(payload.get("ws_url") or "").strip()
+        sid = str(payload.get("session_id") or "").strip()
+        cols = max(20, min(500, _int(payload.get("cols"), 120)))
+        rows = max(5, min(200, _int(payload.get("rows"), 32)))
+        token = str(ns0.get("agent_token") or "").strip()
+        if not ws_url or not sid:
+            return {"ok": False, "error": "ws_url/session_id required"}
+        started = console_term.start_agent_console_dial(
+            ws_url=ws_url, token=token, session_id=sid, cols=cols, rows=rows,
+        )
+        return {"ok": True, "error": "", "started": bool(started), "session_id": sid}
+
     if action == "restart_xray":
         r = ops.xray_control("restart")
         return {"ok": bool(r.get("ok")), "error": "" if r.get("ok") else (r.get("stderr") or "restart failed"), "result": r}
@@ -9025,6 +9310,7 @@ async def agent_pull(request: Request):
     want_update = False
     diag_req = None
     iperf_req = None
+    console_req = None
     xray_upd = ""
     agent_ver = str(body.get("version") or "")
     master_ver = panel_version()
@@ -9058,6 +9344,17 @@ async def agent_pull(request: Request):
             pending_iperf = node.get("iperf3_requested")
             if isinstance(pending_iperf, dict) and pending_iperf.get("host"):
                 iperf_req = dict(pending_iperf)
+            # Console: re-send until agent dials or TTL
+            pending_console = node.get("console_session")
+            if isinstance(pending_console, dict) and pending_console.get("id"):
+                try:
+                    exp = float(pending_console.get("exp") or 0)
+                except (TypeError, ValueError):
+                    exp = 0
+                if exp and time.time() > exp:
+                    node.pop("console_session", None)
+                else:
+                    console_req = dict(pending_console)
             # Remember Xray version reported by NAT agent pull status
             xv = str(status.get("xray_version") or "").strip()
             if xv:
@@ -9083,6 +9380,8 @@ async def agent_pull(request: Request):
         extra["diag"] = diag_req
     if isinstance(iperf_req, dict):
         extra["iperf3"] = iperf_req
+    if isinstance(console_req, dict) and console_req.get("id"):
+        extra["console_session"] = console_req
     if want_update:
         extra["update"] = True
         if isinstance(payload, dict):
@@ -9294,6 +9593,16 @@ def _agent_pull_cycle() -> None:
         threading.Thread(
             target=_iperf_job, args=(res["iperf3"],), daemon=True, name="agent-iperf3",
         ).start()
+    # NAT console: dial master WSS with local PTY
+    cs = res.get("console_session") if isinstance(res.get("console_session"), dict) else None
+    if cs and cs.get("id") and cs.get("ws_url"):
+        console_term.start_agent_console_dial(
+            ws_url=str(cs["ws_url"]),
+            token=token,
+            session_id=str(cs["id"]),
+            cols=max(20, min(500, _int(cs.get("cols"), 120))),
+            rows=max(5, min(200, _int(cs.get("rows"), 32))),
+        )
     if res.get("moved") and res.get("master_url"):
         res = {**res, "ok": False}
     if not res.get("ok"):

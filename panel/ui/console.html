@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% import "_icons.html" as ic %}
+{% block title %}Console · {{ app_name }}{% endblock %}
+{% block page_title %}Console{% endblock %}
+{% block page_sub %}Интерактивный shell на мастере или ноде — без SSH{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="{{ bp }}/static/vendor/xterm/xterm.css">
+<style>
+  .console-bar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:end; margin-bottom:.75rem }
+  .console-bar .grow { flex:1; min-width:180px }
+  #term-wrap {
+    height: calc(100vh - 210px); height: calc(100dvh - 210px);
+    min-height: 320px; background: #0b111c; border: 1px solid var(--border);
+    border-radius: 12px; padding: .5rem; overflow: hidden;
+  }
+  #term { width: 100%; height: 100% }
+  .console-status { font-size: .82rem; color: var(--muted); min-height: 1.2em }
+  .console-status.ok { color: var(--ok) }
+  .console-status.err { color: var(--danger) }
+</style>
+{% endblock %}
+{% block content %}
+<div class="console-bar">
+  <div class="grow">
+    <label class="f">Хост</label>
+    <select id="target" class="w-full">
+      <option value="master">Этот сервер ({{ 'master' if is_master else 'local' }})</option>
+      {% if is_master %}
+      {% for t in targets %}
+      <option value="{{ t.id }}" {% if t.disabled %}disabled{% endif %}>
+        {{ t.label }}{% if t.reason %} — {{ t.reason }}{% endif %}
+      </option>
+      {% endfor %}
+      {% endif %}
+    </select>
+  </div>
+  <button class="btn" type="button" id="btn-connect">{{ ic.icon('play') }} Подключить</button>
+  <button class="btn ghost" type="button" id="btn-disconnect" disabled>{{ ic.icon('stop') }} Отключить</button>
+</div>
+<div class="console-status" id="status">Выберите хост и нажмите «Подключить». Авторизация — сессия панели (SSH не нужен).</div>
+<div id="term-wrap"><div id="term"></div></div>
+{% if is_master and not targets %}
+<div class="hint mt">Ноды появятся здесь после регистрации в Nodes. Tunnel-only Go-агенты в Console недоступны.</div>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="{{ bp }}/static/vendor/xterm/xterm.js"></script>
+<script src="{{ bp }}/static/vendor/xterm/addon-fit.js"></script>
+<script>
+(function () {
+  var bp = {{ bp|tojson }};
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: 'JetBrains Mono, Cascadia Code, Consolas, monospace',
+    theme: { background: '#0b111c', foreground: '#e6ecf5', cursor: '#22d3ee' },
+    scrollback: 5000,
+    convertEol: true
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+
+  var ws = null;
+  var statusEl = document.getElementById('status');
+  var btnOn = document.getElementById('btn-connect');
+  var btnOff = document.getElementById('btn-disconnect');
+  var targetEl = document.getElementById('target');
+
+  function setStatus(msg, cls) {
+    statusEl.textContent = msg || '';
+    statusEl.className = 'console-status' + (cls ? ' ' + cls : '');
+  }
+  function b64enc(str) {
+    var bytes = new TextEncoder().encode(str);
+    var bin = '';
+    bytes.forEach(function (b) { bin += String.fromCharCode(b); });
+    return btoa(bin);
+  }
+  function b64dec(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  function wsUrl(target) {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var cols = term.cols || 120, rows = term.rows || 32;
+    return proto + '//' + location.host + bp + '/console/ws?target=' +
+      encodeURIComponent(target) + '&cols=' + cols + '&rows=' + rows;
+  }
+  function disconnect() {
+    if (ws) {
+      try { ws.close(); } catch (e) {}
+      ws = null;
+    }
+    btnOn.disabled = false;
+    btnOff.disabled = true;
+    targetEl.disabled = false;
+  }
+  function connect() {
+    if (ws) disconnect();
+    var target = targetEl.value || 'master';
+    fit.fit();
+    setStatus('подключение…', '');
+    btnOn.disabled = true;
+    btnOff.disabled = false;
+    targetEl.disabled = true;
+    ws = new WebSocket(wsUrl(target));
+    ws.onopen = function () {
+      setStatus('соединение открыто — ожидание shell…', '');
+      try {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      } catch (e) {}
+    };
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) {
+        term.write(ev.data);
+        return;
+      }
+      if (msg.type === 'data') {
+        try { term.write(b64dec(msg.data || '')); } catch (e) {}
+      } else if (msg.type === 'status') {
+        setStatus(msg.msg || '', '');
+      } else if (msg.type === 'ready') {
+        setStatus('готово · ' + (targetEl.options[targetEl.selectedIndex].text || target), 'ok');
+      } else if (msg.type === 'error') {
+        setStatus(msg.msg || 'ошибка', 'err');
+        term.writeln('\r\n\x1b[31m' + (msg.msg || 'error') + '\x1b[0m');
+      }
+    };
+    ws.onclose = function () {
+      setStatus('отключено', '');
+      disconnect();
+    };
+    ws.onerror = function () {
+      setStatus('ошибка WebSocket', 'err');
+    };
+  }
+
+  term.onData(function (data) {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'data', data: b64enc(data) }));
+  });
+  window.addEventListener('resize', function () {
+    fit.fit();
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+    }
+  });
+  btnOn.addEventListener('click', connect);
+  btnOff.addEventListener('click', function () { disconnect(); setStatus('отключено', ''); });
+  setInterval(function () {
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch (e) {}
+    }
+  }, 25000);
+})();
+</script>
+{% endblock %}

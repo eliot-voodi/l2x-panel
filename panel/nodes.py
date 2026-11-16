@@ -2218,6 +2218,23 @@ def agent_manage_url(node: dict) -> str:
     return agent_endpoint(node, "agent/manage")
 
 
+def master_console_ws_url(master_https_base: str, *, session_id: str, base_path: str = "") -> str:
+    """Agent dials this WSS URL on the master to attach a remote console PTY."""
+    base = (master_https_base or "").rstrip("/")
+    bp = (base_path or "").strip().strip("/")
+    if bp:
+        base = f"{base}/{bp}"
+    if base.startswith("https://"):
+        ws = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        ws = "ws://" + base[len("http://"):]
+    elif base.startswith("wss://") or base.startswith("ws://"):
+        ws = base
+    else:
+        ws = "wss://" + base.lstrip("/")
+    return f"{ws}/agent/console?session_id={session_id}"
+
+
 def panel_login_url(node: dict) -> str:
     """Public login URL for a registered node panel."""
     base = (node.get("url") or "").rstrip("/")

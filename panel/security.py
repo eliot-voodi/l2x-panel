@@ -188,6 +188,7 @@ MANAGE_WRITE = frozenset({
     "restart_xray", "update_xray", "rollback_xray", "apply_xray",
     "save_panel", "enable_agent", "node_diag", "ensure_network_perf",
     "iperf3_ensure", "iperf3_client", "iperf3_serve",
+    "console_connect",
 })
 # High-impact: need confirm + blocked on master by default.
 # set_admin_password removed from agent manage — password changes are local/UI only

@@ -392,7 +392,9 @@ def _panel_locations(store: dict | None = None) -> list[str]:
         "        proxy_set_header X-Forwarded-Proto https;\n"
         "        proxy_set_header Upgrade $http_upgrade;\n"
         "        proxy_set_header Connection $l2x_connection_upgrade;\n"
-        "        proxy_read_timeout 300s;\n"
+        # Console / long-lived panel WebSockets need more than a few minutes
+        "        proxy_read_timeout 1d;\n"
+        "        proxy_send_timeout 1d;\n"
         "        client_max_body_size 64m;\n"
     )
     proxy = f"        proxy_pass http://{PANEL_UPSTREAM};\n{common}"
