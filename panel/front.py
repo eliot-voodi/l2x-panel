@@ -509,7 +509,9 @@ def render(store: dict) -> tuple[str, str, list[str]]:
         "        proxy_pass $l2x_front_upstream;\n"
         "        proxy_protocol on;\n"
         "        proxy_connect_timeout 5s;\n"
-        "        proxy_timeout 1h;\n"
+        # Idle stream sessions used to linger for 1h and pile up (thousands of TIME-WAIT /
+        # ESTAB with empty queues). 10m is above Xray connIdle and enough for long downloads.
+        "        proxy_timeout 10m;\n"
         "    }\n"
         "}\n"
     )

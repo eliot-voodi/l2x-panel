@@ -161,7 +161,8 @@ def default_settings() -> dict:
             "allow_master_manage": False,
         },
         "panel_update": {"auto_check": True, "interval_hours": 12},
-        "iplimit": {"ban_minutes": 30},
+        # max_conn_per_ip: iptables connlimit on :443 (0 = off). Cuts junk ESTAB floods per client IP.
+        "iplimit": {"ban_minutes": 30, "max_conn_per_ip": 64},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
         "pia": {
             "username": "", "password_enc": "", "token_enc": "", "token_expires_at": "",
@@ -1516,6 +1517,10 @@ def _watchdog_cycle() -> None:
         ban_min = _int(store["settings"]["iplimit"].get("ban_minutes"), 30)
         for b in xray.enforce_ip_limits(store, ONLINE, ban_min):
             events.append({"type": "ip_ban", **b})
+        try:
+            xray.enforce_conn_limits(store)
+        except Exception:
+            pass
         if STORE_OK:
             _save_store(store)
         if need_apply and STORE_OK:
@@ -1970,6 +1975,7 @@ def _sync_xray_config() -> None:
                 front.commit(staged)
             # iptables rules do not survive a reboot
             xray.ban_inbound_ports(store)
+            xray.enforce_conn_limits(store)
         _issue_front_certs(store)
     except Exception:
         pass
@@ -6072,6 +6078,11 @@ async def settings_save(request: Request):
             tg["backup_hours"] = _float(form.get("backup_hours"), float(tg.get("backup_hours") or 24))
         elif section == "iplimit":
             s["iplimit"]["ban_minutes"] = _int(form.get("ban_minutes"), 30)
+            s["iplimit"]["max_conn_per_ip"] = max(0, _int(form.get("max_conn_per_ip"), 64))
+            try:
+                xray.enforce_conn_limits(store)
+            except Exception:
+                pass
         elif section == "masterdns":
             md = masterdns_mod.ensure_settings(store)
             md["enabled"] = form.get("enabled") == "1"

@@ -2765,7 +2765,8 @@ def build_config(store: dict) -> dict:
             "levels": {
                 "0": {
                     "statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True,
-                    "bufferSize": 1024, "connIdle": 300, "handshake": 8, "uplinkOnly": 2, "downlinkOnly": 5,
+                    # connIdle 120: drop idle proxy sessions sooner (was 300; nginx stream timeout 10m)
+                    "bufferSize": 1024, "connIdle": 120, "handshake": 8, "uplinkOnly": 2, "downlinkOnly": 5,
                 },
             },
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True,
@@ -3160,6 +3161,7 @@ def apply_config(store: dict, *, xray_only: bool = False, clients_only: bool = F
             pass
         if not xray_only:
             ban_inbound_ports(store)
+            enforce_conn_limits(store)
         return {"ok": True, "error": "", "config": cfg, "verified": True, "unchanged": True}
 
     # Hot client sync: structure same, only users (± routing user rules) differ.
@@ -3239,6 +3241,7 @@ def apply_config(store: dict, *, xray_only: bool = False, clients_only: bool = F
     if _xray_active():
         if not xray_only:
             ban_inbound_ports(store)
+            enforce_conn_limits(store)
         return {"ok": True, "error": "", "config": cfg, "verified": True}
 
     # New config passed -test but broke the running service — roll back.
@@ -3679,6 +3682,40 @@ def _ensure_iplimit_chain() -> None:
         _run(["iptables", "-N", IPLIMIT_CHAIN])
     if _run(["iptables", "-C", "INPUT", "-j", IPLIMIT_CHAIN])["exit_code"] != 0:
         _run(["iptables", "-I", "INPUT", "1", "-j", IPLIMIT_CHAIN])
+
+
+CONNLIMIT_CHAIN = "L2X_CONNLIMIT"
+DEFAULT_MAX_CONN_PER_IP = 64
+
+
+def enforce_conn_limits(store: dict) -> None:
+    """Cap concurrent TCP to :443 per source IP via iptables connlimit (L2X_CONNLIMIT).
+
+    settings.iplimit.max_conn_per_ip: 0 disables the chain; default 64. New connections above
+    the cap get TCP RST; idle junk is also shortened by nginx proxy_timeout / Xray connIdle.
+    """
+    raw = ((store.get("settings") or {}).get("iplimit") or {}).get("max_conn_per_ip", DEFAULT_MAX_CONN_PER_IP)
+    try:
+        limit = max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX_CONN_PER_IP
+    for tool, mask in (("iptables", "32"), ("ip6tables", "128")):
+        if not shutil.which(tool):
+            continue
+        if _run([tool, "-L", CONNLIMIT_CHAIN, "-n"])["exit_code"] != 0:
+            _run([tool, "-N", CONNLIMIT_CHAIN])
+        _run([tool, "-F", CONNLIMIT_CHAIN])
+        while _run([tool, "-D", "INPUT", "-j", CONNLIMIT_CHAIN])["exit_code"] == 0:
+            pass
+        if limit <= 0:
+            continue
+        _run([
+            tool, "-A", CONNLIMIT_CHAIN,
+            "-p", "tcp", "--dport", "443",
+            "-m", "connlimit", f"--connlimit-above={limit}", f"--connlimit-mask={mask}",
+            "-j", "REJECT", "--reject-with", "tcp-reset",
+        ])
+        _run([tool, "-I", "INPUT", "1", "-j", CONNLIMIT_CHAIN])
 
 
 def enforce_ip_limits(store: dict, online_by_client: dict[str, list[str]], ban_minutes: int = 30) -> list[dict]:
