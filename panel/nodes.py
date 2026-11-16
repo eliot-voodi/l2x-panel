@@ -756,9 +756,11 @@ def apply_tunnel_agent_local(cfg: dict | None) -> dict:
             ensure_tunnel_binaries(publish_agent=False)
     unit = Path("/etc/systemd/system/l2x-tunnel-agent.service")
     try:
+        unit_created = False
         if not unit.exists():
             unit.write_text(_TUNNEL_AGENT_UNIT, encoding="utf-8")
             subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30, check=False)
+            unit_created = True
         if not bin_path.exists():
             return {
                 "ok": False,
@@ -773,11 +775,19 @@ def apply_tunnel_agent_local(cfg: dict | None) -> dict:
             ["systemctl", "enable", "--now", "l2x-tunnel-agent"],
             capture_output=True, timeout=30, check=False,
         )
-        # Always restart so profile/PSK changes take effect even if yaml matched.
-        subprocess.run(
-            ["systemctl", "restart", "l2x-tunnel-agent"],
-            capture_output=True, timeout=30, check=False,
-        )
+        # Restart ONLY when agent.yaml changed or unit was just installed / inactive.
+        # Do NOT honor cfg.force here — build_tunnel_agent_config always sets force=True,
+        # and unconditional restart was killing WSS every ~5 min (outbound probe →
+        # last_test → NAT pull version flip → apply identical yaml → restart).
+        inactive = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "l2x-tunnel-agent"],
+            capture_output=True, timeout=10, check=False,
+        ).returncode != 0
+        if changed or unit_created or inactive:
+            subprocess.run(
+                ["systemctl", "restart", "l2x-tunnel-agent"],
+                capture_output=True, timeout=30, check=False,
+            )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "changed": changed}
     return {"ok": True, "changed": changed, "profile": cfg.get("profile"), "has_binary": bin_path.exists()}
@@ -1249,8 +1259,26 @@ def pull_fresh(node: dict, now: datetime | None = None) -> bool:
 
 
 def payload_version(payload: dict) -> str:
+    """Stable hash for NAT pull. Strip volatile probe/sync timestamps so the
+    5‑min outbound probe does not force a full agent re-apply (and tunnel restart).
+    """
     import hashlib
-    body = {k: v for k, v in (payload or {}).items() if k != "pushed_at"}
+
+    def _strip(obj):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if k in ("pushed_at", "last_test", "last_ok", "last_error", "last_warning",
+                         "last_sync", "last_pull", "last_seen", "last_probe", "online",
+                         "fail_streak", "tunnel_peer_online"):
+                    continue
+                out[k] = _strip(v)
+            return out
+        if isinstance(obj, list):
+            return [_strip(x) for x in obj]
+        return obj
+
+    body = _strip({k: v for k, v in (payload or {}).items() if k != "pushed_at"})
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
 
 

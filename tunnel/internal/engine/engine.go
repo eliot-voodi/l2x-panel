@@ -125,15 +125,24 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) helloLoop(ctx context.Context) {
-	t := time.NewTicker(2 * time.Second)
-	defer t.Stop()
+	// Burst HELLO until the portal ACKs, then slow refresh (KA already runs every 5s).
+	// Previously every 2s forever — noisy logs and extra portal work for no gain.
+	fast := time.NewTicker(2 * time.Second)
+	defer fast.Stop()
+	acked := false
+	payload := []byte(e.Token + "|" + e.NodeID)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			payload := []byte(e.Token + "|" + e.NodeID)
+		case <-fast.C:
 			_ = e.send(proto.Frame{Type: proto.TypeHELLO, Payload: payload}, 0)
+			if e.online.Load() {
+				if !acked {
+					acked = true
+					fast.Reset(60 * time.Second)
+				}
+			}
 		}
 	}
 }
