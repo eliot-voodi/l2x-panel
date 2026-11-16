@@ -7560,7 +7560,15 @@ def _node_push_job(node_id: str, label: str, host: str):
                     n["last_warning"] = ""
                     nodes_mod.refresh_tunnel_only_health(store, [n])
                 else:
-                    n["last_warning"] = "NAT: конфиг в очереди — нода заберёт через /agent/pull"
+                    # Prefer warning from push(); only invent a queue tip if none.
+                    tip = str(node_snap.get("last_warning") or "").strip()
+                    if not tip:
+                        mode = (
+                            "NAT" if n.get("nat")
+                            else ("Reverse" if n.get("rv_mode") else "L2X")
+                        )
+                        tip = f"{mode}: конфиг в очереди — нода заберёт через /agent/pull"
+                    n["last_warning"] = tip[:600]
             else:
                 n["last_ok"] = bool(node_snap.get("last_ok"))
                 n["last_error"] = node_snap.get("last_error") or ""

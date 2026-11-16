@@ -2739,17 +2739,18 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
         if can_try:
             result = _push_once(node, payload, timeout=min(int(timeout or 60), 15))
             if result.get("ok"):
-                warns = list(result.get("warnings") or [])
-                warns.append(f"{mode}: live push OK (tunnel_agent/apply)")
+                # Real apply warnings only — do not stash "live push OK" into last_warning
+                # (UI treats last_warning as a yellow warn badge).
+                warns = [w for w in (result.get("warnings") or []) if w and "live push OK" not in str(w)]
                 result = {**result, "warnings": warns, "queued": False, "nat_live_push": True}
                 node["last_sync"] = now_iso()
                 node["last_ok"] = True
                 node["last_error"] = ""
-                node["last_warning"] = "; ".join(str(w) for w in warns if w)[:600]
+                node["last_warning"] = "; ".join(str(w) for w in warns)[:600]
                 return result
             pull_warn = (
-                f"{mode} live push fail ({str(result.get('error') or 'fail')[:120]}); "
-                "ждём /agent/pull (~20с)"
+                f"{mode}: конфиг в очереди — нода заберёт через /agent/pull"
+                f" ({str(result.get('error') or 'fail')[:80]})"
             )
             node["last_sync"] = now_iso()
             node["last_ok"] = True
