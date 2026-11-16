@@ -3686,36 +3686,92 @@ def _ensure_iplimit_chain() -> None:
 
 CONNLIMIT_CHAIN = "L2X_CONNLIMIT"
 DEFAULT_MAX_CONN_PER_IP = 64
+# Parallel SYN storms race past connlimit; also rate-limit new handshakes per source IP.
+_SYN_HASHLIMIT = "25/sec"
+_SYN_HASHLIMIT_BURST = "50"
+
+
+def _connlimit_rules_ok(tool: str, limit: int, mask: str) -> bool:
+    """True when L2X_CONNLIMIT already has the expected syn-hashlimit + connlimit rules."""
+    out = (_run([tool, "-S", CONNLIMIT_CHAIN]).get("stdout") or "")
+    if f"--connlimit-above {limit}" not in out and f"--connlimit-above={limit}" not in out:
+        return False
+    if f"--connlimit-mask {mask}" not in out and f"--connlimit-mask={mask}" not in out:
+        return False
+    if "hashlimit" not in out or "--syn" not in out:
+        return False
+    return True
+
+
+def _prune_excess_443(limit: int) -> None:
+    """Kill ESTAB :443 sockets per peer IP when over limit (connlimit alone loses SYN races)."""
+    if limit <= 0 or not shutil.which("ss"):
+        return
+    from collections import Counter
+    counts: Counter[str] = Counter()
+    out = _run(["ss", "-H", "-tan"]).get("stdout") or ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "ESTAB":
+            continue
+        local, peer = parts[3], parts[4]
+        if not local.endswith(":443"):
+            continue
+        counts[peer.rsplit(":", 1)[0]] += 1
+    for host, n in counts.items():
+        if n > limit:
+            _run(["ss", "-K", "dst", host])
 
 
 def enforce_conn_limits(store: dict) -> None:
-    """Cap concurrent TCP to :443 per source IP via iptables connlimit (L2X_CONNLIMIT).
+    """Cap concurrent TCP to :443 per source IP (iptables L2X_CONNLIMIT + ss prune).
 
-    settings.iplimit.max_conn_per_ip: 0 disables the chain; default 64. New connections above
-    the cap get TCP RST; idle junk is also shortened by nginx proxy_timeout / Xray connIdle.
+    settings.iplimit.max_conn_per_ip: 0 disables; default 64.
+    Rules are updated only when missing/changed — never flushed every watchdog tick
+    (a flush window lets SYN floods establish hundreds of ESTAB sockets).
     """
     raw = ((store.get("settings") or {}).get("iplimit") or {}).get("max_conn_per_ip", DEFAULT_MAX_CONN_PER_IP)
     try:
         limit = max(0, int(raw or 0))
     except (TypeError, ValueError):
         limit = DEFAULT_MAX_CONN_PER_IP
-    for tool, mask in (("iptables", "32"), ("ip6tables", "128")):
+    for tool, mask, hl_name in (
+        ("iptables", "32", "l2x443syn4"),
+        ("ip6tables", "128", "l2x443syn6"),
+    ):
         if not shutil.which(tool):
             continue
         if _run([tool, "-L", CONNLIMIT_CHAIN, "-n"])["exit_code"] != 0:
             _run([tool, "-N", CONNLIMIT_CHAIN])
-        _run([tool, "-F", CONNLIMIT_CHAIN])
-        while _run([tool, "-D", "INPUT", "-j", CONNLIMIT_CHAIN])["exit_code"] == 0:
-            pass
+        has_jump = _run([tool, "-C", "INPUT", "-j", CONNLIMIT_CHAIN])["exit_code"] == 0
         if limit <= 0:
+            _run([tool, "-F", CONNLIMIT_CHAIN])
+            while _run([tool, "-D", "INPUT", "-j", CONNLIMIT_CHAIN])["exit_code"] == 0:
+                pass
             continue
-        _run([
-            tool, "-A", CONNLIMIT_CHAIN,
-            "-p", "tcp", "--dport", "443",
-            "-m", "connlimit", f"--connlimit-above={limit}", f"--connlimit-mask={mask}",
-            "-j", "REJECT", "--reject-with", "tcp-reset",
-        ])
-        _run([tool, "-I", "INPUT", "1", "-j", CONNLIMIT_CHAIN])
+        if not _connlimit_rules_ok(tool, limit, mask):
+            _run([tool, "-F", CONNLIMIT_CHAIN])
+            # SYN rate first — shrinks parallel handshake races past connlimit.
+            _run([
+                tool, "-A", CONNLIMIT_CHAIN,
+                "-p", "tcp", "--dport", "443", "--syn",
+                "-m", "hashlimit",
+                f"--hashlimit-above={_SYN_HASHLIMIT}",
+                f"--hashlimit-burst={_SYN_HASHLIMIT_BURST}",
+                "--hashlimit-mode", "srcip",
+                f"--hashlimit-name={hl_name}",
+                "-j", "DROP",
+            ])
+            _run([
+                tool, "-A", CONNLIMIT_CHAIN,
+                "-p", "tcp", "--dport", "443",
+                "-m", "connlimit", f"--connlimit-above={limit}", f"--connlimit-mask={mask}",
+                "-j", "REJECT", "--reject-with", "tcp-reset",
+            ])
+        if not has_jump:
+            _run([tool, "-I", "INPUT", "1", "-j", CONNLIMIT_CHAIN])
+    if limit > 0:
+        _prune_excess_443(limit)
 
 
 def enforce_ip_limits(store: dict, online_by_client: dict[str, list[str]], ban_minutes: int = 30) -> list[dict]:
