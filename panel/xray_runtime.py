@@ -657,6 +657,103 @@ def balancer_member_tags(store: dict, balancer: dict, *, healthy_only: bool = Fa
     return [t for t in pool_list if outbound_member_ok(store, t)]
 
 
+def balancer_sticky_member(
+    store: dict, balancer: dict, *, known_outbounds: set[str] | None = None,
+) -> str:
+    """Pick one stable egress for apps that break when exit IP flips (Telegram).
+
+    Prefers last_test.ok with lowest RTT; falls back to first selector member.
+    Choice is fixed until the next apply_config — not on every observatory tick.
+    """
+    members = balancer_member_tags(store, balancer, healthy_only=False)
+    if known_outbounds is not None:
+        members = [m for m in members if m in known_outbounds]
+    if not members:
+        return ""
+    by_tag = {
+        str(o.get("tag") or ""): o
+        for o in (store.get("outbounds_custom") or [])
+        if o.get("tag")
+    }
+    scored: list[tuple[int, int, int, str]] = []
+    for idx, tag in enumerate(members):
+        lt = (by_tag.get(tag) or {}).get("last_test") or {}
+        if lt.get("ok") is False:
+            continue
+        try:
+            ms = int(lt.get("ms") or 999999)
+        except (TypeError, ValueError):
+            ms = 999999
+        # ok True → rank 0; missing probe → rank 1
+        rank = 0 if lt.get("ok") is True else 1
+        scored.append((rank, ms, idx, tag))
+    if scored:
+        scored.sort()
+        return scored[0][3]
+    return members[0]
+
+
+# Apps whose long-lived sessions break when balancer spreads TCP across exit IPs.
+_STICKY_BALANCER_DOMAINS = ["geosite:telegram"]
+_STICKY_BALANCER_IPS = ["geoip:telegram"]
+
+
+def _telegram_sticky_rules(
+    store: dict,
+    active_clients: list[dict],
+    *,
+    known_outbounds: set[str] | None = None,
+) -> list[dict]:
+    """Pin Telegram to one balancer member per user (before user→balancerTag rules)."""
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for c in active_clients:
+        pairs: list[tuple[str, str]] = []
+        try:
+            for e in subscription_entries(store, c):
+                pairs.append((str(e.get("email") or ""), str(e.get("tag") or "")))
+        except Exception:
+            pass
+        try:
+            ob = client_default_outbound(store, c)
+            if ob and ob != NONE_TAG:
+                pairs.append((str(c.get("email") or ""), str(ob)))
+        except Exception:
+            pass
+        for email, tag in pairs:
+            email = (email or "").strip()
+            tag = normalize_outbound_tag(tag)
+            if not email or not tag:
+                continue
+            bal = balancer_by_tag(store, tag) if _is_balancer_target(store, tag) else None
+            if not bal:
+                rt = _route_target(store, tag, known_outbounds=known_outbounds)
+                btag = str(rt.get("balancerTag") or "").strip()
+                bal = balancer_by_tag(store, btag) if btag else None
+            if not bal:
+                continue
+            sticky = balancer_sticky_member(store, bal, known_outbounds=known_outbounds)
+            if not sticky:
+                continue
+            key = (email, sticky)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "type": "field",
+                "user": [email],
+                "domain": list(_STICKY_BALANCER_DOMAINS),
+                "outboundTag": sticky,
+            })
+            out.append({
+                "type": "field",
+                "user": [email],
+                "ip": list(_STICKY_BALANCER_IPS),
+                "outboundTag": sticky,
+            })
+    return out
+
+
 # ---------------------------------------------------------------- outbounds
 
 def _custom_outbounds(store: dict) -> list[dict]:
@@ -2622,6 +2719,10 @@ def build_config(store: dict) -> dict:
     _routes = [r for r in _routes if _has_sel(r)] + [r for r in _routes if not _has_sel(r)]
     for r in _routes:
         rules.extend(_rule_from_route(store, r, known_outbounds=known_outbounds))
+    # Telegram (and similar) must not spread across balancer exit IPs — MTProto
+    # hangs/reconnects when sibling TCP connections leave via different nodes.
+    # Pin geosite/geoip:telegram to one sticky member before user→balancerTag.
+    rules.extend(_telegram_sticky_rules(store, active_clients, known_outbounds=known_outbounds))
     for c in active_clients:
         for e in subscription_entries(store, c):
             rules.append({
