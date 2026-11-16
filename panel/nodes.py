@@ -2729,16 +2729,18 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
             node["last_ok"] = False
             node["last_error"] = self_err
             return {"ok": False, "error": self_err}
-    # NAT egress nodes often still expose HTTPS for the panel agent (domain + token).
-    # Try a short live /agent/apply so Sync can refresh l2x-tunnel-agent immediately;
-    # fall back to pull-queue when the node is truly unreachable inbound.
-    if node.get("nat"):
+    # NAT / +Reverse (L2X) nodes: try a short live /agent/apply, then fall back to
+    # /agent/pull instead of hard sync err (Errno 110 timeout is common when the
+    # public IP flaps while the Go tunnel peer stays online).
+    pull_fallback = bool(node.get("nat") or node.get("rv_mode") or uses_l2x_tunnel(node))
+    if pull_fallback:
         can_try = bool((node.get("url") or domain) and str(node.get("token") or "").strip())
+        mode = "NAT" if node.get("nat") else ("Reverse" if node.get("rv_mode") else "L2X")
         if can_try:
             result = _push_once(node, payload, timeout=min(int(timeout or 60), 15))
             if result.get("ok"):
                 warns = list(result.get("warnings") or [])
-                warns.append("NAT: live push OK (tunnel_agent/apply)")
+                warns.append(f"{mode}: live push OK (tunnel_agent/apply)")
                 result = {**result, "warnings": warns, "queued": False, "nat_live_push": True}
                 node["last_sync"] = now_iso()
                 node["last_ok"] = True
@@ -2746,7 +2748,7 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
                 node["last_warning"] = "; ".join(str(w) for w in warns if w)[:600]
                 return result
             pull_warn = (
-                f"NAT live push fail ({str(result.get('error') or 'fail')[:120]}); "
+                f"{mode} live push fail ({str(result.get('error') or 'fail')[:120]}); "
                 "ждём /agent/pull (~20с)"
             )
             node["last_sync"] = now_iso()
