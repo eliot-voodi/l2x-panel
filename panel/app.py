@@ -1074,6 +1074,8 @@ def _allowed_outbounds(store: dict) -> set[str]:
 # ================================================================ background workers
 
 WATCHDOG_INTERVAL = int(os.environ.get("L2XPANEL_WATCHDOG_SEC", "20"))
+# ss-based :443 per-IP prune; conntrack/connlimit alone leaks under reconnect storms.
+CONN_PRUNE_INTERVAL = int(os.environ.get("L2XPANEL_CONN_PRUNE_SEC", "3"))
 _stop = threading.Event()
 ONLINE: dict[str, list[str]] = {}
 HISTORY = sysmon.History(DATA / "history.json")
@@ -1669,6 +1671,18 @@ def _watchdog_loop() -> None:
             pass
 
 
+def _conn_prune_loop() -> None:
+    """Every few seconds drop ESTAB :443 peers over max_conn_per_ip (see xray._prune_excess_443)."""
+    while not _stop.wait(max(1, CONN_PRUNE_INTERVAL)):
+        try:
+            store = _load_store()
+            limit = _int((store.get("settings") or {}).get("iplimit", {}).get("max_conn_per_ip"), 64)
+            if limit > 0:
+                xray._prune_excess_443(limit)
+        except Exception:
+            pass
+
+
 # ================================================================ Xray core update check
 
 XRAY_UPDATE_JOB: dict[str, str] = {}
@@ -2023,8 +2037,8 @@ def _startup():
         except Exception:
             pass
     threading.Thread(target=_bg_pihole_dns_port, name="pihole-dns-port", daemon=True).start()
-    for target in (_sync_xray_config, _watchdog_loop, _history_loop, _xray_update_loop, _panel_update_loop,
-                   _geo_update_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
+    for target in (_sync_xray_config, _watchdog_loop, _conn_prune_loop, _history_loop, _xray_update_loop,
+                   _panel_update_loop, _geo_update_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
                    _agent_pull_loop, _tg_backup_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()

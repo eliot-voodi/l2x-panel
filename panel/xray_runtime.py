@@ -3686,9 +3686,10 @@ def _ensure_iplimit_chain() -> None:
 
 CONNLIMIT_CHAIN = "L2X_CONNLIMIT"
 DEFAULT_MAX_CONN_PER_IP = 64
-# Parallel SYN storms race past connlimit; also rate-limit new handshakes per source IP.
-_SYN_HASHLIMIT = "25/sec"
-_SYN_HASHLIMIT_BURST = "50"
+# Conntrack often under-counts ESTAB on this host, so connlimit alone is leaky.
+# Keep SYN intake low; ss prune (watchdog / conn-prune loop) enforces the real cap.
+_SYN_HASHLIMIT = "5/sec"
+_SYN_HASHLIMIT_BURST = "40"
 
 
 def _connlimit_rules_ok(tool: str, limit: int, mask: str) -> bool:
@@ -3736,8 +3737,8 @@ def enforce_conn_limits(store: dict) -> None:
     except (TypeError, ValueError):
         limit = DEFAULT_MAX_CONN_PER_IP
     for tool, mask, hl_name in (
-        ("iptables", "32", "l2x443syn4"),
-        ("ip6tables", "128", "l2x443syn6"),
+        ("iptables", "32", "l2x443syn4c"),
+        ("ip6tables", "128", "l2x443syn6c"),
     ):
         if not shutil.which(tool):
             continue
