@@ -349,24 +349,44 @@ def demote_store_to_agent(store: dict) -> dict:
 
 
 def uses_l2x_tunnel(node: dict) -> bool:
-    """Egress via l2x-tunneld SOCKS (WSS agent), not Xray VLESS reverse."""
+    """Egress via l2x-tunneld SOCKS (WSS/UDP agent), not classic master→node bridge.
+
+    Sticky rules (important for +Reverse off):
+    - Explicit tunnel_mode=l2x_udp → L2X
+    - Explicit xray_reverse / bridge / off / direct → not L2X
+    - Empty mode + NAT → L2X
+    - Empty mode + tunnel-only Go agent (no panel token) → L2X
+    - Empty mode + reachable panel agent (has token, rv_mode off) → classic bridge
+      (do NOT re-stick from leftover tunnel_node_id — that trapped nodes after Reverse ✓ off)
+    """
     if not node.get("as_outbound") or not node.get("enabled", True):
         return False
     mode = str(node.get("tunnel_mode") or "").strip()
     if mode == "l2x_udp":
         return True
-    if mode == "xray_reverse":
+    if mode in ("xray_reverse", "bridge", "off", "direct"):
         return False
-    # Prefer reverse when reverse identity exists (do not steal am/root after promote).
+    # Prefer Xray reverse when reverse identity exists and mode was never set to L2X.
     if node.get("rv_uuid") or node.get("rv_mode"):
         node["tunnel_mode"] = "xray_reverse"
         return False
-    # Sticky: once a Go agent id is assigned, keep L2X even if mode was cleared.
-    if str(node.get("tunnel_node_id") or "").strip():
+    # Tunnel-only Go agent (no panel /agent token): keep L2X via agent id.
+    if str(node.get("tunnel_node_id") or "").strip() and not str(node.get("token") or "").strip():
         node["tunnel_mode"] = "l2x_udp"
         return True
-    # Default for NAT without reverse: l2x_udp
-    return bool(node.get("nat"))
+    if node.get("nat"):
+        node["tunnel_mode"] = "l2x_udp"
+        return True
+    return False
+
+
+def clear_l2x_tunnel_mode(node: dict) -> None:
+    """Leave L2X datapath: classic master→node bridge (reachable nodes after +Reverse off)."""
+    node["rv_mode"] = False
+    node["tunnel_mode"] = ""
+    node.pop("tunnel_peer_online", None)
+    node.pop("tunnel_transport", None)
+    # Keep tunnel_node_id so re-enabling Reverse reuses the same SOCKS user / HELLO id.
 
 
 def is_tunnel_only_node(node: dict) -> bool:
@@ -711,6 +731,20 @@ def ensure_tunnel_binaries(*, publish_agent: bool = True) -> dict:
         pass
     out["ok"] = True
     return out
+
+
+def stop_tunnel_agent_local() -> dict:
+    """Disable L2X tunnel-agent on this host (after +Reverse off / leave L2X)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["systemctl", "disable", "--now", "l2x-tunnel-agent"],
+            capture_output=True, timeout=30, check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    # Leave agent.yaml in place for easy re-enable; service must stay stopped.
+    return {"ok": True, "stopped": True}
 
 
 def apply_tunnel_agent_local(cfg: dict | None) -> dict:
@@ -1675,12 +1709,14 @@ def node_outbound_config(node: dict) -> dict:
         domain = urlparse(node.get("url") or "").hostname or ""
     return {
         "protocol": "vless",
+        # packetEncoding xudp: Discord/voice UDP over the WS bridge (without it UDP is dropped)
         "settings": {
             "vnext": [{
                 "address": domain,
                 "port": 443,
                 "users": [{"id": node["bridge_uuid"], "encryption": "none", "flow": ""}],
             }],
+            "packetEncoding": "xudp",
         },
         "streamSettings": {
             "network": "ws",
@@ -1774,15 +1810,13 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
     }
     if existing:
         keep = existing.get("last_test")
-        existing.pop("reverse", None)
+        existing.clear()
         existing.update(entry)
         # Keep a fresh successful probe; drop stale failures when flipping to Direct
         if uses_direct_connect(node):
             if isinstance(keep, dict) and keep.get("ok") is True:
                 existing["last_test"] = keep
-            else:
-                existing.pop("last_test", None)
-        elif keep:
+        elif isinstance(keep, dict) and keep.get("ok") is True:
             existing["last_test"] = keep
     else:
         customs.append(entry)
@@ -2190,6 +2224,11 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         tac = build_tunnel_agent_config(store, node)
         if tac:
             out["tunnel_agent"] = tac
+    else:
+        # Explicit null: agent must stop l2x-tunnel-agent (leave Reverse / leave L2X).
+        # Omit key would keep a stale agent dialing forever.
+        out["tunnel_mode"] = ""
+        out["tunnel_agent"] = None
     return out
 
 

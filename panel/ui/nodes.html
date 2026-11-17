@@ -220,14 +220,15 @@
             </form>
             {% endif %}
             {% if not n.nat %}
+            {% set l2x_on = n.rv_mode or (n.tunnel_mode == 'l2x_udp') %}
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/reverse"
-                  onsubmit="return confirm('{% if n.rv_mode %}Выключить reverse/L2X: мастер снова будет подключаться к ноде напрямую?{% else %}Включить +Reverse: L2X-туннель нода→мастер (как за NAT), с выбором профиля{% endif %}')">
-              <button class="btn ghost sm" title="Outbound через L2X-туннель (нода → мастер), как у нод за NAT" {% if job_running %}disabled{% endif %}>{% if n.rv_mode %}Reverse ✓{% else %}+ Reverse{% endif %}</button>
+                  onsubmit="return confirm('{% if l2x_on %}Выключить reverse/L2X: мастер снова dial на ноду (bridge). Discord/UDP снова через Xray.{% else %}Включить +Reverse: L2X-туннель нода→мастер. SOCKS сейчас TCP-only — Discord voice может не работать.{% endif %}')">
+              <button class="btn ghost sm" title="Outbound через L2X-туннель (нода → мастер), как у нод за NAT" {% if job_running %}disabled{% endif %}>{% if l2x_on %}Reverse ✓{% else %}+ Reverse{% endif %}</button>
             </form>
             {% endif %}
             {% if n.nat or n.rv_mode or n.tunnel_mode == 'l2x_udp' %}
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/tunnel-profile" class="flex" style="gap:.3rem;align-items:center"
-                  title="Способ L2X-туннеля: No DPI / DPI lite / UDP">
+                  title="Способ L2X-туннеля: No DPI / DPI lite / UDP (транспорт туннеля; user UDP/Discord — отдельно)">
               <select name="profile" style="padding:.2rem .35rem;font-size:.75rem;max-width:9.5rem"
                       onchange="this.form.submit()" {% if job_running %}disabled{% endif %}>
                 {% for pid, p in tunnel_profiles.items() %}
@@ -325,9 +326,10 @@
             </form>
             {% endif %}
             {% if not n.nat %}
+            {% set l2x_on_m = n.rv_mode or (n.tunnel_mode == 'l2x_udp') %}
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/reverse"
-                  onsubmit="return confirm('{% if n.rv_mode %}Выключить reverse/L2X?{% else %}Включить +Reverse (L2X нода → мастер)?{% endif %}')">
-              <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>{% if n.rv_mode %}Reverse ✓{% else %}+ Reverse{% endif %}</button>
+                  onsubmit="return confirm('{% if l2x_on_m %}Выключить reverse/L2X → bridge (Discord/UDP)?{% else %}Включить +Reverse (L2X)?{% endif %}')">
+              <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>{% if l2x_on_m %}Reverse ✓{% else %}+ Reverse{% endif %}</button>
             </form>
             {% endif %}
             {% if n.nat or n.rv_mode or n.tunnel_mode == 'l2x_udp' %}

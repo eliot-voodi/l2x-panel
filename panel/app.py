@@ -8079,10 +8079,16 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 if not nodes_mod.is_master(store):
                     flash(request, "Только мастер может менять режим outbound", "error")
                     return go("/nodes")
-                node["rv_mode"] = not node.get("rv_mode")
+                # Stuck state: rv_mode=false but tunnel_mode still l2x_udp (old sticky bug).
+                # Treat that as "on" so the next click leaves L2X instead of re-enabling.
+                was_on = bool(
+                    node.get("rv_mode")
+                    or (str(node.get("tunnel_mode") or "").strip() == "l2x_udp")
+                )
                 node.pop("rv_conns", None)
                 node.pop("reverse_ok", None)
-                if node["rv_mode"]:
+                if not was_on:
+                    node["rv_mode"] = True
                     node["as_outbound"] = True
                     node["direct_connect"] = False
                     # +Reverse → L2X agent tunnel (same profiles as NAT), not Xray reverse
@@ -8093,10 +8099,11 @@ async def nodes_action(node_id: str, action: str, request: Request):
                     nodes_mod.tunnel_agent_id(node)
                     nodes_mod.sync_tunneld_for_fleet(store)
                 else:
-                    node["tunnel_mode"] = ""
+                    # Leave L2X completely → classic master→node VLESS/WS bridge (UDP/Discord OK)
+                    nodes_mod.clear_l2x_tunnel_mode(node)
                     nodes_mod.ensure_bridge(node)
                     nodes_mod.sync_tunneld_for_fleet(store)
-                label = f"reverse/L2X {'вкл' if node['rv_mode'] else 'выкл'}"
+                label = f"reverse/L2X {'выкл' if was_on else 'вкл'}"
             elif action == "direct":
                 if node.get("nat") or node.get("rv_mode") or nodes_mod.uses_l2x_tunnel(node):
                     flash(request, "Direct connect только для публичной ноды (не NAT / не Reverse)", "error")
@@ -9126,9 +9133,13 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
                 ns.pop("reverse_bridge", None)
                 ns.pop("nat", None)
     tunnel_agent_res = None
-    if isinstance(payload.get("tunnel_agent"), dict):
+    if "tunnel_agent" in payload:
+        tac = payload.get("tunnel_agent")
         try:
-            tunnel_agent_res = nodes_mod.apply_tunnel_agent_local(payload.get("tunnel_agent"))
+            if tac is None:
+                tunnel_agent_res = nodes_mod.stop_tunnel_agent_local()
+            elif isinstance(tac, dict):
+                tunnel_agent_res = nodes_mod.apply_tunnel_agent_local(tac)
         except Exception as exc:  # noqa: BLE001
             tunnel_agent_res = {"ok": False, "error": str(exc)}
     res = _apply_xray(_load_store(), hold_front_commit=hold_front_commit)
