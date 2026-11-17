@@ -582,8 +582,8 @@
   <input type="hidden" name="section" value="iplimit">
   <label class="f">Блокировка лишних IP, минут</label><input name="ban_minutes" type="number" min="1" value="{{ s.iplimit.ban_minutes }}">
   <div class="hint">Если у клиента задан лимит IP, а онлайн больше адресов, самые новые IP блокируются iptables-цепочкой L2X_IPLIMIT на это время. Список, разбан и статистика — на странице <a href="{{ bp }}/bans">Баны IP</a> и в карточке клиента.</div>
-  <label class="f mt">Макс. TCP-соединений с одного IP на :443</label><input name="max_conn_per_ip" type="number" min="0" value="{{ s.iplimit.max_conn_per_ip if s.iplimit.max_conn_per_ip is defined else 64 }}">
-  <div class="hint">0 — выкл. Иначе iptables <code>connlimit</code> (цепочка L2X_CONNLIMIT): новые коннекты сверх лимита получают TCP RST. Режет мусорные ESTAB/flood без затрагивания активных сессий в пределах лимита.</div>
+  <label class="f mt">Макс. TCP-соединений с одного IP на :443</label><input name="max_conn_per_ip" type="number" min="0" value="{{ s.iplimit.max_conn_per_ip if s.iplimit.max_conn_per_ip is defined else 256 }}">
+  <div class="hint">0 — выкл. Иначе iptables <code>connlimit</code> + точечный prune лишних ESTAB. По умолчанию 256 — XHTTP/xmux держит много параллельных сокетов; слишком низкий лимит (например 64) ломает XHTTP. Flood по-прежнему режется RST сверх лимита.</div>
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 {% endif %}

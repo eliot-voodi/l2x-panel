@@ -3685,11 +3685,12 @@ def _ensure_iplimit_chain() -> None:
 
 
 CONNLIMIT_CHAIN = "L2X_CONNLIMIT"
-DEFAULT_MAX_CONN_PER_IP = 64
+# XHTTP/xmux opens many parallel :443 sockets; 64 was killing real clients.
+DEFAULT_MAX_CONN_PER_IP = 256
 # Conntrack often under-counts ESTAB on this host, so connlimit alone is leaky.
-# Keep SYN intake low; ss prune (watchdog / conn-prune loop) enforces the real cap.
-_SYN_HASHLIMIT = "5/sec"
-_SYN_HASHLIMIT_BURST = "40"
+# SYN rate must still allow XHTTP multi-conn bursts; ss prune enforces the real cap.
+_SYN_HASHLIMIT = "30/sec"
+_SYN_HASHLIMIT_BURST = "120"
 
 
 def _connlimit_rules_ok(tool: str, limit: int, mask: str) -> bool:
@@ -3701,15 +3702,22 @@ def _connlimit_rules_ok(tool: str, limit: int, mask: str) -> bool:
         return False
     if "hashlimit" not in out or "--syn" not in out:
         return False
+    # Detect stale low SYN caps from v1.9.177–179 (broke XHTTP handshake bursts).
+    if "hashlimit-above 5/sec" in out or "hashlimit-above=5/sec" in out:
+        return False
     return True
 
 
 def _prune_excess_443(limit: int) -> None:
-    """Kill ESTAB :443 sockets per peer IP when over limit (connlimit alone loses SYN races)."""
+    """Drop only ESTAB :443 sockets above the per-IP cap (never wipe the whole IP).
+
+    Previous ``ss -K dst <ip>`` killed *all* sockets once over limit — XHTTP/xmux
+    then looked completely dead every prune tick.
+    """
     if limit <= 0 or not shutil.which("ss"):
         return
-    from collections import Counter
-    counts: Counter[str] = Counter()
+    from collections import defaultdict
+    by_ip: dict[str, list[str]] = defaultdict(list)
     out = _run(["ss", "-H", "-tan"]).get("stdout") or ""
     for line in out.splitlines():
         parts = line.split()
@@ -3718,16 +3726,21 @@ def _prune_excess_443(limit: int) -> None:
         local, peer = parts[3], parts[4]
         if not local.endswith(":443"):
             continue
-        counts[peer.rsplit(":", 1)[0]] += 1
-    for host, n in counts.items():
-        if n > limit:
-            _run(["ss", "-K", "dst", host])
+        host = peer.rsplit(":", 1)[0]
+        by_ip[host].append(peer)
+    for host, peers in by_ip.items():
+        if len(peers) <= limit:
+            continue
+        # Keep the first ``limit`` peers; kill only the overflow (stable order).
+        peers.sort()
+        for peer in peers[limit:]:
+            _run(["ss", "-K", "dst", peer])
 
 
 def enforce_conn_limits(store: dict) -> None:
     """Cap concurrent TCP to :443 per source IP (iptables L2X_CONNLIMIT + ss prune).
 
-    settings.iplimit.max_conn_per_ip: 0 disables; default 64.
+    settings.iplimit.max_conn_per_ip: 0 disables; default 256 (XHTTP-friendly).
     Rules are updated only when missing/changed — never flushed every watchdog tick
     (a flush window lets SYN floods establish hundreds of ESTAB sockets).
     """

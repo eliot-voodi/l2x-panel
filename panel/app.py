@@ -164,8 +164,8 @@ def default_settings() -> dict:
             "allow_master_manage": False,
         },
         "panel_update": {"auto_check": True, "interval_hours": 12},
-        # max_conn_per_ip: iptables connlimit on :443 (0 = off). Cuts junk ESTAB floods per client IP.
-        "iplimit": {"ban_minutes": 30, "max_conn_per_ip": 64},
+        # max_conn_per_ip: iptables connlimit on :443 (0 = off). XHTTP/xmux needs hundreds of sockets.
+        "iplimit": {"ban_minutes": 30, "max_conn_per_ip": 256},
         "xray_update": {"auto_check": True, "interval_hours": 12, "include_prerelease": False},
         "pia": {
             "username": "", "password_enc": "", "token_enc": "", "token_expires_at": "",
@@ -210,6 +210,16 @@ def _ensure_settings(store: dict) -> dict:
         else:
             s.setdefault(k, v)
     s.pop("l2tp_auto", None)
+    # One-shot: old default 64 + nuclear ss -K broke XHTTP/xmux (many :443 sockets).
+    ipl = s.setdefault("iplimit", {})
+    if ipl.get("_xhttp_conn_cap") != 1:
+        try:
+            cur_cap = int(ipl.get("max_conn_per_ip") or 0)
+        except (TypeError, ValueError):
+            cur_cap = 0
+        if cur_cap == 64:
+            ipl["max_conn_per_ip"] = 256
+        ipl["_xhttp_conn_cap"] = 1
     masterdns_mod.ensure_settings(store)
     return s
 
@@ -1689,7 +1699,7 @@ def _conn_prune_loop() -> None:
     while not _stop.wait(max(1, CONN_PRUNE_INTERVAL)):
         try:
             store = _load_store()
-            limit = _int((store.get("settings") or {}).get("iplimit", {}).get("max_conn_per_ip"), 64)
+            limit = _int((store.get("settings") or {}).get("iplimit", {}).get("max_conn_per_ip"), 256)
             if limit > 0:
                 xray._prune_excess_443(limit)
         except Exception:
@@ -6363,7 +6373,8 @@ async def settings_save(request: Request):
             tg["backup_hours"] = _float(form.get("backup_hours"), float(tg.get("backup_hours") or 24))
         elif section == "iplimit":
             s["iplimit"]["ban_minutes"] = _int(form.get("ban_minutes"), 30)
-            s["iplimit"]["max_conn_per_ip"] = max(0, _int(form.get("max_conn_per_ip"), 64))
+            s["iplimit"]["max_conn_per_ip"] = max(0, _int(form.get("max_conn_per_ip"), 256))
+            s["iplimit"]["_xhttp_conn_cap"] = 1
             try:
                 xray.enforce_conn_limits(store)
             except Exception:
