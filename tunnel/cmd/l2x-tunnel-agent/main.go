@@ -73,9 +73,13 @@ func main() {
 		if wsURL == "" {
 			log.Fatal("transport=wss requires ws_url (wss://master/ws-…)")
 		}
-		log.Printf("l2x-tunnel-agent transport=wss url=%s cipher=%s", wsURL, cfg.Tunnel.Cipher)
+		links := cfg.WSSLinks
+		if links < 1 {
+			links = 4
+		}
+		log.Printf("l2x-tunnel-agent transport=wss url=%s cipher=%s links=%d", wsURL, cfg.Tunnel.Cipher, links)
 		go func() {
-			if err := eng.DialWS(ctx, wsURL); err != nil {
+			if err := eng.DialWS(ctx, wsURL, links); err != nil {
 				log.Printf("wss: %v", err)
 				cancel()
 			}

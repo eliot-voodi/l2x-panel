@@ -7,7 +7,9 @@ import (
 
 const (
 	HeaderSize = 12
-	MaxPayload = 1400
+	// MaxPayload is the max DATA frame body. WSS carries large frames; UDP path
+	// fragments to ~1200 in the engine before send.
+	MaxPayload = 32768
 )
 
 const (

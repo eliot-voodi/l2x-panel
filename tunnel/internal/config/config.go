@@ -41,6 +41,8 @@ type Config struct {
 	WSPath   string `yaml:"ws_path"`
 	// Agent: full wss://master/ws-… URL (HTTPS camouflage)
 	WSURL string `yaml:"ws_url"`
+	// Agent: parallel WSS links (default 4) for higher throughput
+	WSSLinks int `yaml:"wss_links"`
 	// Agent default dial target if OPEN payload empty (lab)
 	DefaultDial string `yaml:"default_dial"`
 }
@@ -62,6 +64,7 @@ func Defaults(role string) *Config {
 		Transport:   "wss",
 		WSListen:    "127.0.0.1:11081",
 		WSPath:      "/ws-l2x-tunnel",
+		WSSLinks:    4,
 		DefaultDial: "",
 	}
 	if role == "agent" {
@@ -92,6 +95,12 @@ func Load(path string, role string) (*Config, error) {
 	}
 	if c.Tunnel.PathCount > 16 {
 		c.Tunnel.PathCount = 16
+	}
+	if c.WSSLinks < 1 {
+		c.WSSLinks = 4
+	}
+	if c.WSSLinks > 4 {
+		c.WSSLinks = 4
 	}
 	if c.Tunnel.PSK == "" {
 		return nil, fmt.Errorf("tunnel.psk is required")

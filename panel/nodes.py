@@ -588,6 +588,7 @@ def render_agent_tunnel_yaml(cfg: dict) -> str:
     if transport in ("wss", "both"):
         ws = str(cfg.get("ws_url") or "").strip()
         lines.append(f"ws_url: {json.dumps(ws)}")
+        lines.append("wss_links: 4")
     lines.append("tunnel:")
     lines.append(f"  psk: {json.dumps(psk)}")
     lines.append(f"  token: {json.dumps(token)}")

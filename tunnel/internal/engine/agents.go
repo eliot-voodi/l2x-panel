@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -11,15 +12,27 @@ import (
 	"github.com/eliot-voodi/l2x-panel/tunnel/internal/crypto"
 )
 
-// agentLink is one connected tunnel-agent (WSS and/or UDP) on the portal.
-type agentLink struct {
-	id      string
-	ws      *websocket.Conn
-	udp     *net.UDPAddr
-	cipher  crypto.Cipher // nil → engine primary Cipher
+const maxAgentWS = 4
+
+// wsSlot is one WSS connection with its own write lock (parallel congestion windows).
+type wsSlot struct {
+	c       *websocket.Conn
 	writeMu sync.Mutex
-	online  bool
-	seen    time.Time
+}
+
+// agentLink is one connected tunnel-agent (WSS pool and/or UDP) on the portal.
+type agentLink struct {
+	id     string
+	ws     []*wsSlot
+	udp    *net.UDPAddr
+	cipher crypto.Cipher // nil → engine primary Cipher
+	rr     atomic.Uint32
+	online bool
+	seen   time.Time
+}
+
+func (a *agentLink) hasWS() bool {
+	return a != nil && len(a.ws) > 0
 }
 
 func (e *Engine) initAgents() {
@@ -52,23 +65,44 @@ func (e *Engine) SetAltCipher(c crypto.Cipher) {
 }
 
 func (e *Engine) registerAgent(nodeID string, c *websocket.Conn, ciph crypto.Cipher) {
+	if nodeID == "" || c == nil {
+		return
+	}
 	e.initAgents()
 	e.agentsMu.Lock()
-	old := e.agents[nodeID]
-	link := &agentLink{id: nodeID, ws: c, online: true, seen: time.Now(), cipher: ciph}
-	if old != nil {
-		link.udp = old.udp
-		if ciph == nil {
-			link.cipher = old.cipher
+	a := e.agents[nodeID]
+	if a == nil {
+		a = &agentLink{id: nodeID, online: true, seen: time.Now(), cipher: ciph}
+		e.agents[nodeID] = a
+	} else {
+		a.online = true
+		a.seen = time.Now()
+		if ciph != nil {
+			a.cipher = ciph
 		}
 	}
-	e.agents[nodeID] = link
+	for _, s := range a.ws {
+		if s != nil && s.c == c {
+			e.agentsMu.Unlock()
+			e.online.Store(true)
+			e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+			return
+		}
+	}
+	a.ws = append(a.ws, &wsSlot{c: c})
+	var drop []*wsSlot
+	for len(a.ws) > maxAgentWS {
+		drop = append(drop, a.ws[0])
+		a.ws = a.ws[1:]
+	}
 	e.agentsMu.Unlock()
+	for _, s := range drop {
+		if s != nil && s.c != nil {
+			_ = s.c.Close()
+		}
+	}
 	e.online.Store(true)
 	e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
-	if old != nil && old.ws != nil && old.ws != c {
-		_ = old.ws.Close()
-	}
 }
 
 func (e *Engine) registerAgentUDP(nodeID string, addr *net.UDPAddr, ciph crypto.Cipher) {
@@ -81,6 +115,7 @@ func (e *Engine) registerAgentUDP(nodeID string, addr *net.UDPAddr, ciph crypto.
 	link := &agentLink{id: nodeID, udp: addr, online: true, seen: time.Now(), cipher: ciph}
 	if old != nil {
 		link.ws = old.ws
+		link.rr.Store(old.rr.Load())
 		if ciph == nil {
 			link.cipher = old.cipher
 		}
@@ -108,13 +143,26 @@ func (e *Engine) unregisterAgentWS(c *websocket.Conn) {
 	e.agentsMu.Lock()
 	defer e.agentsMu.Unlock()
 	for id, a := range e.agents {
-		if a != nil && a.ws == c {
-			a.ws = nil
-			if a.udp == nil {
-				delete(e.agents, id)
-			} else {
-				a.online = true // UDP may still be live
+		if a == nil {
+			continue
+		}
+		kept := a.ws[:0]
+		found := false
+		for _, s := range a.ws {
+			if s != nil && s.c == c {
+				found = true
+				continue
 			}
+			kept = append(kept, s)
+		}
+		if !found {
+			continue
+		}
+		a.ws = kept
+		if len(a.ws) == 0 && a.udp == nil {
+			delete(e.agents, id)
+		} else {
+			a.online = true // remaining WSS and/or UDP may still be live
 		}
 	}
 	if len(e.agents) == 0 {
@@ -144,13 +192,23 @@ func (e *Engine) agentOnline(nodeID string) bool {
 	if a == nil || !a.online {
 		return false
 	}
-	if a.ws != nil {
+	if a.hasWS() {
 		return true
 	}
 	if a.udp != nil && time.Since(a.seen) < 45*time.Second {
 		return true
 	}
 	return false
+}
+
+func (e *Engine) agentHasUDP(nodeID string) bool {
+	if nodeID == "" {
+		return false
+	}
+	e.agentsMu.RLock()
+	a := e.agents[nodeID]
+	e.agentsMu.RUnlock()
+	return a != nil && a.udp != nil
 }
 
 func (e *Engine) AgentsStatus() map[string]bool {
@@ -163,7 +221,7 @@ func (e *Engine) AgentsStatus() map[string]bool {
 			out[id] = false
 			continue
 		}
-		if a.ws != nil {
+		if a.hasWS() {
 			out[id] = true
 			continue
 		}
@@ -184,7 +242,7 @@ func (e *Engine) cipherForAgent(agentID string) crypto.Cipher {
 	return e.Cipher
 }
 
-func (e *Engine) writeAgent(nodeID string, packet []byte) error {
+func (e *Engine) writeAgent(nodeID string, streamID uint32, packet []byte) error {
 	e.agentsMu.RLock()
 	a := e.agents[nodeID]
 	e.agentsMu.RUnlock()
@@ -202,15 +260,30 @@ func (e *Engine) writeAgent(nodeID string, packet []byte) error {
 			}
 		}
 	}
-	if a.ws != nil {
-		a.writeMu.Lock()
-		defer a.writeMu.Unlock()
-		_ = a.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
-		err := a.ws.WriteMessage(websocket.BinaryMessage, packet)
-		if err == nil {
-			e.Stats.PacketsOut.Add(1)
-		}
-		return err
+	if !a.hasWS() {
+		return errNoPeer
 	}
-	return errNoPeer
+	e.agentsMu.RLock()
+	slots := a.ws
+	n := len(slots)
+	e.agentsMu.RUnlock()
+	if n == 0 {
+		return errNoPeer
+	}
+	idx := int(streamID) % n
+	if streamID == 0 {
+		idx = int(a.rr.Add(1)-1) % n
+	}
+	slot := slots[idx]
+	if slot == nil || slot.c == nil {
+		return errNoPeer
+	}
+	slot.writeMu.Lock()
+	defer slot.writeMu.Unlock()
+	_ = slot.c.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	err := slot.c.WriteMessage(websocket.BinaryMessage, packet)
+	if err == nil {
+		e.Stats.PacketsOut.Add(1)
+	}
+	return err
 }

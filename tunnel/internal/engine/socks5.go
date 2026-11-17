@@ -181,6 +181,7 @@ func readSocksAddr(r io.Reader, atyp byte, buf []byte) (host string, port uint16
 }
 
 func (e *Engine) socksConnect(conn net.Conn, agentID, target string) {
+	tuneTCP(conn)
 	id := e.nextID.Add(1)
 	st := &stream{id: id, conn: conn, pathID: 0, agentID: agentID, ready: make(chan struct{})}
 	e.mu.Lock()

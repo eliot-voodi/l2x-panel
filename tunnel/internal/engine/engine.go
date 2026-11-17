@@ -62,10 +62,10 @@ type Engine struct {
 
 	onAgentHello func(addr *net.UDPAddr)
 
-	// Agent-side single WSS link (HTTPS camouflage).
-	wsMu      sync.RWMutex
-	wsWriteMu sync.Mutex
-	ws        wsConn
+	// Agent-side WSS pool (HTTPS camouflage; parallel links for throughput).
+	wsMu    sync.RWMutex
+	wsSlots []*wsSlot
+	wsRR    atomic.Uint32
 
 	// Portal: many agents keyed by node_id (WSS and/or UDP).
 	agentsMu sync.RWMutex
@@ -73,19 +73,17 @@ type Engine struct {
 	altMu    sync.RWMutex
 }
 
-// wsConn is satisfied by *websocket.Conn (binary messages).
-type wsConn interface {
-	WriteMessage(messageType int, data []byte) error
-	ReadMessage() (messageType int, p []byte, err error)
-	Close() error
-	SetReadDeadline(t time.Time) error
-	SetWriteDeadline(t time.Time) error
-}
+const (
+	dataChunkWSS = 32768
+	dataChunkUDP = 1200
+	tcpBufSize   = 4 << 20 // 4 MiB
+)
 
 func New(role string, ciph crypto.Cipher, p *pool.Pool, token, nodeID, defDial string, maxStreams int) *Engine {
 	if maxStreams <= 0 {
 		maxStreams = 4000
 	}
+	poolSize := proto.HeaderSize + proto.MaxPayload + 64
 	e := &Engine{
 		Role:     role,
 		Token:    token,
@@ -96,12 +94,63 @@ func New(role string, ciph crypto.Cipher, p *pool.Pool, token, nodeID, defDial s
 		MaxStr:   maxStreams,
 		streams:  make(map[uint32]*stream),
 		bufPool: sync.Pool{New: func() any {
-			b := make([]byte, 2048)
+			b := make([]byte, poolSize)
 			return &b
 		}},
 	}
 	e.nextID.Store(1)
 	return e
+}
+
+// tuneTCP applies NoDelay + larger buffers for bulk throughput.
+func tuneTCP(c net.Conn) {
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tc.SetNoDelay(true)
+	_ = tc.SetReadBuffer(tcpBufSize)
+	_ = tc.SetWriteBuffer(tcpBufSize)
+}
+
+// useUDPChunk is true when the tunnel datapath prefers UDP (MTU-safe frames).
+func (e *Engine) useUDPChunk(agentID string) bool {
+	if e.Role == "portal" {
+		return e.agentHasUDP(agentID)
+	}
+	peer := e.GetPeer()
+	return peer != nil && peer.IP != nil && !peer.IP.IsLoopback()
+}
+
+func (e *Engine) dataChunkSize(agentID string) int {
+	if e.useUDPChunk(agentID) {
+		return dataChunkUDP
+	}
+	return dataChunkWSS
+}
+
+// sendDATA fragments payload to path-appropriate DATA frames.
+func (e *Engine) sendDATA(st *stream, payload []byte) error {
+	if st == nil || len(payload) == 0 {
+		return nil
+	}
+	chunk := e.dataChunkSize(st.agentID)
+	if chunk < 1 {
+		chunk = dataChunkUDP
+	}
+	for len(payload) > 0 {
+		n := chunk
+		if n > len(payload) {
+			n = len(payload)
+		}
+		p := make([]byte, n)
+		copy(p, payload[:n])
+		if err := e.send(proto.Frame{Type: proto.TypeDATA, StreamID: st.id, Payload: p}, st.pathID); err != nil {
+			return err
+		}
+		payload = payload[n:]
+	}
+	return nil
 }
 
 func (e *Engine) SetPeer(addr *net.UDPAddr) {
@@ -326,10 +375,10 @@ func (e *Engine) sendForAgent(agentID string, fr proto.Frame, pathHint uint8) er
 		e.mu.RUnlock()
 	}
 	peer := e.GetPeer()
-	if peer == nil && e.Role == "agent" && e.getWS() == nil {
+	if peer == nil && e.Role == "agent" && !e.hasWS() {
 		return errNoPeer
 	}
-	if peer == nil && e.Role == "portal" && agentID == "" && e.getWS() == nil {
+	if peer == nil && e.Role == "portal" && agentID == "" && !e.hasWS() {
 		// allow if any agent online (control frames)
 		if len(e.AgentsStatus()) == 0 {
 			return errNoPeer
@@ -362,49 +411,77 @@ func (e *Engine) sendToAgent(addr *net.UDPAddr, agentID string, fr proto.Frame, 
 	if e.Role == "portal" && agentID != "" {
 		ciph = e.cipherForAgent(agentID)
 	}
-	raw := make([]byte, proto.HeaderSize+len(fr.Payload)+ciph.Overhead()+16)
+	need := proto.HeaderSize + len(fr.Payload) + ciph.Overhead()
+	bp := e.bufPool.Get().(*[]byte)
+	raw := *bp
+	if cap(raw) < need {
+		raw = make([]byte, need)
+	} else {
+		raw = raw[:need]
+	}
 	n, err := proto.Encode(raw, fr)
 	if err != nil {
+		*bp = raw
+		e.bufPool.Put(bp)
 		return err
 	}
-	hdr := raw[:proto.HeaderSize]
-	plain := raw[proto.HeaderSize:n]
+	var hdrCopy [proto.HeaderSize]byte
+	copy(hdrCopy[:], raw[:proto.HeaderSize])
+	plainLen := n - proto.HeaderSize
 	nonce := crypto.Nonce12(pathID, seq)
-	ct := ciph.Seal(nil, nonce, plain, hdr)
-	out := append(append([]byte{}, hdr...), ct...)
+	ct := ciph.Seal(nil, nonce, raw[proto.HeaderSize:n], hdrCopy[:])
+	outNeed := proto.HeaderSize + len(ct)
+	if cap(raw) < outNeed {
+		raw = make([]byte, outNeed)
+	} else {
+		raw = raw[:outNeed]
+	}
+	copy(raw[:proto.HeaderSize], hdrCopy[:])
+	copy(raw[proto.HeaderSize:], ct)
+	out := raw
+
+	put := func() {
+		*bp = raw
+		e.bufPool.Put(bp)
+	}
 
 	// Portal → specific agent (WSS or UDP)
 	if e.Role == "portal" && agentID != "" {
-		if err := e.writeAgent(agentID, out); err != nil {
-			return err
+		err = e.writeAgent(agentID, fr.StreamID, out)
+		if err == nil {
+			e.Stats.BytesOut.Add(uint64(plainLen))
 		}
-		e.Stats.BytesOut.Add(uint64(len(plain)))
-		return nil
+		put()
+		return err
 	}
-	// Agent (or legacy single-link portal) WSS
-	if e.getWS() != nil {
-		if err := e.writeWS(out); err != nil {
-			return err
+
+	// Prefer real UDP peer when available (profile=udp/both); else WSS pool.
+	useUDP := addr != nil && e.Pool != nil && e.useUDPChunk(agentID)
+	if useUDP {
+		path := e.Pool.ByID(pathID)
+		if path == nil {
+			path = e.Pool.Next()
 		}
-		e.Stats.BytesOut.Add(uint64(len(plain)))
-		return nil
+		if path != nil {
+			_, err = path.Conn.WriteToUDP(out, addr)
+			if err == nil {
+				e.Stats.PacketsOut.Add(1)
+				e.Stats.BytesOut.Add(uint64(plainLen))
+				put()
+				return nil
+			}
+		}
 	}
-	if e.Pool == nil || addr == nil {
-		return errNoPeer
+	if e.hasWS() {
+		err = e.writeWS(fr.StreamID, out)
+		if err == nil {
+			e.Stats.BytesOut.Add(uint64(plainLen))
+		}
+		put()
+		return err
 	}
-	path := e.Pool.ByID(pathID)
-	if path == nil {
-		path = e.Pool.Next()
-	}
-	if path == nil {
-		return errNoPeer
-	}
-	_, err = path.Conn.WriteToUDP(out, addr)
-	if err == nil {
-		e.Stats.PacketsOut.Add(1)
-		e.Stats.BytesOut.Add(uint64(len(plain)))
-	}
-	return err
+	put()
+	return errNoPeer
 }
 
 // SendCtrl sends a control frame to the current peer.
@@ -443,6 +520,9 @@ func (e *Engine) acceptOpen(fr proto.Frame) {
 		log.Printf("dial %s %s: %v", network, target, err)
 		e.closeStream(fr.StreamID, true)
 		return
+	}
+	if network == "tcp" {
+		tuneTCP(conn)
 	}
 	st.conn = conn
 	_ = e.send(proto.Frame{Type: proto.TypeOPENACK, StreamID: fr.StreamID}, 0)
@@ -522,13 +602,11 @@ func (e *Engine) closeStream(id uint32, notify bool) {
 }
 
 func (e *Engine) pipeConn(st *stream) {
-	buf := make([]byte, 1200)
+	buf := make([]byte, dataChunkWSS)
 	for {
 		n, err := st.conn.Read(buf)
 		if n > 0 {
-			payload := make([]byte, n)
-			copy(payload, buf[:n])
-			_ = e.send(proto.Frame{Type: proto.TypeDATA, StreamID: st.id, Payload: payload}, st.pathID)
+			_ = e.sendDATA(st, buf[:n])
 		}
 		if err != nil {
 			e.closeStream(st.id, true)
@@ -584,6 +662,7 @@ func (e *Engine) handleProxyConn(conn net.Conn, dialTarget string) {
 		_ = conn.Close()
 		return
 	}
+	tuneTCP(conn)
 	id := e.nextID.Add(1)
 	nPaths := len(e.Pool.Paths())
 	if nPaths < 1 {

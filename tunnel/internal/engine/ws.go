@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -22,44 +23,82 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-func (e *Engine) getWS() wsConn {
+func (e *Engine) hasWS() bool {
 	e.wsMu.RLock()
 	defer e.wsMu.RUnlock()
-	return e.ws
+	return len(e.wsSlots) > 0
 }
 
-func (e *Engine) setWS(c *websocket.Conn) {
+func (e *Engine) addWS(c *websocket.Conn) {
+	if c == nil {
+		return
+	}
 	e.wsMu.Lock()
-	old, _ := e.ws.(*websocket.Conn)
-	e.ws = c
+	for _, s := range e.wsSlots {
+		if s != nil && s.c == c {
+			e.wsMu.Unlock()
+			e.online.Store(true)
+			e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+			return
+		}
+	}
+	e.wsSlots = append(e.wsSlots, &wsSlot{c: c})
+	var drop []*wsSlot
+	for len(e.wsSlots) > maxAgentWS {
+		drop = append(drop, e.wsSlots[0])
+		e.wsSlots = e.wsSlots[1:]
+	}
 	e.wsMu.Unlock()
-	if old != nil && old != c {
-		_ = old.Close()
+	for _, s := range drop {
+		if s != nil && s.c != nil {
+			_ = s.c.Close()
+		}
 	}
-	if c != nil {
-		e.online.Store(true)
-		e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
-	}
+	e.online.Store(true)
+	e.SetPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
 }
 
 func (e *Engine) clearWS(c *websocket.Conn) {
 	e.wsMu.Lock()
-	cur, _ := e.ws.(*websocket.Conn)
-	if cur == c {
-		e.ws = nil
+	kept := e.wsSlots[:0]
+	for _, s := range e.wsSlots {
+		if s != nil && s.c == c {
+			continue
+		}
+		kept = append(kept, s)
 	}
+	e.wsSlots = kept
+	empty := len(e.wsSlots) == 0
 	e.wsMu.Unlock()
+	if empty {
+		// Keep online if UDP peer is real (non-loopback).
+		peer := e.GetPeer()
+		if peer == nil || peer.IP == nil || peer.IP.IsLoopback() {
+			e.online.Store(false)
+		}
+	}
 }
 
-func (e *Engine) writeWS(packet []byte) error {
-	c := e.getWS()
-	if c == nil {
+func (e *Engine) writeWS(streamID uint32, packet []byte) error {
+	e.wsMu.RLock()
+	slots := e.wsSlots
+	n := len(slots)
+	e.wsMu.RUnlock()
+	if n == 0 {
 		return errNoPeer
 	}
-	e.wsWriteMu.Lock()
-	defer e.wsWriteMu.Unlock()
-	_ = c.SetWriteDeadline(time.Now().Add(15 * time.Second))
-	err := c.WriteMessage(websocket.BinaryMessage, packet)
+	idx := int(streamID) % n
+	if streamID == 0 {
+		idx = int(e.wsRR.Add(1)-1) % n
+	}
+	slot := slots[idx]
+	if slot == nil || slot.c == nil {
+		return errNoPeer
+	}
+	slot.writeMu.Lock()
+	defer slot.writeMu.Unlock()
+	_ = slot.c.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	err := slot.c.WriteMessage(websocket.BinaryMessage, packet)
 	if err == nil {
 		e.Stats.PacketsOut.Add(1)
 	}
@@ -78,8 +117,8 @@ func (e *Engine) serveWSConn(c *websocket.Conn, remote string) {
 
 	agentID := ""
 	if e.Role == "agent" {
-		e.setWS(c)
-		log.Printf("wss link up %s", remote)
+		e.addWS(c)
+		log.Printf("wss link up %s slots=%d", remote, e.wsSlotCount())
 		payload := []byte(e.Token + "|" + e.NodeID)
 		if err := e.SendCtrl(proto.TypeHELLO, payload); err != nil {
 			log.Printf("wss hello send: %v", err)
@@ -107,6 +146,12 @@ func (e *Engine) serveWSConn(c *websocket.Conn, remote string) {
 		}
 		e.handleCipherPacket(data, nil)
 	}
+}
+
+func (e *Engine) wsSlotCount() int {
+	e.wsMu.RLock()
+	defer e.wsMu.RUnlock()
+	return len(e.wsSlots)
 }
 
 // tryRegisterFromPacket decrypts one packet; on HELLO registers the agent WS.
@@ -168,14 +213,43 @@ func (e *Engine) ServeWS(ctx context.Context, listen, path string) error {
 	return err
 }
 
-// DialWS keeps a persistent WSS session to master (browser-like WebSocket over TLS).
-func (e *Engine) DialWS(ctx context.Context, rawURL string) error {
+// DialWS keeps persistent WSS sessions to master (browser-like WebSocket over TLS).
+// links controls parallel connections (default 4, max 4) for higher throughput.
+func (e *Engine) DialWS(ctx context.Context, rawURL string, links int) error {
+	if links < 1 {
+		links = 4
+	}
+	if links > maxAgentWS {
+		links = maxAgentWS
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return err
 	}
+	_ = u
+
+	var wg sync.WaitGroup
+	for i := 0; i < links; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			e.dialWSLoop(ctx, rawURL, idx)
+		}(i)
+	}
+	wg.Wait()
+	return nil
+}
+
+func (e *Engine) dialWSLoop(ctx context.Context, rawURL string, idx int) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		log.Printf("wss[%d] url: %v", idx, err)
+		return
+	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
+		ReadBufferSize:   65536,
+		WriteBufferSize:  65536,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: u.Hostname(),
@@ -190,15 +264,15 @@ func (e *Engine) DialWS(ctx context.Context, rawURL string) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		default:
 		}
 		c, _, err := dialer.DialContext(ctx, rawURL, header)
 		if err != nil {
-			log.Printf("wss dial %s: %v (retry %s)", rawURL, err, backoff)
+			log.Printf("wss[%d] dial %s: %v (retry %s)", idx, rawURL, err, backoff)
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-time.After(backoff):
 			}
 			if backoff < 30*time.Second {
@@ -208,6 +282,6 @@ func (e *Engine) DialWS(ctx context.Context, rawURL string) error {
 		}
 		backoff = time.Second
 		e.serveWSConn(c, rawURL)
-		log.Printf("wss disconnected, reconnecting")
+		log.Printf("wss[%d] disconnected, reconnecting", idx)
 	}
 }
