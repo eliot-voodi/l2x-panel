@@ -32,6 +32,13 @@ type stream struct {
 	ready   chan struct{}
 	buf     [][]byte
 	bufMu   sync.Mutex
+
+	// Portal SOCKS UDP ASSOCIATE: DATA frames are relayed as datagrams (not TCP).
+	udpMode   bool
+	udpPC     net.PacketConn
+	udpClient net.Addr
+	udpHdr    []byte // ATYP+ADDR+PORT for SOCKS UDP replies
+	udpMu     sync.Mutex
 }
 
 type Engine struct {
@@ -414,8 +421,13 @@ func (e *Engine) acceptOpen(fr proto.Frame) {
 		_ = e.send(proto.Frame{Type: proto.TypeCLOSE, StreamID: fr.StreamID}, 0)
 		return
 	}
+	network := "tcp"
+	if len(target) >= 4 && target[:4] == "udp:" {
+		network = "udp"
+		target = target[4:]
+	}
 	// Register immediately so early DATA is buffered before dial completes.
-	st := &stream{id: fr.StreamID, pathID: 0, ready: make(chan struct{})}
+	st := &stream{id: fr.StreamID, pathID: 0, ready: make(chan struct{}), udpMode: network == "udp"}
 	e.mu.Lock()
 	if len(e.streams) >= e.MaxStr {
 		e.mu.Unlock()
@@ -426,9 +438,9 @@ func (e *Engine) acceptOpen(fr proto.Frame) {
 	e.mu.Unlock()
 	e.Stats.Streams.Add(1)
 
-	conn, err := net.DialTimeout("tcp", target, 8*time.Second)
+	conn, err := net.DialTimeout(network, target, 8*time.Second)
 	if err != nil {
-		log.Printf("dial %s: %v", target, err)
+		log.Printf("dial %s %s: %v", network, target, err)
 		e.closeStream(fr.StreamID, true)
 		return
 	}
@@ -441,7 +453,11 @@ func (e *Engine) acceptOpen(fr proto.Frame) {
 	for _, p := range pending {
 		_, _ = conn.Write(p)
 	}
-	go e.pipeConn(st)
+	if network == "udp" {
+		go e.pipeUDP(st)
+	} else {
+		go e.pipeConn(st)
+	}
 }
 
 func (e *Engine) onData(fr proto.Frame) {
@@ -449,6 +465,21 @@ func (e *Engine) onData(fr proto.Frame) {
 	st := e.streams[fr.StreamID]
 	e.mu.RUnlock()
 	if st == nil || st.closed.Load() {
+		return
+	}
+	// Portal UDP ASSOCIATE: wrap payload as SOCKS5 UDP reply to the client.
+	if st.udpMode && st.conn == nil && st.udpPC != nil {
+		st.udpMu.Lock()
+		pc, from, hdr := st.udpPC, st.udpClient, append([]byte(nil), st.udpHdr...)
+		st.udpMu.Unlock()
+		if pc == nil || from == nil || len(hdr) == 0 {
+			return
+		}
+		pkt := make([]byte, 3+len(hdr)+len(fr.Payload))
+		// RSV=0, FRAG=0
+		copy(pkt[3:], hdr)
+		copy(pkt[3+len(hdr):], fr.Payload)
+		_, _ = pc.WriteTo(pkt, from)
 		return
 	}
 	if st.conn == nil {
@@ -492,6 +523,23 @@ func (e *Engine) closeStream(id uint32, notify bool) {
 
 func (e *Engine) pipeConn(st *stream) {
 	buf := make([]byte, 1200)
+	for {
+		n, err := st.conn.Read(buf)
+		if n > 0 {
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+			_ = e.send(proto.Frame{Type: proto.TypeDATA, StreamID: st.id, Payload: payload}, st.pathID)
+		}
+		if err != nil {
+			e.closeStream(st.id, true)
+			return
+		}
+	}
+}
+
+// pipeUDP reads datagrams from a connected UDP socket and forwards each as one DATA frame.
+func (e *Engine) pipeUDP(st *stream) {
+	buf := make([]byte, 2048)
 	for {
 		n, err := st.conn.Read(buf)
 		if n > 0 {

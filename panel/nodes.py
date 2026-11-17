@@ -1192,7 +1192,11 @@ def refresh_tunnel_only_health(store: dict, nodes: list[dict] | None = None) -> 
 
 
 def tunnel_node_outbound_config(store: dict, node: dict) -> dict:
-    """Xray socks outbound → l2x-tunneld → agent freedom (SOCKS user = agent node_id)."""
+    """Xray socks outbound → l2x-tunneld → agent (TCP CONNECT + UDP ASSOCIATE).
+
+    SOCKS user = agent node_id. UDP (Discord voice, QUIC, etc.) works when
+    l2x-tunneld supports ASSOCIATE and agents dial ``udp:host:port`` streams.
+    """
     host, port = tunnel_socks_addr(store)
     aid = tunnel_agent_id(node)
     return {
