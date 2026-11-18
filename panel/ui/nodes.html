@@ -16,6 +16,54 @@
 {% endblock %}
 {% block head %}
 <style>
+  /* Compact desktop: one viewport row, no horizontal scroll */
+  .nodes-desk.table-wrap { overflow: visible }
+  .nodes-desk table { table-layout: fixed; width: 100% }
+  .nodes-desk th, .nodes-desk td { padding: .4rem .45rem; vertical-align: top; font-size: .82rem }
+  .nodes-desk th:nth-child(1), .nodes-desk td:nth-child(1) { width: 9.5rem }
+  .nodes-desk th:nth-child(2), .nodes-desk td:nth-child(2) { width: 11rem }
+  .nodes-desk th:nth-child(3), .nodes-desk td:nth-child(3) { width: 7.5rem }
+  .nodes-desk th:nth-child(4), .nodes-desk td:nth-child(4) { width: 11rem }
+  .nodes-desk th:nth-child(5), .nodes-desk td:nth-child(5) { width: 4.5rem }
+  .nodes-desk th:nth-child(6), .nodes-desk td:nth-child(6) { width: 5.5rem }
+  .nodes-desk th:nth-child(7), .nodes-desk td:nth-child(7) { width: 7rem }
+  .nodes-desk .badge { font-size: .68rem; padding: .1rem .35rem; margin: 0 .1rem .15rem 0; display: inline-block }
+  .nodes-desk .nd-tags { display: flex; flex-wrap: wrap; gap: .15rem; max-height: 2.6rem; overflow: hidden }
+  .nodes-desk .nd-sync-msg {
+    display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: .68rem; margin-top: .15rem;
+  }
+  .nodes-desk .nd-acts {
+    display: flex; flex-wrap: nowrap; gap: .25rem; align-items: center; justify-content: flex-end;
+    max-width: 100%;
+  }
+  .nodes-desk .nd-acts .btn.sm { padding: .18rem .4rem; font-size: .7rem }
+  .nodes-desk .nd-acts select {
+    padding: .15rem .25rem; font-size: .68rem; max-width: 7.2rem;
+  }
+  .nodes-desk .nd-more { position: relative; flex-shrink: 0 }
+  .nodes-desk .nd-more > summary {
+    list-style: none; cursor: pointer; user-select: none;
+    padding: .18rem .45rem; font-size: .7rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--muted);
+  }
+  .nodes-desk .nd-more > summary::-webkit-details-marker { display: none }
+  .nodes-desk .nd-more[open] > summary { color: var(--accent); border-color: var(--accent) }
+  .nodes-desk .nd-more-panel {
+    position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
+    min-width: 16rem; max-width: min(22rem, 70vw);
+    padding: .55rem; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--surface); box-shadow: var(--shadow);
+    display: flex; flex-wrap: wrap; gap: .3rem; align-items: center;
+  }
+  .nodes-desk .nd-more-panel .btn.sm { padding: .2rem .45rem; font-size: .72rem }
+  .nodes-desk .nd-more-panel input[type=password],
+  .nodes-desk .nd-more-panel input[type=text] {
+    width: 7rem; padding: .2rem .35rem; font-size: .72rem;
+  }
+  .nodes-desk .nd-title-form input { width: 100%; max-width: 8.5rem; padding: .15rem .3rem; font-size: .7rem }
+  .nodes-desk td .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block }
+  .nodes-help summary, .nodes-uq summary { cursor: pointer; font-weight: 650 }
   .nodes-mobile { display: none }
   @media (max-width: 860px) {
     .nodes-desktop { display: none }
@@ -56,9 +104,9 @@
 </style>
 {% endblock %}
 {% block content %}
-<div class="card">
-  <h3>Как это работает</h3>
-  <div class="hint">
+<details class="card nodes-help">
+  <summary>Как это работает</summary>
+  <div class="hint mt">
     <b>Мастер</b> ставит ноду по SSH (domain + login + pass, порт любой).
     <b>Обычная нода</b>: открыт :443, мастер пушит конфиг, Outbound = VLESS/WS bridge на ноде.
     <b>Нода за NAT</b>: входящих портов нет (SSH достаточно). Нода сама тянет конфиг с мастера; egress —
@@ -74,34 +122,37 @@
     <button class="btn danger">Восстановить MASTER на этой панели</button>
   </form>
   {% endif %}
-</div>
+</details>
 
 {% include "_jobs.html" %}
 
 {% if is_master %}
 {% set uq = update_queue if update_queue is defined else {} %}
-<div class="card">
-  <div class="card-head">
-    <h3>Очередь обновления нод</h3>
+<details class="card nodes-uq" {% if uq.current or uq.pending %}open{% endif %}>
+  <summary>
+    Очередь обновления
+    {% if uq.current %}<span class="badge ok">{{ uq.current.name }}</span>
+    {% elif uq.pending %}<span class="badge warn">{{ uq.pending|length }}</span>
+    {% else %}<span class="dim small">пусто</span>{% endif %}
+  </summary>
+  <div class="card-head mt" style="border:0;padding:0">
+    <div class="hint" style="margin:0">Панель на нодах обновляется <b>строго по одной</b>.</div>
     <div class="actions">
       {% if uq.pending %}
       <form method="post" action="{{ bp }}/nodes/update-queue/clear"
             onsubmit="return confirm('Очистить ожидающие в очереди? Текущее обновление продолжится.')">
-        <button class="btn ghost sm">Очистить очередь</button>
+        <button class="btn ghost sm">Очистить</button>
       </form>
       {% endif %}
       <a class="btn ghost sm" href="{{ bp }}/nodes">{{ ic.icon('refresh') }}</a>
     </div>
   </div>
-  <div class="hint">Панель на нодах обновляется <b>строго по одной</b> (fast update + авто-откат на ноде). Параллельный апдейт запрещён, чтобы кластер не «лёг» разом.</div>
   {% if uq.current %}
-  <div class="mt" style="padding:.65rem .85rem;border:1px solid var(--accent);border-radius:10px;background:var(--accent-soft)">
+  <div class="mt" style="padding:.5rem .75rem;border:1px solid var(--accent);border-radius:10px;background:var(--accent-soft)">
     <b>Сейчас:</b> <span class="mono">{{ uq.current.name }}</span>
     <span class="badge ok">{{ uq.current.status or 'running' }}</span>
     <span class="dim small">{{ uq.current.via }} · с {{ fmt_dt(uq.current.started_at) if uq.current.started_at else '—' }}</span>
   </div>
-  {% else %}
-  <div class="hint mt">Сейчас никто не обновляется.</div>
   {% endif %}
   {% if uq.pending %}
   <table class="mt"><thead><tr><th>#</th><th>Нода</th><th>Через</th><th>В очереди</th></tr></thead>
@@ -118,7 +169,7 @@
   </table>
   {% endif %}
   {% if uq.history %}
-  <details class="mt"><summary class="small" style="cursor:pointer">Недавние результаты ({{ uq.history|length }})</summary>
+  <details class="mt"><summary class="small" style="cursor:pointer">Недавние ({{ uq.history|length }})</summary>
     <table class="mt"><thead><tr><th>Нода</th><th>Результат</th><th>Версия</th><th>Когда</th></tr></thead>
       <tbody>
       {% for h in uq.history|reverse %}
@@ -133,57 +184,76 @@
     </table>
   </details>
   {% endif %}
-</div>
+</details>
 
 <div class="card" style="padding:0">
   {# —— Desktop —— #}
-  <div class="table-wrap nodes-desktop">
+  <div class="table-wrap nodes-desktop nodes-desk">
   <table>
     <thead><tr>
-      <th>Нода</th><th>Domain / URL</th><th>Версия</th><th>Outbound</th><th>Зеркало</th><th>Статус</th><th>Sync / расписание</th><th class="right">{{ t('Действия') }}</th>
+      <th>Нода</th><th>Domain</th><th>Версия</th><th>Outbound</th><th>Зерк.</th><th>Статус</th><th>Sync</th><th class="right">{{ t('Действия') }}</th>
     </tr></thead>
     <tbody>
     {% for n in items %}
+      {% set l2x_on = n.rv_mode or (n.tunnel_mode == 'l2x_udp') %}
       <tr>
         <td>
-          <b>{{ n.name }}</b><div class="dim small mono">{{ n.id[:8] }}</div>
-          <form method="post" action="{{ bp }}/nodes/{{ n.id }}/user_title" class="mt" style="margin-top:.35rem"
-                title="Имя в подписке / отдельном коннекте у клиента">
-            <label class="f" style="font-size:.7rem;margin:0">Название у пользователя</label>
-            <div class="flex" style="gap:.3rem;align-items:center">
-              <input name="user_title" value="{{ n.user_title or '' }}" placeholder="{{ n.name }}"
-                     style="padding:.2rem .35rem;font-size:.75rem;min-width:8rem;flex:1">
-              <button class="btn ghost sm" style="padding:.2rem .4rem;font-size:.7rem">OK</button>
+          <b>{{ n.name }}</b>
+          <div class="dim small mono">{{ n.id[:8] }}</div>
+          <form method="post" action="{{ bp }}/nodes/{{ n.id }}/user_title" class="nd-title-form mt"
+                title="Имя в подписке у клиента">
+            <div class="flex" style="gap:.25rem;align-items:center;margin-top:.25rem">
+              <input name="user_title" value="{{ n.user_title or '' }}" placeholder="{{ n.name }}">
+              <button class="btn ghost sm" style="padding:.15rem .35rem;font-size:.68rem">OK</button>
             </div>
           </form>
         </td>
-        <td class="small mono">{{ n.domain or n.url }}{% if n.base_path %}<div class="dim">/{{ n.base_path }}/</div>{% endif %}</td>
-        <td class="small mono">
-          {% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn" title="мастер {{ master_version }}"{% endif %}>{{ n.panel_version }}</span>{% else %}<span class="dim">?</span>{% endif %}
-          {% if n.update_queue_status == 'running' %}<div class="badge ok">обновляется</div>
-          {% elif n.update_queue_status == 'queued' %}<div class="badge warn">в очереди</div>
-          {% elif n.update_queue_status == 'failed' %}<div class="badge err">update fail</div>{% endif %}
-          <div class="dim" title="Xray{% if master_xray %} · мастер {{ master_xray }}{% endif %}">xray {% if n.xray_version %}<span {% if n.xray_available %}class="badge warn"{% elif master_xray and n.xray_version != master_xray %}class="badge warn"{% endif %}>{{ n.xray_version }}</span>{% else %}?{% endif %}{% if n.xray_available and n.xray_latest %} → {{ n.xray_latest }}{% endif %}</div>
-          {% if n.last_update %}<div class="dim">{{ fmt_dt(n.last_update) }}</div>{% endif %}
+        <td class="small">
+          <span class="mono" title="{{ n.domain or n.url }}">{{ n.domain or n.url }}</span>
+          {% if n.base_path %}<div class="dim mono">/{{ n.base_path }}/</div>{% endif %}
         </td>
-        <td>{% if n.as_outbound %}<span class="badge ok">node_{{ n.name }}</span>{% if n.direct_connect %} <span class="badge ok" title="Клиенты подключаются к ноде напрямую">Direct</span>{% endif %}{% if n.tunnel_mode == 'l2x_udp' %} <span class="badge ok" title="Egress через l2x-tunneld">L2X</span>{% if n.tunnel_profile == 'dpi_lite' %} <span class="badge" title="WSS без ChaCha">DPI-lite</span>{% elif n.tunnel_profile == 'udp' %} <span class="badge warn" title="UDP :4443">UDP</span>{% elif n.tunnel_profile == 'no_dpi' or not n.tunnel_profile %} <span class="badge" title="WSS+ChaCha">NoDPI</span>{% endif %}{% if n.tunnel_peer_online == true %} <span class="badge ok" title="l2x-tunneld peer online">peer</span>{% elif n.tunnel_peer_online == false %} <span class="badge err" title="l2x-tunneld peer offline — egress/outbound не работает">peer↓</span>{% endif %}{% endif %}{% if n.tunnel_mode == 'l2x_udp' and not n.token %} <span class="badge" title="Go tunnel-agent">agent</span>{% elif n.nat %} <span class="badge" title="Нода за NAT">NAT</span>{% elif n.rv_mode and n.tunnel_mode == 'xray_reverse' %} <span class="badge {% if (n.rv_conns or 0) > 0 %}ok{% else %}warn{% endif %}" title="Xray reverse">reverse</span>{% elif n.rv_mode %} <span class="badge">rv</span>{% endif %}{% else %}<span class="dim">—</span>{% endif %}</td>
-        <td>{% if n.mirror %}<span class="badge ok" title="Полная копия мастера для быстрого failover">standby</span>{% elif n.nat %}<span class="dim" title="Зеркало недоступно за NAT">—</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+        <td class="small">
+          {% if n.panel_version %}<span class="badge {% if master_version and n.panel_version != master_version %}warn{% endif %}" title="мастер {{ master_version or '—' }}">{{ n.panel_version }}</span>{% else %}<span class="dim">?</span>{% endif %}
+          {% if n.update_queue_status == 'running' %}<span class="badge ok">upd…</span>
+          {% elif n.update_queue_status == 'queued' %}<span class="badge warn">очередь</span>
+          {% elif n.update_queue_status == 'failed' %}<span class="badge err" title="update fail">upd!</span>{% endif %}
+          <div class="dim" title="Xray{% if master_xray %} · мастер {{ master_xray }}{% endif %}">x {{ n.xray_version or '?' }}</div>
+        </td>
+        <td>
+          {% if n.as_outbound %}
+          <div class="nd-tags">
+            <span class="badge ok">node_{{ n.name }}</span>
+            {% if n.direct_connect %}<span class="badge ok" title="Клиенты → нода напрямую">Direct</span>{% endif %}
+            {% if n.tunnel_mode == 'l2x_udp' %}
+              <span class="badge ok" title="Egress через l2x-tunneld">L2X</span>
+              {% if n.tunnel_profile == 'dpi_lite' %}<span class="badge" title="WSS без ChaCha">DPI-lite</span>
+              {% elif n.tunnel_profile == 'udp' %}<span class="badge warn" title="UDP :4443">UDP</span>
+              {% else %}<span class="badge" title="WSS+ChaCha">NoDPI</span>{% endif %}
+              {% if n.tunnel_peer_online == true %}<span class="badge ok" title="peer online">peer</span>
+              {% elif n.tunnel_peer_online == false %}<span class="badge err" title="peer offline">peer↓</span>{% endif %}
+            {% endif %}
+            {% if n.tunnel_mode == 'l2x_udp' and not n.token %}<span class="badge" title="Go tunnel-agent">agent</span>
+            {% elif n.nat %}<span class="badge" title="NAT">NAT</span>
+            {% elif n.rv_mode %}<span class="badge">rv</span>{% endif %}
+          </div>
+          {% else %}<span class="dim">—</span>{% endif %}
+        </td>
+        <td>{% if n.mirror %}<span class="badge ok" title="standby failover">✓</span>{% else %}<span class="dim">—</span>{% endif %}</td>
         <td>
           {% if not n.enabled %}<span class="badge">выкл</span>
           {% elif n.online == true %}<span class="badge ok" title="{{ n.last_seen or '' }}">online</span>
-          {% elif n.online == false %}<span class="badge err" title="{{ n.last_probe_error or '' }}">offline</span>
+          {% elif n.online == false %}<span class="badge err" title="{{ n.last_probe_error or '' }}">off</span>
           {% else %}<span class="badge">?</span>{% endif %}
-          {% if n.enabled and n.last_ok and n.last_warning %}<div class="badge warn" title="{{ n.last_warning }}">warn</div>
-          {% elif n.enabled and n.last_ok %}<div class="badge ok">sync ok</div>
-          {% elif n.enabled and n.last_error %}<div class="badge err" title="{{ n.last_error }}">sync err</div>{% endif %}
+          {% if n.enabled and n.last_ok and n.last_warning %}<span class="badge warn" title="{{ n.last_warning }}">warn</span>
+          {% elif n.enabled and n.last_ok %}<span class="badge ok" title="sync ok">ok</span>
+          {% elif n.enabled and n.last_error %}<span class="badge err" title="{{ n.last_error }}">err</span>{% endif %}
         </td>
         <td class="small">
-          <div class="dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}никогда{% endif %}</div>
-          {% if n.last_error %}<div class="badge err" title="{{ n.last_error }}">{{ n.last_error[:80] }}</div>{% endif %}
-          {% if n.last_warning %}<div class="badge warn" title="{{ n.last_warning }}">{{ n.last_warning[:80] }}</div>{% endif %}
-          <form method="post" action="{{ bp }}/nodes/{{ n.id }}/schedule" class="flex" style="gap:.3rem;margin-top:.35rem;align-items:center"
-                title="Автоматический sync по расписанию">
-            <select name="sync_interval_min" style="padding:.2rem .35rem;font-size:.75rem;max-width:7.5rem"
+          <div class="dim">{% if n.last_sync %}{{ fmt_dt(n.last_sync) }}{% else %}—{% endif %}</div>
+          {% if n.last_warning %}<span class="badge warn nd-sync-msg" title="{{ n.last_warning }}">pull queue</span>
+          {% elif n.last_error %}<span class="badge err nd-sync-msg" title="{{ n.last_error }}">sync err</span>{% endif %}
+          <form method="post" action="{{ bp }}/nodes/{{ n.id }}/schedule" title="Авто-sync">
+            <select name="sync_interval_min" style="padding:.15rem .25rem;font-size:.68rem;max-width:6.5rem;margin-top:.2rem"
                     onchange="this.form.submit()">
               {% for mins, label in sync_intervals %}
               <option value="{{ mins }}" {% if (n.sync_interval_min or 0)|int == mins %}selected{% endif %}>{{ label }}</option>
@@ -192,68 +262,67 @@
           </form>
         </td>
         <td>
-          <div class="actions" style="justify-content:flex-end;flex-wrap:wrap">
+          <div class="nd-acts">
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/sync"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Sync</button></form>
-            <a class="btn ghost sm" href="{{ bp }}/settings-node?id={{ n.id }}&tab=system" title="iperf3: замер скорости master ↔ нода">iperf{% if n.iperf3_last and n.iperf3_last.down_mbps is not none %} {{ n.iperf3_last.down_mbps }}↓{% endif %}</a>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-check"><button class="btn ghost sm" title="Проверить версию Xray на ноде">Xray?</button></form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-update"
-                  onsubmit="return confirm('Обновить Xray на {{ n.name }} до latest?\n{% if n.nat %}NAT: очередь agent pull ≤20 с{% else %}Ядро перезапустится, при ошибке — откат{% endif %}')">
-              <button class="btn ghost sm" title="Обновить Xray-core на ноде" {% if job_running %}disabled{% endif %}>Xray↑</button>
-            </form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/mirror"><button class="btn ghost sm" title="Полная копия мастера (standby)" {% if job_running %}disabled{% endif %}>{% if n.mirror %}Зеркало ✓{% else %}+ Зеркало{% endif %}</button></form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.3rem"
-                  title="В очередь (по одной). {% if n.nat %}NAT: agent pull{% else %}Без пароля — agent; с паролем — SSH{% endif %}"
-                  onsubmit="return confirm('Поставить {{ n.name }} в очередь обновления панели?\nНоды обновляются строго по одной.')">
-              {% if not n.nat %}
-              <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password"
-                     style="width:6.5rem;padding:.25rem .4rem;font-size:.75rem">
-              {% endif %}
-              <button class="btn sm" {% if n.update_queue_status == 'running' or n.update_queue_status == 'queued' %}disabled{% endif %}>
-                {% if n.update_queue_status == 'running' %}⏳{% elif n.update_queue_status == 'queued' %}…{% else %}{{ t('Обновить') }}{% endif %}
-              </button>
-            </form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm" title="Использовать как outbound">{% if n.as_outbound %}Outbound ✓{% else %}+ Outbound{% endif %}</button></form>
-            {% if not n.nat and not n.rv_mode and n.tunnel_mode != 'l2x_udp' %}
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/direct"
-                  onsubmit="return confirm('{% if n.direct_connect %}Выключить Direct: клиенты снова пойдут через мастер (маскарад)?{% else %}Включить Direct: клиенты подключаются сразу к ноде; учёт трафика и маршруты остаются на мастере (через агента){% endif %}')">
-              <button class="btn ghost sm" title="Клиенты → нода напрямую (не через мастер). Трафик/квоты/маршруты — на мастере" {% if job_running %}disabled{% endif %}>{% if n.direct_connect %}Direct ✓{% else %}+ Direct{% endif %}</button>
-            </form>
-            {% endif %}
             {% if not n.nat %}
-            {% set l2x_on = n.rv_mode or (n.tunnel_mode == 'l2x_udp') %}
             <form method="post" action="{{ bp }}/nodes/{{ n.id }}/reverse"
-                  onsubmit="return confirm('{% if l2x_on %}Выключить reverse/L2X: мастер снова dial на ноду (bridge). Discord/UDP снова через Xray.{% else %}Включить +Reverse: L2X-туннель нода→мастер. SOCKS сейчас TCP-only — Discord voice может не работать.{% endif %}')">
-              <button class="btn ghost sm" title="Outbound через L2X-туннель (нода → мастер), как у нод за NAT" {% if job_running %}disabled{% endif %}>{% if l2x_on %}Reverse ✓{% else %}+ Reverse{% endif %}</button>
+                  onsubmit="return confirm('{% if l2x_on %}Выключить reverse/L2X → bridge?{% else %}Включить +Reverse (L2X)?{% endif %}')">
+              <button class="btn ghost sm" title="L2X reverse" {% if job_running %}disabled{% endif %}>{% if l2x_on %}Rev✓{% else %}+Rev{% endif %}</button>
             </form>
             {% endif %}
             {% if n.nat or n.rv_mode or n.tunnel_mode == 'l2x_udp' %}
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/tunnel-profile" class="flex" style="gap:.3rem;align-items:center"
-                  title="Способ L2X-туннеля: No DPI / DPI lite / UDP (транспорт туннеля; user UDP/Discord — отдельно)">
-              <select name="profile" style="padding:.2rem .35rem;font-size:.75rem;max-width:9.5rem"
-                      onchange="this.form.submit()" {% if job_running %}disabled{% endif %}>
+            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/tunnel-profile" class="flex" style="gap:.2rem;align-items:center"
+                  title="Профиль L2X-туннеля">
+              <select name="profile" onchange="this.form.submit()" {% if job_running %}disabled{% endif %}>
                 {% for pid, p in tunnel_profiles.items() %}
-                <option value="{{ pid }}" {% if (n.tunnel_profile or 'no_dpi') == pid %}selected{% endif %} title="{{ p.hint }}">{{ p.label }}</option>
+                <option value="{{ pid }}" {% if (n.tunnel_profile or 'no_dpi') == pid %}selected{% endif %}>{{ p.label }}</option>
                 {% endfor %}
               </select>
               {% if n.tunnel_mode == 'l2x_udp' and not n.token %}
               <input type="password" name="password" placeholder="SSH" autocomplete="new-password"
-                     style="width:5.5rem;padding:.25rem .4rem;font-size:.75rem" title="Для tunnel-only агента нужен SSH">
+                     style="width:4.5rem;padding:.15rem .25rem;font-size:.68rem" title="tunnel-only: нужен SSH">
               {% endif %}
             </form>
             {% endif %}
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/token" class="flex" style="gap:.3rem"
-                  title="Обновить agent token ноды (пустое = не менять)">
-              <input type="password" name="token" placeholder="{% if n.token %}••••{{ n.token[-4:] }}{% else %}token{% endif %}"
-                     class="mono" style="width:16rem;padding:.25rem .4rem;font-size:.7rem" autocomplete="new-password">
-              <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Token</button>
-            </form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/promote" class="flex" style="gap:.3rem"
-                  onsubmit="return confirm('Передать роль MASTER ноде {{ n.name }}?\nЭта панель станет агентом.{% if n.mirror %}\nЗеркало: данные уже на ноде — SSH не обязателен.{% endif %}')">
-              <input type="password" name="password" placeholder="{% if n.mirror %}SSH (опц.){% else %}SSH pass{% endif %}" {% if not n.mirror %}required{% endif %} style="width:7rem;padding:.25rem .4rem;font-size:.75rem" autocomplete="new-password">
-              <button class="btn sm" {% if job_running %}disabled{% endif %}>→ Master</button>
-            </form>
-            <form method="post" action="{{ bp }}/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду?')"><button class="btn danger icon">{{ ic.icon('trash') }}</button></form>
+            <details class="nd-more">
+              <summary>Ещё</summary>
+              <div class="nd-more-panel">
+                <a class="btn ghost sm" href="{{ bp }}/settings-node?id={{ n.id }}&tab=system" title="iperf3">iperf{% if n.iperf3_last and n.iperf3_last.down_mbps is not none %} {{ n.iperf3_last.down_mbps }}↓{% endif %}</a>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-check"><button class="btn ghost sm">Xray?</button></form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/xray-update"
+                      onsubmit="return confirm('Обновить Xray на {{ n.name }}?')">
+                  <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Xray↑</button>
+                </form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/mirror"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>{% if n.mirror %}Зеркало ✓{% else %}+Зеркало{% endif %}</button></form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/outbound"><button class="btn ghost sm">{% if n.as_outbound %}Out ✓{% else %}+Out{% endif %}</button></form>
+                {% if not n.nat and not n.rv_mode and n.tunnel_mode != 'l2x_udp' %}
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/direct"
+                      onsubmit="return confirm('{% if n.direct_connect %}Выключить Direct?{% else %}Включить Direct?{% endif %}')">
+                  <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>{% if n.direct_connect %}Direct ✓{% else %}+Direct{% endif %}</button>
+                </form>
+                {% endif %}
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/update" class="flex" style="gap:.25rem;width:100%"
+                      onsubmit="return confirm('Обновить панель на {{ n.name }}?')">
+                  {% if not n.nat %}
+                  <input type="password" name="password" placeholder="SSH (опц.)" autocomplete="new-password">
+                  {% endif %}
+                  <button class="btn sm" {% if n.update_queue_status == 'running' or n.update_queue_status == 'queued' %}disabled{% endif %}>
+                    {% if n.update_queue_status == 'running' %}⏳{% elif n.update_queue_status == 'queued' %}…{% else %}{{ t('Обновить') }}{% endif %}
+                  </button>
+                </form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/token" class="flex" style="gap:.25rem;width:100%" title="Пусто = не менять">
+                  <input type="password" name="token" placeholder="{% if n.token %}••••{{ n.token[-4:] }}{% else %}token{% endif %}" class="mono" autocomplete="new-password" style="flex:1;width:auto">
+                  <button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Token</button>
+                </form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/promote" class="flex" style="gap:.25rem;width:100%"
+                      onsubmit="return confirm('Передать MASTER → {{ n.name }}?')">
+                  <input type="password" name="password" placeholder="{% if n.mirror %}SSH (опц.){% else %}SSH{% endif %}" {% if not n.mirror %}required{% endif %} autocomplete="new-password">
+                  <button class="btn sm" {% if job_running %}disabled{% endif %}>→Master</button>
+                </form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/toggle"><button class="btn ghost sm" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
+                <form method="post" action="{{ bp }}/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду?')"><button class="btn danger sm">{{ ic.icon('trash') }}</button></form>
+              </div>
+            </details>
           </div>
         </td>
       </tr>
@@ -462,5 +531,18 @@
     if (detail) detail.hidden = !open;
     btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
+  document.addEventListener('toggle', function (ev) {
+    var t = ev.target;
+    if (!t || !t.classList || !t.classList.contains('nd-more') || !t.open) return;
+    document.querySelectorAll('details.nd-more[open]').forEach(function (el) {
+      if (el !== t) el.removeAttribute('open');
+    });
+  }, true);
+  document.addEventListener('click', function (ev) {
+    if (ev.target.closest && ev.target.closest('details.nd-more')) return;
+    document.querySelectorAll('details.nd-more[open]').forEach(function (el) {
+      el.removeAttribute('open');
+    });
+  });
 </script>
 {% endblock %}
