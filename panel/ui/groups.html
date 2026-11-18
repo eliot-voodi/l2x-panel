@@ -35,12 +35,15 @@
         </td>
         <td>{% if g.clients %}<span class="badge accent">{{ g.clients }}</span>{% else %}<span class="dim">0</span>{% endif %}</td>
         <td class="small">
-          {% if g.allowed_tags %}
+          {% if list_mode(g, list_key='allowed_tags', mode_key='select_mode') == 'all' %}
+            <span class="dim">все</span>
+          {% elif g.allowed_tags %}
             {% for tg in g.allowed_tags %}<span class="badge" style="margin:0 .2rem .2rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}
-          {% else %}<span class="dim">все</span>{% endif %}
+          {% else %}<span class="dim">только основная</span>{% endif %}
         </td>
         <td class="small">
-          {% if g.inbounds %}{{ g.inbounds|join(', ') }}{% else %}<span class="dim">все</span>{% endif %}
+          {% if list_mode(g, list_key='inbounds', mode_key='ib_mode') == 'all' %}<span class="dim">все</span>
+          {% elif g.inbounds %}{{ g.inbounds|join(', ') }}{% else %}<span class="dim">—</span>{% endif %}
         </td>
         <td class="small">{% if g.outbound %}{{ outbound_label(store, g.outbound) }}{% else %}<span class="dim">как у клиента</span>{% endif %}</td>
         <td>

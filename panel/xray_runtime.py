@@ -1522,6 +1522,12 @@ def ensure_groups(store: dict) -> list[dict]:
             g["allowed_tags"] = []
         if not isinstance(g.get("inbounds"), list):
             g["inbounds"] = []
+        # Explicit modes: empty lists alone used to mean «all», which flipped
+        # «выбранные» (only primary / partial) back to «все» after save.
+        if g.get("ib_mode") not in ("all", "select"):
+            g["ib_mode"] = "select" if g.get("inbounds") else "all"
+        if g.get("select_mode") not in ("all", "select"):
+            g["select_mode"] = "select" if g.get("allowed_tags") else "all"
         g.setdefault("outbound", "")
         cleaned.append(g)
     store["groups"] = cleaned
@@ -1606,8 +1612,20 @@ def new_group(*, name: str = "", comment: str = "") -> dict:
         "comment": (comment or "").strip(),
         "allowed_tags": [],
         "inbounds": [],
+        "ib_mode": "all",
+        "select_mode": "all",
         "outbound": "",
     }
+
+
+def list_mode(obj: dict | None, *, list_key: str, mode_key: str) -> str:
+    """Resolve all|select for inbounds / allowed_tags (legacy: non-empty list ⇒ select)."""
+    if not isinstance(obj, dict):
+        return "all"
+    mode = str(obj.get(mode_key) or "").strip().lower()
+    if mode in ("all", "select"):
+        return mode
+    return "select" if obj.get(list_key) else "all"
 
 
 # ---------------------------------------------------------------- clients
@@ -1653,6 +1671,10 @@ def ensure_client(client: dict) -> dict:
     client.setdefault("tg_fio", "")
     client.setdefault("allowed_tags", [])
     client.setdefault("group_id", "")
+    if client.get("ib_mode") not in ("all", "select"):
+        client["ib_mode"] = "select" if client.get("inbounds") else "all"
+    if client.get("select_mode") not in ("all", "select"):
+        client["select_mode"] = "select" if client.get("allowed_tags") else "all"
     client.setdefault("outbound_limits", {})
     client.setdefault("daily_outbound_limits", {})
     client.setdefault("wg_private", "")

@@ -982,6 +982,7 @@ for _name, _fn in {
     "flag_emoji": xray.flag_emoji, "outbound_label": xray.outbound_label, "client_status": xray.client_status,
     "client_used_bytes": xray.client_used_bytes, "gb_to_bytes": xray.gb_to_bytes, "days_left": xray.days_left,
     "inbound_used_bytes": xray.inbound_used_bytes, "inbound_access_ok": xray.inbound_access_ok,
+    "list_mode": xray.list_mode,
 }.items():
     templates.env.globals[_name] = _fn
 templates.env.globals["P"] = P
@@ -3178,29 +3179,40 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     # «Основная» идёт отдельно — не держим её в extras (иначе дубль в подписке).
     if outbound and outbound in selected:
         selected = [t for t in selected if t != outbound]
+    ib_mode = str(form.get("ib_mode") or "all").strip().lower()
+    if ib_mode not in ("all", "select"):
+        ib_mode = "all"
+    select_mode = str(form.get("select_mode") or "all").strip().lower()
+    if select_mode not in ("all", "select"):
+        select_mode = "all"
+    client["ib_mode"] = ib_mode
+    client["select_mode"] = select_mode
     if gid:
         # Group owns base inbounds/outbounds. Personal lists are optional extras only.
-        if form.get("ib_mode", "all") == "all":
+        # «Снять все» / «только группа» → empty personal lists (mode=all).
+        if ib_mode == "all":
             client["inbounds"] = []
         else:
-            client["inbounds"] = sel_ib  # may be empty = no extras
-        if form.get("select_mode", "all") == "all" or not selected:
+            client["inbounds"] = sel_ib  # may be empty = no personal extras
+        if select_mode == "all":
             client["allowed_tags"] = []
         else:
             client["allowed_tags"] = selected
         # Primary always from group when assigned.
         client["outbound"] = ""
     else:
-        if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib:
+        if ib_mode == "all":
             client["inbounds"] = []
         else:
+            if not sel_ib:
+                return "Отметьте хотя бы один inbound или выберите режим «все»"
             client["inbounds"] = sel_ib
-        if form.get("select_mode", "all") == "all":
+        if select_mode == "all":
             client["allowed_tags"] = []
             client["outbound"] = outbound if outbound in known or outbound == "direct" else "direct"
         elif outbound and (outbound in known or outbound == "direct"):
             # Primary alone is enough; checkboxes are optional extras.
-            # Store [primary] when no extras so empty list still means «все».
+            # Store [primary] when no extras so empty list is not read as «все».
             client["outbound"] = outbound
             client["allowed_tags"] = selected if selected else [outbound]
         elif selected:
@@ -3731,10 +3743,28 @@ def _group_form(form, store: dict, group: dict) -> str | None:
     # so the same tag is not listed twice.
     if outbound and outbound in selected:
         selected = [t for t in selected if t != outbound]
-    group["allowed_tags"] = [] if form.get("select_mode", "all") == "all" or not selected else selected
+    select_mode = str(form.get("select_mode") or "all").strip().lower()
+    if select_mode not in ("all", "select"):
+        select_mode = "all"
+    group["select_mode"] = select_mode
+    if select_mode == "all":
+        group["allowed_tags"] = []
+    else:
+        # Keep «выбранные» even when only primary is chosen (no extra checkboxes).
+        # Store [primary] so empty list is not re-read as legacy «все».
+        group["allowed_tags"] = selected if selected else ([outbound] if outbound else [])
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
-    group["inbounds"] = [] if form.get("ib_mode", "all") == "all" or set(sel_ib) == known_ib else sel_ib
+    ib_mode = str(form.get("ib_mode") or "all").strip().lower()
+    if ib_mode not in ("all", "select"):
+        ib_mode = "all"
+    group["ib_mode"] = ib_mode
+    if ib_mode == "all":
+        group["inbounds"] = []
+    else:
+        if not sel_ib:
+            return "Отметьте хотя бы один inbound или выберите режим «все»"
+        group["inbounds"] = sel_ib
     if outbound and outbound != "direct" and outbound not in known:
         return f"Неизвестный outbound {outbound}"
     if not outbound:
