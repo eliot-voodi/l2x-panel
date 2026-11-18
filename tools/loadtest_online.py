@@ -122,6 +122,9 @@ def _http(
 
 def api(base: str, token: str, path: str, *, method: str = "GET", data: dict | None = None, timeout: float = 45.0) -> Any:
     url = base.rstrip("/") + "/panel/api/" + path.lstrip("/")
+    # Panel parses JSON on every POST — always send an object body.
+    if method.upper() == "POST" and data is None:
+        data = {}
     code, raw, _ = _http(method, url, token=token, data=data, timeout=timeout)
     try:
         payload = json.loads(raw.decode("utf-8", "replace") or "{}")
@@ -130,6 +133,28 @@ def api(base: str, token: str, path: str, *, method: str = "GET", data: dict | N
     if code >= 400 or not payload.get("success", True):
         raise RuntimeError(f"API {path}: HTTP {code} {payload.get('msg') or raw[:200]!r}")
     return payload.get("obj")
+
+
+def api_retry(
+    base: str,
+    token: str,
+    path: str,
+    *,
+    method: str = "GET",
+    data: dict | None = None,
+    timeout: float = 120.0,
+    attempts: int = 5,
+) -> Any:
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return api(base, token, path, method=method, data=data, timeout=timeout)
+        except Exception as e:
+            last = e
+            wait = min(30.0, 1.5 * (i + 1))
+            print(f"  ! API {method} {path} try {i + 1}/{attempts}: {e} — sleep {wait:.1f}s")
+            time.sleep(wait)
+    raise RuntimeError(str(last) if last else "api failed")
 
 
 # --------------------------------------------------------------------------- subscription / link parse
@@ -364,74 +389,118 @@ def load_subs_file(path: str, n: int) -> list[ClientRow]:
     return rows
 
 
+def _row_from_public(c: dict) -> ClientRow:
+    return ClientRow(
+        email=str(c.get("email") or ""),
+        uuid=str(c.get("uuid") or ""),
+        sub_url=str(c.get("sub_url") or ""),
+    )
+
+
 def prepare_clients(base: str, token: str, n: int, prefix: str, group_id: str, reuse: bool) -> list[ClientRow]:
     existing = list_loadtest_clients(base, token, prefix)
     rows: list[ClientRow] = []
     if reuse and existing:
         existing = sorted(existing, key=lambda c: str(c.get("email") or ""))[:n]
-        for c in existing:
-            rows.append(ClientRow(
-                email=str(c["email"]),
-                uuid=str(c.get("uuid") or ""),
-                sub_url=str(c.get("sub_url") or ""),
-            ))
+        rows = [_row_from_public(c) for c in existing]
         print(f"[prepare] reuse {len(rows)} existing {prefix}-* clients")
         if len(rows) >= n:
             return rows[:n]
 
-    have = {r.email for r in rows}
     need = n - len(rows)
-    if need >= 50:
-        print(f"[prepare] WARNING: creating {need} clients one-by-one (each triggers xray apply). "
-              f"Prefer --reuse after first run, or --subs-file.")
-    print(f"[prepare] creating {need} clients via API…")
-    for i in range(need):
+    start = 1
+    have = {r.email for r in rows}
+    while f"{prefix}-{start:04d}" in have:
+        start += 1
+
+    payload: dict[str, Any] = {
+        "count": need,
+        "prefix": prefix,
+        "start": start,
+        "enabled": True,
+        "sub_enabled": True,
+        "comment": "loadtest auto",
+        "limit_ip": 0,
+        "outbound": "direct",
+    }
+    if group_id:
+        payload["group_id"] = group_id
+
+    # Prefer bulkAdd (one xray apply). Fallback: one-by-one with retries.
+    print(f"[prepare] bulkAdd {need} clients (prefix={prefix}, start={start})…")
+    try:
+        obj = api_retry(base, token, "clients/bulkAdd", method="POST", data=payload, timeout=600.0, attempts=4)
+        batch = obj if isinstance(obj, list) else []
+        rows.extend(_row_from_public(c) for c in batch)
+        print(f"[prepare] bulkAdd ok: +{len(batch)} (total {len(rows)})")
+        if len(rows) >= n:
+            return rows[:n]
+    except Exception as e:
+        print(f"[prepare] bulkAdd unavailable ({e}) — falling back to single add")
+
+    print(f"[prepare] creating {n - len(rows)} clients one-by-one…")
+    have = {r.email for r in rows}
+    while len(rows) < n:
         idx = len(rows) + 1
-        # find free index
         while f"{prefix}-{idx:04d}" in have:
             idx += 1
         email = f"{prefix}-{idx:04d}"
-        payload: dict[str, Any] = {
+        one = {
             "email": email,
             "enabled": True,
             "sub_enabled": True,
             "comment": "loadtest auto",
             "limit_ip": 0,
+            "outbound": "direct",
         }
         if group_id:
-            payload["group_id"] = group_id
+            one["group_id"] = group_id
         try:
-            obj = api(base, token, "clients/add", method="POST", data=payload, timeout=90.0)
-        except RuntimeError as e:
-            # apply_xray after each add is heavy — brief backoff
-            print(f"  ! add {email}: {e}")
-            time.sleep(1.0)
-            obj = api(base, token, "clients/add", method="POST", data=payload, timeout=90.0)
-        rows.append(ClientRow(
-            email=email,
-            uuid=str((obj or {}).get("uuid") or ""),
-            sub_url=str((obj or {}).get("sub_url") or ""),
-        ))
+            obj = api_retry(base, token, "clients/add", method="POST", data=one, timeout=180.0, attempts=6)
+            rows.append(_row_from_public(obj or {"email": email}))
+        except Exception as e:
+            # Apply may drop the HTTP response after the client was already saved.
+            time.sleep(2.0)
+            found = next((c for c in list_loadtest_clients(base, token, prefix) if c.get("email") == email), None)
+            if found:
+                print(f"  ~ add {email}: response lost but client exists")
+                rows.append(_row_from_public(found))
+            else:
+                print(f"  !! give up on {email}: {e}")
+                raise
         have.add(email)
-        if (i + 1) % 25 == 0 or i + 1 == need:
-            print(f"  … {i + 1}/{need}")
-        # small pause to avoid hammering apply
-        time.sleep(0.05)
+        if len(rows) % 25 == 0 or len(rows) == n:
+            print(f"  … {len(rows)}/{n}")
+        time.sleep(0.4)
     return rows[:n]
 
 
 def cleanup_clients(base: str, token: str, prefix: str) -> int:
+    print(f"[cleanup] bulkDelete prefix={prefix}-* …")
+    try:
+        obj = api_retry(
+            base, token, "clients/bulkDelete", method="POST",
+            data={"prefix": prefix + "-"}, timeout=300.0, attempts=4,
+        )
+        n = int((obj or {}).get("removed") or 0)
+        print(f"[cleanup] deleted {n}")
+        return n
+    except Exception as e:
+        print(f"[cleanup] bulkDelete unavailable ({e}) — single deletes")
     victims = list_loadtest_clients(base, token, prefix)
     print(f"[cleanup] deleting {len(victims)} {prefix}-* clients…")
     n = 0
     for c in victims:
         email = str(c.get("email") or "")
         try:
-            api(base, token, f"clients/delete/{urllib.parse.quote(email, safe='')}", method="POST")
+            api_retry(
+                base, token, f"clients/delete/{urllib.parse.quote(email, safe='')}",
+                method="POST", data={}, timeout=120.0, attempts=4,
+            )
             n += 1
-        except RuntimeError as e:
-            print(f"  ! delete {email}: {e}")
-        time.sleep(0.03)
+        except Exception as ex:
+            print(f"  ! delete {email}: {ex}")
+        time.sleep(0.2)
     print(f"[cleanup] deleted {n}")
     return n
 

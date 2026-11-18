@@ -6806,6 +6806,54 @@ async def rest_api(path: str, request: Request):
             xray.ensure_wg_peer(st, c)
         res = _apply_xray(_load_store(), xray_only=True)
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
+    if parts == ["clients", "bulkAdd"] and request.method == "POST":
+        # One xray apply for many clients — used by loadtest (avoids nginx drop per add).
+        count = max(0, min(2000, _int(data.get("count"))))
+        prefix = str(data.get("prefix") or "loadtest").strip() or "loadtest"
+        if not count:
+            return _api_err("count required")
+        start = max(1, _int(data.get("start") or 1))
+        created: list[dict] = []
+        with mutate() as st:
+            have = {str(x.get("email") or "") for x in st["clients"]}
+            idx = start
+            while len(created) < count:
+                email = f"{prefix}-{idx:04d}"
+                idx += 1
+                if email in have:
+                    continue
+                if not xray.EMAIL_RE.match(email):
+                    return _api_err(f"bad email pattern {email}")
+                c = xray.ensure_client({"email": email, "sub_token": secrets.token_urlsafe(18)})
+                err = _api_apply_client(st, c, data)
+                if err:
+                    return _api_err(err)
+                st["clients"].append(c)
+                xray.ensure_wg_peer(st, c)
+                have.add(email)
+                created.append(c)
+        res = _apply_xray(_load_store(), xray_only=True)
+        store2 = _load_store()
+        return _api_ok(
+            [_public_client(store2, next(x for x in store2["clients"] if x["email"] == c["email"])) for c in created],
+            res.get("error", ""),
+        )
+    if parts == ["clients", "bulkDelete"] and request.method == "POST":
+        prefix = str(data.get("prefix") or "").strip()
+        if not prefix:
+            return _api_err("prefix required")
+        removed = 0
+        with mutate() as st:
+            keep = []
+            for c in st["clients"]:
+                if str(c.get("email") or "").startswith(prefix):
+                    removed += 1
+                else:
+                    keep.append(c)
+            st["clients"] = keep
+        if removed:
+            _apply_xray(_load_store(), xray_only=True)
+        return _api_ok({"removed": removed})
     if len(parts) == 3 and parts[:2] == ["clients", "update"] and request.method == "POST":
         with mutate() as st:
             c = next((x for x in st["clients"] if x["email"] == parts[2]), None)
