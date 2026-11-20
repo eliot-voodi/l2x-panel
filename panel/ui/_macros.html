@@ -5,6 +5,7 @@
 {%- elif status == 'daily_limited' -%}<span class="badge warn">день</span>
 {%- elif status == 'disabled' -%}<span class="badge">выключен</span>
 {%- elif status == 'connected' -%}<span class="badge ok">connected</span>
+{%- elif status == 'degraded' -%}<span class="badge warn">high-loss</span>
 {%- elif status == 'error' -%}<span class="badge err">error</span>
 {%- elif status == 'disconnected' -%}<span class="badge">disconnected</span>
 {%- else -%}<span class="badge">{{ status }}</span>

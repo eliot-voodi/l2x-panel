@@ -428,6 +428,9 @@ def direct_pool_hidden_member_tags(store: dict) -> set[str]:
     return hidden
 
 
+PROBE_HISTORY_N = 20  # rolling window for outbound packet-loss %
+
+
 def sub_health_settings(store: dict) -> dict:
     """Subscription health gate: hide disconnected / high-loss outbounds from client links."""
     sub = ((store.get("settings") or {}).get("sub") or {})
@@ -435,35 +438,64 @@ def sub_health_settings(store: dict) -> dict:
         max_loss = float(sub.get("max_loss_pct") if sub.get("max_loss_pct") not in (None, "") else 20)
     except (TypeError, ValueError):
         max_loss = 20.0
+    try:
+        probe_sec = int(sub.get("ob_probe_sec") if sub.get("ob_probe_sec") not in (None, "") else 60)
+    except (TypeError, ValueError):
+        probe_sec = 60
     return {
         "hide_unhealthy": bool(sub.get("hide_unhealthy", True)),
         "max_loss_pct": max(0.0, min(100.0, max_loss)),
+        # How often the panel probes every enabled custom outbound
+        "ob_probe_sec": max(30, min(3600, probe_sec)),
     }
 
 
-def custom_outbound_status(o: dict) -> str:
-    """UI status: enabled + successful probe → connected; explicit fail → disconnected."""
+def outbound_loss_pct(o: dict) -> float | None:
+    """Rolling probe loss % from ``probe_history`` / ``last_test.loss_pct``."""
+    lt = o.get("last_test") if isinstance(o.get("last_test"), dict) else {}
+    hist = o.get("probe_history")
+    if isinstance(hist, list) and hist:
+        fails = sum(1 for x in hist if not x)
+        return round(100.0 * fails / len(hist), 1)
+    if isinstance(lt, dict) and lt.get("loss_pct") is not None:
+        try:
+            return float(lt["loss_pct"])
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def custom_outbound_status(o: dict, *, max_loss_pct: float | None = None) -> str:
+    """UI status: enabled + successful probe → connected; fail → disconnected; high loss → degraded."""
     if not o.get("enabled", True):
         return "disabled"
     # Direct-connect entries are judged by node reachability, not bridge hairpin probe
     if o.get("direct_connect") or o.get("kind") == "local_direct":
         return "connected"
     lt = o.get("last_test")
-    if isinstance(lt, dict) and lt.get("ok") is True:
-        return "connected"
     if isinstance(lt, dict) and lt.get("ok") is False:
         return "disconnected"
+    if isinstance(lt, dict) and lt.get("ok") is True:
+        if max_loss_pct is not None:
+            loss = outbound_loss_pct(o)
+            if loss is not None and loss > max_loss_pct:
+                return "degraded"
+        return "connected"
     # Not probed yet — treat as live for UI until first fail
     return "connected"
 
 
-def custom_outbound_healthy(o: dict) -> bool:
-    """Standalone custom may appear in subscription (hide on explicit probe fail)."""
+def custom_outbound_healthy(o: dict, *, max_loss_pct: float | None = None) -> bool:
+    """Standalone custom may appear in subscription (hide on probe fail / high loss)."""
     if not o.get("enabled", True):
         return False
     lt = o.get("last_test")
     if isinstance(lt, dict) and lt.get("ok") is False:
         return False
+    if max_loss_pct is not None:
+        loss = outbound_loss_pct(o)
+        if loss is not None and loss > max_loss_pct:
+            return False
     return True
 
 
@@ -616,7 +648,7 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
                     return True
             except Exception:
                 return True
-        return custom_outbound_healthy(o)
+        return custom_outbound_healthy(o, max_loss_pct=cfg["max_loss_pct"])
 
     for b in ensure_balancers(store).values():
         if b.get("tag") != tag:
@@ -3355,6 +3387,190 @@ def query_stats(pattern: str = "", reset: bool = False) -> dict[str, int]:
         for m in re.finditer(r'name:\s*"([^"]+)"\s+value:\s*(\d+)', r["stdout"] or ""):
             out[m.group(1)] = int(m.group(2))
     return out
+
+
+def query_observatory_health() -> dict[str, dict]:
+    """Per-outbound observatory snapshot from ``xray api bi`` (alive / delay / last error).
+
+    Returns ``{outboundTag: {alive, delay_ms, error}}``. Empty when balancers/observatory
+    are off or RoutingService is unreachable — panel probes remain the source of truth.
+    """
+    r = _run([XRAY_BIN, "api", "bi", f"--server={XRAY_API}"], timeout=8)
+    if r["exit_code"] != 0 or not (r.get("stdout") or "").strip():
+        return {}
+    raw = r["stdout"] or ""
+    out: dict[str, dict] = {}
+
+    def _ingest(tag: str, alive, delay, err: str = "") -> None:
+        tag = str(tag or "").strip()
+        if not tag:
+            return
+        delay_ms = None
+        try:
+            if delay is not None and delay != "":
+                # Xray may report delay as ms int or duration string
+                if isinstance(delay, (int, float)):
+                    delay_ms = int(delay)
+                else:
+                    s = str(delay).strip().lower()
+                    if s.endswith("ms"):
+                        delay_ms = int(float(s[:-2]))
+                    elif s.endswith("s"):
+                        delay_ms = int(float(s[:-1]) * 1000)
+                    else:
+                        delay_ms = int(float(s))
+        except (TypeError, ValueError):
+            delay_ms = None
+        prev = out.get(tag)
+        # Prefer dead / higher-delay reports when the same tag appears in several balancers
+        if prev and prev.get("alive") is False and alive is not False:
+            return
+        out[tag] = {
+            "alive": bool(alive) if alive is not None else True,
+            "delay_ms": delay_ms,
+            "error": str(err or "")[:200],
+        }
+
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        bals = data.get("balancer") or data.get("balancers") or data.get("Balancer") or []
+        if isinstance(bals, dict):
+            bals = list(bals.values())
+        for bal in bals or []:
+            if not isinstance(bal, dict):
+                continue
+            obs = bal.get("observatory") or bal.get("Observatory") or {}
+            statuses = []
+            if isinstance(obs, dict):
+                statuses = obs.get("status") or obs.get("Status") or obs.get("outboundStatus") or []
+            elif isinstance(obs, list):
+                statuses = obs
+            for st in statuses or []:
+                if not isinstance(st, dict):
+                    continue
+                _ingest(
+                    st.get("outboundTag") or st.get("outbound_tag") or st.get("tag") or "",
+                    st.get("alive") if "alive" in st else st.get("Alive"),
+                    st.get("delay") if "delay" in st else st.get("Delay"),
+                    str(st.get("lastErrorReason") or st.get("last_error_reason") or st.get("error") or ""),
+                )
+    else:
+        # Protobuf text dump fallback
+        cur_tag = alive = delay = err = None
+        for line in raw.splitlines():
+            s = line.strip()
+            m = re.match(r'outboundTag:\s*"([^"]+)"', s) or re.match(r'tag:\s*"([^"]+)"', s)
+            if m:
+                if cur_tag:
+                    _ingest(cur_tag, alive, delay, err or "")
+                cur_tag, alive, delay, err = m.group(1), None, None, ""
+                continue
+            if s.startswith("alive:"):
+                alive = "true" in s.lower()
+            elif s.startswith("delay:"):
+                delay = s.split(":", 1)[1].strip().strip('"')
+            elif "lastErrorReason" in s or "last_error_reason" in s:
+                err = s.split(":", 1)[-1].strip().strip('"')
+        if cur_tag:
+            _ingest(cur_tag, alive, delay, err or "")
+    return out
+
+
+def apply_outbound_probe(
+    o: dict,
+    *,
+    ok: bool,
+    ms: int = 0,
+    error: str = "",
+    at: str | None = None,
+    obs: dict | None = None,
+    max_loss_pct: float = 20.0,
+) -> list[dict]:
+    """Persist probe + rolling loss on outbound; return Telegram-worthy health events."""
+    tag = str(o.get("tag") or "")
+    prev_lt = o.get("last_test") if isinstance(o.get("last_test"), dict) else {}
+    prev_ok = prev_lt.get("ok")  # None = never probed
+    prev_loss = outbound_loss_pct(o)
+    prev_high = bool(o.get("tg_high_loss"))
+
+    # Merge observatory: dead observatory overrides a flaky successful curl (and vice versa for alive delay)
+    obs_alive = None
+    obs_delay = None
+    obs_err = ""
+    if isinstance(obs, dict):
+        if "alive" in obs:
+            obs_alive = bool(obs.get("alive"))
+        if obs.get("delay_ms") is not None:
+            try:
+                obs_delay = int(obs["delay_ms"])
+            except (TypeError, ValueError):
+                obs_delay = None
+        obs_err = str(obs.get("error") or "")[:200]
+        if obs_alive is False:
+            ok = False
+            if not error:
+                error = obs_err or "observatory: not alive"
+        elif obs_alive is True and ok and obs_delay is not None and (not ms or ms <= 0):
+            ms = obs_delay
+
+    hist = list(o.get("probe_history") or [])
+    hist.append(bool(ok))
+    hist = hist[-PROBE_HISTORY_N:]
+    o["probe_history"] = hist
+    fails = sum(1 for x in hist if not x)
+    loss = round(100.0 * fails / len(hist), 1) if hist else 0.0
+
+    o["last_test"] = {
+        "ok": bool(ok),
+        "ms": int(ms or 0),
+        "at": at or now_utc().isoformat(),
+        "error": str(error or "")[:300],
+        "loss_pct": loss,
+        "samples": len(hist),
+    }
+    if obs_alive is not None:
+        o["last_test"]["obs_alive"] = obs_alive
+    if obs_delay is not None:
+        o["last_test"]["obs_ms"] = obs_delay
+
+    events: list[dict] = []
+    label = str(o.get("remark") or tag)
+    # Connect / disconnect only after we have a prior baseline (avoid spam on first boot)
+    if prev_ok is True and not ok:
+        events.append({
+            "type": "disconnect", "tag": tag, "label": label,
+            "ms": int(ms or 0), "loss_pct": loss, "error": str(error or "")[:200],
+        })
+    elif prev_ok is False and ok:
+        events.append({
+            "type": "connect", "tag": tag, "label": label,
+            "ms": int(ms or 0), "loss_pct": loss,
+        })
+
+    high_now = loss > float(max_loss_pct) and len(hist) >= 3
+    if high_now and not prev_high:
+        o["tg_high_loss"] = True
+        events.append({
+            "type": "high_loss", "tag": tag, "label": label,
+            "loss_pct": loss, "max_loss_pct": float(max_loss_pct),
+            "ok": bool(ok), "ms": int(ms or 0),
+        })
+    elif (not high_now) and prev_high:
+        o.pop("tg_high_loss", None)
+        events.append({
+            "type": "loss_ok", "tag": tag, "label": label,
+            "loss_pct": loss, "max_loss_pct": float(max_loss_pct),
+            "ok": bool(ok), "ms": int(ms or 0),
+        })
+    elif prev_loss is None:
+        # Seed flag without notifying when already unhealthy at first window fill
+        if high_now:
+            o["tg_high_loss"] = True
+
+    return events
 
 
 def query_user_stats() -> dict[str, dict[str, int]]:

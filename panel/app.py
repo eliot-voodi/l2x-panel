@@ -152,7 +152,7 @@ def default_settings() -> dict:
             "json_fragment": "", "json_noise": "", "json_mux": "",
             "hwid_required": False, "hwid_fallback": "device", "migrate_url": False, "happ_provider_id": "",
             # Hide disconnected / high-loss outbounds from subscription until healthy again
-            "hide_unhealthy": True, "max_loss_pct": 20,
+            "hide_unhealthy": True, "max_loss_pct": 20, "ob_probe_sec": 60,
             # PasarGuard/Marzban jwt.secret_key values — accept signed legacy sub tokens
             "legacy_jwt_secrets": [],
         },
@@ -1581,12 +1581,53 @@ def _agent_direct_connect_report(store: dict | None = None) -> None:
     nodes_mod.report_request(master_url, token, body, timeout=15)
 
 
-OUTBOUND_PROBE_INTERVAL = int(os.environ.get("L2XPANEL_OB_PROBE_SEC", "300"))
+OUTBOUND_PROBE_INTERVAL = int(os.environ.get("L2XPANEL_OB_PROBE_SEC", "60"))
+
+
+def _tg_outbound_events(events: list[dict]) -> None:
+    """Notify admins about outbound connect / disconnect / packet-loss."""
+    for e in events or []:
+        typ = e.get("type")
+        tag = tgbot.escape(e.get("tag") or "?")
+        label = tgbot.escape(e.get("label") or e.get("tag") or "?")
+        loss = e.get("loss_pct")
+        loss_s = f"{loss}%" if loss is not None else "n/a"
+        if typ == "disconnect":
+            err = tgbot.escape(e.get("error") or "probe failed")
+            _tg_admin(
+                f"🔴 Outbound <b>{label}</b> (<code>{tag}</code>) disconnected\n"
+                f"loss {loss_s} · {err}",
+                flag="notify_outbounds",
+            )
+        elif typ == "connect":
+            ms = e.get("ms")
+            extra = f" · {ms} мс" if ms else ""
+            _tg_admin(
+                f"🟢 Outbound <b>{label}</b> (<code>{tag}</code>) connected{extra}\n"
+                f"loss {loss_s}",
+                flag="notify_outbounds",
+            )
+        elif typ == "high_loss":
+            max_l = e.get("max_loss_pct")
+            st = "up" if e.get("ok") else "down"
+            _tg_admin(
+                f"🟠 Outbound <b>{label}</b> (<code>{tag}</code>): высокие потери\n"
+                f"loss <b>{loss_s}</b> (порог {max_l}%) · probe {st}",
+                flag="notify_outbounds",
+            )
+        elif typ == "loss_ok":
+            _tg_admin(
+                f"✅ Outbound <b>{label}</b> (<code>{tag}</code>): потери в норме\n"
+                f"loss {loss_s}",
+                flag="notify_outbounds",
+            )
 
 
 def _outbounds_probe_cycle() -> None:
-    """Ping enabled custom/node outbounds; status + subscription gate use last_test."""
+    """Ping every enabled custom/node outbound; track loss + TG on connect/disconnect."""
     store = _load_store()
+    health = xray.sub_health_settings(store)
+    max_loss = float(health.get("max_loss_pct") or 20)
     tags = [o["tag"] for o in (store.get("outbounds_custom") or []) if o.get("enabled", True) and o.get("tag")]
     if not tags:
         return
@@ -1603,19 +1644,35 @@ def _outbounds_probe_cycle() -> None:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for tag, res in pool.map(lambda t: _one(t), tags):
             results[tag] = res
+
+    obs_map: dict[str, dict] = {}
+    try:
+        obs_map = xray.query_observatory_health()
+    except Exception:
+        obs_map = {}
+
     now = xray.now_utc().isoformat()
+    events: list[dict] = []
     with mutate() as st:
         for o in st.get("outbounds_custom") or []:
             tag = o.get("tag")
             if tag not in results:
                 continue
             r = results[tag]
-            o["last_test"] = {
-                "ok": bool(r.get("ok")),
-                "ms": int(r.get("ms") or 0),
-                "at": now,
-                "error": str(r.get("error") or "")[:300],
-            }
+            events.extend(xray.apply_outbound_probe(
+                o,
+                ok=bool(r.get("ok")),
+                ms=int(r.get("ms") or 0),
+                error=str(r.get("error") or "")[:300],
+                at=now,
+                obs=obs_map.get(tag),
+                max_loss_pct=max_loss,
+            ))
+    if events:
+        try:
+            _tg_outbound_events(events)
+        except Exception:
+            pass
 
 
 def _outbounds_probe_loop() -> None:
@@ -1627,7 +1684,14 @@ def _outbounds_probe_loop() -> None:
             _outbounds_probe_cycle()
         except Exception:
             pass
-        if _stop.wait(max(60, OUTBOUND_PROBE_INTERVAL)):
+        try:
+            interval = xray.sub_health_settings(_load_store()).get("ob_probe_sec") or OUTBOUND_PROBE_INTERVAL
+        except Exception:
+            interval = OUTBOUND_PROBE_INTERVAL
+        # Env override wins when explicitly set
+        if os.environ.get("L2XPANEL_OB_PROBE_SEC"):
+            interval = OUTBOUND_PROBE_INTERVAL
+        if _stop.wait(max(30, int(interval))):
             return
 
 
@@ -2524,9 +2588,13 @@ def _sparkline(values: list[float], w: int = 120, h: int = 28) -> str:
 def _outbound_usage(store: dict) -> dict:
     """Per-outbound totals, share, current/avg/peak speed and 1h sparkline."""
     ot = store.get("outbound_traffic") or {}
+    max_loss = xray.sub_health_settings(store).get("max_loss_pct")
     kinds: dict[str, tuple[str, str]] = {"direct": ("system", "active")}
     for o in store.get("outbounds_custom") or []:
-        kinds[o["tag"]] = (o.get("kind") or "custom", "active" if o.get("enabled", True) else "disabled")
+        kinds[o["tag"]] = (
+            o.get("kind") or "custom",
+            xray.custom_outbound_status(o, max_loss_pct=max_loss),
+        )
     tags = list(kinds) + [t_ for t_ in ot if t_ not in kinds]
     h1, h24 = OB_STATS.summary(60), OB_STATS.summary(1440)
     last = OB_STATS.points[-60:]
@@ -2535,7 +2603,8 @@ def _outbound_usage(store: dict) -> dict:
         tr = ot.get(tag) or {}
         up, down = int(tr.get("up") or 0), int(tr.get("down") or 0)
         rate = OB_STATS.rates.get(tag) or {"up": 0, "down": 0}
-        if not (up or down) and kinds.get(tag, ("", ""))[1] != "connected" and tag != "direct":
+        st = kinds.get(tag, ("", ""))[1]
+        if not (up or down) and st not in ("connected", "active", "degraded") and tag != "direct":
             continue
         kind, status = kinds.get(tag, ("system", "active"))
         rows.append({
@@ -4283,9 +4352,11 @@ def outbounds_page(request: Request):
     store = _load_store()
     ot = store.get("outbound_traffic") or {}
     rows = [{"tag": "direct", "kind": "system", "label": "🏠 Direct", "enabled": True, "status": "active"}]
-    hide_unhealthy = xray.sub_health_settings(store)["hide_unhealthy"]
+    health_cfg = xray.sub_health_settings(store)
+    hide_unhealthy = health_cfg["hide_unhealthy"]
+    max_loss = health_cfg["max_loss_pct"]
     for o in store["outbounds_custom"]:
-        status = xray.custom_outbound_status(o)
+        status = xray.custom_outbound_status(o, max_loss_pct=max_loss)
         in_sub = bool(o.get("in_sub", True))
         live = status == "connected" or not hide_unhealthy
         cfg = o.get("config") or {}
@@ -4630,17 +4701,39 @@ def outbound_action(tag: str, action: str, request: Request):
     if redir := _require(request):
         return redir
     if action == "test":
-        res = xray.test_outbound(_load_store(), tag)
+        store0 = _load_store()
+        res = xray.test_outbound(store0, tag)
+        health = xray.sub_health_settings(store0)
+        events: list[dict] = []
         with mutate() as store:
             o = next((x for x in store["outbounds_custom"] if x["tag"] == tag), None)
             if o:
-                o["last_test"] = {
-                    "ok": res["ok"],
-                    "ms": res.get("ms"),
-                    "at": xray.now_utc().isoformat(),
-                    "error": str(res.get("error") or "")[:300],
-                }
-        flash(request, f"{tag}: {'OK ' + str(res.get('ms')) + ' мс' if res['ok'] else 'ошибка ' + str(res.get('error'))}",
+                try:
+                    obs = xray.query_observatory_health().get(tag)
+                except Exception:
+                    obs = None
+                events = xray.apply_outbound_probe(
+                    o,
+                    ok=bool(res.get("ok")),
+                    ms=int(res.get("ms") or 0),
+                    error=str(res.get("error") or "")[:300],
+                    at=xray.now_utc().isoformat(),
+                    obs=obs,
+                    max_loss_pct=float(health.get("max_loss_pct") or 20),
+                )
+        if events:
+            try:
+                _tg_outbound_events(events)
+            except Exception:
+                pass
+        loss = ""
+        try:
+            lt = next((x.get("last_test") for x in _load_store().get("outbounds_custom") or [] if x.get("tag") == tag), None)
+            if isinstance(lt, dict) and lt.get("loss_pct") is not None:
+                loss = f", loss {lt['loss_pct']}%"
+        except Exception:
+            pass
+        flash(request, f"{tag}: {'OK ' + str(res.get('ms')) + ' мс' if res['ok'] else 'ошибка ' + str(res.get('error'))}{loss}",
               "info" if res["ok"] else "error")
         return go("/outbounds")
     if action == "reconnect":
@@ -6302,6 +6395,7 @@ async def settings_save(request: Request):
                 "happ_provider_id": str(form.get("happ_provider_id") or "").strip(),
                 "hide_unhealthy": form.get("hide_unhealthy") == "1",
                 "max_loss_pct": max(0, min(100, _int(form.get("max_loss_pct"), 20))),
+                "ob_probe_sec": max(30, min(3600, _int(form.get("ob_probe_sec"), 60))),
             })
         elif section == "webhooks":
             wh = webhooks.ensure(s)
@@ -6392,6 +6486,7 @@ async def settings_save(request: Request):
                 "notify_nodes": form.get("notify_nodes") == "1",
                 "notify_changes": form.get("notify_changes") == "1",
                 "notify_updates": form.get("notify_updates") == "1",
+                "notify_outbounds": form.get("notify_outbounds") == "1",
                 "notify_expire_days": _float(form.get("notify_expire_days"), 3),
                 "cpu_threshold": _float(form.get("cpu_threshold"), 85), "report_hours": _float(form.get("report_hours"), 24),
                 "backup_hours": _float(form.get("backup_hours"), 24),

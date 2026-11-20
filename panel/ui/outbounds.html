@@ -68,7 +68,7 @@
         <td>{{ m.status_badge(o.status if o.status else 'active') }}</td>
         <td class="small mono">{{ o.info or '' }}{% if o.via %}<div class="dim">via {{ o.via }}</div>{% endif %}</td>
         <td class="small nowrap">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</td>
-        <td class="small">{% if o.last_test %}{% if o.last_test.ok %}<span class="badge ok">{{ o.last_test.ms }} мс</span>{% else %}<span class="badge err" title="{{ o.last_test.error or '' }}">ошибка</span>{% if o.last_test.error %}<div class="dim" style="color:var(--danger);max-width:14rem;white-space:normal">{{ o.last_test.error }}</div>{% endif %}{% endif %}<div class="dim">{{ ago(o.last_test.at) }}</div>{% endif %}</td>
+        <td class="small">{% if o.last_test %}{% if o.last_test.ok %}<span class="badge ok">{{ o.last_test.ms }} мс</span>{% else %}<span class="badge err" title="{{ o.last_test.error or '' }}">ошибка</span>{% if o.last_test.error %}<div class="dim" style="color:var(--danger);max-width:14rem;white-space:normal">{{ o.last_test.error }}</div>{% endif %}{% endif %}{% if o.last_test.loss_pct is defined and o.last_test.loss_pct is not none %}<div class="dim">loss {{ o.last_test.loss_pct }}%{% if o.last_test.samples %} · {{ o.last_test.samples }} проб{% endif %}</div>{% endif %}<div class="dim">{{ ago(o.last_test.at) }}</div>{% endif %}</td>
         <td>
           <div class="actions" style="justify-content:flex-end">
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm" title="Проверить через временный Xray">{{ t('Тест') }}</button></form>
@@ -110,7 +110,7 @@
             {% if o.info %}<div><span class="lbl">Инфо</span><span class="val mono">{{ o.info }}</span></div>{% endif %}
             {% if o.via %}<div><span class="lbl">Via</span><span class="val mono">{{ o.via }}</span></div>{% endif %}
             <div><span class="lbl">Трафик</span><span class="val">↑{{ format_traffic(o.up) }} ↓{{ format_traffic(o.down) }}</span></div>
-            <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% if o.last_test.error %}: {{ o.last_test.error }}{% endif %}{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
+            <div><span class="lbl">Тест</span><span class="val">{% if o.last_test %}{% if o.last_test.ok %}{{ o.last_test.ms }} мс{% else %}ошибка{% if o.last_test.error %}: {{ o.last_test.error }}{% endif %}{% endif %}{% if o.last_test.loss_pct is defined and o.last_test.loss_pct is not none %} · loss {{ o.last_test.loss_pct }}%{% endif %} · {{ ago(o.last_test.at) }}{% else %}—{% endif %}</span></div>
           </div>
           <div class="actions">
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/test"><button class="btn ghost sm">{{ t('Тест') }}</button></form>
@@ -134,7 +134,7 @@
     {% endif %}
   </div>
 </div>
-<div class="hint">Статус custom/node: <b>connected</b> только если outbound включён и последний пинг успешен; иначе <b>disconnected</b> — в подписку не попадает (если включено «скрывать unhealthy»). Тест поднимает временный Xray → generate_204; периодический probe обновляет статус сам.</div>
+<div class="hint">Статус custom/node: <b>connected</b> — последний пинг OK и loss в норме; <b>high-loss</b> — потери выше порога; <b>disconnected</b> — пинг провален. Нездоровые outbound скрываются из подписки (настройка «Подписки»). Probe всех enabled outbound + observatory; disconnect/connect и high-loss уходят в Telegram.</div>
 
 <dialog id="dlg-add">
   <div class="card-head"><h3 id="ob-title">Новый outbound</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>

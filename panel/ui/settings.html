@@ -87,8 +87,12 @@
       <label class="f">Макс. потери пакетов, %</label>
       <input name="max_loss_pct" type="number" min="0" max="100" value="{{ sb.max_loss_pct if sb.max_loss_pct is defined else 20 }}">
     </div>
+    <div style="max-width:220px">
+      <label class="f">Интервал probe, сек</label>
+      <input name="ob_probe_sec" type="number" min="30" max="3600" value="{{ sb.ob_probe_sec if sb.ob_probe_sec is defined else 60 }}">
+    </div>
   </div>
-  <div class="hint">Custom с проваленным тестом или loss выше порога — не попадают в подписку (и в balancer), пока не восстановятся. Клиент увидит изменения после обновления подписки.</div>
+  <div class="hint">Каждый enabled custom/node outbound пингуется по расписанию (generate_204 + Xray observatory). Loss считается по окну последних проб. При disconnect/connect и loss выше порога — уведомление в Telegram (если включено). Нездоровые outbound скрываются из подписки, пока не восстановятся.</div>
 
   <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
   <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. <b>Mux по умолчанию выключен</b> (иначе сильно режет скорость, особенно upload). Включайте явно: <code>{"enabled":true,"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}</code>. Пустой Fragment/Noise = не трогать.</div>
@@ -168,6 +172,7 @@
   {{ m.check('notify_quota', tg.notify_quota, 'Истечение срока / исчерпание трафика / авто-сброс') }}
   {{ m.check('notify_iplimit', tg.notify_iplimit, 'Блокировки по лимиту IP') }}
   {{ m.check('notify_nodes', tg.notify_nodes if tg.notify_nodes is defined else True, 'Ноды: online/offline, sync, update, provision, promote, любые изменения') }}
+  {{ m.check('notify_outbounds', tg.notify_outbounds if tg.notify_outbounds is defined else True, 'Outbounds: disconnect / connect и высокие потери пакетов') }}
   {{ m.check('notify_changes', tg.notify_changes if tg.notify_changes is defined else True, 'Изменения: кто (логин+IP) и что сделал — клиенты, inbounds, outbounds, settings, DoH…') }}
   {{ m.check('notify_updates', tg.notify_updates if tg.notify_updates is defined else True, 'Обновления: новая версия Xray или панели на GitHub') }}
   <div class="row">

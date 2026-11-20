@@ -175,9 +175,10 @@ def _exit_meta(store: dict, tag: str) -> dict:
                 break
         return {"tag": tag, "label": label, "kind": kind, "members": members, "fallback": "block"}
     status = ""
+    max_loss = xray.sub_health_settings(store).get("max_loss_pct")
     for o in store.get("outbounds_custom") or []:
         if o.get("tag") == tag:
-            status = xray.custom_outbound_status(o)
+            status = xray.custom_outbound_status(o, max_loss_pct=max_loss)
             break
     return {"tag": tag, "label": label, "kind": kind, "status": status}
 
