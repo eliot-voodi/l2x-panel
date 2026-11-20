@@ -4463,6 +4463,51 @@ def _add_custom_outbound(store: dict, tag: str, remark: str, config: dict, kind:
     return None
 
 
+def _unique_outbound_tag(store: dict, base: str) -> str:
+    """Allocate ``base-copy`` / ``base-copy2`` … within TAG_RE length."""
+    raw = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(base or "ob").strip()).strip(".-_") or "ob"
+    # leave room for "-copy" / "-copy99"
+    stem = raw[:32].rstrip(".-_") or "ob"
+    used = set(xray.all_outbound_tags(store)) | {"api"}
+    for i in range(0, 500):
+        suffix = "-copy" if i == 0 else f"-copy{i + 1}"
+        cand = (stem[: max(1, 41 - len(suffix))] + suffix).rstrip(".-_")
+        if xray.TAG_RE.match(cand) and cand not in used:
+            return cand
+    raise ValueError("не удалось подобрать свободный tag")
+
+
+def _clone_custom_outbound(store: dict, src: dict) -> dict:
+    """Deep-copy a custom outbound (full config + meta); new tag, clean runtime fields."""
+    clone = json.loads(json.dumps(src))
+    src_tag = str(src.get("tag") or "ob")
+    new_tag = _unique_outbound_tag(store, src_tag)
+    clone["tag"] = new_tag
+    remark = str(src.get("remark") or src_tag).strip()
+    if not remark.endswith("(копия)"):
+        clone["remark"] = f"{remark} (копия)"
+    else:
+        clone["remark"] = remark
+    # Runtime / probe state — fresh copy
+    for k in ("last_test", "probe_history", "tg_high_loss", "pia_reconnected_at"):
+        clone.pop(k, None)
+    # Node-bound entries: keep dial config, detach from node lifecycle
+    if clone.get("kind") == "node" or clone.get("node_id") or clone.get("tunnel") or clone.get("reverse"):
+        clone["kind"] = "custom"
+        for k in ("node_id", "tunnel", "reverse", "direct_connect"):
+            clone.pop(k, None)
+    cfg = clone.get("config")
+    if isinstance(cfg, dict):
+        cfg = json.loads(json.dumps(cfg))
+        cfg.pop("tag", None)
+        clone["config"] = cfg
+    clone["enabled"] = bool(src.get("enabled", True))
+    clone["in_sub"] = bool(src.get("in_sub", True))
+    store.setdefault("outbounds_custom", []).append(clone)
+    store.setdefault("outbound_traffic", {})[new_tag] = {"up": 0, "down": 0, "last_up": 0, "last_down": 0}
+    return clone
+
+
 @app.post("/outbounds/add")
 async def outbound_add(request: Request):
     if redir := _require(request):
@@ -4744,6 +4789,9 @@ def outbound_action(tag: str, action: str, request: Request):
         else:
             flash(request, f"PIA reconnect {tag}: {res.get('error')}", "error")
         return go("/outbounds")
+    previous_customs: list | None = None
+    previous_traffic: dict | None = None
+    new_tag = ""
     with mutate() as store:
         if action == "reset":
             store.setdefault("outbound_traffic", {}).setdefault(tag, {}).update({"up": 0, "down": 0})
@@ -4756,16 +4804,52 @@ def outbound_action(tag: str, action: str, request: Request):
                 o["enabled"] = not o.get("enabled", True)
             elif action == "sub":
                 o["in_sub"] = not o.get("in_sub", True)
+            elif action == "clone":
+                previous_customs = json.loads(json.dumps(store["outbounds_custom"]))
+                previous_traffic = json.loads(json.dumps(store.get("outbound_traffic") or {}))
+                try:
+                    clone = _clone_custom_outbound(store, o)
+                except Exception as exc:  # noqa: BLE001
+                    flash(request, f"Копирование {tag}: {exc}", "error")
+                    return go("/outbounds")
+                new_tag = str(clone.get("tag") or "")
             elif action == "delete":
                 used = [c["email"] for c in store["clients"] if c.get("outbound") == tag]
                 if used:
                     flash(request, f"{tag} используется клиентами: {', '.join(used)}", "error")
                     return go("/outbounds")
                 store["outbounds_custom"].remove(o)
-    xr = _apply_xray(_load_store(), xray_only=True) if action != "reset" else {"ok": True}
+            else:
+                flash(request, "Неизвестное действие", "error")
+                return go("/outbounds")
+    if action == "reset":
+        flash(request, *_ok_msg(f"{tag}: reset", {"ok": True}))
+        _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: сброс трафика")
+        return go("/outbounds")
+    xr = _apply_xray(_load_store(), xray_only=True)
+    if action == "clone":
+        if not xr.get("ok"):
+            with mutate() as store:
+                if previous_customs is not None:
+                    store["outbounds_custom"] = previous_customs
+                if previous_traffic is not None:
+                    store["outbound_traffic"] = previous_traffic
+                elif new_tag:
+                    store.get("outbound_traffic", {}).pop(new_tag, None)
+            flash(
+                request,
+                f"Копия {tag} не сохранена — Xray отклонил конфиг: {xr.get('error')}",
+                "error",
+            )
+            return go("/outbounds")
+        _tg_change(
+            f"📤 Outbound <b>{tgbot.escape(tag)}</b>: скопирован → "
+            f"<b>{tgbot.escape(new_tag)}</b>"
+        )
+        flash(request, f"Outbound {tag} скопирован → {new_tag}", "info")
+        return go("/outbounds")
     labels = {
         "delete": "удалён", "toggle": "вкл/выкл", "sub": "в подписке вкл/выкл",
-        "reset": "сброс трафика",
     }
     if action in labels:
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: {labels[action]}")

@@ -240,18 +240,32 @@ fetch_source() {
 install_packages() {
   step "Пакеты"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq --no-install-recommends \
-    curl ca-certificates unzip jq openssl socat cron kmod iproute2 iptables \
-    python3 python3-venv \
-    wireguard-tools >/dev/null
+  # Stale apt lists → 404 on security.debian.org for superseded package builds (common on Debian 11).
+  apt_refresh() {
+    apt-get update -qq || apt-get update -qq --allow-releaseinfo-change || apt-get update
+  }
+  apt_refresh
+  local pkgs=(
+    curl ca-certificates unzip jq openssl socat cron kmod iproute2 iptables
+    python3 python3-venv
+    wireguard-tools
+  )
+  if ! apt-get install -y -qq --no-install-recommends "${pkgs[@]}" >/dev/null; then
+    warn "apt install: 404/устаревший индекс — повторный apt-get update + --fix-missing"
+    apt_refresh
+    apt-get install -y -qq --no-install-recommends --fix-missing "${pkgs[@]}"
+  fi
   ok "Системные пакеты"
   # nginx is always the public entry: :443 front for inbounds (Xray listens only on 127.0.0.1)
   if systemctl is-active -q caddy 2>/dev/null; then
     warn "Caddy занимает :80/:443 — останавливаю и отключаю его"
     systemctl disable --now caddy
   fi
-  apt-get install -y -qq nginx libnginx-mod-stream >/dev/null
+  if ! apt-get install -y -qq nginx libnginx-mod-stream >/dev/null; then
+    warn "nginx apt: повтор после update"
+    apt_refresh
+    apt-get install -y -qq --fix-missing nginx libnginx-mod-stream
+  fi
   ok "$(nginx -v 2>&1 | sed 's/.*: //') + stream"
 }
 

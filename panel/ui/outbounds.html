@@ -78,6 +78,7 @@
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reconnect"><button class="btn ghost sm" title="Перерегистрировать WireGuard у PIA">Reconnect</button></form>
             {% endif %}
             <button type="button" class="btn ghost icon" title="Редактировать" data-tag="{{ o.tag }}" onclick="obOpen(this.dataset.tag)">{{ ic.icon('edit') }}</button>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/clone"><button class="btn ghost icon" title="Копировать outbound полностью">{{ ic.icon('copy') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/sub"><button class="btn ghost icon" title="Показывать в подписках">{{ ic.icon('link') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/toggle"><button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/delete" onsubmit="return confirm('Удалить {{ o.tag }}?')"><button class="btn danger icon">{{ ic.icon('trash') }}</button></form>
@@ -120,6 +121,7 @@
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/reconnect"><button class="btn ghost sm">Reconnect</button></form>
             {% endif %}
             <button type="button" class="btn ghost sm" data-tag="{{ o.tag }}" onclick="obOpen(this.dataset.tag)">{{ ic.icon('edit') }} Правка</button>
+            <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/clone"><button class="btn ghost sm" title="Копировать outbound полностью">{{ ic.icon('copy') }} Копия</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/sub"><button class="btn ghost sm">{{ ic.icon('link') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/toggle"><button class="btn ghost sm">{{ ic.icon('power') }}</button></form>
             <form method="post" action="{{ bp }}/outbounds/{{ o.tag }}/delete" onsubmit="return confirm('Удалить {{ o.tag }}?')"><button class="btn danger sm">{{ ic.icon('trash') }}</button></form>
