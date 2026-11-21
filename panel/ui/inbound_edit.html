@@ -564,7 +564,7 @@
   document.getElementById('btn_sids').addEventListener('click', function () {
     getJson('/api/keys/shortids').then(function (d) {
       if (!d.ok) { alert(d.error || 'ошибка'); return; }
-      document.getElementById('r_sids').value = (d.short_ids || []).join(',');
+      document.getElementById('r_sids').value = (d.short_ids || []).filter(Boolean).join(',');
     });
   });
   document.getElementById('btn_mldsa').addEventListener('click', function () {

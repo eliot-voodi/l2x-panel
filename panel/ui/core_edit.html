@@ -731,8 +731,11 @@ function coreRegenShortIds() {
     .then(function (r) { return r.json(); })
     .then(function (d) {
       var ids = d.short_ids || d.ids || d;
-      if (Array.isArray(ids)) document.getElementById('core-ib-rsids').value = ids.join(',');
-      else if (typeof ids === 'string') document.getElementById('core-ib-rsids').value = ids;
+      if (Array.isArray(ids)) {
+        document.getElementById('core-ib-rsids').value = ids.filter(Boolean).join(',');
+      } else if (typeof ids === 'string') {
+        document.getElementById('core-ib-rsids').value = ids.split(/[\s,]+/).filter(Boolean).join(',');
+      }
     }).catch(function () {});
 }
 

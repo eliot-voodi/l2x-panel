@@ -173,11 +173,12 @@ def generate_short_id(nbytes: int = 4) -> str:
 
 
 def generate_short_ids(count: int = 8) -> list[str]:
-    """Mixed-length shortIds like common panel UIs (0..16 hex chars)."""
-    lengths = (0, 2, 4, 6, 8, 10, 12, 14, 16)
-    out = [""]
-    for i in range(max(1, count) - 1):
-        out.append(secrets.token_hex(lengths[(i % (len(lengths) - 1)) + 1] // 2))
+    """Mixed-length shortIds (2..16 hex chars). Never includes an empty id."""
+    lengths = (2, 4, 6, 8, 10, 12, 14, 16)
+    n = max(1, int(count or 8))
+    out: list[str] = []
+    for i in range(n):
+        out.append(secrets.token_hex(lengths[i % len(lengths)] // 2))
     return out
 
 
