@@ -1705,7 +1705,8 @@ def _push_direct_nodes_clients(
 
     def _one(nid: str, label: str) -> None:
         try:
-            _node_push_job(nid, label, host, timeout=timeout)
+            # Limits/expiry/enable: lightweight clients+groups push (hot-apply on agent)
+            _node_push_job(nid, label, host, timeout=timeout, clients_only=True)
         except Exception:
             pass
 
@@ -1737,14 +1738,21 @@ def _schedule_direct_sync(reason: str = "client") -> None:
 
         def _run() -> None:
             global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
-            # Minimal coalesce so multi-field form save = one push
-            time.sleep(0.05)
             with _DIRECT_SYNC_LOCK:
                 why = _DIRECT_SYNC_PENDING or "client"
+            # User edits (limits/expiry) go out immediately; background traffic sync may coalesce briefly
+            urgent = str(why).startswith((
+                "client", "api-", "group", "limit", "xray-clients", "quota",
+            ))
+            if not urgent:
+                time.sleep(0.05)
+            with _DIRECT_SYNC_LOCK:
+                why = _DIRECT_SYNC_PENDING or why or "client"
                 _DIRECT_SYNC_PENDING = ""
             try:
+                # wait=True so a second edit during push is re-queued after apply finishes
                 _push_direct_nodes_clients(
-                    _load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=False,
+                    _load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=True,
                 )
             finally:
                 with _DIRECT_SYNC_LOCK:
@@ -4163,7 +4171,7 @@ async def client_save(request: Request):
         f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}",
         " · ".join(bits),
     )
-    flash(request, *_ok_msg(f"Клиент {c['email']} сохранён", result))
+    flash(request, *_ok_msg(f"Клиент {c['email']} сохранён · sync на ноды", result))
     return go(f"/clients/{c['email']}/edit")
 
 
@@ -9413,8 +9421,18 @@ async def nodes_provision(request: Request):
     return go("/nodes")
 
 
-def _node_push_job(node_id: str, label: str, host: str, timeout: int | None = None):
-    """Push config to one node outside STORE_LOCK (avoids deadlock / hung panel)."""
+def _node_push_job(
+    node_id: str,
+    label: str,
+    host: str,
+    timeout: int | None = None,
+    *,
+    clients_only: bool = False,
+):
+    """Push config to one node outside STORE_LOCK (avoids deadlock / hung panel).
+
+    clients_only: lightweight clients/groups sync (limits, expiry, enable) — fast hot-apply on agent.
+    """
     with mutate() as store:
         node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
         if not node:
@@ -9438,7 +9456,10 @@ def _node_push_job(node_id: str, label: str, host: str, timeout: int | None = No
                     f"xray={'ok' if xr.get('ok') else xr.get('error')}"
                 ),
             }
-        payload = nodes_mod.build_payload(store, node, xray.build_config)
+        if clients_only:
+            payload = nodes_mod.build_clients_sync_payload(store, node, xray.build_config)
+        else:
+            payload = nodes_mod.build_payload(store, node, xray.build_config)
         node_snap = dict(node)
         name = node.get("name") or node_id
         prev_ok = bool(node.get("last_ok"))
@@ -10644,6 +10665,54 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
         dc_tag0 = str(payload.get("direct_connect_tag") or "").strip()
         if dc_tag0:
             keep_tags.add(dc_tag0)
+    # Fast path: master user edit (limits / expiry / enable) — clients+groups only
+    if payload.get("clients_only_sync"):
+        with mutate() as st:
+            if payload.get("clients") is not None:
+                st["clients"] = (
+                    list(payload["clients"]) if mirror
+                    else nodes_mod._agent_safe_clients(
+                        payload["clients"],
+                        keep_tags=keep_tags,
+                        direct_self_tag=str(payload.get("direct_connect_tag") or "").strip()
+                        if payload.get("direct_connect") else "",
+                    )
+                )
+            if payload.get("groups") is not None:
+                st["groups"] = list(payload["groups"] or [])
+            ns = st.setdefault("settings", {}).setdefault("nodes", {})
+            if payload.get("direct_connect") is not None:
+                ns["direct_connect"] = bool(payload.get("direct_connect"))
+            dc_tag = str(payload.get("direct_connect_tag") or "").strip()
+            if dc_tag:
+                ns["direct_connect_tag"] = dc_tag
+            if payload.get("node_id"):
+                ns["upstream_node_id"] = str(payload.get("node_id"))
+            master_url = str(payload.get("master_url") or "").rstrip("/")
+            if master_url:
+                ns["upstream_master_url"] = master_url
+                ns["master_pull_url"] = master_url
+        res = _apply_xray(
+            _load_store(),
+            clients_only=True,
+            hold_front_commit=hold_front_commit,
+        )
+        err = res.get("error") or ""
+        try:
+            err = xray.clean_xray_error(err) or err
+        except Exception:
+            pass
+        out = {
+            "ok": bool(res.get("ok")),
+            "error": err,
+            "warnings": [],
+            "mirror": mirror,
+            "clients_only_sync": True,
+            "hot_clients": bool(res.get("hot_clients")),
+        }
+        if hold_front_commit and res.get("_front_staged") is not None:
+            out["_front_staged"] = res.get("_front_staged")
+        return out
     with mutate() as st:
         if payload.get("clients") is not None:
             st["clients"] = (

@@ -2460,6 +2460,27 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     return out
 
 
+def build_clients_sync_payload(store: dict, node: dict, build_config) -> dict:
+    """Lightweight push: clients + groups only (limits/expiry/enable) for fast node sync.
+
+    Agent applies with HandlerService hot user sync — no full Xray/nginx rebuild.
+    """
+    full = build_payload(store, node, build_config)
+    return {
+        "clients_only_sync": True,
+        "demote_to_agent": True,
+        "mirror": bool(full.get("mirror")),
+        "nat": bool(full.get("nat")),
+        "direct_connect": bool(full.get("direct_connect")),
+        "direct_connect_tag": str(full.get("direct_connect_tag") or ""),
+        "master_url": str(full.get("master_url") or ""),
+        "node_id": full.get("node_id"),
+        "clients": list(full.get("clients") or []),
+        "groups": list(full.get("groups") or []),
+        "pushed_at": now_iso(),
+    }
+
+
 def agent_endpoint(node: dict, path: str) -> str:
     """Agent API under the node's secret base_path (nginx only proxies that prefix)."""
     base = (node.get("url") or "").rstrip("/")
