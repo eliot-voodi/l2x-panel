@@ -2450,49 +2450,68 @@ def _core_id_for_inbound(store: dict, ib: dict) -> str:
     return ""
 
 
-def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str]) -> tuple[str, dict | None]:
-    """If inbound belongs to a Direct node's core, return (node_domain, remapped_ib).
+def _direct_node_for_inbound(store: dict, ib: dict) -> dict | None:
+    """Direct-connect node that owns this inbound via ``core_id`` (if any)."""
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return None
+    cid = _core_id_for_inbound(store, ib)
+    if not cid:
+        return None
+    for node in nodes_mod.ensure_list(store):
+        if str(node.get("core_id") or "").strip() != cid:
+            continue
+        if nodes_mod.uses_direct_connect(node):
+            return node
+    return None
 
-    Subscription must dial the node (e.g. ``buh.ro0t.dev``), not the panel host
-    (``web.ro0t.dev``). Bridge/tunnel nodes keep the master domain.
+
+def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str]) -> tuple[str, dict | None, dict | None]:
+    """If inbound belongs to a Direct node's core, return (node_domain, remapped_ib, node).
+
+    Subscription must dial the node (e.g. ``hub.ro0t.dev`` / ``buh.ro0t.dev``),
+    not the panel host (``web.ro0t.dev``). Bridge/tunnel nodes keep the master domain.
     """
     try:
         import nodes as nodes_mod
     except Exception:
-        return "", None
+        return "", None, None
     # Explicit share_host that is already a non-master domain wins.
     try:
         import front as front_mod
         explicit = front_mod.normalize_host(ib.get("share_host") or "")
     except Exception:
         explicit = str(ib.get("share_host") or "").strip().lower()
+    node = _direct_node_for_inbound(store, ib)
     if explicit and explicit not in master_hosts:
-        return explicit, None
+        return explicit, None, node
 
-    cid = _core_id_for_inbound(store, ib)
-    if not cid:
-        return "", None
-    best = None
-    for node in nodes_mod.ensure_list(store):
-        if str(node.get("core_id") or "").strip() != cid:
-            continue
-        if not nodes_mod.uses_direct_connect(node):
-            continue
-        dom = nodes_mod.node_public_domain(node) or ""
-        if not dom:
-            continue
-        best = (dom, node)
-        break
-    if not best:
-        return "", None
-    dom, _node = best
+    if not node:
+        return "", None, None
+    dom = nodes_mod.node_public_domain(node) or ""
+    if not dom:
+        return "", None, node
     try:
         remapped = nodes_mod.remap_inbounds_for_host(
             [ib], new_host=dom, old_hosts=master_hosts,
         )
-        return dom, (remapped[0] if remapped else None)
+        return dom, (remapped[0] if remapped else None), node
     except Exception:
-        return dom, None
+        return dom, None, node
+
+
+def _direct_ident_for_tag(client: dict, tag: str, *, label: str = "") -> dict:
+    """Build ``email~node_*`` identity used when dialing a Direct node."""
+    ident_uuid = P.identity_uuid(client["uuid"], tag)
+    return {
+        "uuid": ident_uuid,
+        "email": f"{client['email']}~{tag}",
+        "password": P.derived_password(ident_uuid),
+        "main": True,
+        "tag": tag,
+        "label": label or tag,
+    }
 
 
 def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
@@ -2513,12 +2532,19 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
         master_hosts = nodes_mod.master_public_domains(store)
     except Exception:
         master_hosts = set()
+        nodes_mod = None  # type: ignore
     pool_hidden = direct_pool_hidden_member_tags(store)
     # Several identities from one inbound (or several inbounds) → append outbound label
     multi_idents = multi or any(len(client_identities(store, client, i)) > 1 for i in ibs)
     for ib in ibs:
-        core_host, core_ib = _direct_node_host_for_inbound(store, ib, master_hosts)
+        core_host, core_ib, core_node = _direct_node_host_for_inbound(store, ib, master_hosts)
         ib_base = core_ib or ib
+        core_tag = ""
+        if core_node is not None and nodes_mod is not None:
+            try:
+                core_tag = nodes_mod.node_outbound_tag(core_node)
+            except Exception:
+                core_tag = ""
         for ident in client_identities(store, client, ib):
             if ident["main"]:
                 ob = client_default_outbound(store, client)
@@ -2539,17 +2565,16 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                     with_outbound=False,
                 )
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
-                # Direct node as основная: dial node host with email~node_* (agent local_direct)
-                if ob and ob != "direct" and _is_direct_connect_tag(store, ob):
-                    ident_uuid = P.identity_uuid(client["uuid"], ob)
-                    ident_use = {
-                        "uuid": ident_uuid,
-                        "email": f"{client['email']}~{ob}",
-                        "password": P.derived_password(ident_uuid),
-                        "main": True,
-                        "tag": ob,
-                        "label": outbound_label(store, ob),
-                    }
+                # Prefer the inbound's own Direct node identity so each node profile
+                # dials that node with email~node_* (traffic counted on the node).
+                if core_tag and _is_direct_connect_tag(store, core_tag):
+                    ident_use = _direct_ident_for_tag(
+                        client, core_tag, label=outbound_label(store, core_tag),
+                    )
+                elif ob and ob != "direct" and _is_direct_connect_tag(store, ob):
+                    ident_use = _direct_ident_for_tag(
+                        client, ob, label=outbound_label(store, ob),
+                    )
                 else:
                     ident_use = ident
             else:
@@ -2568,21 +2593,28 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 )
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
                 ident_use = ident
+            # Direct node inbound MUST advertise the node domain (never master).
+            # Only fall back to outbound Direct host when the inbound itself is master's.
+            host_use = core_host or dc_host or host
             ib_use = ib_base
-            host_use = core_host or host
-            if dc_host:
-                host_use = dc_host
+            remap_to = core_host or dc_host
+            if remap_to and nodes_mod is not None:
                 try:
-                    import nodes as nodes_mod
                     remapped = nodes_mod.remap_inbounds_for_host(
-                        [ib_base], new_host=dc_host, old_hosts=master_hosts,
+                        [ib_base], new_host=remap_to, old_hosts=master_hosts,
                     )
                     if remapped:
                         ib_use = remapped[0]
                 except Exception:
                     ib_use = ib_base
+            # Belt-and-suspenders: endpoint_for prefers share_host over host arg.
+            if remap_to and isinstance(ib_use, dict):
+                ib_use = dict(ib_use)
+                ib_use["share_host"] = remap_to
             ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
             if ep:
+                if remap_to:
+                    ep["address"] = remap_to
                 _apply_cosmetic_path(store, client, ib_use, ep)
                 eps.extend(P._apply_external_proxy(ep, ib_use))
     return eps
