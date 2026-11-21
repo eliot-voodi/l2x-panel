@@ -2450,8 +2450,8 @@ def _core_id_for_inbound(store: dict, ib: dict) -> str:
     return ""
 
 
-def _direct_node_for_inbound(store: dict, ib: dict) -> dict | None:
-    """Direct-connect node that owns this inbound via ``core_id`` (if any)."""
+def _node_for_inbound_core(store: dict, ib: dict) -> dict | None:
+    """Node that owns this inbound via ``core_id`` (Direct / standalone node cores)."""
     try:
         import nodes as nodes_mod
     except Exception:
@@ -2462,16 +2462,46 @@ def _direct_node_for_inbound(store: dict, ib: dict) -> dict | None:
     for node in nodes_mod.ensure_list(store):
         if str(node.get("core_id") or "").strip() != cid:
             continue
-        if nodes_mod.uses_direct_connect(node):
-            return node
+        return node
     return None
 
 
-def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str]) -> tuple[str, dict | None, dict | None]:
-    """If inbound belongs to a Direct node's core, return (node_domain, remapped_ib, node).
+def _direct_node_for_inbound(store: dict, ib: dict) -> dict | None:
+    """Direct-connect node that owns this inbound via ``core_id`` (if any)."""
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return None
+    node = _node_for_inbound_core(store, ib)
+    if node is not None and nodes_mod.uses_direct_connect(node):
+        return node
+    return None
 
-    Subscription must dial the node (e.g. ``hub.ro0t.dev`` / ``buh.ro0t.dev``),
-    not the panel host (``web.ro0t.dev``). Bridge/tunnel nodes keep the master domain.
+
+def _subscription_should_dial_node(node: dict | None) -> bool:
+    """Whether subscription profiles for this node's inbound must dial the node host.
+
+    Direct-connect always. Standalone node cores (own domain, not NAT/tunnel) also —
+    their Reality/VLESS listeners live on the node, not on the master.
+    """
+    if not isinstance(node, dict):
+        return False
+    try:
+        import nodes as nodes_mod
+        if nodes_mod.uses_direct_connect(node):
+            return True
+        if node.get("nat") or node.get("tunnel") or node.get("rv_mode"):
+            return False
+        return bool(nodes_mod.node_public_domain(node))
+    except Exception:
+        return False
+
+
+def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str]) -> tuple[str, dict | None, dict | None]:
+    """If inbound belongs to a node core clients should dial, return (node_domain, remapped_ib, node).
+
+    Subscription must dial the node (e.g. ``buh.ro0t.dev`` / ``am.ro0t.dev``),
+    not the panel host (``web.ro0t.dev``). NAT/tunnel bridge nodes keep the master domain.
     """
     try:
         import nodes as nodes_mod
@@ -2483,14 +2513,14 @@ def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str])
         explicit = front_mod.normalize_host(ib.get("share_host") or "")
     except Exception:
         explicit = str(ib.get("share_host") or "").strip().lower()
-    node = _direct_node_for_inbound(store, ib)
+    node = _node_for_inbound_core(store, ib)
     if explicit and explicit not in master_hosts:
         return explicit, None, node
 
-    if not node:
-        return "", None, None
+    if not _subscription_should_dial_node(node):
+        return "", None, node
     dom = nodes_mod.node_public_domain(node) or ""
-    if not dom:
+    if not dom or dom in master_hosts:
         return "", None, node
     try:
         remapped = nodes_mod.remap_inbounds_for_host(
