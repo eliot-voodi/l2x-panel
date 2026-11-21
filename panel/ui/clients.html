@@ -222,12 +222,7 @@
       <option value="">— без группы —</option>
       {% for g in groups or [] %}<option value="{{ g.id }}">{{ g.name }}</option>{% endfor %}
     </select>
-    <label class="f">Outbound</label>
-    <select name="outbound">
-      <option value="direct">🏠 Direct</option>
-      {% for b in store.balancers.values() if b.enabled %}<option value="{{ b.tag }}">{{ outbound_label(store, b.tag) }}</option>{% endfor %}
-      {% for o in store.outbounds_custom %}<option value="{{ o.tag }}">{{ outbound_label(store, o.tag) }}</option>{% endfor %}
-    </select>
+    <div class="hint">Inbounds берутся из группы (или все). Исходящие — в ядрах.</div>
     <div class="actions mt"><button class="btn">Создать</button></div>
   </form>
 </dialog>

@@ -1632,8 +1632,9 @@ def client_inbounds(store: dict, client: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------- client groups
-# Groups define which outbounds (subscription connections) and inbounds a client gets.
-# Empty allowed_tags / inbounds on a group = all. Client without group_id keeps personal lists.
+# Groups assign inbounds only (outbounds / routing live in cores).
+# Empty inbounds on a group = all. Client without group_id keeps personal inbound lists.
+# Legacy allowed_tags / outbound fields may still exist in store; empty allowed_tags = all.
 
 def ensure_groups(store: dict) -> list[dict]:
     groups = store.setdefault("groups", [])

@@ -3463,9 +3463,6 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     gid = str(form.get("group_id") or "").strip()
     if gid and not xray.get_group(store, gid):
         return "Неизвестная группа"
-    known = {t_["tag"] for t_ in xray.selectable_outbound_tags(store)}
-    # Primary link is chosen only in «Подключения в подписке» (radio main_outbound).
-    outbound = str(form.get("main_outbound") or form.get("outbound") or "").strip()
     old_email = client.get("email")
     client["email"] = email
     client["enabled"] = form.get("enabled", "1") == "1"
@@ -3518,31 +3515,20 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     client["group_id"] = gid
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
-    selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
-    # «Основная» идёт отдельно — не держим её в extras (иначе дубль в подписке).
-    if outbound and outbound in selected:
-        selected = [t for t in selected if t != outbound]
     ib_mode = str(form.get("ib_mode") or "all").strip().lower()
     if ib_mode not in ("all", "select"):
         ib_mode = "all"
-    select_mode = str(form.get("select_mode") or "all").strip().lower()
-    if select_mode not in ("all", "select"):
-        select_mode = "all"
     client["ib_mode"] = ib_mode
-    client["select_mode"] = select_mode
+    # Outbounds no longer assigned per client — empty allowed_tags = all (cores/routing).
+    client["select_mode"] = "all"
+    client["allowed_tags"] = []
+    client["outbound"] = ""
     if gid:
-        # Group owns base inbounds/outbounds. Personal lists are optional extras only.
-        # «Снять все» / «только группа» → empty personal lists (mode=all).
+        # Group owns base inbounds. Personal lists are optional extras only.
         if ib_mode == "all":
             client["inbounds"] = []
         else:
             client["inbounds"] = sel_ib  # may be empty = no personal extras
-        if select_mode == "all":
-            client["allowed_tags"] = []
-        else:
-            client["allowed_tags"] = selected
-        # Primary always from group when assigned.
-        client["outbound"] = ""
     else:
         if ib_mode == "all":
             client["inbounds"] = []
@@ -3550,38 +3536,13 @@ def _client_form(form, store: dict, client: dict) -> str | None:
             if not sel_ib:
                 return "Отметьте хотя бы один inbound или выберите режим «все»"
             client["inbounds"] = sel_ib
-        if select_mode == "all":
-            client["allowed_tags"] = []
-            client["outbound"] = outbound if outbound in known or outbound == "direct" else "direct"
-        elif outbound and (outbound in known or outbound == "direct"):
-            # Primary alone is enough; checkboxes are optional extras.
-            # Store [primary] when no extras so empty list is not read as «все».
-            client["outbound"] = outbound
-            client["allowed_tags"] = selected if selected else [outbound]
-        elif selected:
-            client["allowed_tags"] = selected
-            client["outbound"] = selected[0]
-        else:
-            return "Выберите основную ссылку или хотя бы одно подключение"
-        ob = client.get("outbound") or "direct"
-        if ob != xray.NONE_TAG and ob not in known and ob != "direct":
-            return f"Неизвестный outbound {ob}"
-        client["outbound"] = ob
     # Optional manual WireGuard tunnel IP (empty → auto from inbound pool on ensure_wg_peer).
     if "wg_ip" in form:
         raw_wg = str(form.get("wg_ip") or "").strip().split("/")[0]
         client["wg_ip"] = raw_wg
-    limits = {}
-    daily_limits = {}
-    for tag in known:
-        gb = _float(form.get(f"limit_{tag}"))
-        if gb > 0:
-            limits[tag] = gb
-        dgb = _float(form.get(f"daily_limit_{tag}"))
-        if dgb > 0:
-            daily_limits[tag] = dgb
-    client["outbound_limits"] = limits
-    client["daily_outbound_limits"] = daily_limits
+    # Per-outbound limits UI removed — keep previously stored values as-is.
+    client.setdefault("outbound_limits", client.get("outbound_limits") or {})
+    client.setdefault("daily_outbound_limits", client.get("daily_outbound_limits") or {})
     if old_email and old_email != email:
         for r in store.get("routes") or []:
             if isinstance(r.get("user"), list):
@@ -4020,7 +3981,9 @@ async def clients_bulk(request: Request):
                     bulk_gid = ""
                 c = xray.ensure_client({"email": email, "sub_token": secrets.token_urlsafe(18),
                                         "limit_gb": _float(form.get("limit_gb")),
-                                        "outbound": str(form.get("outbound") or "direct"),
+                                        "outbound": "",
+                                        "allowed_tags": [],
+                                        "select_mode": "all",
                                         "group_id": bulk_gid})
                 days = _int(form.get("days"))
                 if days and form.get("first_use") == "1":
@@ -4079,23 +4042,10 @@ def _group_form(form, store: dict, group: dict) -> str | None:
         return "Укажите название группы"
     group["name"] = name
     group["comment"] = str(form.get("comment") or "").strip()
-    known = {t["tag"] for t in xray.selectable_outbound_tags(store)}
-    selected = [str(x) for x in form.getlist("allowed_tags") if str(x) in known]
-    outbound = str(form.get("main_outbound") or form.get("outbound") or "").strip()
-    # Primary is always in the subscription via group.outbound — drop it from extras
-    # so the same tag is not listed twice.
-    if outbound and outbound in selected:
-        selected = [t for t in selected if t != outbound]
-    select_mode = str(form.get("select_mode") or "all").strip().lower()
-    if select_mode not in ("all", "select"):
-        select_mode = "all"
-    group["select_mode"] = select_mode
-    if select_mode == "all":
-        group["allowed_tags"] = []
-    else:
-        # Keep «выбранные» even when only primary is chosen (no extra checkboxes).
-        # Store [primary] so empty list is not re-read as legacy «все».
-        group["allowed_tags"] = selected if selected else ([outbound] if outbound else [])
+    # Outbounds are no longer assigned on groups — only inbounds.
+    group["select_mode"] = "all"
+    group["allowed_tags"] = []
+    group["outbound"] = ""
     known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
     sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
     ib_mode = str(form.get("ib_mode") or "all").strip().lower()
@@ -4108,12 +4058,6 @@ def _group_form(form, store: dict, group: dict) -> str | None:
         if not sel_ib:
             return "Отметьте хотя бы один inbound или выберите режим «все»"
         group["inbounds"] = sel_ib
-    if outbound and outbound != "direct" and outbound not in known:
-        return f"Неизвестный outbound {outbound}"
-    if not outbound:
-        # Fallback: first extra, else empty (= first selectable / direct at resolve time)
-        outbound = selected[0] if selected else ""
-    group["outbound"] = outbound
     return None
 
 

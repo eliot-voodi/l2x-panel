@@ -27,14 +27,12 @@
     <select name="group_id" id="client-group">
       <option value="">— без группы (личные настройки) —</option>
       {% for g in (groups or []) %}
-      <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.allowed_tags %} · {{ g.allowed_tags|length }} подкл.{% endif %}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
+      <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.inbounds %} · {{ g.inbounds|length }} ib{% elif list_mode(g, list_key='inbounds', mode_key='ib_mode') == 'all' %} · все ib{% endif %}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
       {% endfor %}
     </select>
-    <div class="hint">{% if groups %}Группа задаёт inbounds, подключения и основную ссылку.
-      Ручной выбор ниже не обязателен — можно только дописать личные extras.
+    <div class="hint">{% if groups %}Группа задаёт набор <b>inbounds</b>. Исходящие — в ядрах.
       <a href="{{ bp }}/groups">Управление группами</a>.
-      {% else %}Групп пока нет — <a href="{{ bp }}/groups/new">создайте</a>, чтобы назначать наборы подключений.{% endif %}
-      {% if group %} Сейчас основная: <b>{{ outbound_label(store, eff_outbound or group.outbound or (eff_tags[0] if eff_tags else 'direct')) }}</b> (группа).{% endif %}</div>
+      {% else %}Групп пока нет — <a href="{{ bp }}/groups/new">создайте</a>, чтобы назначать inbounds.{% endif %}</div>
     <div class="mt">
       <input type="hidden" name="enabled" value="0">{{ m.check('enabled', c.enabled, t('Включён')) }}
       <input type="hidden" name="sub_enabled" value="0">{{ m.check('sub_enabled', c.sub_enabled, 'Подписка доступна') }}
@@ -135,20 +133,14 @@
   <div class="card" style="border-color:var(--accent)" id="group-summary">
     <h3>Группа «{{ group.name }}»</h3>
     <div class="small">
-      <div><span class="dim">Основная ссылка:</span>
-        <b>{{ outbound_label(store, eff_outbound or group.outbound or (eff_tags[0] if eff_tags else 'direct')) }}</b></div>
-      <div class="mt"><span class="dim">Подключения:</span>
-        {% if eff_tags %}{% for tg in eff_tags %}<span class="badge accent" style="margin:0 .2rem .2rem 0">{{ outbound_label(store, tg) }}</span>{% endfor %}{% else %}все{% endif %}</div>
-      <div class="mt"><span class="dim">Inbounds:</span> {% if eff_inbounds %}{{ eff_inbounds|join(', ') }}{% else %}все{% endif %}</div>
+      <div><span class="dim">Inbounds:</span> {% if eff_inbounds %}{{ eff_inbounds|join(', ') }}{% else %}все{% endif %}</div>
     </div>
-    <div class="hint mt">База из группы. Ниже можно вручную дописать личные inbounds/подключения (добавятся к группе). Лимиты GB — личные.</div>
+    <div class="hint mt">База inbounds из группы. Ниже можно дописать личные inbounds поверх группы.</div>
   </div>
   {% endif %}
 
   {% set ib_mode = list_mode(c, list_key='inbounds', mode_key='ib_mode') %}
-  {% set select_mode = list_mode(c, list_key='allowed_tags', mode_key='select_mode') %}
   {% set group_ib_mode = list_mode(group, list_key='inbounds', mode_key='ib_mode') if group else 'all' %}
-  {% set group_select_mode = list_mode(group, list_key='allowed_tags', mode_key='select_mode') if group else 'all' %}
   <div class="card" id="card-inbounds">
     <div class="card-head"><h3>Inbounds{% if group %} <span class="badge">из группы</span>{% endif %}</h3>
       <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if ib_mode == 'all' %}checked{% endif %}> {% if group %}только группа{% else %}все{% endif %}</label>
@@ -161,7 +153,7 @@
       <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
       <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
     </div>
-    <div class="hint mb0">Точки входа: мастер + уникальные tag из снимков <b>Ядер</b>. Ноду <b>+Direct</b> сюда назначать не нужно — см. «Подключения в подписке». Inbound «Direct → master egress» — служебный.</div>
+    <div class="hint mb0">Точки входа: мастер + уникальные tag из снимков <b>Ядер</b>. Исходящие и маршруты — в ядрах. Inbound «Direct → master egress» — служебный.</div>
     {% for ib in inbounds %}
       <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if group %}{% if ib_mode == 'select' and ib.tag in (c.inbounds or []) %}checked{% endif %}{% else %}{% if ib_mode == 'all' or ib.tag in (c.inbounds or []) %}checked{% endif %}{% endif %}>
         <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }}
@@ -170,55 +162,6 @@
       </label><br>
     {% else %}<div class="dim">Нет inbounds для клиентов</div>{% endfor %}
     {% if group %}<div class="hint">По умолчанию — inbounds группы. «Дописать» добавляет личные поверх группы. «Снять все» — снова только группа.</div>{% endif %}
-  </div>
-
-  <div class="card" id="card-allowed">
-    <div class="card-head"><h3>Подключения в подписке и лимиты по ним{% if group %} <span class="badge">из группы</span>{% endif %}</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if select_mode == 'all' %}checked{% endif %}> {% if group %}только группа{% else %}все{% endif %}</label>
-        <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if select_mode == 'select' %}checked{% endif %}> {% if group %}дописать{% else %}выбранные{% endif %}</label></div>
-    </div>
-    {% if group %}
-    <div class="hint mb0">Основная и список конфигов — из группы
-      (<b>{{ outbound_label(store, eff_outbound or group.outbound or 'direct') }}</b>{% if group_select_mode == 'all' %}: все{% elif group.allowed_tags %}: {% for t in group.allowed_tags %}{{ outbound_label(store, t) }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}: только основная{% endif %}).
-      Ручной выбор необязателен. «Снять все» сбрасывает личные extras на группу.</div>
-    {% else %}
-    <div class="hint mb0">«Основная» всегда в подписке (галочка для неё не нужна). Галочки — только дополнительные конфиги.
-      Чтобы клиент ходил <b>напрямую на ноду</b> (+Direct): в <a href="{{ bp }}/nodes">Nodes</a> включите <b>+Direct</b> у ноды, затем выберите её как <b>Основная</b> здесь. Маршруты/лимиты остаются с мастера; выход «Мастер» на ноде — через backhaul.</div>
-    {% endif %}
-    <div class="flex" style="gap:.4rem;margin:.6rem 0">
-      <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
-      <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
-    </div>
-    <table>
-      <thead><tr>
-        <th><input type="checkbox" data-master="allowed_tags" data-mode="select_mode" title="Доп. все / снять"></th>
-        <th>Основная</th>
-        <th>Подключение</th>
-        {% if not is_new %}<th>Потрачено</th><th>Сегодня</th>{% endif %}
-        <th style="width:120px">Лимит, GB</th>
-        <th style="width:120px">День, GB</th>
-      </tr></thead>
-      <tbody>
-      {% set main_ob = c.outbound or (group.outbound if group else '') or (eff_outbound or '') %}
-      {% for tg in tags %}
-        {% set is_main = (not group) and (main_ob == tg.tag or (not main_ob and loop.first)) %}
-        <tr>
-          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}"
-            {% if is_main %}disabled{% elif group %}{% if select_mode == 'select' and tg.tag in (c.allowed_tags or []) %}checked{% endif %}{% else %}{% if select_mode == 'all' and not is_main and tg.kind != 'system' %}checked{% elif select_mode == 'select' and tg.tag in (c.allowed_tags or []) and not is_main %}checked{% endif %}{% endif %}></td>
-          <td>{% if group %}<span class="dim" title="Основная из группы">—</span>{% else %}<input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if is_main %}checked{% endif %} title="Основная ссылка">{% endif %}</td>
-          <td>{{ tg.label }} {% if tg.direct_connect %}<span class="badge ok" title="Клиент → нода напрямую, маршруты с мастера">Direct</span>{% elif tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.kind == 'system' %}<span class="badge">system</span>{% elif tg.kind == 'node' %}<span class="badge">node</span>{% endif %}{% if tg.status and tg.status not in ('connected', 'enabled', 'Direct') %} <span class="badge">{{ tg.status }}</span>{% endif %}</td>
-          {% if not is_new %}
-          <td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>
-          <td class="small nowrap">{{ format_traffic(tg.daily_used) }}{% if tg.daily_exceeded %} <span class="badge warn">день</span>{% endif %}</td>
-          {% endif %}
-          <td><input name="limit_{{ tg.tag }}" type="number" step="0.01" min="0" value="{{ tg.limit if tg.limit is defined else ((c.outbound_limits or {}).get(tg.tag) or '') }}" placeholder="∞"></td>
-          <td><input name="daily_limit_{{ tg.tag }}" type="number" step="0.01" min="0" value="{{ tg.daily_limit if tg.daily_limit is defined else ((c.daily_outbound_limits or {}).get(tg.tag) or '') }}" placeholder="∞"></td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    <div class="hint">Лимиты по outbound отдельно от общего. Дневной — сброс в 00:00 UTC. Исчерпанный outbound пропадает из подписки до обновления лимита.
-      {% if group %}«Дописать» добавит отмеченные к группе; основная ссылка всегда из группы.{% else %}Галочка на «основной» не нужна — иначе конфиг дублируется в подписке.{% endif %}</div>
   </div>
 
   <div class="card" id="card-wg">
@@ -364,49 +307,21 @@
   }
   (function () {
     var form = document.querySelector('form[action$="/clients/save"]');
+    if (!form) return;
     var boxes = function (name) { return Array.prototype.slice.call(form.querySelectorAll('input[type=checkbox][name="' + name + '"]')); };
     var setMode = function (mode, value) {
       var r = form.querySelector('input[name="' + mode + '"][value="' + value + '"]');
       if (r) r.checked = true;
     };
-    var syncMaster = function (name) {
-      var m = form.querySelector('[data-master="' + name + '"]');
-      if (!m) return;
-      var b = boxes(name), on = b.filter(function (x) { return x.checked; }).length;
-      m.checked = b.length > 0 && on === b.length;
-      m.indeterminate = on > 0 && on < b.length;
-    };
-    var syncMainExtras = function () {
-      var main = form.querySelector('input[name="main_outbound"]:checked');
-      var mainTag = main ? main.value : '';
-      boxes('allowed_tags').forEach(function (c) {
-        if (c.value === mainTag) {
-          c.checked = false;
-          c.disabled = true;
-        } else {
-          c.disabled = false;
-        }
-      });
-      syncMaster('allowed_tags');
-    };
     var groupEl = document.getElementById('client-group');
     var hasGroup = function () { return !!(groupEl && groupEl.value); };
     var setAll = function (name, mode, value) {
-      var main = form.querySelector('input[name="main_outbound"]:checked');
-      var mainTag = main ? main.value : '';
       boxes(name).forEach(function (x) {
-        if (name === 'allowed_tags' && x.value === mainTag) {
-          x.checked = false;
-          x.disabled = true;
-          return;
-        }
         x.disabled = false;
         x.checked = value;
       });
-      // With a group: clear → «только группа»; without group: keep «выбранные» (only primary).
       if (!value && hasGroup()) setMode(mode, 'all');
       else setMode(mode, 'select');
-      syncMaster(name);
     };
     form.querySelectorAll('[data-check-all]').forEach(function (b) {
       b.addEventListener('click', function () { setAll(b.dataset.checkAll, b.dataset.mode, true); });
@@ -414,18 +329,7 @@
     form.querySelectorAll('[data-uncheck-all]').forEach(function (b) {
       b.addEventListener('click', function () { setAll(b.dataset.uncheckAll, b.dataset.mode, false); });
     });
-    form.querySelectorAll('[data-master]').forEach(function (m) {
-      m.addEventListener('change', function () { setAll(m.dataset.master, m.dataset.mode, m.checked); });
-      boxes(m.dataset.master).forEach(function (x) {
-        x.addEventListener('change', function () { setMode(m.dataset.mode, 'select'); syncMaster(m.dataset.master); });
-      });
-      syncMaster(m.dataset.master);
-    });
     boxes('inbounds').forEach(function (x) { x.addEventListener('change', function () { setMode('ib_mode', 'select'); }); });
-    form.querySelectorAll('input[name="main_outbound"]').forEach(function (r) {
-      r.addEventListener('change', function () { syncMainExtras(); setMode('select_mode', 'select'); });
-    });
-    // «только группа» / «все» radios clear personal extras.
     form.querySelectorAll('input[name="ib_mode"]').forEach(function (r) {
       r.addEventListener('change', function () {
         if (r.value === 'all') {
@@ -433,37 +337,14 @@
         }
       });
     });
-    form.querySelectorAll('input[name="select_mode"]').forEach(function (r) {
-      r.addEventListener('change', function () {
-        if (r.value === 'all') {
-          boxes('allowed_tags').forEach(function (x) {
-            if (x.disabled) return;
-            x.checked = false;
-          });
-          syncMaster('allowed_tags');
-        }
-      });
-    });
-    syncMainExtras();
     function onGroupChange() {
       if (!groupEl || !groupEl.value) return;
-      // Switching personal → group: drop personal lists («снять все» / только группа).
       setMode('ib_mode', 'all');
-      setMode('select_mode', 'all');
       boxes('inbounds').forEach(function (x) { x.checked = false; });
-      boxes('allowed_tags').forEach(function (x) { x.checked = false; x.disabled = false; });
-      syncMaster('allowed_tags');
     }
     if (groupEl) groupEl.addEventListener('change', onGroupChange);
     form.addEventListener('submit', function (e) {
-      if (groupEl && groupEl.value) return; // group owns inbounds/outbounds; extras optional
-      var main = form.querySelector('input[name="main_outbound"]:checked');
-      if (!main) {
-        e.preventDefault();
-        alert('Выберите основную ссылку в колонке «Основная»');
-        return;
-      }
-      syncMainExtras(); // ensure primary checkbox not submitted
+      if (groupEl && groupEl.value) return;
       var ibSel = form.querySelector('input[name="ib_mode"][value="select"]');
       if (ibSel && ibSel.checked && boxes('inbounds').length && !boxes('inbounds').some(function (x) { return x.checked; })) {
         e.preventDefault();

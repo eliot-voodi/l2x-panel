@@ -13,7 +13,6 @@
 {% endblock %}
 {% block content %}
 {% set ib_mode = list_mode(g, list_key='inbounds', mode_key='ib_mode') %}
-{% set select_mode = list_mode(g, list_key='allowed_tags', mode_key='select_mode') %}
 <form method="post" action="{{ bp }}/groups/save">
   <input type="hidden" name="id" value="{{ '' if is_new else g.id }}">
   <div class="card">
@@ -22,7 +21,7 @@
       <div><label class="f">Название</label><input name="name" value="{{ g.name }}" required autofocus placeholder="Free / Premium / …"></div>
       <div><label class="f">Комментарий</label><input name="comment" value="{{ g.comment or '' }}" placeholder="для себя"></div>
     </div>
-    <div class="hint">Основная ссылка и список конфигов задаются только в блоке «Подключения в подписке» ниже.</div>
+    <div class="hint">Группа назначает клиентам только <b>inbounds</b>. Маршрутизация и исходящие настраиваются в <b>Ядрах</b>.</div>
   </div>
 
   <div class="card">
@@ -45,31 +44,6 @@
     {% else %}<div class="dim">Нет inbounds</div>{% endfor %}
   </div>
 
-  <div class="card">
-    <div class="card-head"><h3>Подключения в подписке</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="all" {% if select_mode == 'all' %}checked{% endif %}> все</label>
-        <label class="check" style="margin:0 .4rem"><input type="radio" name="select_mode" value="select" {% if select_mode == 'select' %}checked{% endif %}> выбранные</label></div>
-    </div>
-    <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
-      <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
-      <button type="button" class="btn sm ghost" data-uncheck-all="allowed_tags" data-mode="select_mode">Снять все</button>
-    </div>
-    <table>
-      <thead><tr><th>Доп.</th><th>Основная</th><th>Подключение</th></tr></thead>
-      <tbody>
-      {% for tg in tags %}
-        {% set is_main = g.outbound == tg.tag or (not g.outbound and loop.first) %}
-        <tr>
-          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if is_main %}disabled{% elif select_mode == 'all' and tg.kind != 'system' %}checked{% elif select_mode == 'select' and tg.tag in (g.allowed_tags or []) %}checked{% endif %} data-extra="1"></td>
-          <td><input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if is_main %}checked{% endif %}></td>
-          <td>{{ tg.label }}{% if tg.kind == 'balancer' %} <span class="badge">авто</span>{% elif tg.kind == 'system' %} <span class="badge">system</span>{% endif %}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    <div class="hint mt">«Основная» всегда в подписке (без галочки). Галочка «Доп.» — только дополнительные конфиги; иначе основная дублируется.</div>
-  </div>
-
   <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/groups">{{ t('Отмена') }}</a></div>
 </form>
 <script>
@@ -80,27 +54,11 @@
     var r = form.querySelector('input[name="' + modeName + '"][value="' + value + '"]');
     if (r) r.checked = true;
   }
-  function syncMainExtras() {
-    if (!form) return;
-    var main = form.querySelector('input[name="main_outbound"]:checked');
-    var mainTag = main ? main.value : '';
-    form.querySelectorAll('input[name="allowed_tags"]').forEach(function (c) {
-      if (c.value === mainTag) {
-        c.checked = false;
-        c.disabled = true;
-      } else {
-        c.disabled = false;
-      }
-    });
-  }
   document.querySelectorAll('[data-check-all]').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var name = btn.getAttribute('data-check-all');
       var mode = btn.getAttribute('data-mode');
-      var main = form && form.querySelector('input[name="main_outbound"]:checked');
-      var mainTag = main ? main.value : '';
       document.querySelectorAll('input[name="' + name + '"]').forEach(function (c) {
-        if (name === 'allowed_tags' && c.value === mainTag) { c.checked = false; c.disabled = true; return; }
         c.disabled = false;
         c.checked = true;
       });
@@ -115,29 +73,14 @@
         if (c.disabled) return;
         c.checked = false;
       });
-      // Keep «выбранные»: empty extras = only primary (not legacy «все»).
       if (mode) setMode(mode, 'select');
     });
   });
   if (form) {
-    form.querySelectorAll('input[name="main_outbound"]').forEach(function (r) {
-      r.addEventListener('change', function () { syncMainExtras(); setMode('select_mode', 'select'); });
-    });
     form.querySelectorAll('input[name="inbounds"]').forEach(function (c) {
       c.addEventListener('change', function () { setMode('ib_mode', 'select'); });
     });
-    form.querySelectorAll('input[name="allowed_tags"]').forEach(function (c) {
-      c.addEventListener('change', function () { setMode('select_mode', 'select'); });
-    });
-    syncMainExtras();
     form.addEventListener('submit', function (e) {
-      var main = form.querySelector('input[name="main_outbound"]:checked');
-      if (!main) {
-        e.preventDefault();
-        alert('Выберите основную ссылку в колонке «Основная»');
-        return;
-      }
-      syncMainExtras();
       var ibSel = form.querySelector('input[name="ib_mode"][value="select"]');
       var ibBoxes = form.querySelectorAll('input[name="inbounds"]');
       if (ibSel && ibSel.checked && ibBoxes.length && !Array.prototype.some.call(ibBoxes, function (x) { return x.checked; })) {
