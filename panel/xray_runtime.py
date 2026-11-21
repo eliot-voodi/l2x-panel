@@ -2344,28 +2344,36 @@ def client_identities(store: dict, client: dict, ib: dict) -> list[dict]:
         return [main]
     if ib["protocol"] in ("socks", "http"):
         return [main]
-    # Direct-connect primary: share link dials the node with email~node_* UUID.
-    # Register that identity even when subscription_entries skips the default tag.
+    # Direct-connect: subscription dials the node with email~node_* UUID.
+    # Register that identity even when the client's default outbound is ``direct``
+    # (common after sync) — otherwise the node only has the base UUID and
+    # master-issued node profiles fail auth.
     default = client_default_outbound(store, client)
-    out: list[dict] = []
+    self_tag = ""
+    try:
+        ns = (store.get("settings") or {}).get("nodes") or {}
+        if ns.get("direct_connect"):
+            self_tag = str(ns.get("direct_connect_tag") or "").strip()
+    except Exception:
+        self_tag = ""
+    primary_tag = ""
     if default and default != "direct" and _is_direct_connect_tag(store, default):
-        ident_uuid = P.identity_uuid(client["uuid"], default)
+        primary_tag = default
+    elif self_tag and _is_direct_connect_tag(store, self_tag):
+        primary_tag = self_tag
+    out: list[dict] = []
+    if primary_tag:
+        ident_uuid = P.identity_uuid(client["uuid"], primary_tag)
         out.append({
             "uuid": ident_uuid,
-            "email": f"{client['email']}~{default}",
+            "email": f"{client['email']}~{primary_tag}",
             "password": P.derived_password(ident_uuid),
             "main": True,
-            "tag": default,
-            "label": outbound_label(store, default),
+            "tag": primary_tag,
+            "label": outbound_label(store, primary_tag),
         })
-        # On Direct agents also keep the base UUID so a flaky sync that only
-        # emitted the legacy identity still accepts the client.
-        try:
-            import nodes as nodes_mod
-            if not nodes_mod.is_master(store):
-                out.append(dict(main))
-        except Exception:
-            out.append(dict(main))
+        # Always keep the base UUID too (legacy clients / Russia-style profiles).
+        out.append(dict(main))
     else:
         out.append(main)
     for e in subscription_entries(store, client):
@@ -2595,13 +2603,20 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                     with_outbound=False,
                 )
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
-                # Prefer the inbound's own Direct node identity so each node profile
-                # dials that node with email~node_* (traffic counted on the node).
-                if core_tag and _is_direct_connect_tag(store, core_tag):
-                    ident_use = _direct_ident_for_tag(
-                        client, core_tag, label=outbound_label(store, core_tag),
-                    )
+                # Node-owned inbound: dial the node with the BASE client UUID.
+                # Nodes always have it (email~node_* may be missing until the agent
+                # rebuilds identities) — this is what makes sub profiles work.
+                if core_host:
+                    ident_use = {
+                        "uuid": client["uuid"],
+                        "email": client["email"],
+                        "password": client.get("password") or P.derived_password(client["uuid"]),
+                        "main": True,
+                        "tag": core_tag or "",
+                        "label": outbound_label(store, core_tag) if core_tag else "",
+                    }
                 elif ob and ob != "direct" and _is_direct_connect_tag(store, ob):
+                    # Master inbound remapped to a Direct outbound host
                     ident_use = _direct_ident_for_tag(
                         client, ob, label=outbound_label(store, ob),
                     )
