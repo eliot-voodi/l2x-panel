@@ -4458,8 +4458,9 @@ def _add_custom_outbound(store: dict, tag: str, remark: str, config: dict, kind:
     if tag in xray.all_outbound_tags(store) or tag in ("api",):
         return f"Tag {tag} уже занят"
     config.pop("tag", None)
+    # Opt-in: do not auto-enable or put into subscription / balancer pool
     store["outbounds_custom"].append({"tag": tag, "remark": remark or tag, "config": config, "kind": kind,
-                                      "enabled": True, "in_sub": True, "info": info, "country": country.upper()})
+                                      "enabled": False, "in_sub": False, "info": info, "country": country.upper()})
     return None
 
 
@@ -4479,8 +4480,17 @@ def _unique_outbound_tag(store: dict, base: str) -> str:
 
 def _clone_custom_outbound(store: dict, src: dict) -> dict:
     """Deep-copy a custom outbound (full config + meta); new tag, clean runtime fields."""
-    clone = json.loads(json.dumps(src))
     src_tag = str(src.get("tag") or "ob")
+    cfg_src = src.get("config") if isinstance(src.get("config"), dict) else {}
+    # Reverse/NAT portals have no dial object — a bare copy would be useless when enabled
+    if src.get("reverse") and not cfg_src:
+        raise ValueError(
+            f"{src_tag}: reverse/portal без dial-конфига — копировать нечего "
+            "(включите as_outbound на другой ноде)"
+        )
+    if not cfg_src and not src.get("tunnel"):
+        raise ValueError(f"{src_tag}: пустой config — нечего копировать")
+    clone = json.loads(json.dumps(src))
     new_tag = _unique_outbound_tag(store, src_tag)
     clone["tag"] = new_tag
     remark = str(src.get("remark") or src_tag).strip()
@@ -4501,8 +4511,11 @@ def _clone_custom_outbound(store: dict, src: dict) -> dict:
         cfg = json.loads(json.dumps(cfg))
         cfg.pop("tag", None)
         clone["config"] = cfg
-    clone["enabled"] = bool(src.get("enabled", True))
-    clone["in_sub"] = bool(src.get("in_sub", True))
+    if not (clone.get("config") or {}):
+        raise ValueError(f"{src_tag}: после копирования нет dial-конфига")
+    # Copy stays off until explicitly enabled / added to subscription
+    clone["enabled"] = False
+    clone["in_sub"] = False
     store.setdefault("outbounds_custom", []).append(clone)
     store.setdefault("outbound_traffic", {})[new_tag] = {"up": 0, "down": 0, "last_up": 0, "last_down": 0}
     return clone
@@ -4789,67 +4802,60 @@ def outbound_action(tag: str, action: str, request: Request):
         else:
             flash(request, f"PIA reconnect {tag}: {res.get('error')}", "error")
         return go("/outbounds")
-    previous_customs: list | None = None
-    previous_traffic: dict | None = None
     new_tag = ""
+    clone_error = ""
+    need_xray = True
     with mutate() as store:
         if action == "reset":
             store.setdefault("outbound_traffic", {}).setdefault(tag, {}).update({"up": 0, "down": 0})
+            need_xray = False
         else:
             o = next((x for x in store["outbounds_custom"] if x["tag"] == tag), None)
             if not o:
-                flash(request, "Outbound не найден", "error")
-                return go("/outbounds")
-            if action == "toggle":
+                clone_error = "Outbound не найден"
+            elif action == "toggle":
                 o["enabled"] = not o.get("enabled", True)
             elif action == "sub":
                 o["in_sub"] = not o.get("in_sub", True)
+                # Subscription flag only — Xray dial set unchanged
+                need_xray = False
             elif action == "clone":
-                previous_customs = json.loads(json.dumps(store["outbounds_custom"]))
-                previous_traffic = json.loads(json.dumps(store.get("outbound_traffic") or {}))
                 try:
                     clone = _clone_custom_outbound(store, o)
+                    new_tag = str(clone.get("tag") or "")
+                    # Disabled copy is not emitted into Xray — no restart
+                    need_xray = False
                 except Exception as exc:  # noqa: BLE001
-                    flash(request, f"Копирование {tag}: {exc}", "error")
-                    return go("/outbounds")
-                new_tag = str(clone.get("tag") or "")
+                    clone_error = str(exc)
             elif action == "delete":
                 used = [c["email"] for c in store["clients"] if c.get("outbound") == tag]
                 if used:
-                    flash(request, f"{tag} используется клиентами: {', '.join(used)}", "error")
-                    return go("/outbounds")
-                store["outbounds_custom"].remove(o)
+                    clone_error = f"{tag} используется клиентами: {', '.join(used)}"
+                else:
+                    store["outbounds_custom"].remove(o)
             else:
-                flash(request, "Неизвестное действие", "error")
-                return go("/outbounds")
+                clone_error = "Неизвестное действие"
+    if clone_error:
+        flash(request, clone_error if action != "clone" else f"Копирование {tag}: {clone_error}", "error")
+        return go("/outbounds")
     if action == "reset":
         flash(request, *_ok_msg(f"{tag}: reset", {"ok": True}))
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: сброс трафика")
         return go("/outbounds")
-    xr = _apply_xray(_load_store(), xray_only=True)
     if action == "clone":
-        if not xr.get("ok"):
-            with mutate() as store:
-                if previous_customs is not None:
-                    store["outbounds_custom"] = previous_customs
-                if previous_traffic is not None:
-                    store["outbound_traffic"] = previous_traffic
-                elif new_tag:
-                    store.get("outbound_traffic", {}).pop(new_tag, None)
-            flash(
-                request,
-                f"Копия {tag} не сохранена — Xray отклонил конфиг: {xr.get('error')}",
-                "error",
-            )
-            return go("/outbounds")
         _tg_change(
             f"📤 Outbound <b>{tgbot.escape(tag)}</b>: скопирован → "
-            f"<b>{tgbot.escape(new_tag)}</b>"
+            f"<b>{tgbot.escape(new_tag)}</b> (выкл.)"
         )
-        flash(request, f"Outbound {tag} скопирован → {new_tag}", "info")
+        flash(request, f"Outbound {tag} скопирован → {new_tag} (выключен, не в подписке)", "info")
         return go("/outbounds")
+    if action == "sub":
+        _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: в подписке вкл/выкл")
+        flash(request, f"{tag}: sub", "info")
+        return go("/outbounds")
+    xr = _apply_xray(_load_store(), xray_only=True) if need_xray else {"ok": True}
     labels = {
-        "delete": "удалён", "toggle": "вкл/выкл", "sub": "в подписке вкл/выкл",
+        "delete": "удалён", "toggle": "вкл/выкл",
     }
     if action in labels:
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: {labels[action]}")

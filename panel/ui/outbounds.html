@@ -136,7 +136,7 @@
     {% endif %}
   </div>
 </div>
-<div class="hint">Статус custom/node: <b>connected</b> — последний пинг OK и loss в норме; <b>high-loss</b> — потери выше порога; <b>disconnected</b> — пинг провален. Нездоровые outbound скрываются из подписки (настройка «Подписки»). Probe всех enabled outbound + observatory; disconnect/connect и high-loss уходят в Telegram.</div>
+<div class="hint">Новый / скопированный outbound создаётся <b>выключенным</b> и не в подписке — включите кнопкой питания и «в подписке» вручную. Статус: <b>connected</b> — пинг OK и loss в норме; <b>high-loss</b> / <b>disconnected</b> — скрываются из подписки при включённой настройке. Probe + Telegram на disconnect/connect/high-loss.</div>
 
 <dialog id="dlg-add">
   <div class="card-head"><h3 id="ob-title">Новый outbound</h3><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
