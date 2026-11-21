@@ -2133,6 +2133,14 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         and not i.get("_system")
         and i.get("tag") not in (MASTER_BACKHAUL_TAG, "rv-in", "node-bridge")
     ]
+    # PasarGuard exclude_inbound_tags (also applied in store_view; re-apply for safety)
+    if core and not mirror:
+        try:
+            import cores as _cores
+            inbounds = _cores.apply_exclude_inbounds(inbounds, core)
+            inbounds = _cores.mark_fallback_inbounds(inbounds, core)
+        except Exception:
+            pass
     # Path/TLS share domains must be the node hostname, not the master
     node_dom = node_public_domain(node)
     if inbounds and node_dom and (node.get("sync_inbounds", True) or mirror or bridge_on or dc):
@@ -2181,6 +2189,20 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         routes = _agent_safe_routes(cfg_store.get("routes") or [], keep_tags=keep_tags)
         balancers = _agent_safe_balancers(cfg_store.get("balancers") or {}, keep_tags=keep_tags)
         peers = None
+    # Strip excluded inbound tags from client assignments (PasarGuard exclude_inbound_tags)
+    if core and not mirror:
+        excl = set(str(t) for t in (core.get("exclude_inbound_tags") or []) if t)
+        if excl:
+            cleaned = []
+            for c in clients:
+                if not isinstance(c, dict):
+                    continue
+                cc = dict(c)
+                ibs = cc.get("inbounds")
+                if isinstance(ibs, list):
+                    cc["inbounds"] = [t for t in ibs if str(t) not in excl]
+                cleaned.append(cc)
+            clients = cleaned
     if dc:
         customs = [o for o in customs if o.get("tag") not in (self_tag, MASTER_EGRESS_TAG)]
         customs.append(_local_direct_outbound(node))
@@ -2268,6 +2290,8 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         "node_id": node.get("id"),
         "core_id": (core or {}).get("id") if core else (node.get("core_id") or ""),
         "core_name": (core or {}).get("name") if core else "",
+        "core_exclude_inbound_tags": list((core or {}).get("exclude_inbound_tags") or []) if core else [],
+        "core_fallbacks_inbound_tags": list((core or {}).get("fallbacks_inbound_tags") or []) if core else [],
         "bridge": {
             "uuid": node.get("bridge_uuid"),
             "path": node.get("bridge_path"),

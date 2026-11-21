@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}Ядра · {{ app_name }}{% endblock %}
 {% block page_title %}Ядра{% endblock %}
-{% block page_sub %}Профили настроек Xray для нод (inbounds / outbounds / маршруты). Нода получает выбранное ядро при Sync.{% endblock %}
+{% block page_sub %}Профили Xray для нод (PasarGuard CoreConfig): config, exclude, fallbacks, policy{% endblock %}
 {% block top_actions %}
 {% if is_master %}
 <a class="btn ghost" href="{{ bp }}/nodes">{{ ic.icon('globe') }} Узлы</a>
@@ -20,13 +20,13 @@
 <div class="card"><div class="badge warn">Ядра управляются только на master.</div></div>
 {% else %}
 
-<details class="card" open>
-  <summary style="cursor:pointer"><b>Как это работает</b></summary>
+<details class="card">
+  <summary style="cursor:pointer"><b>Как это работает (PasarGuard)</b></summary>
   <div class="hint mt">
-    <b>Ядро</b> — именованный снимок настроек (inbounds, outbounds, routes, balancers, DNS), как в Pasarguard.
-    При установке ноды через SSH (мастер) авто-настройка сохраняется; на ноду назначается ядро.
-    <b>Наследует мастер</b> — при Sync уходит живой конфиг мастера.
-    Иначе — фиксированный снимок (обновите кнопкой «С мастерa»).
+    <b>Ядро</b> — именованный CoreConfig: срезы панели + <code>exclude_inbound_tags</code>,
+    <code>fallbacks_inbound_tags</code>, JSON <code>config</code>, <code>statsUserOnline</code>.
+    Нода при Sync получает назначенное ядро. SSH-установка через мастер без изменений.
+    Default-ядро нельзя удалить.
   </div>
 </details>
 
@@ -51,17 +51,20 @@
         {% set s = c.summary or {} %}
         <tr>
           <td>
-            <b>{{ c.name }}</b>
+            <a href="{{ bp }}/cores/{{ c.id }}"><b>{{ c.name }}</b></a>
+            {% if s.is_default %}<span class="badge ok">default</span>{% endif %}
             {% if c.remark %}<div class="dim small">{{ c.remark }}</div>{% endif %}
             <div class="dim small mono">{{ c.id }}</div>
           </td>
           <td>
             {% if s.inherit_master %}
-            <span class="badge ok" title="Sync берёт живые настройки мастера">наследует</span>
+            <span class="badge ok">наследует</span>
             {% else %}
-            <span class="badge warn" title="Фиксированный снимок">снимок</span>
+            <span class="badge warn">снимок</span>
             {% endif %}
-            <div class="dim small">{{ c.engine or 'xray' }}</div>
+            <div class="dim small">{{ s.engine or 'xray' }}</div>
+            {% if s.exclude %}<div class="badge warn" title="exclude_inbound_tags">ex {{ s.exclude }}</div>{% endif %}
+            {% if s.has_config %}<div class="badge">JSON</div>{% endif %}
           </td>
           <td class="small">
             <span class="badge">in {{ s.inbounds or 0 }}</span>
@@ -81,30 +84,18 @@
           </td>
           <td class="right">
             <div class="flex" style="gap:.35rem;flex-wrap:wrap;justify-content:flex-end">
-              <form method="post" action="{{ bp }}/cores/{{ c.id }}/rename" class="flex" style="gap:.25rem;align-items:center">
-                <input name="name" value="{{ c.name }}" style="width:7.5rem;padding:.2rem .35rem;font-size:.75rem" title="Имя">
-                <input name="remark" value="{{ c.remark or '' }}" placeholder="…" style="width:5rem;padding:.2rem .35rem;font-size:.75rem" title="Комментарий">
-                <button class="btn ghost sm">OK</button>
-              </form>
-              {% if s.inherit_master %}
-              <form method="post" action="{{ bp }}/cores/{{ c.id }}/inherit"
-                    onsubmit="return confirm('Зафиксировать снимок с мастера? Ядро перестанет наследовать изменения.')">
-                <input type="hidden" name="inherit_master" value="0">
-                <button class="btn ghost sm">→ Снимок</button>
-              </form>
-              {% else %}
-              <form method="post" action="{{ bp }}/cores/{{ c.id }}/refresh"
-                    onsubmit="return confirm('Перезаписать ядро текущими настройками мастера?')">
-                <button class="btn ghost sm">С мастера</button>
-              </form>
-              <form method="post" action="{{ bp }}/cores/{{ c.id }}/inherit">
-                <input type="hidden" name="inherit_master" value="1">
-                <button class="btn ghost sm">→ Наследовать</button>
+              <a class="btn ghost sm" href="{{ bp }}/cores/{{ c.id }}">Настройки</a>
+              {% if not s.inherit_master %}
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/edit-mode">
+                <button class="btn sm">Править</button>
               </form>
               {% endif %}
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/duplicate">
+                <button class="btn ghost sm">Копия</button>
+              </form>
               <form method="post" action="{{ bp }}/cores/{{ c.id }}/delete"
-                    onsubmit="return confirm('Удалить ядро «{{ c.name }}»? Ноды перейдут на другое.')">
-                <button class="btn danger sm" {% if items|length <= 1 %}disabled title="Нельзя удалить последнее"{% endif %}>{{ ic.icon('trash') }}</button>
+                    onsubmit="return confirm('Удалить ядро «{{ c.name }}»?')">
+                <button class="btn danger sm" {% if s.is_default or items|length <= 1 %}disabled title="Default / последнее нельзя удалить"{% endif %}>{{ ic.icon('trash') }}</button>
               </form>
             </div>
           </td>

@@ -1,0 +1,4 @@
+v2.1.0: PasarGuard-parity core settings (exclude, fallbacks, config, policy).
+
+Full core edit UI, slice edit-mode, validation, sync filters for
+exclude_inbound_tags / fallbacks_inbound_tags / config overlay.

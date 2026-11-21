@@ -276,6 +276,18 @@
         </div>
       </div>
       {% endif %}
+      {% if edit_core %}
+      <div class="card upd-banner" style="border-color:var(--accent)">
+        <div>
+          <b>Режим ядра: {{ edit_core.name }}</b>
+          <div class="small muted">Inbounds / Outbounds / Маршруты / Балансировщики / DNS правятся в этом ядре (как в PasarGuard).</div>
+        </div>
+        <div class="actions">
+          <a class="btn sm" href="{{ bp }}/cores/{{ edit_core.id }}">Настройки ядра</a>
+          <form method="post" action="{{ bp }}/cores/{{ edit_core.id }}/edit-mode-clear"><button class="btn ghost sm">Выйти</button></form>
+        </div>
+      </div>
+      {% endif %}
       {% block content %}{% endblock %}
     </div>
   </main>

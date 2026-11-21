@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import hashlib
 import json
 import os
@@ -78,6 +79,8 @@ STARTED_AT = time.time()
 # Fail-closed when store.json is corrupt and .bak cannot be recovered.
 STORE_OK = True
 STORE_ERR = ""
+# PasarGuard-style: when set, mutate() edits that core's slices instead of master.
+_EDIT_CORE_CV: contextvars.ContextVar[str] = contextvars.ContextVar("edit_core_id", default="")
 
 
 def panel_version() -> str:
@@ -392,8 +395,13 @@ def _save_store(data: dict) -> None:
 
 
 @contextmanager
-def mutate(*, history_section: str = "", history_note: str = ""):
-    """Yield store for edits. Auto-records version history for clients/inbounds/settings/…"""
+def mutate(*, history_section: str = "", history_note: str = "", edit_core_id: str | None = None):
+    """Yield store for edits. Auto-records version history for clients/inbounds/settings/…
+
+    When ``edit_core_id`` (or session/context edit core) points at a non-inherit
+    core, top-level config slices are temporarily swapped to that core's lists so
+    existing Inbounds/Outbounds/Routing handlers edit the core (PasarGuard UX).
+    """
     with STORE_LOCK:
         if not STORE_OK:
             raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
@@ -401,16 +409,77 @@ def mutate(*, history_section: str = "", history_note: str = ""):
         if not STORE_OK:
             raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
         before_state = shist.canonical_state(store)
-        yield store
+        cid = (edit_core_id if edit_core_id is not None else _EDIT_CORE_CV.get()) or ""
+        cid = str(cid).strip()
+        core = None
+        backup: dict[str, Any] | None = None
+        if cid:
+            try:
+                cores_mod.ensure_cores(store)
+                core = cores_mod.core_by_id(store, cid)
+            except Exception:
+                core = None
+            if core and not core.get("inherit_master"):
+                backup = {}
+                for key in cores_mod.CORE_SLICES:
+                    backup[key] = store.get(key)
+                    if key in ("balancers", "dns", "xray_settings"):
+                        if not isinstance(core.get(key), dict):
+                            core[key] = {}
+                        store[key] = core[key]
+                    else:
+                        if not isinstance(core.get(key), list):
+                            core[key] = []
+                        store[key] = core[key]
+        try:
+            yield store
+        finally:
+            if backup is not None and core is not None:
+                for key, val in backup.items():
+                    store[key] = val
+                core["inherit_master"] = False
+                core["updated_at"] = cores_mod.now_iso()
         after_state = shist.canonical_state(store)
         if after_state != before_state:
             meta = tgbot.get_actor_meta()
+            note = history_note
+            if core is not None:
+                note = (note + " · core " + str(core.get("name") or cid)).strip(" ·")
             shist.record(
                 before_state, after_state,
                 user=meta.get("user") or "", ip=meta.get("ip") or "",
-                section=history_section, note=history_note,
+                section=history_section or ("cores" if core is not None else ""),
+                note=note,
             )
         _save_store(store)
+
+
+def _config_store(request: Request) -> dict:
+    """Store view for config UI — core slices when editing a core."""
+    store = _load_store()
+    cid = str(request.session.get(cores_mod.EDIT_CORE_SESSION) or _EDIT_CORE_CV.get() or "").strip()
+    if not cid:
+        return store
+    try:
+        return cores_mod.store_view_for_core_edit(store, cid)
+    except Exception:
+        return store
+
+
+def _edit_core_banner(request: Request) -> dict | None:
+    cid = str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "").strip()
+    if not cid:
+        return None
+    store = _load_store()
+    core = cores_mod.core_by_id(store, cid)
+    if not core:
+        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        return None
+    return {
+        "id": core.get("id"),
+        "name": core.get("name") or core.get("id"),
+        "inherit_master": bool(core.get("inherit_master")),
+    }
 
 
 FRONT_CERT_RETRY = 3600
@@ -1025,14 +1094,17 @@ def _client_ip(request: Request) -> str:
 def _require(request: Request):
     if not _user(request):
         tgbot.clear_actor()
+        _EDIT_CORE_CV.set("")
         return go("/login")
     exp = request.session.get("exp", 0)
     if exp and time.time() > exp:
         request.session.clear()
         tgbot.clear_actor()
+        _EDIT_CORE_CV.set("")
         return go("/login")
     # Always attribute subsequent TG change/node notices to this panel session
     tgbot.bind_actor(str(_user(request) or "?"), _client_ip(request))
+    _EDIT_CORE_CV.set(str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "").strip())
     return None
 
 
@@ -1058,6 +1130,7 @@ def page(request: Request, template: str, active: str = "", status_code: int = 2
         "cur_path": _cur_path(request),
         "is_master": nodes_mod.is_master(_load_store()) if _user(request) else True,
         "csrf_token": csrf,
+        "edit_core": _edit_core_banner(request) if _user(request) else None,
     }
     base.update(ctx)
     return templates.TemplateResponse(template, base, status_code=status_code)
@@ -2940,7 +3013,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
 async def inbounds_page(request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     rows = []
     for ib in store["inbounds"]:
         n_clients = sum(1 for c in store["clients"] if ib in xray.client_inbounds(store, c))
@@ -3001,7 +3074,7 @@ async def inbound_check(request: Request):
 def inbound_new(request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     proto = request.query_params.get("protocol") or "vless"
     port = xray.free_inbound_port(store)
     ib = P.default_inbound(proto, port, f"{proto}-{port}")
@@ -3018,7 +3091,7 @@ def inbound_new(request: Request):
 def inbound_edit(ib_id: int, request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     ib = xray.inbound_by_id(store, ib_id)
     if not ib:
         flash(request, "Inbound не найден", "error")
@@ -4362,7 +4435,7 @@ def _pia_loop() -> None:
 def outbounds_page(request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     ot = store.get("outbound_traffic") or {}
     rows = [{"tag": "direct", "kind": "system", "label": "🏠 Direct", "enabled": True, "status": "active"}]
     health_cfg = xray.sub_health_settings(store)
@@ -4882,7 +4955,7 @@ def outbound_action(tag: str, action: str, request: Request):
 def balancers_page(request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     bals = xray.ensure_balancers(store)
     active = {k: xray.balancer_member_tags(store, b) for k, b in bals.items()}
     return page(request, "balancers.html", active="balancers", balancers=bals, active_members=active,
@@ -5033,7 +5106,7 @@ def _routing_lint_or_flash(request: Request, store: dict) -> str | None:
 def routing_page(request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     route_clients = xray.route_picker_clients(store)
     route_source_ips = xray.route_picker_source_ips(store)
     import route_lint as route_lint_mod
@@ -5197,7 +5270,7 @@ def routing_action(name: str, action: str, request: Request):
 def xray_page(request: Request):
     if redir := _require(request):
         return redir
-    store = _load_store()
+    store = _config_store(request)
     tab = request.query_params.get("tab") or "general"
     ctx: dict[str, Any] = {}
     if tab == "core":
@@ -7561,10 +7634,10 @@ def nodes_page(request: Request):
 
 @app.get("/cores", response_class=HTMLResponse)
 def cores_page(request: Request):
-    """Pasarguard-style «Ядра» — named Xray profiles assigned to nodes."""
+    """PasarGuard-style «Ядра» — named Xray profiles assigned to nodes."""
     if redir := _require(request):
         return redir
-    with mutate() as store:
+    with mutate(edit_core_id="") as store:
         cores_mod.ensure_cores(store)
         nodes_mod.ensure_list(store)
     store = _load_store()
@@ -7588,6 +7661,32 @@ def cores_page(request: Request):
     )
 
 
+@app.get("/cores/{core_id}", response_class=HTMLResponse)
+def core_edit_page(core_id: str, request: Request):
+    if redir := _require(request):
+        return redir
+    with mutate(edit_core_id="") as store:
+        cores_mod.ensure_cores(store)
+    store = _load_store()
+    core = cores_mod.core_by_id(store, core_id)
+    if not core:
+        flash(request, "Ядро не найдено", "error")
+        return go("/cores")
+    usage = cores_mod.cores_usage(store).get(core_id, 0)
+    return page(
+        request, "core_edit.html", active="nodes",
+        core=core,
+        summary=cores_mod.core_summary(core),
+        usage=usage,
+        nodes=cores_mod.nodes_for_core(store, core_id),
+        inbound_tags=cores_mod.preview_inbound_tags(store, core),
+        config_json=cores_mod.config_json_text(core),
+        is_master=nodes_mod.is_master(store),
+        nodes_tab="cores",
+        editing=str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "") == core_id,
+    )
+
+
 @app.post("/cores/add")
 async def cores_add(request: Request):
     if redir := _require(request):
@@ -7599,10 +7698,13 @@ async def cores_add(request: Request):
     name = str(form.get("name") or "").strip() or "Core"
     remark = str(form.get("remark") or "").strip()
     clone = form.get("clone_master") != "0"
-    with mutate(history_section="cores", history_note=f"create core {name}") as store:
-        core = cores_mod.create_core(store, name=name, remark=remark, clone_master=clone)
+    clone_from = str(form.get("clone_from") or "").strip() or None
+    with mutate(history_section="cores", history_note=f"create core {name}", edit_core_id="") as store:
+        core = cores_mod.create_core(
+            store, name=name, remark=remark, clone_master=clone, clone_from=clone_from,
+        )
     flash(request, f"Ядро «{core.get('name')}» создано", "info")
-    return go("/cores")
+    return go(f"/cores/{core['id']}")
 
 
 @app.post("/cores/{core_id}/{action}")
@@ -7617,18 +7719,59 @@ async def cores_action(core_id: str, action: str, request: Request):
         form = await request.form()
     except Exception:
         form = {}
-    with mutate(history_section="cores", history_note=f"core {action}") as store:
+    # Enter/leave structured edit mode (session only)
+    if action == "edit-mode":
+        with mutate(edit_core_id="") as store:
+            core = cores_mod.core_by_id(store, core_id)
+        if not core:
+            flash(request, "Ядро не найдено", "error")
+            return go("/cores")
+        if core.get("inherit_master"):
+            flash(request, "Сначала отключите «наследует мастер» (→ Снимок), чтобы править срезы ядра", "error")
+            return go(f"/cores/{core_id}")
+        request.session[cores_mod.EDIT_CORE_SESSION] = core_id
+        flash(request, f"Режим правки ядра «{core.get('name')}»: Inbounds / Outbounds / Маршруты / DNS", "info")
+        return go("/inbounds")
+    if action == "edit-mode-clear":
+        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        flash(request, "Режим правки ядра выключен — снова мастер", "info")
+        return go("/cores")
+
+    go_edit = form.get("stay") == "1"
+    with mutate(history_section="cores", history_note=f"core {action}", edit_core_id="") as store:
         cores_mod.ensure_cores(store)
         core = cores_mod.core_by_id(store, core_id)
         if not core and action != "delete":
             flash(request, "Ядро не найдено", "error")
             return go("/cores")
         if action == "delete":
+            if request.session.get(cores_mod.EDIT_CORE_SESSION) == core_id:
+                request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
             err = cores_mod.delete_core(store, core_id)
             if err:
                 flash(request, err, "error")
+                return go(f"/cores/{core_id}")
+            flash(request, "Ядро удалено", "info")
+            return go("/cores")
+        elif action == "save":
+            # checkbox fields absent when unchecked
+            data = {k: form.get(k) for k in form.keys()}
+            data["stats_user_online"] = "1" if form.get("stats_user_online") else "0"
+            data["access_log"] = "1" if form.get("access_log") else "0"
+            data["dns_log"] = "1" if form.get("dns_log") else "0"
+            was_inherit = bool(core.get("inherit_master"))
+            data["inherit_master"] = "1" if form.get("inherit_master") else "0"
+            errs = cores_mod.update_core_settings(core, data)
+            # Turning off inherit without slices → snapshot master (PasarGuard fixed config)
+            if not errs and was_inherit and not core.get("inherit_master"):
+                if not (core.get("inbounds") or core.get("outbounds_custom") or core.get("routes")):
+                    cores_mod.refresh_core_from_master(store, core)
+            if core.get("inherit_master") and request.session.get(cores_mod.EDIT_CORE_SESSION) == core_id:
+                request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+            if errs:
+                flash(request, "; ".join(errs[:4]), "error")
             else:
-                flash(request, "Ядро удалено", "info")
+                flash(request, f"Ядро «{core.get('name')}» сохранено", "info")
         elif action == "rename":
             cores_mod.rename_core(
                 core,
@@ -7643,14 +7786,45 @@ async def cores_action(core_id: str, action: str, request: Request):
             on = form.get("inherit_master") == "1"
             cores_mod.set_inherit(core, on)
             if on:
+                if request.session.get(cores_mod.EDIT_CORE_SESSION) == core_id:
+                    request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
                 flash(request, f"«{core.get('name')}»: наследует живые настройки мастера", "info")
             else:
-                # Snapshot current master so the core has real slices
                 cores_mod.refresh_core_from_master(store, core)
                 flash(request, f"«{core.get('name')}»: фиксированный снимок (не наследует)", "info")
+        elif action == "default":
+            err = cores_mod.set_default_core(store, core_id)
+            flash(request, err or f"«{core.get('name')}» — ядро по умолчанию", "error" if err else "info")
+        elif action == "duplicate":
+            copy = cores_mod.create_core(
+                store,
+                name=f"{core.get('name')} copy",
+                remark=str(core.get("remark") or ""),
+                clone_from=core_id,
+            )
+            flash(request, f"Создана копия «{copy.get('name')}»", "info")
+            return go(f"/cores/{copy['id']}")
+        elif action == "sync-nodes":
+            nodes = cores_mod.nodes_for_core(store, core_id)
+            if not nodes:
+                flash(request, "Нет нод с этим ядром", "info")
+            else:
+                host = public_host()
+                ok_n = 0
+                for n in nodes:
+                    if not n.get("enabled", True):
+                        continue
+                    try:
+                        payload = nodes_mod.build_payload(store, n, xray.build_config)
+                        push = nodes_mod.push(n, payload, master_host=host)
+                        if push.get("ok") or push.get("queued"):
+                            ok_n += 1
+                    except Exception:
+                        pass
+                flash(request, f"Sync ядра «{core.get('name')}»: {ok_n}/{len(nodes)} нод", "info")
         else:
             flash(request, "Неизвестное действие", "error")
-    return go("/cores")
+    return go(f"/cores/{core_id}" if go_edit or action == "save" else "/cores")
 
 
 def _node_xray_check_one(node: dict) -> dict:
