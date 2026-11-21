@@ -1555,6 +1555,7 @@ def _notify_events(events: list[dict]) -> None:
         if typ in (
             "expired", "quota_exceeded", "tag_exceeded", "auto_reset",
             "daily_exceeded", "daily_tag_exceeded", "renewed", "auto_disable", "auto_delete",
+            "auto_block",
         ) and s.get("notify_quota"):
             text = {
                 "expired": f"⏰ {e['email']}: срок истёк",
@@ -1566,11 +1567,12 @@ def _notify_events(events: list[dict]) -> None:
                 "renewed": f"♻️ {e['email']}: новый период (+{e.get('days') or '?'} дн), трафик обнулён ({e.get('reason')})",
                 "auto_disable": f"⛔️ {e['email']}: отключён ({e.get('reason')})",
                 "auto_delete": f"🗑 {e['email']}: удалён ({e.get('reason')})",
+                "auto_block": f"🚫 {e['email']}: доступ закрыт ({e.get('reason')}) — дисконнект",
             }.get(typ) or f"{e.get('email')}: {typ}"
             BOT.send(text)
             # Also notify the linked subscriber
             email = e.get("email")
-            if email and typ in ("expired", "quota_exceeded", "auto_reset", "daily_exceeded", "renewed", "auto_disable"):
+            if email and typ in ("expired", "quota_exceeded", "auto_reset", "daily_exceeded", "renewed", "auto_disable", "auto_block"):
                 store = _load_store()
                 c = next((x for x in store.get("clients") or [] if x.get("email") == email), None)
                 if c and c.get("tg_id"):
@@ -1581,6 +1583,7 @@ def _notify_events(events: list[dict]) -> None:
                         "auto_reset": f"🔄 Трафик по подписке <b>{email}</b> сброшен по расписанию.",
                         "renewed": f"♻️ Подписка <b>{email}</b> продлена, счётчик трафика обнулён.",
                         "auto_disable": f"⛔️ Подписка <b>{email}</b> отключена.",
+                        "auto_block": f"🚫 Доступ по подписке <b>{email}</b> закрыт — подключения сброшены.",
                     }.get(typ)
                     if user_text:
                         BOT.send(user_text + "\n\n" + _client_summary(c), c["tg_id"])
@@ -1654,8 +1657,31 @@ def _expiry_warnings(store: dict) -> None:
         BOT.send(text, chat)
 
 
+_LAST_QUOTA_DIRECT_PUSH = 0.0
+
+
+def _push_direct_nodes_clients(store: dict, *, reason: str = "quota") -> None:
+    """Push client list to Direct nodes so limited/expired users are removed from Xray there."""
+    global _LAST_QUOTA_DIRECT_PUSH
+    if not nodes_mod.is_master(store):
+        return
+    host = public_host()
+    pushed = False
+    for node in nodes_mod.direct_connect_nodes(store):
+        if not node.get("enabled", True) or not node.get("id"):
+            continue
+        try:
+            name = node.get("name") or str(node.get("id") or "")[:8]
+            _node_push_job(str(node["id"]), f"{name}: {reason}", host)
+            pushed = True
+        except Exception:
+            pass
+    if pushed:
+        _LAST_QUOTA_DIRECT_PUSH = time.time()
+
+
 def _watchdog_cycle() -> None:
-    global ONLINE
+    global ONLINE, _LAST_QUOTA_DIRECT_PUSH
     need_apply = False
     with STORE_LOCK:
         store = _load_store()
@@ -1680,13 +1706,27 @@ def _watchdog_cycle() -> None:
             xray.enforce_conn_limits(store)
         except Exception:
             pass
+        limited_now = any(
+            isinstance(c, dict) and not xray.client_access_ok(c)
+            for c in (store.get("clients") or [])
+        )
         if STORE_OK:
             _save_store(store)
         if need_apply and STORE_OK:
-            _apply_xray(store, xray_only=True)
+            # Hot-remove users from local Xray (no full restart when possible)
+            _apply_xray(store, clients_only=True)
     if STORE_OK:
         _expiry_warnings(store)
         _notify_events(events)
+        # Drop limited/expired clients from Direct nodes (they dial the node, not master)
+        try:
+            if need_apply:
+                _push_direct_nodes_clients(store, reason="quota")
+            elif limited_now and (time.time() - float(_LAST_QUOTA_DIRECT_PUSH or 0)) > 60:
+                # Re-assert if a prior push failed while flags were already set
+                _push_direct_nodes_clients(store, reason="quota-reassert")
+        except Exception:
+            pass
         # Public direct_connect agents push traffic counters to master
         try:
             _agent_direct_connect_report(store)
@@ -10668,6 +10708,8 @@ async def agent_report(request: Request):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     err_code, err_msg = 0, ""
     changed = False
+    quota_hit = False
+    push_node_id = ""
     with mutate() as st:
         node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
         if not node or not node.get("enabled", True):
@@ -10684,9 +10726,27 @@ async def agent_report(request: Request):
             )
             node["last_ok"] = True
             node["last_seen"] = nodes_mod.now_iso()
+            # Traffic from Direct node may cross limit_gb / expire — kick immediately
+            st["_events"] = []
+            if xray.enforce_quotas(st):
+                quota_hit = True
+                push_node_id = str(node.get("id") or "")
+                try:
+                    _apply_xray(st, clients_only=True)
+                except Exception:
+                    pass
     if err_code:
         return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
-    return {"ok": True, "changed": bool(changed)}
+    if quota_hit and push_node_id:
+        try:
+            name = ""
+            st2 = _load_store()
+            n2 = next((n for n in nodes_mod.ensure_list(st2) if n.get("id") == push_node_id), None)
+            name = (n2 or {}).get("name") or push_node_id[:8]
+            _node_push_job(push_node_id, f"{name}: quota", public_host())
+        except Exception:
+            pass
+    return {"ok": True, "changed": bool(changed), "quota_enforced": bool(quota_hit)}
 
 
 @app.post("/agent/pull")

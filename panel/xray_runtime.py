@@ -4003,7 +4003,12 @@ def _period_delta(period: str, base: datetime) -> datetime:
 
 
 def _apply_limit_action(client: dict, *, kind: str, action: str, now: datetime, events: list[dict]) -> str | None:
-    """Apply on_expire / on_quota action. Returns email if client should be deleted."""
+    """Apply on_expire / on_quota action. Returns email if client should be deleted.
+
+    ``block`` (default): client stays in the panel but ``client_access_ok`` is false —
+    they are removed from Xray (master + Direct nodes on next sync) so active sessions
+    drop and new dials fail.
+    """
     action = action if action in LIMIT_ACTIONS else "block"
     email = client.get("email") or ""
     if action == "renew":
@@ -4018,7 +4023,8 @@ def _apply_limit_action(client: dict, *, kind: str, action: str, now: datetime, 
     if action == "delete":
         events.append({"type": "auto_delete", "email": email, "reason": kind})
         return email
-    # block — flag only; access denied via client_access_ok
+    # block — deny access; apply_config / Direct push remove the user from Xray
+    events.append({"type": "auto_block", "email": email, "reason": kind})
     return None
 
 
