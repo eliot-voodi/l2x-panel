@@ -2067,9 +2067,16 @@ def renew_client_period(client: dict, *, now: datetime | None = None) -> None:
         client["next_reset"] = _period_delta(client["reset_period"], now).isoformat(timespec="seconds")
 
 
-def selectable_outbound_tags(store: dict) -> list[dict]:
+def selectable_outbound_tags(store: dict, *, include_system: bool = True) -> list[dict]:
+    """Outbounds shown in client/group «Подключения в подписке».
+
+    ``direct`` is a system tag (opt-in): selectable in UI, but not auto-added when
+    mode is «все» / when freezing new outbound tags onto users.
+    """
     ensure_balancers(store)
     out: list[dict] = []
+    if include_system:
+        out.append({"tag": "direct", "label": outbound_label(store, "direct"), "kind": "system"})
     for b in store["balancers"].values():
         if b.get("enabled", True):
             out.append({"tag": b["tag"], "label": outbound_label(store, b["tag"]), "kind": "balancer"})
@@ -2087,7 +2094,8 @@ def _all_inbound_tags(store: dict, *, exclude: str = "") -> list[str]:
 
 
 def _all_outbound_assign_tags(store: dict, *, exclude: str = "") -> list[str]:
-    tags = [x["tag"] for x in selectable_outbound_tags(store) if x.get("tag")]
+    # Exclude system tags (direct): freeze/propagate must not silently opt everyone into Direct.
+    tags = [x["tag"] for x in selectable_outbound_tags(store, include_system=False) if x.get("tag")]
     if exclude:
         tags = [t for t in tags if t != exclude]
     return tags
@@ -2140,10 +2148,11 @@ def apply_tag_to_users(store: dict, *, kind: str, tag: str, propagate: bool) -> 
 
 
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
-    """Extra subscription identities (balancers / custom outbounds).
+    """Extra subscription identities (balancers / custom outbounds / opt-in direct).
 
     Primary («основная») is emitted separately as the main identity — skipped here
     so the same outbound does not appear twice. Unhealthy outbounds omitted.
+    ``direct`` is included only when explicitly listed in allowed_tags (not mode «все»).
     """
     if not client.get("uuid") or not client.get("sub_enabled", True):
         return []
@@ -2151,6 +2160,10 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
         return []
     tags = [b["tag"] for b in ensure_balancers(store).values() if b.get("enabled", True)]
     tags += [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
+    # Opt-in system outbound: only when explicitly selected (non-empty allowed list).
+    eff = client_effective_allowed_tags(store, client)
+    if "direct" in eff and "direct" not in tags:
+        tags = ["direct"] + tags
     # Main («основная») is already emitted as the primary identity — do not duplicate it.
     default = client_default_outbound(store, client)
     entries = []

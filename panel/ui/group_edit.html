@@ -55,9 +55,9 @@
       {% for tg in tags %}
         {% set is_main = g.outbound == tg.tag or (not g.outbound and loop.first) %}
         <tr>
-          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if is_main %}disabled{% elif select_mode == 'all' or tg.tag in (g.allowed_tags or []) %}checked{% endif %} data-extra="1"></td>
+          <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}" {% if is_main %}disabled{% elif select_mode == 'all' and tg.kind != 'system' %}checked{% elif select_mode == 'select' and tg.tag in (g.allowed_tags or []) %}checked{% endif %} data-extra="1"></td>
           <td><input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if is_main %}checked{% endif %}></td>
-          <td>{{ tg.label }}{% if tg.kind == 'balancer' %} <span class="badge">авто</span>{% endif %}</td>
+          <td>{{ tg.label }}{% if tg.kind == 'balancer' %} <span class="badge">авто</span>{% elif tg.kind == 'system' %} <span class="badge">system</span>{% endif %}</td>
         </tr>
       {% endfor %}
       </tbody>

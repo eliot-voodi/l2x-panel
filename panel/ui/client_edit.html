@@ -199,9 +199,9 @@
         {% set is_main = (not group) and (main_ob == tg.tag or (not main_ob and loop.first)) %}
         <tr>
           <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}"
-            {% if is_main %}disabled{% elif group %}{% if select_mode == 'select' and tg.tag in (c.allowed_tags or []) %}checked{% endif %}{% else %}{% if select_mode == 'all' and not is_main %}checked{% elif select_mode == 'select' and tg.tag in (c.allowed_tags or []) and not is_main %}checked{% endif %}{% endif %}></td>
+            {% if is_main %}disabled{% elif group %}{% if select_mode == 'select' and tg.tag in (c.allowed_tags or []) %}checked{% endif %}{% else %}{% if select_mode == 'all' and not is_main and tg.kind != 'system' %}checked{% elif select_mode == 'select' and tg.tag in (c.allowed_tags or []) and not is_main %}checked{% endif %}{% endif %}></td>
           <td>{% if group %}<span class="dim" title="Основная из группы">—</span>{% else %}<input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if is_main %}checked{% endif %} title="Основная ссылка">{% endif %}</td>
-          <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
+          <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.kind == 'system' %}<span class="badge">system</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
           {% if not is_new %}
           <td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>
           <td class="small nowrap">{{ format_traffic(tg.daily_used) }}{% if tg.daily_exceeded %} <span class="badge warn">день</span>{% endif %}</td>
