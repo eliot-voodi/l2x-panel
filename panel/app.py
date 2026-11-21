@@ -2318,11 +2318,21 @@ def _sub_response(request: Request, token: str) -> Response:
         doh_url = doh_mod.public_url(store, client)
         doh_tunnel = True
     if fmt == "json":
-        body = json.dumps(
-            [P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_tunnel)
-             for e in eps if e["protocol"] != "wireguard"],
-            ensure_ascii=False, indent=2,
-        )
+        # Default: one Ascella-style profile (cascade balancers + routing).
+        # ?flat=1 → legacy array of per-endpoint configs.
+        flat = str(request.query_params.get("flat") or "").lower() in ("1", "true", "yes")
+        usable = [e for e in eps if e.get("protocol") != "wireguard"]
+        if flat:
+            payload: object = [
+                P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_tunnel)
+                for e in usable
+            ]
+        else:
+            title = s.get("title") or f"{app_title()} · {client['email']}"
+            payload = P.xray_unified_client_config(
+                usable, extras, doh_url=doh_url, doh_in_tunnel=doh_tunnel, remarks=title,
+            )
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
         return Response(body, media_type="application/json", headers=headers)
     if fmt == "clash":
         body = yaml.safe_dump(

@@ -95,7 +95,7 @@
   <div class="hint">Каждый enabled custom/node outbound пингуется по расписанию (generate_204 + Xray observatory). Loss считается по окну последних проб. При disconnect/connect и loss выше порога — уведомление в Telegram (если включено). Нездоровые outbound скрываются из подписки, пока не восстановятся.</div>
 
   <h3 class="mt">JSON-подписка: Fragment / Noise / Mux</h3>
-  <div class="hint">Вставляются в outbound <code>proxy</code> конфигов <code>?format=json</code>. <b>Mux по умолчанию выключен</b> (иначе сильно режет скорость, особенно upload). Включайте явно: <code>{"enabled":true,"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}</code>. Пустой Fragment/Noise = не трогать.</div>
+  <div class="hint"><code>?format=json</code> — один Xray-профиль с каскадом транспортов (Reality→HY2→XHTTP→…) и маршрутизацией (RU/private→direct, block UDP/443). Старый формат (массив профилей): <code>?format=json&amp;flat=1</code>. Fragment/Noise/Mux вставляются в первый hop. <b>Mux по умолчанию выключен</b>. Пример Mux: <code>{"enabled":true,"concurrency":8,"xudpConcurrency":16,"xudpProxyUDP443":"reject"}</code>.</div>
   <label class="f">Fragment JSON</label>
   <textarea name="json_fragment" class="mono" rows="4" placeholder='{"packets":"tlshello","length":"100-200","interval":"10-20"}'>{{ sb.json_fragment }}</textarea>
   <label class="f">Noise / finalmask.udp JSON</label>

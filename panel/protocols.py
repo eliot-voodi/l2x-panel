@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import uuid as uuidlib
 from typing import Any
@@ -1378,14 +1379,29 @@ def _mux_compatible(ep: dict | None, proxy: dict | None = None) -> bool:
     return net in MUX_NETWORKS
 
 
-def apply_sub_json_extras(cfg: dict, extras: dict | None, *, ep: dict | None = None) -> dict:
+def apply_sub_json_extras(
+    cfg: dict,
+    extras: dict | None,
+    *,
+    ep: dict | None = None,
+    proxy_tag: str = "proxy",
+) -> dict:
     """Inject Fragment / Noise / Mux into a JSON subscription client config.
 
     Mux is OFF by default (throughput). Enable explicitly via Settings → Sub →
     json_mux, e.g. {"enabled": true, "concurrency": 8}.
     """
     outs = cfg.get("outbounds") or []
-    proxy = next((o for o in outs if o.get("tag") == "proxy"), outs[0] if outs else None)
+    proxy = next((o for o in outs if o.get("tag") == proxy_tag), None)
+    if proxy is None:
+        proxy = next((o for o in outs if o.get("tag") == "proxy"), None)
+    if proxy is None:
+        # Unified cascade: first non-system outbound
+        skip = {"direct", "block", "dns-out", "fragment"}
+        proxy = next(
+            (o for o in outs if o.get("tag") and not str(o["tag"]).startswith("LOOP-") and o["tag"] not in skip),
+            outs[0] if outs else None,
+        )
     if not proxy:
         return cfg
     extras = extras or {}
@@ -1412,38 +1428,129 @@ def apply_sub_json_extras(cfg: dict, extras: dict | None, *, ep: dict | None = N
     return cfg
 
 
-def xray_client_config(ep: dict, extras: dict | None = None, *, doh_url: str = "", doh_in_tunnel: bool = False) -> dict:
-    """Full client config for a JSON subscription item."""
+def _hysteria_client_outbound(ep: dict, tag: str) -> dict:
+    tls: dict[str, Any] = {
+        "serverName": ep.get("sni") or ep["address"],
+        "alpn": ["h3"],
+        "fingerprint": ep.get("fp") or "firefox",
+        "enableSessionResumption": False,
+    }
+    if ep.get("allow_insecure"):
+        tls["allowInsecure"] = True
+    return {
+        "tag": tag,
+        "protocol": "hysteria",
+        "settings": {"version": 2, "address": ep["address"], "port": ep["port"]},
+        "streamSettings": {
+            "network": "hysteria",
+            "security": "tls",
+            "tlsSettings": tls,
+            "hysteriaSettings": {"version": 2, "auth": ep.get("password") or ep.get("uuid") or ""},
+            "finalmask": {"quicParams": {
+                "congestion": "brutal",
+                "brutalUp": ep.get("brutal_up") or "100mbps",
+                "brutalDown": ep.get("brutal_down") or "300mbps",
+                "keepAlivePeriod": 60,
+                "debug": False,
+            }},
+        },
+    }
+
+
+def _endpoint_to_named_outbound(ep: dict, tag: str) -> dict:
     if ep.get("protocol") == "hysteria":
-        proxy = {
-            "tag": "proxy", "protocol": "hysteria",
-            "settings": {"version": 2, "address": ep["address"], "port": ep["port"]},
-            "streamSettings": {
-                "network": "hysteria", "security": "tls",
-                "tlsSettings": {"serverName": ep.get("sni") or ep["address"], "allowInsecure": bool(ep.get("allow_insecure"))},
-                "hysteriaSettings": {"version": 2, "auth": ep["password"]},
-                "finalmask": {"quicParams": {
-                    "brutalUp": ep.get("brutal_up") or "100mbps",
-                    "brutalDown": ep.get("brutal_down") or "300mbps",
-                }},
-            },
-        }
+        return _hysteria_client_outbound(ep, tag)
+    out = endpoint_to_xray_outbound(ep, tag)
+    # Client apps expect tcp (not raw) for Reality/Vision
+    st = out.get("streamSettings") or {}
+    if st.get("network") == "raw":
+        st["network"] = "tcp"
+        out["streamSettings"] = st
+    return out
+
+
+def _transport_rank(ep: dict) -> tuple:
+    """Ascella-like preference: Reality Vision → HY2 → XHTTP TLS → XHTTP Reality → WS → rest."""
+    proto = str(ep.get("protocol") or "")
+    net = str(ep.get("net") or "")
+    sec = str(ep.get("security") or "")
+    mode = str(ep.get("mode") or "")
+    flow = str(ep.get("flow") or "")
+    port = int(ep.get("port") or 0)
+    if proto == "hysteria" or net == "hysteria":
+        return (1, 0, port)
+    if net in ("raw", "tcp") and sec == "reality" and flow:
+        # Prefer non-2053 / lower exotic ports after canonical 443/8443
+        pref = 0 if port in (443, 8443) else 1
+        return (0, pref, port)
+    if net == "xhttp" and sec == "tls":
+        return (2, 0 if mode == "packet-up" else 1, port)
+    if net == "xhttp" and sec == "reality":
+        return (3, 0, port)
+    if net == "ws":
+        return (4, 0, port)
+    if sec == "reality":
+        return (5, 0, port)
+    return (9, 0, port)
+
+
+def _outbound_tag_for_ep(ep: dict, idx: int, used: set[str]) -> str:
+    proto = str(ep.get("protocol") or "")
+    net = str(ep.get("net") or "")
+    sec = str(ep.get("security") or "")
+    mode = str(ep.get("mode") or "")
+    if proto == "hysteria" or net == "hysteria":
+        base = "HY2"
+    elif net in ("raw", "tcp") and sec == "reality":
+        sni = str(ep.get("sni") or "").split(".")[0] or "reality"
+        base = f"REALITY-{sni}"[:24]
+    elif net == "xhttp" and sec == "reality":
+        base = "XH-REALITY"
+    elif net == "xhttp":
+        base = "XHTTP-LTE" if mode == "packet-up" else "XHTTP"
+    elif net == "ws":
+        base = "WS"
+    elif net == "grpc":
+        base = "GRPC"
     else:
-        proxy = endpoint_to_xray_outbound(ep, "proxy")
+        base = f"{proto or 'ob'}-{net or 'net'}".upper()
+    base = re.sub(r"[^A-Za-z0-9_-]", "-", base).strip("-_") or f"OB-{idx}"
+    tag = base
+    n = 2
+    while tag in used:
+        tag = f"{base}-{n}"
+        n += 1
+    used.add(tag)
+    return tag
+
+
+def _client_dns_servers(*, doh_url: str = "", doh_in_tunnel: bool = False) -> list:
     if doh_url and doh_in_tunnel:
-        # Resolve DoH host via proxy (inside tunnel)
-        dns_servers: list = [{"address": doh_url, "domains": ["geosite:geolocation-!cn"]}, "1.1.1.1"]
-        # Xray DoH as string URL uses system dial — prefer https+local for out-of-tunnel;
-        # for in-tunnel put DoH first as plain https URL (client dials through routing if supported).
-        dns_servers = [doh_url, "localhost"]
-    elif doh_url:
-        dns_servers = [doh_url.replace("https://", "https+local://", 1), "localhost"]
-    else:
-        dns_servers = ["1.1.1.1", "8.8.8.8"]
+        return [doh_url, "localhost"]
+    if doh_url:
+        return [doh_url.replace("https://", "https+local://", 1), "localhost"]
+    return [
+        "1.1.1.1",
+        "8.8.8.8",
+        {
+            "address": "77.88.8.8",
+            "port": 53,
+            "domains": [
+                "geosite:private",
+                "geosite:category-ru",
+                "domain:gstatic.com",
+            ],
+        },
+    ]
+
+
+def xray_client_config(ep: dict, extras: dict | None = None, *, doh_url: str = "", doh_in_tunnel: bool = False) -> dict:
+    """Full client config for a single-endpoint JSON subscription item."""
+    proxy = _endpoint_to_named_outbound(ep, "proxy")
     cfg = {
         "remarks": ep.get("remark") or "",
         "log": {"loglevel": "warning"},
-        "dns": {"servers": dns_servers},
+        "dns": {"servers": _client_dns_servers(doh_url=doh_url, doh_in_tunnel=doh_in_tunnel), "queryStrategy": "UseIPv4"},
         "inbounds": [
             {"tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"udp": True},
              "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}},
@@ -1451,21 +1558,154 @@ def xray_client_config(ep: dict, extras: dict | None = None, *, doh_url: str = "
         ],
         "outbounds": [
             proxy,
-            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "direct", "protocol": "freedom", "settings": {"userLevel": 8},
+             "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}}},
             {"tag": "block", "protocol": "blackhole"},
             {"tag": "dns-out", "protocol": "dns"},
         ],
         "routing": {
-            "domainStrategy": "AsIs",
+            "domainStrategy": "IPIfNonMatch",
             "rules": [
                 {"type": "field", "inboundTag": ["socks", "http"], "port": 53, "outboundTag": "dns-out"},
-                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
+                {"type": "field", "domain": ["geosite:private", "geosite:category-ru"], "outboundTag": "direct"},
+                {"type": "field", "ip": ["geoip:private", "geoip:ru"], "outboundTag": "direct"},
                 {"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
             ],
         },
     }
     return apply_sub_json_extras(cfg, extras, ep=ep)
 
+
+def xray_unified_client_config(
+    endpoints: list[dict],
+    extras: dict | None = None,
+    *,
+    doh_url: str = "",
+    doh_in_tunnel: bool = False,
+    remarks: str = "",
+) -> dict:
+    """Single Ascella-style Xray profile: transports as outbounds + cascade balancers.
+
+    Order: Reality Vision → Hysteria2 → XHTTP → XHTTP Reality → WS → other.
+    Failover via leastLoad balancers + loopback reroutes (same pattern as Ascella JP).
+    """
+    raw_eps = [e for e in endpoints if e and e.get("protocol") != "wireguard"]
+    # One outbound per transport (address/port/net/…); drop duplicates from multi-identity subs.
+    eps: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for e in raw_eps:
+        key = (
+            e.get("protocol"), e.get("address"), int(e.get("port") or 0),
+            e.get("net"), e.get("security"), e.get("path"), e.get("sni"), e.get("mode"),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        eps.append(e)
+    if not eps:
+        return {
+            "remarks": remarks or "",
+            "log": {"loglevel": "warning"},
+            "inbounds": [],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": []},
+        }
+    if len(eps) == 1:
+        cfg = xray_client_config(eps[0], extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel)
+        if remarks:
+            cfg["remarks"] = remarks
+        return cfg
+
+    ordered = sorted(eps, key=_transport_rank)
+    used_tags: set[str] = set()
+    proxy_tags: list[str] = []
+    outbounds: list[dict] = []
+    for i, ep in enumerate(ordered):
+        tag = _outbound_tag_for_ep(ep, i + 1, used_tags)
+        proxy_tags.append(tag)
+        outbounds.append(_endpoint_to_named_outbound(ep, tag))
+
+    balancers: list[dict] = []
+    rules: list[dict] = []
+    for i, tag in enumerate(proxy_tags):
+        bal_tag = f"BAL-{i + 1}"
+        if i + 1 < len(proxy_tags):
+            loop_tag = f"LOOP-{i + 1}"
+            reroute = f"REROUTE-{i + 1}"
+            outbounds.append({"tag": loop_tag, "protocol": "loopback", "settings": {"inboundTag": reroute}})
+            balancers.append({
+                "tag": bal_tag,
+                "selector": [tag],
+                "fallbackTag": loop_tag,
+                "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
+            })
+            rules.append({"inboundTag": [reroute], "balancerTag": f"BAL-{i + 2}"})
+        else:
+            balancers.append({
+                "tag": bal_tag,
+                "selector": [tag],
+                "fallbackTag": proxy_tags[0],
+                "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
+            })
+
+    outbounds.extend([
+        {"tag": "direct", "protocol": "freedom", "settings": {"userLevel": 8},
+         "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}}},
+        {"tag": "block", "protocol": "blackhole"},
+        {"tag": "dns-out", "protocol": "dns"},
+    ])
+
+    rules.extend([
+        {"type": "field", "inboundTag": ["socks", "http"], "port": 53, "outboundTag": "dns-out"},
+        {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
+        {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
+        {"type": "field", "domain": ["geosite:private", "geosite:category-ru"], "outboundTag": "direct"},
+        {"type": "field", "ip": ["geoip:private", "geoip:ru"], "outboundTag": "direct"},
+        {"type": "field", "network": "tcp,udp", "balancerTag": "BAL-1"},
+    ])
+
+    title = remarks or (ordered[0].get("remark") or "L2X")
+    cfg: dict[str, Any] = {
+        "remarks": title,
+        "meta": None,
+        "log": {"loglevel": "warning"},
+        "stats": {},
+        "policy": {
+            "levels": {"8": {"downlinkOnly": 2}},
+            "system": {"statsOutboundDownlink": True, "statsOutboundUplink": True},
+        },
+        "dns": {
+            "queryStrategy": "UseIPv4",
+            "servers": _client_dns_servers(doh_url=doh_url, doh_in_tunnel=doh_in_tunnel),
+        },
+        "inbounds": [
+            {
+                "tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False},
+            },
+            {"tag": "http", "listen": "127.0.0.1", "port": 10809, "protocol": "http", "settings": {}},
+        ],
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "balancers": balancers,
+            "rules": rules,
+        },
+        "burstObservatory": {
+            "subjectSelector": list(proxy_tags),
+            "pingConfig": {
+                "destination": "https://www.gstatic.com/generate_204",
+                "httpMethod": "GET",
+                "interval": "5m",
+                "sampling": 1,
+                "timeout": "5s",
+            },
+        },
+    }
+    return apply_sub_json_extras(cfg, extras, ep=ordered[0], proxy_tag=proxy_tags[0])
 
 # ---------------------------------------------------------------- Clash / Mihomo
 
