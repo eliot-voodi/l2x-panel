@@ -2233,6 +2233,28 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
     return entries
 
 
+def _is_direct_connect_tag(store: dict, tag: str) -> bool:
+    """True when ``tag`` is a Direct-connect node outbound (master registry or agent self-tag).
+
+    Unlike ``_direct_connect_endpoint_host``, does **not** require a resolvable public host —
+    sync on agents must still emit ``email~node_*`` identities when panel host is briefly empty.
+    """
+    tag = str(tag or "").strip()
+    if not tag or tag in ("direct", "block", "master"):
+        return False
+    try:
+        import nodes as nodes_mod
+        node = nodes_mod.node_by_outbound_tag(store, tag)
+        if nodes_mod.uses_direct_connect(node):
+            return True
+        ns = (store.get("settings") or {}).get("nodes") or {}
+        if ns.get("direct_connect") and str(ns.get("direct_connect_tag") or "").strip() == tag:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def client_identities(store: dict, client: dict, ib: dict) -> list[dict]:
     main = {"uuid": client["uuid"], "email": client["email"], "password": client["password"], "main": True, "tag": ""}
     if ib["protocol"] == "wireguard":
@@ -2240,21 +2262,30 @@ def client_identities(store: dict, client: dict, ib: dict) -> list[dict]:
         return [main]
     if ib["protocol"] in ("socks", "http"):
         return [main]
-    # Direct-connect primary: share link dials the node host with email~node_* UUID.
-    # Keep that identity in Xray even when subscription_entries skips the default tag.
+    # Direct-connect primary: share link dials the node with email~node_* UUID.
+    # Register that identity even when subscription_entries skips the default tag.
     default = client_default_outbound(store, client)
-    dc_host, _dc_node = _direct_connect_endpoint_host(store, default)
-    if dc_host and default and default != "direct":
+    out: list[dict] = []
+    if default and default != "direct" and _is_direct_connect_tag(store, default):
         ident_uuid = P.identity_uuid(client["uuid"], default)
-        main = {
+        out.append({
             "uuid": ident_uuid,
             "email": f"{client['email']}~{default}",
             "password": P.derived_password(ident_uuid),
             "main": True,
             "tag": default,
             "label": outbound_label(store, default),
-        }
-    out = [main]
+        })
+        # On Direct agents also keep the base UUID so a flaky sync that only
+        # emitted the legacy identity still accepts the client.
+        try:
+            import nodes as nodes_mod
+            if not nodes_mod.is_master(store):
+                out.append(dict(main))
+        except Exception:
+            out.append(dict(main))
+    else:
+        out.append(main)
     for e in subscription_entries(store, client):
         out.append({"uuid": e["uuid"], "email": e["email"], "password": e["password"], "main": False, "tag": e["tag"], "label": e["label"]})
     return out
@@ -2282,24 +2313,22 @@ def _direct_connect_endpoint_host(store: dict, tag: str) -> tuple[str, dict | No
     ``settings.nodes.direct_connect_tag`` + local public host.
     """
     tag = str(tag or "").strip()
-    if not tag:
+    if not tag or not _is_direct_connect_tag(store, tag):
         return "", None
     try:
         import nodes as nodes_mod
         node = nodes_mod.node_by_outbound_tag(store, tag)
         if nodes_mod.uses_direct_connect(node):
             return nodes_mod.node_public_domain(node) or "", node
-        ns = (store.get("settings") or {}).get("nodes") or {}
-        if ns.get("direct_connect") and str(ns.get("direct_connect_tag") or "").strip() == tag:
+        host = ""
+        try:
+            import front as front_mod
+            host = front_mod.public_domain(store) or ""
+        except Exception:
             host = ""
-            try:
-                import front as front_mod
-                host = front_mod.public_domain(store) or ""
-            except Exception:
-                host = ""
-            if not host:
-                host = str(((store.get("settings") or {}).get("panel") or {}).get("public_host") or "")
-            return str(host or "").strip(), None
+        if not host:
+            host = str(((store.get("settings") or {}).get("panel") or {}).get("public_host") or "")
+        return str(host or "").strip(), None
     except Exception:
         pass
     return "", None
@@ -2398,7 +2427,7 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 )
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
                 # Direct node as основная: dial node host with email~node_* (agent local_direct)
-                if dc_host and ob and ob != "direct":
+                if ob and ob != "direct" and _is_direct_connect_tag(store, ob):
                     ident_uuid = P.identity_uuid(client["uuid"], ob)
                     ident_use = {
                         "uuid": ident_uuid,
@@ -2932,8 +2961,7 @@ def build_config(store: dict) -> dict:
                 **_route_target(store, ob, known_outbounds=known_outbounds),
             })
             # Direct-connect primary identity is email~node_* (see client_identities)
-            dc_host, _ = _direct_connect_endpoint_host(store, ob)
-            if dc_host:
+            if _is_direct_connect_tag(store, ob):
                 rules.append({
                     "type": "field",
                     "user": [f"{c['email']}~{ob}"],
