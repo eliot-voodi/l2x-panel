@@ -7760,17 +7760,6 @@ CORE_EDITOR_TABS = (
 )
 
 
-def _core_section_path(section: str) -> str:
-    return {
-        "inbounds": "/inbounds",
-        "outbounds": "/outbounds",
-        "routing": "/routing",
-        "balancers": "/balancers",
-        "dns": "/xray?tab=dns",
-        "advanced": "/xray?tab=template",
-    }.get(section, "")
-
-
 @app.get("/cores/{core_id}", response_class=HTMLResponse)
 def core_edit_page(core_id: str, request: Request):
     if redir := _require(request):
@@ -7778,43 +7767,43 @@ def core_edit_page(core_id: str, request: Request):
     tab = str(request.query_params.get("tab") or "general").strip().lower()
     if tab not in {t[0] for t in CORE_EDITOR_TABS}:
         tab = "general"
-    # PasarGuard: section tabs open the network editors scoped to this core
-    if tab in ("inbounds", "outbounds", "routing", "balancers", "dns", "advanced"):
-        with mutate(edit_core_id="") as store:
-            core = cores_mod.core_by_id(store, core_id)
-        if not core:
-            flash(request, "Ядро не найдено", "error")
-            return go("/cores")
-        dest = _core_section_path(tab)
-        if core.get("inherit_master"):
-            # Edit live master (schema uses this) — still entered only via Cores UI
-            request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
-            request.session["core_net_master"] = "1"
-            flash(
-                request,
-                f"«{core.get('name')}» наследует мастер — правите live-мастер ({tab}). "
-                f"Схема трафика использует эти настройки.",
-                "info",
-            )
-        else:
-            request.session.pop("core_net_master", None)
-            request.session[cores_mod.EDIT_CORE_SESSION] = core_id
-            flash(request, f"Ядро «{core.get('name')}»: редактирование — {tab}", "info")
-        return go(dest or f"/cores/{core_id}")
 
     with mutate(edit_core_id="") as store:
         cores_mod.ensure_cores(store)
+        core = cores_mod.core_by_id(store, core_id)
+        if not core:
+            flash(request, "Ядро не найдено", "error")
+            return go("/cores")
+        # Scope session for optional deep links; UI stays on this page
+        if core.get("inherit_master"):
+            request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+            request.session["core_net_master"] = "1"
+        else:
+            request.session.pop("core_net_master", None)
+            request.session[cores_mod.EDIT_CORE_SESSION] = core_id
+
     store = _load_store()
     core = cores_mod.core_by_id(store, core_id)
-    if not core:
-        flash(request, "Ядро не найдено", "error")
-        return go("/cores")
     usage = cores_mod.cores_usage(store).get(core_id, 0)
-    # Preview slices (live master if inherit)
+    # Slices: live master if inherit, else core profile
     view = store if core.get("inherit_master") else cores_mod.store_view_for_core_edit(store, core_id)
-    bals = view.get("balancers") or {}
-    if not isinstance(bals, dict):
-        bals = {}
+    bals_src = view.get("balancers") or {}
+    if not isinstance(bals_src, dict):
+        bals_src = {}
+    bals_tmp = {"balancers": {k: dict(v) if isinstance(v, dict) else {} for k, v in bals_src.items()}}
+    xray.ensure_balancers(bals_tmp)
+    bals = bals_tmp["balancers"]
+    xs = view.get("xray_settings") or {}
+    if not isinstance(xs, dict):
+        xs = {}
+    dns = view.get("dns") or {}
+    if not isinstance(dns, dict):
+        dns = {}
+    patch = xs.get("template_patch")
+    try:
+        patch_text = json.dumps(patch, ensure_ascii=False, indent=2) if patch else ""
+    except Exception:
+        patch_text = ""
     return page(
         request, "core_edit.html", active="nodes",
         core=core,
@@ -7832,7 +7821,11 @@ def core_edit_page(core_id: str, request: Request):
         preview_outbounds=list(view.get("outbounds_custom") or []),
         preview_routes=list(view.get("routes") or []),
         preview_balancers=bals,
-        preview_dns=view.get("dns") or {},
+        preview_dns=dns,
+        preview_xray=xs,
+        template_patch_text=patch_text,
+        outbound_tags=xray.all_outbound_tags(view),
+        view_store=view,
     )
 
 
@@ -7872,6 +7865,193 @@ async def cores_scope(request: Request):
     return go(nxt)
 
 
+def _core_back(core_id: str, tab: str = "general") -> str:
+    tab = tab if tab in {t[0] for t in CORE_EDITOR_TABS} else "general"
+    if tab == "general":
+        return f"/cores/{core_id}"
+    return f"/cores/{core_id}?tab={tab}"
+
+
+@app.post("/cores/{core_id}/panel/{tab}/{action}")
+async def cores_panel_action(core_id: str, tab: str, action: str, request: Request):
+    """In-page core editor mutations — always return to the same core tab."""
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только мастер", "error")
+        return go("/cores")
+    form = {}
+    try:
+        form = await request.form()
+    except Exception:
+        form = {}
+    tab = tab if tab in {t[0] for t in CORE_EDITOR_TABS} else "general"
+    back = _core_back(core_id, tab)
+
+    # edit_core_id: mutate core slices; inherit cores edit master live
+    with mutate(edit_core_id="", history_section="cores", history_note=f"panel {tab}/{action}") as store:
+        cores_mod.ensure_cores(store)
+        core = cores_mod.core_by_id(store, core_id)
+        if not core:
+            flash(request, "Ядро не найдено", "error")
+            return go("/cores")
+        inherit = bool(core.get("inherit_master"))
+        target_id = "" if inherit else core_id
+
+    # Re-enter mutate with correct slice target
+    with mutate(edit_core_id=target_id, history_section="cores", history_note=f"panel {tab}/{action}") as store:
+        core = cores_mod.core_by_id(store, core_id) or {}
+        if tab == "inbounds":
+            ibs = store.setdefault("inbounds", [])
+            if action == "toggle":
+                ib_id = _int(form.get("id"))
+                ib = next((i for i in ibs if i.get("id") == ib_id), None)
+                if not ib:
+                    flash(request, "Inbound не найден", "error")
+                    return go(back)
+                ib["enabled"] = not ib.get("enabled", True)
+                flash(request, f"Inbound {ib.get('tag')}: {'вкл' if ib['enabled'] else 'выкл'}", "info")
+            elif action == "delete":
+                ib_id = _int(form.get("id"))
+                if len(ibs) <= 1:
+                    flash(request, "Нельзя удалить последний inbound", "error")
+                    return go(back)
+                store["inbounds"] = [i for i in ibs if i.get("id") != ib_id]
+                flash(request, "Inbound удалён", "info")
+            else:
+                flash(request, "Неизвестное действие", "error")
+        elif tab == "outbounds":
+            outs = store.setdefault("outbounds_custom", [])
+            tag = str(form.get("tag") or "").strip()
+            o = next((x for x in outs if x.get("tag") == tag), None)
+            if action == "toggle" and o:
+                o["enabled"] = not o.get("enabled", True)
+                flash(request, f"{tag}: {'вкл' if o['enabled'] else 'выкл'}", "info")
+            elif action == "delete" and o:
+                store["outbounds_custom"] = [x for x in outs if x.get("tag") != tag]
+                flash(request, f"{tag} удалён", "info")
+            elif action == "sub" and o:
+                o["in_sub"] = not o.get("in_sub", True)
+                flash(request, f"{tag}: подписка {'вкл' if o.get('in_sub', True) else 'выкл'}", "info")
+            else:
+                flash(request, "Outbound не найден", "error")
+        elif tab == "routing":
+            routes = store.setdefault("routes", [])
+            name = str(form.get("name") or "").strip()
+            idx = next((i for i, r in enumerate(routes) if r.get("name") == name), None)
+            if idx is None and action != "add":
+                flash(request, "Правило не найдено", "error")
+                return go(back)
+            if action == "toggle":
+                routes[idx]["enabled"] = not routes[idx].get("enabled", True)
+                flash(request, f"{name}: {'вкл' if routes[idx]['enabled'] else 'выкл'}", "info")
+            elif action == "delete":
+                routes.pop(idx)
+                flash(request, f"{name} удалено", "info")
+            elif action == "up":
+                if idx > 0:
+                    routes[idx - 1], routes[idx] = routes[idx], routes[idx - 1]
+                    flash(request, f"{name}: выше", "info")
+            elif action == "down":
+                if idx < len(routes) - 1:
+                    routes[idx + 1], routes[idx] = routes[idx], routes[idx + 1]
+                    flash(request, f"{name}: ниже", "info")
+            elif action == "add":
+                rule, err = _route_rule_from_form(form)
+                if err or not rule:
+                    flash(request, err or "Ошибка формы", "error")
+                    return go(back)
+                rname = rule.get("name") or ""
+                if not rname or any(r.get("name") == rname for r in routes):
+                    flash(request, "Нужно уникальное имя", "error")
+                    return go(back)
+                rule["enabled"] = True
+                routes.append(rule)
+                flash(request, f"Правило {rname} добавлено", "info")
+            else:
+                flash(request, "Неизвестное действие", "error")
+        elif tab == "balancers":
+            key = str(form.get("key") or "").strip()
+            bals = xray.ensure_balancers(store)
+            b = bals.get(key)
+            if not b:
+                flash(request, "Балансировщик не найден", "error")
+                return go(back)
+            if action == "toggle":
+                b["enabled"] = not b.get("enabled", True)
+                flash(request, f"{key}: {'вкл' if b['enabled'] else 'выкл'}", "info")
+            elif action == "save":
+                b["enabled"] = form.get("enabled") == "1"
+                b["label"] = str(form.get("label") or "").strip()[:80]
+                b["sub_direct_pool"] = form.get("sub_direct_pool") == "1"
+                b["probe_url"] = str(form.get("probe_url") or b.get("probe_url") or "").strip()
+                b["probe_interval"] = str(form.get("probe_interval") or b.get("probe_interval") or "").strip()
+                raw_fb = str(form.get("fallback") or "direct").strip()
+                b["fallback"] = "none" if raw_fb.lower() in ("none", "-", "off") else (raw_fb or "direct")
+                getlist = getattr(form, "getlist", None)
+                members = [str(x) for x in (getlist("members") if callable(getlist) else [])]
+                all_custom = {o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("tag")}
+                if not members or set(members) == all_custom:
+                    b["members"] = []
+                else:
+                    b["members"] = members
+                if key == "least_load":
+                    b["expected"] = max(1, _int(form.get("expected"), 1))
+                    b["max_rtt"] = str(form.get("max_rtt") or "1s")
+                    b["tolerance"] = _float(form.get("tolerance"), 0.15)
+                flash(request, f"{key} сохранён", "info")
+            else:
+                flash(request, "Неизвестное действие", "error")
+        elif tab == "dns" and action == "save":
+            d = store.setdefault("dns", {})
+            if not isinstance(d, dict):
+                d = {}
+                store["dns"] = d
+            d["enabled"] = form.get("enabled") == "1"
+            d["servers"] = [ln.strip() for ln in str(form.get("servers") or "").splitlines() if ln.strip()]
+            d["query_strategy"] = str(form.get("query_strategy") or "UseIP").strip() or "UseIP"
+            d["disable_cache"] = form.get("disable_cache") == "1"
+            hosts = {}
+            for line in str(form.get("hosts") or "").splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    hosts[k.strip()] = v.strip()
+            d["hosts"] = hosts
+            d["fakedns"] = {
+                "enabled": form.get("fakedns") == "1",
+                "pool": str(form.get("fake_pool") or "198.18.0.0/15"),
+                "size": _int(form.get("fake_size"), 65535),
+            }
+            flash(request, "DNS сохранён", "info")
+        elif tab == "advanced" and action == "save":
+            xs = store.setdefault("xray_settings", {})
+            if not isinstance(xs, dict):
+                xs = {}
+                store["xray_settings"] = xs
+            raw = str(form.get("template_patch") or "").strip()
+            if not raw:
+                xs["template_patch"] = {}
+            else:
+                try:
+                    patch = json.loads(raw)
+                except Exception as e:
+                    flash(request, f"JSON patch: {e}", "error")
+                    return go(back)
+                if not isinstance(patch, dict):
+                    flash(request, "template_patch должен быть JSON-объектом", "error")
+                    return go(back)
+                xs["template_patch"] = patch
+            flash(request, "Дополнительно сохранено", "info")
+        else:
+            flash(request, "Неизвестная вкладка/действие", "error")
+            return go(back)
+
+    # Master xray only when editing inherit/live master
+    if inherit:
+        _apply_xray(_load_store(), xray_only=True)
+    return go(back)
+
+
 @app.post("/cores/add")
 async def cores_add(request: Request):
     if redir := _require(request):
@@ -7905,28 +8085,27 @@ async def cores_action(core_id: str, action: str, request: Request):
     except Exception:
         form = {}
     # Enter/leave structured edit mode (session only)
-        if action == "edit-mode":
-            with mutate(edit_core_id="") as store:
-                core = cores_mod.core_by_id(store, core_id)
-            if not core:
-                # «default» / missing id used by banner «Закрыть» when master-live
-                request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
-                request.session.pop("core_net_master", None)
-                return go("/cores")
-            if core.get("inherit_master"):
-                request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
-                request.session["core_net_master"] = "1"
-                flash(request, f"«{core.get('name')}» → мастер (live)", "info")
-                return go("/inbounds")
-            request.session.pop("core_net_master", None)
-            request.session[cores_mod.EDIT_CORE_SESSION] = core_id
-            flash(request, f"Режим правки ядра «{core.get('name')}»: Inbounds / Outbounds / Маршруты / DNS", "info")
-            return go("/inbounds")
-        if action == "edit-mode-clear":
+    if action == "edit-mode":
+        with mutate(edit_core_id="") as store:
+            core = cores_mod.core_by_id(store, core_id)
+        if not core:
             request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
             request.session.pop("core_net_master", None)
-            flash(request, "Редактор сети закрыт — вернитесь через Ядра", "info")
             return go("/cores")
+        if core.get("inherit_master"):
+            request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+            request.session["core_net_master"] = "1"
+            flash(request, f"«{core.get('name')}» → мастер (live)", "info")
+            return go(f"/cores/{core_id}")
+        request.session.pop("core_net_master", None)
+        request.session[cores_mod.EDIT_CORE_SESSION] = core_id
+        flash(request, f"Режим правки ядра «{core.get('name')}»", "info")
+        return go(f"/cores/{core_id}")
+    if action == "edit-mode-clear":
+        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        request.session.pop("core_net_master", None)
+        flash(request, "Редактор сети закрыт — вернитесь через Ядра", "info")
+        return go("/cores")
 
     go_edit = form.get("stay") == "1"
     with mutate(history_section="cores", history_note=f"core {action}", edit_core_id="") as store:
