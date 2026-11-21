@@ -193,7 +193,7 @@
               <td>{% if r.filter_kind %}<span class="badge">фильтр</span>{% else %}<span class="badge accent">правило</span>{% endif %}</td>
               <td>{{ r.label }}</td>
               <td class="small mono">{{ (r.domain + r.ip + r.protocol)[:4]|join(', ') }}</td>
-              <td><a href="{{ bp }}/routing">открыть</a></td>
+              <td><a href="{{ bp }}/cores">ядра</a></td>
             </tr>
             {% else %}
             <tr><td colspan="5" class="empty">Правил нет</td></tr>
@@ -230,7 +230,7 @@
     <div id="chk-result" class="sch-result" hidden></div>
     <div id="chk-path" class="sch-path" hidden></div>
     <div class="hint" style="margin-top:.4rem">
-      <a href="{{ bp }}/routing">Правила</a> · <a href="{{ bp }}/outbounds">Выходы</a>
+      <a href="{{ bp }}/cores">Ядра</a> · правила / выходы
     </div>
   </aside>
 </div>

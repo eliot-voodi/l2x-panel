@@ -468,18 +468,26 @@ def _config_store(request: Request) -> dict:
 
 def _edit_core_banner(request: Request) -> dict | None:
     cid = str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "").strip()
-    if not cid:
-        return None
-    store = _load_store()
-    core = cores_mod.core_by_id(store, cid)
-    if not core:
-        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
-        return None
-    return {
-        "id": core.get("id"),
-        "name": core.get("name") or core.get("id"),
-        "inherit_master": bool(core.get("inherit_master")),
-    }
+    if cid:
+        store = _load_store()
+        core = cores_mod.core_by_id(store, cid)
+        if not core:
+            request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+            return None
+        return {
+            "id": core.get("id"),
+            "name": core.get("name") or core.get("id"),
+            "inherit_master": bool(core.get("inherit_master")),
+            "master_live": False,
+        }
+    if request.session.get("core_net_master"):
+        return {
+            "id": "",
+            "name": "Мастер (live)",
+            "inherit_master": True,
+            "master_live": True,
+        }
+    return None
 
 
 def _editing_core() -> bool:
@@ -514,6 +522,22 @@ def _cores_scope_ctx(request: Request) -> dict:
         "active_core_name": (active or {}).get("name") or "",
         "core_scope_master": not bool(active),
     }
+
+
+# Inbounds / Outbounds / Routing / Balancers live under Cores (not main sidebar).
+_CORE_NET_PATHS = ("/inbounds", "/outbounds", "/routing", "/balancers")
+
+
+def _require_core_net(request: Request):
+    """Block direct sidebar-less access unless a core (or master-via-core) scope is open."""
+    if redir := _require(request):
+        return redir
+    cid = str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "").strip()
+    master_ok = bool(request.session.get("core_net_master"))
+    if cid or master_ok:
+        return None
+    flash(request, "Inbounds / Outbounds / маршруты / балансировщики настраиваются в Ядрах (Nodes → Ядра).", "info")
+    return go("/cores")
 
 
 FRONT_CERT_RETRY = 3600
@@ -3045,7 +3069,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
 
 @app.get("/inbounds", response_class=HTMLResponse)
 async def inbounds_page(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     store = _config_store(request)
     rows = []
@@ -3058,7 +3082,7 @@ async def inbounds_page(request: Request):
         rows.append({**ib, "n_clients": n_clients, "used": xray.inbound_used_bytes(ib),
                      "ok": xray.inbound_access_ok(ib), "lint": lint})
     xtest = await run_in_threadpool(inbound_lint.xray_dry_test, store)
-    return page(request, "inbounds.html", active="inbounds", items=rows, store=store, xtest=xtest,
+    return page(request, "inbounds.html", active="nodes", items=rows, store=store, xtest=xtest,
                 **_cores_scope_ctx(request))
 
 
@@ -3107,7 +3131,7 @@ async def inbound_check(request: Request):
 
 @app.get("/inbounds/new", response_class=HTMLResponse)
 def inbound_new(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     store = _config_store(request)
     proto = request.query_params.get("protocol") or "vless"
@@ -3118,13 +3142,13 @@ def inbound_new(request: Request):
         lint_issues = inbound_lint.inbound_issues(store, ib)
     except Exception:
         lint_issues = []
-    return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=True, store=store,
-                certs=ops.list_certs(), lint_issues=lint_issues)
+    return page(request, "inbound_edit.html", active="nodes", ib=ib, is_new=True, store=store,
+                certs=ops.list_certs(), lint_issues=lint_issues, **_cores_scope_ctx(request))
 
 
 @app.get("/inbounds/{ib_id}/edit", response_class=HTMLResponse)
 def inbound_edit(ib_id: int, request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     store = _config_store(request)
     ib = xray.inbound_by_id(store, ib_id)
@@ -3135,13 +3159,13 @@ def inbound_edit(ib_id: int, request: Request):
         lint_issues = inbound_lint.inbound_issues(store, ib)
     except Exception:
         lint_issues = []
-    return page(request, "inbound_edit.html", active="inbounds", ib=ib, is_new=False, store=store,
-                certs=ops.list_certs(), lint_issues=lint_issues)
+    return page(request, "inbound_edit.html", active="nodes", ib=ib, is_new=False, store=store,
+                certs=ops.list_certs(), lint_issues=lint_issues, **_cores_scope_ctx(request))
 
 
 @app.post("/inbounds/save")
 async def inbound_save(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     form = await request.form()
     ib_id = _int(form.get("id"))
@@ -3205,7 +3229,7 @@ async def inbound_save(request: Request):
 
 @app.post("/inbounds/{ib_id}/{action}")
 def inbound_action(ib_id: int, action: str, request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     what = ""
     tag = ""
@@ -4474,7 +4498,7 @@ def _pia_loop() -> None:
 
 @app.get("/outbounds", response_class=HTMLResponse)
 def outbounds_page(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     store = _config_store(request)
     ot = store.get("outbound_traffic") or {}
@@ -4503,7 +4527,7 @@ def outbounds_page(request: Request):
         r.setdefault("via", "")
     custom = {o["tag"]: {"config": o.get("config") or {}, "remark": o.get("remark") or "", "country": o.get("country") or ""}
               for o in store["outbounds_custom"]}
-    return page(request, "outbounds.html", active="outbounds", items=rows, nord_countries=[], custom=custom,
+    return page(request, "outbounds.html", active="nodes", items=rows, nord_countries=[], custom=custom,
                 dialer_tags=[r["tag"] for r in rows], ss_methods=P.SS_METHODS, fingerprints=P.FINGERPRINTS,
                 pia=_pia_account_view(), **_cores_scope_ctx(request))
 
@@ -4650,7 +4674,7 @@ def _clone_custom_outbound(store: dict, src: dict) -> dict:
 
 @app.post("/outbounds/add")
 async def outbound_add(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     form = await request.form()
     mode = str(form.get("mode") or "link")
@@ -4888,7 +4912,7 @@ def api_vlessenc(request: Request):
 
 @app.post("/outbounds/{tag}/{action}")
 def outbound_action(tag: str, action: str, request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     if action == "test":
         store0 = _load_store()
@@ -5002,19 +5026,19 @@ def outbound_action(tag: str, action: str, request: Request):
 
 @app.get("/balancers", response_class=HTMLResponse)
 def balancers_page(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     store = _config_store(request)
     bals = xray.ensure_balancers(store)
     active = {k: xray.balancer_member_tags(store, b) for k, b in bals.items()}
-    return page(request, "balancers.html", active="balancers", balancers=bals, active_members=active,
+    return page(request, "balancers.html", active="nodes", balancers=bals, active_members=active,
                 custom=store["outbounds_custom"], watchdog_sec=WATCHDOG_INTERVAL, store=store,
                 default_balancer_labels=xray.BALANCER_LABELS, **_cores_scope_ctx(request))
 
 
 @app.post("/balancers/{key}")
 async def balancers_save(key: str, request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     if key not in ("least_ping", "least_load", "random"):
         return go("/balancers")
@@ -5158,7 +5182,7 @@ def _routing_lint_or_flash(request: Request, store: dict) -> str | None:
 
 @app.get("/routing", response_class=HTMLResponse)
 def routing_page(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     store = _config_store(request)
     route_clients = xray.route_picker_clients(store)
@@ -5168,7 +5192,7 @@ def routing_page(request: Request):
     issues_by_name: dict[str, list] = {}
     for iss in route_issues:
         issues_by_name.setdefault(str(iss.get("name") or ""), []).append(iss)
-    return page(request, "routing.html", active="routing", routes=store["routes"], store=store,
+    return page(request, "routing.html", active="nodes", routes=store["routes"], store=store,
                 route_missing={r.get("name"): xray.route_missing_geo(r) for r in store["routes"]},
                 ext_missing=xray.missing_ext_geo(store),
                 outbounds=xray.all_outbound_tags(store), presets=xray.ROUTE_PRESETS,
@@ -5195,7 +5219,7 @@ def routing_page(request: Request):
 
 @app.post("/routing")
 async def routing_add(request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     form = await request.form()
     rule, err = _route_rule_from_form(form)
@@ -5227,7 +5251,7 @@ async def routing_add(request: Request):
 @app.post("/routing/{name}/save")
 async def routing_save(name: str, request: Request):
     """Update an existing routing rule (edit form)."""
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     form = await request.form()
     rule, err = _route_rule_from_form(form)
@@ -5266,7 +5290,7 @@ async def routing_save(name: str, request: Request):
 
 @app.post("/routing/preset/{key}")
 def routing_preset(key: str, request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     preset = xray.ROUTE_PRESETS.get(key)
     if not preset:
@@ -5290,7 +5314,7 @@ def routing_preset(key: str, request: Request):
 
 @app.post("/routing/{name}/{action}")
 def routing_action(name: str, action: str, request: Request):
-    if redir := _require(request):
+    if redir := _require_core_net(request):
         return redir
     nxt = _next(request, "/routing")
     if action == "save":
@@ -7761,17 +7785,21 @@ def core_edit_page(core_id: str, request: Request):
         if not core:
             flash(request, "Ядро не найдено", "error")
             return go("/cores")
+        dest = _core_section_path(tab)
         if core.get("inherit_master"):
+            # Edit live master (schema uses this) — still entered only via Cores UI
+            request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+            request.session["core_net_master"] = "1"
             flash(
                 request,
-                f"«{core.get('name')}» наследует мастер — сначала сохраните снимок (снимите «наследует»), "
-                f"чтобы править {tab}",
-                "error",
+                f"«{core.get('name')}» наследует мастер — правите live-мастер ({tab}). "
+                f"Схема трафика использует эти настройки.",
+                "info",
             )
-            return go(f"/cores/{core_id}?tab=general")
-        request.session[cores_mod.EDIT_CORE_SESSION] = core_id
-        dest = _core_section_path(tab)
-        flash(request, f"Ядро «{core.get('name')}»: редактирование — {tab}", "info")
+        else:
+            request.session.pop("core_net_master", None)
+            request.session[cores_mod.EDIT_CORE_SESSION] = core_id
+            flash(request, f"Ядро «{core.get('name')}»: редактирование — {tab}", "info")
         return go(dest or f"/cores/{core_id}")
 
     with mutate(edit_core_id="") as store:
@@ -7815,20 +7843,22 @@ async def cores_scope(request: Request):
         return redir
     form = await request.form()
     cid = str(form.get("core_id") or "").strip()
-    nxt = str(form.get("next") or "/outbounds").strip() or "/outbounds"
+    nxt = str(form.get("next") or "/cores").strip() or "/cores"
     if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
-        nxt = "/outbounds"
+        nxt = "/cores"
     if not cid:
         request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        request.session["core_net_master"] = "1"
         flash(request, "Контекст: мастер (live) — схема трафика / Xray панели", "info")
         return go(nxt)
     with mutate(edit_core_id="") as store:
         core = cores_mod.core_by_id(store, cid)
     if not core:
         flash(request, "Ядро не найдено", "error")
-        return go(nxt)
+        return go("/cores")
     if core.get("inherit_master"):
         request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        request.session["core_net_master"] = "1"
         flash(
             request,
             f"«{core.get('name')}» наследует мастер — правите мастер (live). "
@@ -7836,6 +7866,7 @@ async def cores_scope(request: Request):
             "info",
         )
         return go(nxt)
+    request.session.pop("core_net_master", None)
     request.session[cores_mod.EDIT_CORE_SESSION] = cid
     flash(request, f"Контекст ядра «{core.get('name')}»: Outbounds / маршруты / балансировщики", "info")
     return go(nxt)
@@ -7874,22 +7905,28 @@ async def cores_action(core_id: str, action: str, request: Request):
     except Exception:
         form = {}
     # Enter/leave structured edit mode (session only)
-    if action == "edit-mode":
-        with mutate(edit_core_id="") as store:
-            core = cores_mod.core_by_id(store, core_id)
-        if not core:
-            flash(request, "Ядро не найдено", "error")
+        if action == "edit-mode":
+            with mutate(edit_core_id="") as store:
+                core = cores_mod.core_by_id(store, core_id)
+            if not core:
+                # «default» / missing id used by banner «Закрыть» when master-live
+                request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+                request.session.pop("core_net_master", None)
+                return go("/cores")
+            if core.get("inherit_master"):
+                request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+                request.session["core_net_master"] = "1"
+                flash(request, f"«{core.get('name')}» → мастер (live)", "info")
+                return go("/inbounds")
+            request.session.pop("core_net_master", None)
+            request.session[cores_mod.EDIT_CORE_SESSION] = core_id
+            flash(request, f"Режим правки ядра «{core.get('name')}»: Inbounds / Outbounds / Маршруты / DNS", "info")
+            return go("/inbounds")
+        if action == "edit-mode-clear":
+            request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+            request.session.pop("core_net_master", None)
+            flash(request, "Редактор сети закрыт — вернитесь через Ядра", "info")
             return go("/cores")
-        if core.get("inherit_master"):
-            flash(request, "Сначала отключите «наследует мастер» (→ Снимок), чтобы править срезы ядра", "error")
-            return go(f"/cores/{core_id}")
-        request.session[cores_mod.EDIT_CORE_SESSION] = core_id
-        flash(request, f"Режим правки ядра «{core.get('name')}»: Inbounds / Outbounds / Маршруты / DNS", "info")
-        return go("/inbounds")
-    if action == "edit-mode-clear":
-        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
-        flash(request, "Режим правки ядра выключен — снова мастер", "info")
-        return go("/cores")
 
     go_edit = form.get("stay") == "1"
     with mutate(history_section="cores", history_note=f"core {action}", edit_core_id="") as store:

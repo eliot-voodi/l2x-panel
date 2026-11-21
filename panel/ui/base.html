@@ -216,12 +216,8 @@
     <a class="nav-link {% if active=='clients' %}active{% endif %}" href="{{ bp }}/clients">{{ ic.icon('users') }}{{ t('Клиенты') }}</a>
     <a class="nav-link {% if active=='groups' %}active{% endif %}" href="{{ bp }}/groups">{{ ic.icon('layers') }}Группы</a>
     <a class="nav-link {% if active=='migrate' %}active{% endif %}" href="{{ bp }}/clients/migrate">{{ ic.icon('inbox') }}Миграция</a>
-    <a class="nav-link {% if active=='inbounds' %}active{% endif %}" href="{{ bp }}/inbounds">{{ ic.icon('inbox') }}{{ t('Inbounds') }}</a>
     <a class="nav-link {% if active=='bans' %}active{% endif %}" href="{{ bp }}/bans">{{ ic.icon('shield') }}Баны IP</a>
     <div class="nav-group">{{ t('Сеть') }}</div>
-    <a class="nav-link {% if active=='outbounds' %}active{% endif %}" href="{{ bp }}/outbounds">{{ ic.icon('send') }}{{ t('Outbounds') }}</a>
-    <a class="nav-link {% if active=='balancers' %}active{% endif %}" href="{{ bp }}/balancers">{{ ic.icon('scale') }}{{ t('Балансировщики') }}</a>
-    <a class="nav-link {% if active=='routing' %}active{% endif %}" href="{{ bp }}/routing">{{ ic.icon('route') }}{{ t('Маршрутизация') }}</a>
     <a class="nav-link {% if active=='schema' %}active{% endif %}" href="{{ bp }}/schema">{{ ic.icon('activity') }}{{ t('Схема трафика') }}</a>
     <a class="nav-link {% if active=='doh' %}active{% endif %}" href="{{ bp }}/doh">{{ ic.icon('shield') }}DoH / Pi-hole</a>
     <a class="nav-link {% if active=='settings' and request.query_params.get('tab')=='masterdns' %}active{% endif %}" href="{{ bp }}/settings?tab=masterdns">{{ ic.icon('globe') }}MasterDNS</a>
@@ -279,12 +275,13 @@
       {% if edit_core %}
       <div class="card upd-banner" style="border-color:var(--accent)">
         <div>
-          <b>Режим ядра: {{ edit_core.name }}</b>
-          <div class="small muted">Inbounds / Outbounds / Маршруты / Балансировщики / DNS правятся в этом ядре (как в PasarGuard).</div>
+          <b>{% if edit_core.master_live %}Сеть: мастер (live){% else %}Режим ядра: {{ edit_core.name }}{% endif %}</b>
+          <div class="small muted">Inbounds / Outbounds / маршруты / балансировщики — только через Ядра (не в главном меню).</div>
         </div>
         <div class="actions">
-          <a class="btn sm" href="{{ bp }}/cores/{{ edit_core.id }}">Настройки ядра</a>
-          <form method="post" action="{{ bp }}/cores/{{ edit_core.id }}/edit-mode-clear"><button class="btn ghost sm">Выйти</button></form>
+          {% if edit_core.id %}<a class="btn sm" href="{{ bp }}/cores/{{ edit_core.id }}">Настройки ядра</a>
+          {% else %}<a class="btn sm" href="{{ bp }}/cores">Ядра</a>{% endif %}
+          <form method="post" action="{{ bp }}/cores/{% if edit_core.id %}{{ edit_core.id }}{% else %}default{% endif %}/edit-mode-clear"><button class="btn ghost sm">Закрыть</button></form>
         </div>
       </div>
       {% endif %}

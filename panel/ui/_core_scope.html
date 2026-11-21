@@ -16,7 +16,7 @@
     </div>
     <div class="hint" style="margin:0;flex:2;min-width:12rem">
       {% if core_scope_master %}
-      Сейчас правите <b>мастер</b> (используется в «Схеме трафика» и Xray панели).
+      Сейчас правите <b>мастер</b> (схема трафика / Xray панели). Вход только через <a href="{{ bp }}/cores">Ядра</a>.
       {% else %}
       Сейчас правите ядро <b>{{ active_core_name }}</b> — Sync на ноды; Xray мастера не меняется.
       <a href="{{ bp }}/cores/{{ active_core_id }}">настройки ядра</a>

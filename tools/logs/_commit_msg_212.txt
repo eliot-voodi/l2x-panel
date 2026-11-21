@@ -1,0 +1,4 @@
+v2.1.2: Remove Inbounds/Outbounds/Routing/Balancers from main nav.
+
+Network config is only reachable via Cores (PasarGuard-style). Direct
+URLs redirect to /cores unless a core/master-via-core scope is open.
