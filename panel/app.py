@@ -1231,6 +1231,8 @@ def _allowed_outbounds(store: dict) -> set[str]:
 # ================================================================ background workers
 
 WATCHDOG_INTERVAL = int(os.environ.get("L2XPANEL_WATCHDOG_SEC", "20"))
+# Direct agents count traffic + kick locally more often, then sync to master.
+DIRECT_AGENT_INTERVAL = int(os.environ.get("L2XPANEL_DIRECT_AGENT_SEC", "5"))
 # ss-based :443 per-IP prune; conntrack/connlimit alone leaks under reconnect storms.
 CONN_PRUNE_INTERVAL = int(os.environ.get("L2XPANEL_CONN_PRUNE_SEC", "3"))
 _stop = threading.Event()
@@ -1658,21 +1660,31 @@ def _expiry_warnings(store: dict) -> None:
 
 
 _LAST_QUOTA_DIRECT_PUSH = 0.0
+_LAST_TRAFFIC_DIRECT_PUSH = 0.0
 
 
-def _push_direct_nodes_clients(store: dict, *, reason: str = "quota") -> None:
+def _push_direct_nodes_clients(
+    store: dict,
+    *,
+    reason: str = "quota",
+    exclude_ids: set[str] | None = None,
+) -> None:
     """Push client list to Direct nodes so limited/expired users are removed from Xray there."""
     global _LAST_QUOTA_DIRECT_PUSH
     if not nodes_mod.is_master(store):
         return
     host = public_host()
+    skip = {str(x) for x in (exclude_ids or set()) if x}
     pushed = False
     for node in nodes_mod.direct_connect_nodes(store):
         if not node.get("enabled", True) or not node.get("id"):
             continue
+        nid = str(node["id"])
+        if nid in skip:
+            continue
         try:
-            name = node.get("name") or str(node.get("id") or "")[:8]
-            _node_push_job(str(node["id"]), f"{name}: {reason}", host)
+            name = node.get("name") or nid[:8]
+            _node_push_job(nid, f"{name}: {reason}", host)
             pushed = True
         except Exception:
             pass
@@ -1680,8 +1692,28 @@ def _push_direct_nodes_clients(store: dict, *, reason: str = "quota") -> None:
         _LAST_QUOTA_DIRECT_PUSH = time.time()
 
 
+def _clients_access_map(store: dict) -> dict[str, bool]:
+    out: dict[str, bool] = {}
+    for c in store.get("clients") or []:
+        if not isinstance(c, dict):
+            continue
+        email = str(c.get("email") or "").strip()
+        if email:
+            out[email] = bool(xray.client_access_ok(c))
+    return out
+
+
+def _is_direct_agent(store: dict | None = None) -> bool:
+    store = store or _load_store()
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    return (ns.get("role") or "") == "agent" and bool(ns.get("direct_connect"))
+
+
 def _watchdog_cycle() -> None:
     global ONLINE, _LAST_QUOTA_DIRECT_PUSH
+    if _is_direct_agent():
+        _direct_agent_quota_cycle()
+        return
     need_apply = False
     with STORE_LOCK:
         store = _load_store()
@@ -1727,32 +1759,91 @@ def _watchdog_cycle() -> None:
                 _push_direct_nodes_clients(store, reason="quota-reassert")
         except Exception:
             pass
-        # Public direct_connect agents push traffic counters to master
+
+
+def _direct_agent_quota_cycle() -> None:
+    """Direct node: count traffic locally → kick on limit → sync master (+ access map)."""
+    global ONLINE
+    need_kick = False
+    events: list[dict] = []
+    report_body: dict | None = None
+    master_url = ""
+    token = ""
+    with STORE_LOCK:
+        store = _load_store()
+        ns = (store.get("settings") or {}).get("nodes") or {}
+        master_url = (
+            str(ns.get("upstream_master_url") or "").rstrip("/")
+            or str(ns.get("master_pull_url") or "").rstrip("/")
+            or str((ns.get("pull") or {}).get("master_url") or "").rstrip("/")
+        )
+        token = str(ns.get("agent_token") or "").strip()
+        stats = nodes_mod.collect_direct_connect_stats(store)
+        if stats:
+            traffic, online_map, tag = stats
+            # Fold local StatsService counters into client traffic (same math as master)
+            nodes_mod.apply_direct_tag_traffic(store, tag, traffic, online_map)
+            node_id = str(ns.get("upstream_node_id") or "").strip()
+            if node_id:
+                report_body = {
+                    "node_id": node_id,
+                    "direct_connect_tag": tag,
+                    "traffic": traffic,
+                    "online": online_map,
+                    "reported_at": nodes_mod.now_iso(),
+                }
+        # Do NOT harvest_traffic for clients on Direct agents (would double-count
+        # master-synced totals). Still refresh online / IP limits locally.
+        store["_events"] = []
+        if xray.enforce_quotas(store):
+            need_kick = True
+        events.extend(store.pop("_events", []))
+        online = xray.query_online()
+        ONLINE = xray.update_online(store, online)
         try:
-            _agent_direct_connect_report(store)
+            ban_min = _int((store.get("settings") or {}).get("iplimit", {}).get("ban_minutes"), 30)
+            for b in xray.enforce_ip_limits(store, ONLINE, ban_min):
+                events.append({"type": "ip_ban", **b})
         except Exception:
             pass
+        try:
+            xray.enforce_conn_limits(store)
+        except Exception:
+            pass
+        if STORE_OK:
+            _save_store(store)
+        if need_kick and STORE_OK:
+            # Node itself drops the session before waiting for master push
+            _apply_xray(store, clients_only=True)
+    if events:
+        _notify_events(events)
+    if not report_body or not master_url or not token:
+        return
+    try:
+        resp = nodes_mod.report_request(master_url, token, report_body, timeout=15)
+    except Exception:
+        return
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return
+    access = resp.get("access") if isinstance(resp.get("access"), dict) else {}
+    if not access:
+        return
+    with STORE_LOCK:
+        store = _load_store()
+        if nodes_mod.apply_master_access_snapshot(store, access):
+            if STORE_OK:
+                _save_store(store)
+            # Master may block due to traffic counted on other nodes
+            if any(not xray.client_access_ok(c) for c in (store.get("clients") or []) if isinstance(c, dict)):
+                _apply_xray(store, clients_only=True)
 
 
 def _agent_direct_connect_report(store: dict | None = None) -> None:
-    """Agent → master traffic/online for clients that dial this node directly."""
+    """Deprecated entry: Direct agent path is ``_direct_agent_quota_cycle``."""
     store = store or _load_store()
-    ns = (store.get("settings") or {}).get("nodes") or {}
-    if (ns.get("role") or "") != "agent" or not ns.get("direct_connect"):
+    if _is_direct_agent(store):
+        _direct_agent_quota_cycle()
         return
-    body = nodes_mod.collect_direct_connect_report(store)
-    if not body:
-        return
-    master_url = (
-        str(ns.get("upstream_master_url") or "").rstrip("/")
-        or str(ns.get("master_pull_url") or "").rstrip("/")
-        or str((ns.get("pull") or {}).get("master_url") or "").rstrip("/")
-    )
-    token = str(ns.get("agent_token") or "").strip()
-    if not master_url or not token:
-        return
-    nodes_mod.report_request(master_url, token, body, timeout=15)
-
 
 OUTBOUND_PROBE_INTERVAL = int(os.environ.get("L2XPANEL_OB_PROBE_SEC", "60"))
 
@@ -1925,7 +2016,10 @@ def _tg_backup_loop() -> None:
 
 
 def _watchdog_loop() -> None:
-    while not _stop.wait(WATCHDOG_INTERVAL):
+    while True:
+        interval = DIRECT_AGENT_INTERVAL if _is_direct_agent() else WATCHDOG_INTERVAL
+        if _stop.wait(max(1, int(interval or 5))):
+            return
         try:
             _watchdog_cycle()
         except Exception:
@@ -10689,7 +10783,12 @@ async def agent_apply(request: Request, background_tasks: BackgroundTasks):
 
 @app.post("/agent/report")
 async def agent_report(request: Request):
-    """Direct-connect agent reports traffic/online to master (Bearer = node token)."""
+    """Direct-connect agent reports traffic/online to master (Bearer = node token).
+
+    Master merges counters, enforces quotas, returns access map, and fans out
+    client state to other Direct nodes in near real-time.
+    """
+    global _LAST_TRAFFIC_DIRECT_PUSH
     store = _load_store()
     try:
         body = await request.json()
@@ -10709,7 +10808,8 @@ async def agent_report(request: Request):
     err_code, err_msg = 0, ""
     changed = False
     quota_hit = False
-    push_node_id = ""
+    access: dict[str, bool] = {}
+    blocked: list[str] = []
     with mutate() as st:
         node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
         if not node or not node.get("enabled", True):
@@ -10726,27 +10826,36 @@ async def agent_report(request: Request):
             )
             node["last_ok"] = True
             node["last_seen"] = nodes_mod.now_iso()
-            # Traffic from Direct node may cross limit_gb / expire — kick immediately
             st["_events"] = []
             if xray.enforce_quotas(st):
                 quota_hit = True
-                push_node_id = str(node.get("id") or "")
                 try:
                     _apply_xray(st, clients_only=True)
                 except Exception:
                     pass
+            access = _clients_access_map(st)
+            blocked = [email for email, ok in access.items() if not ok]
     if err_code:
         return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
-    if quota_hit and push_node_id:
-        try:
-            name = ""
-            st2 = _load_store()
-            n2 = next((n for n in nodes_mod.ensure_list(st2) if n.get("id") == push_node_id), None)
-            name = (n2 or {}).get("name") or push_node_id[:8]
-            _node_push_job(push_node_id, f"{name}: quota", public_host())
-        except Exception:
-            pass
-    return {"ok": True, "changed": bool(changed), "quota_enforced": bool(quota_hit)}
+    # Fan-out: quota → all Direct immediately; traffic → debounce so other nodes
+    # keep counters fresh for local kick.
+    try:
+        st2 = _load_store()
+        if quota_hit:
+            _push_direct_nodes_clients(st2, reason="quota-fanout", exclude_ids={node_id})
+        elif changed and (time.time() - float(_LAST_TRAFFIC_DIRECT_PUSH or 0)) >= 5:
+            _LAST_TRAFFIC_DIRECT_PUSH = time.time()
+            _push_direct_nodes_clients(st2, reason="traffic-sync", exclude_ids={node_id})
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "changed": bool(changed),
+        "quota_enforced": bool(quota_hit),
+        "access": access,
+        "blocked": blocked,
+    }
+
 
 
 @app.post("/agent/pull")

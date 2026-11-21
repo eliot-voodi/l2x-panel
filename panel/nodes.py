@@ -1489,20 +1489,20 @@ def _accumulate_agent_counters(row: dict, up: int, down: int) -> bool:
     return changed
 
 
-def apply_agent_traffic_report(
+def apply_direct_tag_traffic(
     store: dict,
-    node: dict,
+    tag: str,
     traffic: dict | None,
     online: dict | None = None,
 ) -> bool:
-    """Merge direct_connect agent stats into master client traffic (+ optional online map).
+    """Fold absolute StatsService counters for ``tag`` into client traffic (master-compatible).
 
-    Returns True if store mutated. Only emails for this node's tag (and main email when
-    default outbound is this node) are accepted.
+    Used on master (from agent reports) and on the Direct agent itself (local count → kick).
+    Tracks deltas via ``agent_last_*`` so totals stay consistent across sync.
     """
-    if not uses_direct_connect(node):
+    tag = str(tag or "").strip()
+    if not tag:
         return False
-    tag = node_outbound_tag(node)
     suffix = f"~{tag}"
     traffic = traffic if isinstance(traffic, dict) else {}
     online = online if isinstance(online, dict) else {}
@@ -1542,20 +1542,36 @@ def apply_agent_traffic_report(
         if default_ob == tag:
             candidates.add(base)
 
+        daily = None
+        if xray:
+            try:
+                daily = xray._ensure_daily_bucket(client)
+            except Exception:
+                daily = None
+
         for email in list(candidates):
             cur = traffic.get(email)
             if not isinstance(cur, dict) and email == base:
                 cur = traffic.get(f"{base}{suffix}")
             if not isinstance(cur, dict):
                 continue
-            # Quotas for this outbound key off email~tag
             store_email = email if email.endswith(suffix) else f"{base}{suffix}"
             row = by.setdefault(store_email, {
                 "up": 0, "down": 0, "last_up": 0, "last_down": 0,
                 "agent_last_up": 0, "agent_last_down": 0,
             })
+            before_up = int(row.get("up") or 0)
+            before_down = int(row.get("down") or 0)
             if _accumulate_agent_counters(row, int(cur.get("up") or 0), int(cur.get("down") or 0)):
                 changed = True
+                d_up = int(row.get("up") or 0) - before_up
+                d_down = int(row.get("down") or 0) - before_down
+                if daily is not None and (d_up or d_down):
+                    daily["up"] = int(daily.get("up") or 0) + max(0, d_up)
+                    daily["down"] = int(daily.get("down") or 0) + max(0, d_down)
+                    trow = daily.setdefault("by_tag", {}).setdefault(tag, {"up": 0, "down": 0})
+                    trow["up"] = int(trow.get("up") or 0) + max(0, d_up)
+                    trow["down"] = int(trow.get("down") or 0) + max(0, d_down)
 
         if by:
             up = sum(int(r.get("up") or 0) for r in by.values() if isinstance(r, dict))
@@ -1564,10 +1580,8 @@ def apply_agent_traffic_report(
                 tr["up"], tr["down"] = up, down
                 changed = True
 
-    # Stash online IPs for watchdog merge (email → {ip: ts})
     if online:
         bucket = store.setdefault("_agent_online", {})
-        # Drop previous IPs for this tag, then replace
         for k in list(bucket.keys()):
             if str(k).endswith(suffix):
                 bucket.pop(k, None)
@@ -1583,18 +1597,33 @@ def apply_agent_traffic_report(
                 bucket[em] = {str(ip): 0 for ip in ips}
         changed = True
 
+    return changed
+
+
+def apply_agent_traffic_report(
+    store: dict,
+    node: dict,
+    traffic: dict | None,
+    online: dict | None = None,
+) -> bool:
+    """Merge direct_connect agent stats into master client traffic (+ optional online map)."""
+    if not uses_direct_connect(node):
+        return False
+    changed = apply_direct_tag_traffic(store, node_outbound_tag(node), traffic, online)
     node["last_traffic_report"] = now_iso()
     return changed
 
 
-def collect_direct_connect_report(store: dict) -> dict | None:
-    """On agent: build traffic/online payload for master /agent/report."""
+def collect_direct_connect_stats(store: dict) -> tuple[dict, dict, str] | None:
+    """On Direct agent: absolute user traffic/online for this node's tag.
+
+    Returns ``(traffic, online, tag)`` or None.
+    """
     ns = (store.get("settings") or {}).get("nodes") or {}
     if not ns.get("direct_connect"):
         return None
     tag = str(ns.get("direct_connect_tag") or "").strip()
-    node_id = str(ns.get("upstream_node_id") or "").strip()
-    if not tag or not node_id:
+    if not tag:
         return None
     try:
         import xray_runtime as xray
@@ -1611,7 +1640,6 @@ def collect_direct_connect_report(store: dict) -> dict | None:
         if em.endswith(suffix):
             traffic[em] = {"up": int(cur.get("up") or 0), "down": int(cur.get("down") or 0)}
         elif "~" not in em:
-            # Attribute bare main email on this node to the node identity bucket
             key = f"{em}{suffix}"
             prev = traffic.get(key) or {"up": 0, "down": 0}
             traffic[key] = {
@@ -1627,6 +1655,21 @@ def collect_direct_connect_report(store: dict) -> dict | None:
             online[em] = {str(k): int(v or 0) for k, v in ips.items()}
         elif "~" not in em:
             online[f"{em}{suffix}"] = {str(k): int(v or 0) for k, v in ips.items()}
+    return traffic, online, tag
+
+
+def collect_direct_connect_report(store: dict) -> dict | None:
+    """On agent: build traffic/online payload for master /agent/report."""
+    ns = (store.get("settings") or {}).get("nodes") or {}
+    if not ns.get("direct_connect"):
+        return None
+    node_id = str(ns.get("upstream_node_id") or "").strip()
+    if not node_id:
+        return None
+    stats = collect_direct_connect_stats(store)
+    if not stats:
+        return None
+    traffic, online, tag = stats
     return {
         "node_id": node_id,
         "direct_connect_tag": tag,
@@ -1634,6 +1677,59 @@ def collect_direct_connect_report(store: dict) -> dict | None:
         "online": online,
         "reported_at": now_iso(),
     }
+
+
+def apply_master_access_snapshot(store: dict, access: dict | None) -> bool:
+    """Apply master ``email → access_ok`` map on Direct agent (flags only)."""
+    if not isinstance(access, dict) or not access:
+        return False
+    try:
+        import xray_runtime as xray
+    except Exception:
+        return False
+    changed = False
+    by_email = {
+        str(c.get("email") or ""): c
+        for c in (store.get("clients") or [])
+        if isinstance(c, dict) and c.get("email")
+    }
+    for email, ok in access.items():
+        client = by_email.get(str(email or ""))
+        if not client:
+            continue
+        xray.ensure_client(client)
+        want_ok = bool(ok)
+        if want_ok:
+            if client.get("quota_exceeded") and not xray.client_total_exceeded(client):
+                client["quota_exceeded"] = False
+                changed = True
+            if client.get("expired") and not xray.client_is_expired(client):
+                client["expired"] = False
+                changed = True
+            if client.get("daily_exceeded") and not xray.client_daily_exceeded(client):
+                client["daily_exceeded"] = False
+                changed = True
+        else:
+            if xray.client_is_expired(client):
+                if not client.get("expired"):
+                    client["expired"] = True
+                    changed = True
+            elif xray.client_total_exceeded(client):
+                if not client.get("quota_exceeded"):
+                    client["quota_exceeded"] = True
+                    changed = True
+            elif xray.client_daily_exceeded(client):
+                if not client.get("daily_exceeded"):
+                    client["daily_exceeded"] = True
+                    changed = True
+            else:
+                # Blocked by aggregate traffic counted on other nodes
+                if not client.get("quota_exceeded"):
+                    client["quota_exceeded"] = True
+                    changed = True
+    return changed
+
+
 
 
 def node_pull_base(node: dict) -> str:
