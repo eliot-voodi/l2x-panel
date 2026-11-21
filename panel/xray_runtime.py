@@ -2674,6 +2674,28 @@ def _json_profile_group_key(ep: dict, default_host: str = "") -> tuple[str, str]
     return cid, host
 
 
+def client_prefers_json_sub(store: dict, client: dict) -> bool:
+    """True when any core visible to the client has Custom JSON enabled."""
+    try:
+        import cores as cores_mod
+    except Exception:
+        return False
+    seen: set[str] = set()
+    for ib in client_inbounds(store, client):
+        if not inbound_access_ok(ib):
+            continue
+        cid = _core_id_for_inbound(store, ib)
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        core = cores_mod.core_by_id(store, cid)
+        if not isinstance(core, dict):
+            continue
+        if core.get("sub_custom_json") and str(core.get("sub_custom_json_template") or "").strip():
+            return True
+    return False
+
+
 def client_json_subscription_profiles(
     store: dict,
     client: dict,
@@ -2789,7 +2811,11 @@ def client_json_subscription_profiles(
 
 
 def build_core_custom_json_template(store: dict, core: dict, *, client: dict | None = None) -> str:
-    """Generate Ascella-style Custom JSON template from core inbounds (with placeholders)."""
+    """Generate Ascella-style Custom JSON from **all enabled core inbounds** (placeholders).
+
+    Does not filter by a sample client's inbound checkboxes — every inbound on the core
+    becomes an outbound so Happ can leastPing across them.
+    """
     MAGIC_UUID = "11111111-2222-4333-8444-555555555555"
     MAGIC_HOST = "__L2X_SUB_HOST__"
     MAGIC_EMAIL = "__L2X_SUB_EMAIL__"
@@ -2797,44 +2823,49 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
     cid = str((core or {}).get("id") or "")
     title = str((core or {}).get("name") or (core or {}).get("remark") or "profile").strip() or "profile"
 
-    src_client = client
-    if not isinstance(src_client, dict):
+    eps: list[dict] = []
+    for ib in (core.get("inbounds") or []):
+        if not isinstance(ib, dict) or not ib.get("enabled", True):
+            continue
+        try:
+            ib_use = dict(ib)
+            # Force public host placeholder; keep per-inbound port/SNI/Reality keys.
+            ib_use["share_host"] = MAGIC_HOST
+            ident = {"uuid": MAGIC_UUID, "email": MAGIC_EMAIL, "password": MAGIC_PASS}
+            remark = inbound_sub_label(ib_use) or str(ib_use.get("tag") or title)
+            ep = P.endpoint_for(ib_use, ident, MAGIC_HOST, remark)
+            if not ep or ep.get("protocol") == "wireguard":
+                continue
+            ep["address"] = MAGIC_HOST
+            ep["_core_id"] = cid
+            ep["_inbound_tag"] = str(ib_use.get("tag") or "")
+            if ep.get("uuid"):
+                ep["uuid"] = MAGIC_UUID
+            if ep.get("password"):
+                ep["password"] = MAGIC_PASS
+            eps.append(ep)
+        except Exception:
+            continue
+
+    # Optional: enrich missing stream fields from a live client endpoint with same tag
+    if client is None:
         for c in store.get("clients") or []:
             if isinstance(c, dict) and client_access_ok(c):
-                src_client = c
+                client = c
                 break
-
-    eps: list[dict] = []
-    if isinstance(src_client, dict):
-        for e in client_endpoints(store, src_client):
-            if e.get("protocol") == "wireguard":
+    if isinstance(client, dict) and eps:
+        live_by_tag: dict[str, dict] = {}
+        for e in client_endpoints(store, client):
+            tag = str(e.get("_inbound_tag") or "")
+            if tag and (not cid or (e.get("_core_id") or "") == cid):
+                live_by_tag.setdefault(tag, e)
+        for ep in eps:
+            live = live_by_tag.get(str(ep.get("_inbound_tag") or ""))
+            if not live:
                 continue
-            if cid and (e.get("_core_id") or "") != cid:
-                continue
-            ee = dict(e)
-            ee["address"] = MAGIC_HOST
-            if ee.get("uuid"):
-                ee["uuid"] = MAGIC_UUID
-            if ee.get("password"):
-                ee["password"] = MAGIC_PASS
-            if ee.get("email"):
-                ee["email"] = MAGIC_EMAIL
-            eps.append(ee)
-
-    if not eps:
-        for ib in (core.get("inbounds") or []):
-            if not isinstance(ib, dict) or not ib.get("enabled", True):
-                continue
-            try:
-                ident = {"uuid": MAGIC_UUID, "email": MAGIC_EMAIL, "password": MAGIC_PASS}
-                remark = inbound_sub_label(ib) or title
-                ep = P.endpoint_for(dict(ib), ident, MAGIC_HOST, remark)
-                if ep and ep.get("protocol") != "wireguard":
-                    ep["address"] = MAGIC_HOST
-                    ep["_core_id"] = cid
-                    eps.append(ep)
-            except Exception:
-                continue
+            for k in ("sni", "pbk", "sid", "spx", "fp", "flow", "path", "host", "alpn", "mode"):
+                if not ep.get(k) and live.get(k):
+                    ep[k] = live[k]
 
     cfg = P.xray_unified_client_config(eps, remarks=title)
     text = json.dumps(cfg, ensure_ascii=False, indent=2)

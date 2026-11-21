@@ -2685,6 +2685,11 @@ def _sub_response(request: Request, token: str) -> Response:
             fmt = "clash"
         elif "sing-box" in ua or "sfa" in ua or "sfi" in ua:
             fmt = "singbox"
+        elif "happ" in ua or bool(s.get("json_default")):
+            # Happ expects full Xray JSON profiles (Ascella / Custom JSON), not base64 links
+            fmt = "json"
+        elif xray.client_prefers_json_sub(store, client):
+            fmt = "json"
         elif "text/html" in accept and s.get("show_page", True) and "mozilla" in ua:
             fmt = "html"
     eps = xray.client_endpoints(store, client, s.get("domain") or None)

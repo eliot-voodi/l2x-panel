@@ -1661,13 +1661,15 @@ def xray_unified_client_config(
     Failover via leastLoad balancers + loopback reroutes (same pattern as Ascella JP).
     """
     raw_eps = [e for e in endpoints if e and e.get("protocol") != "wireguard"]
-    # One outbound per transport (address/port/net/…); drop duplicates from multi-identity subs.
+    # One outbound per transport; drop duplicates from multi-identity subs.
+    # Different inbound tags stay separate (ping choice across entrypoints).
     eps: list[dict] = []
     seen_keys: set[tuple] = set()
     for e in raw_eps:
         key = (
             e.get("protocol"), e.get("address"), int(e.get("port") or 0),
             e.get("net"), e.get("security"), e.get("path"), e.get("sni"), e.get("mode"),
+            str(e.get("_inbound_tag") or ""),
         )
         if key in seen_keys:
             continue

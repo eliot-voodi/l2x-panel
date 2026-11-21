@@ -426,9 +426,9 @@
   <div class="card" style="max-width:960px">
     <h3>JSON-подписка для этого ядра</h3>
     <div class="hint">
-      В <code>?format=json</code> каждое ядро — <b>один профиль</b> в приложении.
-      Внутри профиля — <b>все inbound ядра</b> (разные протоколы) + автовыбор по пингу (Ascella / leastLoad).
-      Пользователь видит одну строку, устройство само выбирает лучший протокол.
+      В подписке (Happ / <code>?format=json</code>) каждое ядро — <b>один профиль</b>.
+      Кнопка ниже собирает <b>все inbound этого ядра</b> в outbounds + leastPing.
+      При включённом Custom JSON Happ получает JSON автоматически (не base64-ссылки).
     </div>
     <div class="actions mt">
       <form method="post" action="{{ bp }}/cores/{{ core.id }}/subjson-generate" style="display:inline">
