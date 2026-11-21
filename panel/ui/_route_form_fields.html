@@ -16,7 +16,7 @@
   </div>
 </div>
 <div class="row">
-  <div>
+  <div style="flex:1">
     <label class="f">Пользователи</label>
     <select name="user" multiple size="7" class="route-multi">
       {% if not route_clients %}<option disabled value="">Нет клиентов</option>{% endif %}
@@ -25,18 +25,6 @@
       {% endfor %}
     </select>
     <div class="hint">Ctrl/⌘ — несколько. В Xray подставляются все email клиента (включая <code>email~tag</code>).</div>
-  </div>
-  <div>
-    <label class="f">Источник (IP клиента)</label>
-    <select name="source" multiple size="7" class="route-multi">
-      {% if not route_source_ips %}<option disabled value="">Нет известных IP (появятся после онлайна клиента)</option>{% endif %}
-      {% for o in route_source_ips or [] %}
-      <option value="{{ o.ip }}">{{ o.label }}</option>
-      {% endfor %}
-    </select>
-    <div class="hint">Реальные IP клиентов, с которых они подключались к панели (внешний адрес до VPN). Правило сработает только для трафика с этих адресов — удобно ограничить маршрут конкретным устройством/сетью, даже если у клиента несколько IP. Формат в списке: <code>name-ip</code>.</div>
-    <div class="hint">Доп. CIDR вручную (если IP ещё нет в списке):</div>
-    <textarea name="source_extra" class="mono" style="min-height:2.4rem;margin-top:.35rem" placeholder="10.0.0.0/8&#10;203.0.113.0/24"></textarea>
   </div>
 </div>
 <div class="row">

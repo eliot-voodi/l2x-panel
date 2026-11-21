@@ -171,7 +171,7 @@
 <section class="core-panel {% if core_tab == 'inbounds' %}active{% endif %}" data-panel="inbounds">
   <div class="card-head" style="margin-bottom:.75rem">
     <h3 style="margin:0">Входящие</h3>
-    <a class="btn sm" href="{{ bp }}/inbounds/new?next={{ core_next_inbounds|urlencode }}">{{ ic.icon('plus') }}Добавить</a>
+    <button type="button" class="btn sm" onclick="openCoreInbound()">{{ ic.icon('plus') }}Добавить</button>
   </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
@@ -186,8 +186,8 @@
             <td>{% if i.enabled is not defined or i.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
-                <a class="btn ghost icon" title="Изменить"
-                   href="{{ bp }}/inbounds/{{ i.id }}/edit?next={{ core_next_inbounds|urlencode }}">{{ ic.icon('edit') }}</a>
+                <button type="button" class="btn ghost icon" title="Изменить"
+                        onclick="openCoreInbound('{{ i.id }}')">{{ ic.icon('edit') }}</button>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/toggle">
                   <input type="hidden" name="id" value="{{ i.id }}">
                   <button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button>
@@ -208,13 +208,71 @@
     </div>
   </div>
   <div class="hint">После добавления/правки нажмите <b>Применить</b> вверху страницы.</div>
+
+  <dialog id="dlg-core-ib" style="max-width:720px;width:calc(100% - 1.5rem)">
+    <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/save" id="form-core-ib">
+      <input type="hidden" name="id" id="core-ib-id" value="">
+      <div class="card-head"><h3 id="core-ib-title">Новый inbound</h3>
+        <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+      <div class="row">
+        <div><label class="f">Протокол</label>
+          <select name="protocol" id="core-ib-proto">
+            {% for p in protocols %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+          </select></div>
+        <div><label class="f">Tag</label><input name="tag" id="core-ib-tag" required pattern="[A-Za-z0-9._-]+"></div>
+        <div style="max-width:110px"><label class="f">Port</label><input name="port" id="core-ib-port" type="number" min="1" max="65535" value="{{ free_ib_port }}"></div>
+      </div>
+      <div class="row">
+        <div><label class="f">Название</label><input name="remark" id="core-ib-remark"></div>
+        <div>{{ m.check('enabled', True, 'Включён') }}</div>
+      </div>
+      <div class="row">
+        <div><label class="f">Network</label>
+          <select name="network" id="core-ib-net">
+            {% for n in networks if n != 'hysteria' %}<option value="{{ n }}">{{ n }}</option>{% endfor %}
+          </select></div>
+        <div><label class="f">Security</label>
+          <select name="security" id="core-ib-sec">
+            {% for s in securities %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+          </select></div>
+        <div><label class="f">Fingerprint</label>
+          <select name="client_fp" id="core-ib-fp">
+            {% for f in fingerprints %}<option value="{{ f }}">{{ f }}</option>{% endfor %}
+          </select></div>
+      </div>
+      <div class="row">
+        <div><label class="f">Flow (vless)</label>
+          <select name="flow" id="core-ib-flow"><option value="">нет</option><option>xtls-rprx-vision</option></select></div>
+        <div><label class="f">WS path</label><input name="ws_path" id="core-ib-ws-path" value="/"></div>
+        <div><label class="f">WS host</label><input name="ws_host" id="core-ib-ws-host"></div>
+      </div>
+      <div class="row">
+        <div><label class="f">XHTTP path</label><input name="xh_path" id="core-ib-xh-path" value="/"></div>
+        <div><label class="f">XHTTP host</label><input name="xh_host" id="core-ib-xh-host"></div>
+      </div>
+      <div id="core-ib-reality">
+        <h3 class="mt">Reality</h3>
+        <div class="row">
+          <div><label class="f">Dest</label><input name="r_dest" id="core-ib-rdest" value="www.cloudflare.com:443"></div>
+          <div><label class="f">Server names</label><input name="r_names" id="core-ib-rnames" value="www.cloudflare.com"></div>
+        </div>
+        <div class="row">
+          <div><label class="f">Short IDs</label><input name="r_sids" id="core-ib-rsids" class="mono"></div>
+          <div><label class="f">Private key</label><input name="r_priv" id="core-ib-rpriv" class="mono"></div>
+          <div><label class="f">Public key</label><input name="r_pub" id="core-ib-rpub" class="mono"></div>
+        </div>
+        <div class="hint">Пустые ключи при создании Reality сгенерируются автоматически.</div>
+      </div>
+      <div class="actions mt"><button class="btn" id="core-ib-submit">Добавить</button></div>
+    </form>
+  </dialog>
 </section>
 
 {# ===================== OUTBOUNDS ===================== #}
 <section class="core-panel {% if core_tab == 'outbounds' %}active{% endif %}" data-panel="outbounds">
   <div class="card-head" style="margin-bottom:.75rem">
     <h3 style="margin:0">Исходящие</h3>
-    <a class="btn sm" href="{{ bp }}/outbounds?next={{ core_next_outbounds|urlencode }}">{{ ic.icon('plus') }}Добавить / редактор</a>
+    <button type="button" class="btn sm" onclick="openCoreOutbound()">{{ ic.icon('plus') }}Добавить</button>
   </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
@@ -230,8 +288,8 @@
             <td>{% if o.enabled is not defined or o.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
-                <a class="btn ghost icon" title="Изменить в редакторе"
-                   href="{{ bp }}/outbounds?next={{ core_next_outbounds|urlencode }}#edit={{ o.tag|urlencode }}">{{ ic.icon('edit') }}</a>
+                <button type="button" class="btn ghost icon" title="Изменить"
+                        onclick="openCoreOutbound({{ o.tag|tojson }})">{{ ic.icon('edit') }}</button>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/sub">
                   <input type="hidden" name="tag" value="{{ o.tag }}">
                   <button class="btn ghost icon" title="В подписке">{{ ic.icon('link') }}</button>
@@ -255,7 +313,34 @@
       </table>
     </div>
   </div>
-  <div class="hint">Полное добавление/правка (ссылка, WARP, JSON) — в редакторе outbound’ов. Затем <b>Применить</b>.</div>
+  <div class="hint">Новый outbound создаётся выключенным. Затем <b>Применить</b>.</div>
+
+  <dialog id="dlg-core-ob" style="max-width:720px;width:calc(100% - 1.5rem)">
+    <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/save" id="form-core-ob">
+      <input type="hidden" name="edit_tag" id="core-ob-edit" value="">
+      <input type="hidden" name="mode" id="core-ob-mode" value="link">
+      <div class="card-head"><h3 id="core-ob-title">Новый outbound</h3>
+        <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+      <div class="tabs" id="core-ob-tabs">
+        <a href="#" data-ob-mode="link" class="active">Ссылка</a>
+        <a href="#" data-ob-mode="json">JSON</a>
+      </div>
+      <div class="row">
+        <div><label class="f">Tag</label><input name="tag" id="core-ob-tag" pattern="[A-Za-z0-9._-]*"></div>
+        <div><label class="f">Название</label><input name="remark" id="core-ob-remark"></div>
+        <div style="max-width:90px"><label class="f">Страна</label><input name="country" id="core-ob-country" maxlength="2" style="text-transform:uppercase"></div>
+      </div>
+      <div data-ob-pane="link">
+        <label class="f">Ссылка</label>
+        <input name="link" id="core-ob-link" placeholder="vless:// vmess:// trojan:// ss:// …">
+      </div>
+      <div data-ob-pane="json" hidden>
+        <label class="f">Xray outbound JSON</label>
+        <textarea name="json" id="core-ob-json" class="mono" rows="14" spellcheck="false" placeholder='{"protocol":"vless","settings":{…}}'></textarea>
+      </div>
+      <div class="actions mt"><button class="btn" id="core-ob-submit">Добавить</button></div>
+    </form>
+  </dialog>
 </section>
 
 {# ===================== ROUTING ===================== #}
@@ -497,19 +582,6 @@ function fillCoreRouteForm(form, r) {
   form.querySelector('[name="domain"]').value = _lines(r.domain);
   form.querySelector('[name="ip"]').value = _lines(r.ip);
   _selectMulti(form.querySelector('select[name="user"]'), r.user);
-  var known = {};
-  var srcSel = form.querySelector('select[name="source"]');
-  if (srcSel) {
-    Array.prototype.forEach.call(srcSel.options, function (opt) { known[opt.value] = true; });
-  }
-  var picked = [];
-  var extra = [];
-  _list(r.source).forEach(function (ip) {
-    if (known[ip]) picked.push(ip); else extra.push(ip);
-  });
-  _selectMulti(srcSel, picked);
-  var extraEl = form.querySelector('[name="source_extra"]');
-  if (extraEl) extraEl.value = extra.join('\n');
   form.querySelector('[name="network"]').value = r.network || '';
   form.querySelector('[name="port"]').value = r.port || '';
   var en = form.querySelector('[name="enabled"]');
@@ -556,9 +628,6 @@ function openCoreRouteAdd() {
   if (form) {
     form.reset();
     _selectMulti(form.querySelector('select[name="user"]'), []);
-    _selectMulti(form.querySelector('select[name="source"]'), []);
-    var extra = form.querySelector('[name="source_extra"]');
-    if (extra) extra.value = '';
     var allIb = form.querySelector('[name="inbound_all"]');
     if (allIb) { allIb.checked = false; toggleRouteInboundAll(allIb); }
   }
@@ -569,6 +638,75 @@ function openCoreRouteEdit(r) {
   document.getElementById('core-route-old-name').value = r.name || '';
   fillCoreRouteForm(form, r || {});
   document.getElementById('dlg-core-route-edit').showModal();
+}
+
+var CORE_IB = {{ (core_ib_map or {})|tojson }};
+var CORE_OB = {{ (core_ob_map or {})|tojson }};
+var FREE_IB_PORT = {{ (free_ib_port or 10443)|tojson }};
+
+function openCoreInbound(id) {
+  var form = document.getElementById('form-core-ib');
+  var item = id ? CORE_IB[String(id)] : null;
+  form.reset();
+  document.getElementById('core-ib-id').value = item ? (item.id || '') : '';
+  document.getElementById('core-ib-title').textContent = item ? ('Изменить ' + (item.tag || '')) : 'Новый inbound';
+  document.getElementById('core-ib-submit').textContent = item ? 'Сохранить' : 'Добавить';
+  document.getElementById('core-ib-proto').value = (item && item.protocol) || 'vless';
+  document.getElementById('core-ib-tag').value = (item && item.tag) || '';
+  document.getElementById('core-ib-port').value = (item && item.port) || FREE_IB_PORT;
+  document.getElementById('core-ib-remark').value = (item && item.remark) || '';
+  var en = form.querySelector('[name="enabled"]');
+  if (en) en.checked = !item || item.enabled !== false;
+  document.getElementById('core-ib-net').value = (item && item.network) || 'raw';
+  document.getElementById('core-ib-sec').value = (item && item.security) || 'none';
+  document.getElementById('core-ib-fp').value = (item && item.fingerprint) || 'firefox';
+  document.getElementById('core-ib-flow').value = (item && item.flow) || '';
+  document.getElementById('core-ib-ws-path').value = (item && item.ws_path) || '/';
+  document.getElementById('core-ib-ws-host').value = (item && item.ws_host) || '';
+  document.getElementById('core-ib-xh-path').value = (item && item.xhttp_path) || '/';
+  document.getElementById('core-ib-xh-host').value = (item && item.xhttp_host) || '';
+  document.getElementById('core-ib-rdest').value = (item && item.r_dest) || 'www.cloudflare.com:443';
+  document.getElementById('core-ib-rnames').value = (item && item.r_sni) || 'www.cloudflare.com';
+  document.getElementById('core-ib-rsids').value = (item && item.r_short) || '';
+  document.getElementById('core-ib-rpriv').value = (item && item.r_private) || '';
+  document.getElementById('core-ib-rpub').value = (item && item.r_public) || '';
+  document.getElementById('dlg-core-ib').showModal();
+}
+
+function setCoreObMode(mode) {
+  document.getElementById('core-ob-mode').value = mode;
+  document.querySelectorAll('#core-ob-tabs a').forEach(function (a) {
+    a.classList.toggle('active', a.getAttribute('data-ob-mode') === mode);
+  });
+  document.querySelectorAll('[data-ob-pane]').forEach(function (p) {
+    p.hidden = p.getAttribute('data-ob-pane') !== mode;
+  });
+}
+document.getElementById('core-ob-tabs').addEventListener('click', function (e) {
+  var a = e.target.closest('a[data-ob-mode]');
+  if (!a) return;
+  e.preventDefault();
+  setCoreObMode(a.getAttribute('data-ob-mode'));
+});
+
+function openCoreOutbound(tag) {
+  var item = tag ? CORE_OB[tag] : null;
+  document.getElementById('core-ob-edit').value = tag || '';
+  document.getElementById('core-ob-title').textContent = tag ? ('Изменить ' + tag) : 'Новый outbound';
+  document.getElementById('core-ob-submit').textContent = tag ? 'Сохранить' : 'Добавить';
+  document.getElementById('core-ob-tag').value = tag || '';
+  document.getElementById('core-ob-tag').readOnly = !!tag;
+  document.getElementById('core-ob-remark').value = (item && item.remark) || '';
+  document.getElementById('core-ob-country').value = (item && item.country) || '';
+  document.getElementById('core-ob-link').value = '';
+  try {
+    document.getElementById('core-ob-json').value = item && item.config
+      ? JSON.stringify(item.config, null, 2) : '';
+  } catch (e) {
+    document.getElementById('core-ob-json').value = '';
+  }
+  setCoreObMode(tag ? 'json' : 'link');
+  document.getElementById('dlg-core-ob').showModal();
 }
 </script>
 

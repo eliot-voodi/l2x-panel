@@ -300,19 +300,6 @@
     form.querySelector('[name="domain"]').value = _lines(r.domain);
     form.querySelector('[name="ip"]').value = _lines(r.ip);
     _selectMulti(form.querySelector('select[name="user"]'), r.user);
-    var known = {};
-    var srcSel = form.querySelector('select[name="source"]');
-    if (srcSel) {
-      Array.prototype.forEach.call(srcSel.options, function (opt) { known[opt.value] = true; });
-    }
-    var picked = [];
-    var extra = [];
-    _list(r.source).forEach(function (ip) {
-      if (known[ip]) picked.push(ip); else extra.push(ip);
-    });
-    _selectMulti(srcSel, picked);
-    var extraEl = form.querySelector('[name="source_extra"]');
-    if (extraEl) extraEl.value = extra.join('\n');
     form.querySelector('[name="network"]').value = r.network || '';
     form.querySelector('[name="port"]').value = r.port || '';
     var en = form.querySelector('[name="enabled"]');
@@ -371,9 +358,6 @@
       if (form) {
         form.reset();
         _selectMulti(form.querySelector('select[name="user"]'), []);
-        _selectMulti(form.querySelector('select[name="source"]'), []);
-        var extra = form.querySelector('[name="source_extra"]');
-        if (extra) extra.value = '';
         var allIb = form.querySelector('[name="inbound_all"]');
         if (allIb) {
           allIb.checked = false;

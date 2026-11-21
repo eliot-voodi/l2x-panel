@@ -2815,6 +2815,95 @@ def xray_apply(request: Request):
 
 # ================================================================ inbounds
 
+def _core_inbound_form_patch(form, ib: dict, *, is_new: bool = False) -> str | None:
+    """Compact inbound editor for core modal — does not wipe advanced stream fields on edit."""
+    proto = str(form.get("protocol") or ib.get("protocol") or "vless")
+    if proto not in P.ALL_PROTOCOLS:
+        return "Неизвестный протокол"
+    if is_new or proto != ib.get("protocol"):
+        if proto != ib.get("protocol"):
+            ib["protocol"] = proto
+            ib["settings"] = P.default_settings(proto)
+        else:
+            ib["protocol"] = proto
+    tag = str(form.get("tag") or "").strip()
+    if not xray.TAG_RE.match(tag):
+        return "Tag: латиница/цифры/._-"
+    ib["tag"] = tag
+    ib["remark"] = str(form.get("remark") or tag).strip()
+    ib["enabled"] = form.get("enabled") == "1"
+    ib["port"] = _int(form.get("port"), int(ib.get("port") or 0))
+    if reason := xray.port_forbidden_reason(ib["port"], ib):
+        return reason
+    xray.ensure_inbound_keys(ib)
+    st = ib.setdefault("stream", {})
+    if not isinstance(st, dict):
+        st = {}
+        ib["stream"] = st
+    net = str(form.get("network") or st.get("network") or "raw")
+    if net not in P.NETWORKS:
+        net = "raw"
+    st["network"] = net
+    sec = str(form.get("security") or st.get("security") or "none")
+    if sec not in getattr(P, "SECURITIES", ("none", "tls", "reality")):
+        sec = "none"
+    st["security"] = sec
+    fp = str(form.get("client_fp") or st.get("fingerprint") or "firefox").strip()
+    if fp not in P.FINGERPRINTS:
+        fp = "firefox"
+    st["fingerprint"] = fp
+    s = ib.setdefault("settings", {})
+    if not isinstance(s, dict):
+        s = P.default_settings(proto)
+        ib["settings"] = s
+    if proto == "vless" and "flow" in form:
+        s["flow"] = str(form.get("flow") or "")
+    ws = st.get("ws")
+    if not isinstance(ws, dict):
+        ws = {}
+        st["ws"] = ws
+    if "ws_path" in form:
+        ws["path"] = str(form.get("ws_path") or "/")
+    if "ws_host" in form:
+        ws["host"] = str(form.get("ws_host") or "")
+    xh = st.get("xhttp")
+    if not isinstance(xh, dict):
+        xh = {}
+        st["xhttp"] = xh
+    if "xh_path" in form:
+        xh["path"] = str(form.get("xh_path") or "/")
+    if "xh_host" in form:
+        xh["host"] = str(form.get("xh_host") or "")
+    if sec == "reality":
+        r = st.get("reality")
+        if not isinstance(r, dict):
+            r = {}
+            st["reality"] = r
+        if "r_dest" in form:
+            r["dest"] = str(form.get("r_dest") or r.get("dest") or "www.cloudflare.com:443")
+        if "r_names" in form:
+            names = _split_lines(str(form.get("r_names") or ""))
+            if names:
+                r["server_names"] = names
+        if "r_sids" in form:
+            sids = [x for x in str(form.get("r_sids") or "").replace(",", " ").split() if x]
+            if sids:
+                r["short_ids"] = sids
+        if "r_priv" in form and str(form.get("r_priv") or "").strip():
+            r["private_key"] = str(form.get("r_priv") or "").strip()
+        if "r_pub" in form and str(form.get("r_pub") or "").strip():
+            r["public_key"] = str(form.get("r_pub") or "").strip()
+        r["fingerprint"] = fp
+        if is_new and not r.get("private_key"):
+            keys = xray.generate_reality_keys()
+            if isinstance(keys, dict) and keys.get("private_key"):
+                r["private_key"] = keys["private_key"]
+                r["public_key"] = keys.get("public_key") or ""
+            if not r.get("short_ids"):
+                r["short_ids"] = [xray.generate_short_id()]
+    return None
+
+
 def _inbound_form_to_model(form, ib: dict) -> str | None:
     proto = str(form.get("protocol") or ib.get("protocol") or "vless")
     if proto not in P.ALL_PROTOCOLS:
@@ -7862,6 +7951,45 @@ def core_edit_page(core_id: str, request: Request):
         core_next_inbounds=_core_back(core_id, "inbounds"),
         core_next_outbounds=_core_back(core_id, "outbounds"),
         core_next_routing=_core_back(core_id, "routing"),
+        protocols=list(P.USER_PROTOCOLS),
+        networks=list(P.NETWORKS),
+        securities=("none", "tls", "reality"),
+        free_ib_port=xray.free_inbound_port(view),
+        fingerprints=list(P.FINGERPRINTS),
+        core_ob_map={
+            str(o.get("tag") or ""): {
+                "tag": o.get("tag"),
+                "remark": o.get("remark") or "",
+                "country": o.get("country") or "",
+                "config": o.get("config") or {},
+            }
+            for o in (view.get("outbounds_custom") or [])
+            if isinstance(o, dict) and o.get("tag")
+        },
+        core_ib_map={
+            str(i.get("id") or ""): {
+                "id": i.get("id"),
+                "tag": i.get("tag") or "",
+                "remark": i.get("remark") or "",
+                "protocol": i.get("protocol") or "vless",
+                "port": i.get("port") or "",
+                "enabled": i.get("enabled", True),
+                "network": (i.get("stream") or {}).get("network") or "raw",
+                "security": (i.get("stream") or {}).get("security") or "none",
+                "fingerprint": (i.get("stream") or {}).get("fingerprint") or "firefox",
+                "flow": (i.get("settings") or {}).get("flow") or "",
+                "ws_path": ((i.get("stream") or {}).get("ws") or {}).get("path") or "/",
+                "ws_host": ((i.get("stream") or {}).get("ws") or {}).get("host") or "",
+                "xhttp_path": ((i.get("stream") or {}).get("xhttp") or {}).get("path") or "/",
+                "r_dest": ((i.get("stream") or {}).get("reality") or {}).get("dest") or "",
+                "r_sni": ",".join(((i.get("stream") or {}).get("reality") or {}).get("server_names") or []),
+                "r_private": ((i.get("stream") or {}).get("reality") or {}).get("private_key") or "",
+                "r_public": ((i.get("stream") or {}).get("reality") or {}).get("public_key") or "",
+                "r_short": ",".join(((i.get("stream") or {}).get("reality") or {}).get("short_ids") or []),
+            }
+            for i in preview_ibs
+            if isinstance(i, dict) and i.get("id") is not None
+        },
     )
 
 
@@ -7969,6 +8097,35 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                     return go(back)
                 store["inbounds"] = [i for i in ibs if i.get("id") != ib_id]
                 flash(request, "Inbound удалён", "info")
+            elif action == "save":
+                ib_id = _int(form.get("id"))
+                is_new = not ib_id
+                if ib_id:
+                    ib = next((i for i in ibs if i.get("id") == ib_id), None)
+                    if not ib:
+                        flash(request, "Inbound не найден", "error")
+                        return go(back)
+                else:
+                    proto = str(form.get("protocol") or "vless")
+                    port = _int(form.get("port"), xray.free_inbound_port(store))
+                    ib = P.default_inbound(proto, port, f"{proto}-{port}")
+                    xray.ensure_inbound_keys(ib)
+                    ib["id"] = max([int(i.get("id") or 0) for i in ibs] + [0]) + 1
+                err = _core_inbound_form_patch(form, ib, is_new=is_new)
+                if not err and any(i is not ib and i.get("tag") == ib.get("tag") for i in ibs):
+                    err = "Такой tag уже есть"
+                if not err and any(
+                    i is not ib and int(i.get("port") or 0) == int(ib.get("port") or 0) for i in ibs
+                ):
+                    err = f"Порт {ib.get('port')} уже занят"
+                if err:
+                    flash(request, err, "error")
+                    return go(back)
+                if is_new:
+                    ibs.append(ib)
+                    flash(request, f"Inbound {ib.get('tag')} добавлен", "info")
+                else:
+                    flash(request, f"Inbound {ib.get('tag')} сохранён", "info")
             else:
                 flash(request, "Неизвестное действие", "error")
         elif tab == "outbounds":
@@ -7984,6 +8141,60 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
             elif action == "sub" and o:
                 o["in_sub"] = not o.get("in_sub", True)
                 flash(request, f"{tag}: подписка {'вкл' if o.get('in_sub', True) else 'выкл'}", "info")
+            elif action == "save":
+                edit_tag = str(form.get("edit_tag") or "").strip()
+                mode = str(form.get("mode") or "link").strip()
+                remark = str(form.get("remark") or "").strip()
+                country = str(form.get("country") or "").strip().upper()
+                try:
+                    if mode == "link":
+                        ep = P.link_to_endpoint(str(form.get("link") or ""))
+                        config = P.endpoint_to_xray_outbound(ep, tag or "ob")
+                        remark = remark or ep.get("remark") or tag
+                        info = f"{ep.get('protocol')} {ep.get('address')}:{ep.get('port')}"
+                        if not tag:
+                            tag = str(config.get("tag") or ep.get("protocol") or "ob")
+                    else:
+                        config = json.loads(str(form.get("json") or "{}"))
+                        if not isinstance(config, dict) or not config.get("protocol"):
+                            raise ValueError("в JSON нет protocol")
+                        tag = tag or str(config.get("tag") or "").strip()
+                        info = str(config.get("protocol") or "custom")
+                    if not tag or not xray.TAG_RE.match(tag):
+                        raise ValueError("Tag: латиница/цифры/._-")
+                    config = dict(config)
+                    config.pop("tag", None)
+                except Exception as exc:
+                    flash(request, f"Outbound: {exc}", "error")
+                    return go(back)
+                if edit_tag:
+                    o = next((x for x in outs if x.get("tag") == edit_tag), None)
+                    if not o:
+                        flash(request, "Outbound не найден", "error")
+                        return go(back)
+                    o.update({
+                        "config": config,
+                        "remark": remark or edit_tag,
+                        "country": country,
+                        "info": info,
+                    })
+                    o.pop("last_test", None)
+                    flash(request, f"Outbound {edit_tag} сохранён", "info")
+                else:
+                    if any(x.get("tag") == tag for x in outs):
+                        flash(request, f"Tag {tag} уже есть", "error")
+                        return go(back)
+                    outs.append({
+                        "tag": tag,
+                        "remark": remark or tag,
+                        "country": country,
+                        "kind": "custom",
+                        "enabled": False,
+                        "in_sub": False,
+                        "info": info,
+                        "config": config,
+                    })
+                    flash(request, f"Outbound {tag} добавлен (выкл.)", "info")
             else:
                 flash(request, "Outbound не найден", "error")
         elif tab == "routing":
