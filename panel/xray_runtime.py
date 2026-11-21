@@ -2260,32 +2260,38 @@ def apply_tag_to_users(store: dict, *, kind: str, tag: str, propagate: bool) -> 
 
 
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
-    """Extra subscription identities (custom outbounds / opt-in direct).
+    """Extra subscription identities beyond the main inbound profile.
 
-    Balancers are routing-only and never appear in client subscriptions.
-    Primary («основная») is emitted separately as the main identity — skipped here
-    so the same outbound does not appear twice. Unhealthy outbounds omitted.
-    ``direct`` is included only when explicitly listed in allowed_tags (not mode «все»).
+    Users are assigned **inbounds only**; routing/outbounds live in cores.
+    Therefore subscription shows one profile per inbound (main UUID) — no
+    extra outbound rows (no ``🖥️ tag · GB …`` lines).
+
+    Legacy: if ``allowed_tags`` is a non-empty explicit list, those custom
+    outbound tags may still be emitted (API / old data). Empty list = none.
+    Balancers never appear.
     """
     if not client.get("uuid") or not client.get("sub_enabled", True):
         return []
     if not ignore_quota and not client_access_ok(client):
         return []
-    # Balancers intentionally omitted — they exist for Xray routing rules only.
-    tags = [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
-    # Opt-in system outbound: only when explicitly selected (non-empty allowed list).
-    eff = client_effective_allowed_tags(store, client)
-    if "direct" in eff and "direct" not in tags:
-        tags = ["direct"] + tags
-    # Main («основная») is already emitted as the primary identity — do not duplicate it.
+    # Explicit opt-in only (non-empty allowed_tags). Mode «все» / empty → no extras.
+    eff = [t for t in client_effective_allowed_tags(store, client) if t and t != NONE_TAG]
+    if not eff:
+        return []
+    in_sub_customs = {
+        o["tag"] for o in store.get("outbounds_custom") or []
+        if o.get("enabled", True) and o.get("in_sub", True) and o.get("tag")
+    }
     default = client_default_outbound(store, client)
     if balancer_by_tag(store, default):
         default = "direct"
     entries = []
-    for tag in tags:
-        if tag == default:
+    for tag in eff:
+        if tag == default or tag == "direct":
             continue
         if balancer_by_tag(store, tag):
+            continue
+        if tag not in in_sub_customs:
             continue
         if not ignore_quota and not tag_allowed_for_client(store, client, tag):
             continue
