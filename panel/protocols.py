@@ -1559,11 +1559,15 @@ def render_sub_custom_json(
     client: dict,
     host: str,
     remark: str = "",
+    outbounds: list | None = None,
 ) -> dict | None:
     """Render a per-core Custom JSON subscription template into a client config dict.
 
     Placeholders (use inside JSON string values):
       {{uuid}} {{email}} {{password}} {{host}} {{remark}} {{uuid:TAG}}
+
+    Raw JSON insertion (not quoted):
+      {{outbounds}} — array of auto-built proxy outbounds from this core's inbounds
     """
     raw = str(template or "").strip()
     if not raw:
@@ -1573,6 +1577,10 @@ def render_sub_custom_json(
     password = str((client or {}).get("password") or "")
     host_s = str(host or "").strip()
     remark_s = str(remark or "").strip()
+    outbounds_json = json.dumps(outbounds if isinstance(outbounds, list) else [], ensure_ascii=False)
+
+    # Raw insert first (may appear as "outbounds": {{outbounds}})
+    raw = re.sub(r"\{\{\s*outbounds\s*\}\}", outbounds_json, raw)
 
     def _repl(match: re.Match[str]) -> str:
         key = (match.group(1) or "").strip()
@@ -1586,6 +1594,8 @@ def render_sub_custom_json(
             return _json_escape_unquoted(host_s)
         if key == "remark":
             return _json_escape_unquoted(remark_s)
+        if key == "outbounds":
+            return outbounds_json
         if key.startswith("uuid:"):
             tag = key.split(":", 1)[1].strip()
             return _json_escape_unquoted(identity_uuid(uuid, tag) if tag else uuid)

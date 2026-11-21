@@ -423,15 +423,28 @@
 {# ===================== ADVANCED ===================== #}
 {# ===================== SUBSCRIPTION CUSTOM JSON ===================== #}
 <section class="core-panel {% if core_tab == 'subjson' %}active{% endif %}" data-panel="subjson">
-  <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/save" style="max-width:960px">
+  <div class="card" style="max-width:960px">
+    <h3>JSON-подписка для этого ядра</h3>
+    <div class="hint">
+      В <code>?format=json</code> каждое ядро — <b>один профиль</b> в приложении.
+      Внутри профиля — <b>все inbound ядра</b> (разные протоколы) + автовыбор по пингу (Ascella / leastLoad).
+      Пользователь видит одну строку, устройство само выбирает лучший протокол.
+    </div>
+    <div class="actions mt">
+      <form method="post" action="{{ bp }}/cores/{{ core.id }}/subjson-generate" style="display:inline">
+        <button class="btn" type="submit">Сгенерировать из inbounds</button>
+      </form>
+    </div>
+  </div>
+  <form class="card mt" method="post" action="{{ bp }}/cores/{{ core.id }}/save" style="max-width:960px">
     <input type="hidden" name="stay" value="1">
     <input type="hidden" name="tab" value="subjson">
     <input type="hidden" name="sub_custom_json_form" value="1">
-    <h3>Custom JSON в подписке</h3>
+    <h3>Custom JSON (ручной шаблон)</h3>
     <div class="hint">
-      Если включено, пользователи в <code>?format=json</code> получают этот шаблон как отдельный профиль
-      (на каждую ноду с этим ядром — со своим <code>{{ '{{host}}' }}</code>).
-      Авто-генерация из inbounds этого ядра тогда не добавляется.
+      Если галочка включена — вместо авто-сборки подставляется этот шаблон
+      (на каждую ноду с этим ядром, <code>{{ '{{host}}' }}</code> = домен ноды).
+      Можно вставить готовый Japan/Ascella JSON или нажать «Сгенерировать из inbounds» выше.
     </div>
     <div class="mt">
       {{ m.check('sub_custom_json', core.sub_custom_json, 'Custom JSON') }}
@@ -439,16 +452,17 @@
     <div class="mt">
       <label class="f">Шаблон клиентского Xray JSON</label>
       <textarea name="sub_custom_json_template" class="mono" rows="22" spellcheck="false"
-                placeholder='{"remarks":"Japan","outbounds":[{"protocol":"vless","tag":"proxy","settings":{"vnext":[{"address":"NODE_HOST","port":443,"users":[{"id":"CLIENT_UUID","encryption":"none"}]}]}}]}'>{{ core.sub_custom_json_template or '' }}</textarea>
+                placeholder='Нажмите «Сгенерировать из inbounds» или вставьте полный клиентский JSON'>{{ core.sub_custom_json_template or '' }}</textarea>
     </div>
     <div class="hint mt">
-      Плейсхолдеры (внутри строковых значений JSON):
+      Плейсхолдеры (в строках JSON):
       <code>{{ '{{uuid}}' }}</code>,
       <code>{{ '{{email}}' }}</code>,
       <code>{{ '{{password}}' }}</code>,
-      <code>{{ '{{host}}' }}</code> — домен ноды,
+      <code>{{ '{{host}}' }}</code>,
       <code>{{ '{{remark}}' }}</code>,
-      <code>{{ '{{uuid:TAG}}' }}</code> — identity для <code>email~TAG</code>.
+      <code>{{ '{{uuid:TAG}}' }}</code>.
+      Сырая вставка массива: <code>"outbounds": {{ '{{outbounds}}' }}</code> — авто outbounds из inbound ядра.
     </div>
     <div class="actions mt"><button class="btn">Сохранить</button></div>
   </form>

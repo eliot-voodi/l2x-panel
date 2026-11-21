@@ -8862,6 +8862,21 @@ async def cores_action(core_id: str, action: str, request: Request):
                 flash(request, "; ".join(errs[:4]), "error")
             else:
                 flash(request, f"Ядро «{core.get('name')}» сохранено", "info")
+        elif action == "subjson-generate":
+            try:
+                text = xray.build_core_custom_json_template(store, core)
+                core["sub_custom_json_template"] = text
+                core["sub_custom_json"] = True
+                core["updated_at"] = cores_mod.now_iso()
+                flash(
+                    request,
+                    "Шаблон собран из всех inbound ядра (Ascella / leastPing). "
+                    "Проверьте и нажмите Сохранить при необходимости.",
+                    "info",
+                )
+            except Exception as exc:
+                flash(request, f"Не удалось сгенерировать шаблон: {exc}", "error")
+            return go(_core_back(core_id, "subjson"))
         elif action == "rename":
             cores_mod.rename_core(
                 core,
