@@ -251,6 +251,26 @@ COUNTRY_BY_NAME = {
 }
 COUNTRY_BY_HOST = {"uk": "GB", "sk": "KR", "netflix": "US", "is": "IL"}
 
+# ISO → short RU label for inbound flag picker (shown in subscription as emoji + remark).
+FLAG_CHOICES: list[tuple[str, str]] = [
+    ("", "без флага"),
+    ("RU", "Россия"), ("UA", "Украина"), ("BY", "Беларусь"), ("KZ", "Казахстан"),
+    ("DE", "Германия"), ("NL", "Нидерланды"), ("FI", "Финляндия"), ("SE", "Швеция"),
+    ("NO", "Норвегия"), ("DK", "Дания"), ("PL", "Польша"), ("CZ", "Чехия"),
+    ("AT", "Австрия"), ("CH", "Швейцария"), ("FR", "Франция"), ("GB", "Великобритания"),
+    ("IE", "Ирландия"), ("ES", "Испания"), ("IT", "Италия"), ("PT", "Португалия"),
+    ("BE", "Бельгия"), ("LU", "Люксембург"), ("RO", "Румыния"), ("BG", "Болгария"),
+    ("HU", "Венгрия"), ("SK", "Словакия"), ("SI", "Словения"), ("HR", "Хорватия"),
+    ("RS", "Сербия"), ("TR", "Турция"), ("GR", "Греция"), ("CY", "Кипр"),
+    ("IL", "Израиль"), ("AE", "ОАЭ"), ("SA", "Саудовская Аравия"),
+    ("US", "США"), ("CA", "Канада"), ("MX", "Мексика"), ("BR", "Бразилия"),
+    ("AR", "Аргентина"), ("CL", "Чили"),
+    ("JP", "Япония"), ("KR", "Корея"), ("CN", "Китай"), ("HK", "Гонконг"),
+    ("TW", "Тайвань"), ("SG", "Сингапур"), ("MY", "Малайзия"), ("TH", "Таиланд"),
+    ("VN", "Вьетнам"), ("ID", "Индонезия"), ("IN", "Индия"), ("AU", "Австралия"),
+    ("NZ", "Новая Зеландия"), ("ZA", "ЮАР"),
+]
+
 
 def country_code(item: dict) -> str:
     explicit = str(item.get("country") or "").strip().upper()
@@ -274,6 +294,18 @@ def flag_emoji(code: str) -> str:
     if not re.fullmatch(r"[A-Z]{2}", code):
         return "🌐"
     return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
+
+
+def flag_choices() -> list[dict]:
+    """UI options: [{code, label, flag}] for inbound country select."""
+    out: list[dict] = []
+    for code, name in FLAG_CHOICES:
+        out.append({
+            "code": code,
+            "label": name,
+            "flag": flag_emoji(code) if code else "🌐",
+        })
+    return out
 
 
 def inbound_sub_label(ib: dict | None) -> str:

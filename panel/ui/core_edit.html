@@ -180,7 +180,7 @@
         <tbody>
         {% for i in preview_inbounds %}
           <tr {% if i.enabled is defined and not i.enabled %}style="opacity:.5"{% endif %}>
-            <td class="mono"><b>{{ i.tag }}</b>{% if i.remark %}<div class="dim small">{{ i.remark }}</div>{% endif %}</td>
+            <td class="mono"><b>{% if i.country %}{{ flag_emoji(i.country) }} {% endif %}{{ i.tag }}</b>{% if i.remark %}<div class="dim small">{{ i.remark }}</div>{% endif %}</td>
             <td>{{ i.port or '—' }}</td>
             <td class="small">{{ i.protocol or '—' }}</td>
             <td>{% if i.enabled is not defined or i.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
@@ -446,9 +446,18 @@
       <div style="max-width:110px"><label class="f">Port</label><input name="port" id="core-ib-port" type="number" min="1" max="65535" value="{{ free_ib_port }}"></div>
     </div>
     <div class="row">
-      <div><label class="f">Название</label><input name="remark" id="core-ib-remark"></div>
+      <div style="flex:1"><label class="f">Название в подписке</label><input name="remark" id="core-ib-remark" placeholder="Frankfurt / DE-1"></div>
+      <div style="max-width:14rem">
+        <label class="f">Флаг</label>
+        <select name="country" id="core-ib-country">
+          {% for fc in flag_choices() %}
+          <option value="{{ fc.code }}">{{ fc.flag }} {% if fc.code %}{{ fc.code }} — {% endif %}{{ fc.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <div>{{ m.check('enabled', True, 'Включён') }}</div>
     </div>
+    <div class="hint" id="core-ib-sub-preview-hint">В клиенте: <b id="core-ib-sub-preview">название</b></div>
 
     <div class="row" data-ib-show="stream">
       <div><label class="f">Network</label>
@@ -701,6 +710,23 @@ function openCoreRouteEdit(r) {
     return s;
   }
 
+  function flagEmoji(code) {
+    code = String(code || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(code)) return '';
+    return String.fromCodePoint.apply(null, code.split('').map(function (c) {
+      return 0x1F1E6 + c.charCodeAt(0) - 65;
+    }));
+  }
+  function syncCoreIbSubPreview() {
+    var rm = document.getElementById('core-ib-remark');
+    var cc = document.getElementById('core-ib-country');
+    var prev = document.getElementById('core-ib-sub-preview');
+    if (!prev) return;
+    var name = (rm && rm.value) || (document.getElementById('core-ib-tag') && document.getElementById('core-ib-tag').value) || 'inbound';
+    var f = flagEmoji(cc && cc.value);
+    prev.textContent = (f ? f + ' ' : '') + name;
+  }
+
   function syncCoreIbFields() {
     var protoEl = document.getElementById('core-ib-proto');
     var netEl = document.getElementById('core-ib-net');
@@ -763,8 +789,11 @@ function openCoreRouteEdit(r) {
     document.getElementById('core-ib-tag').value = (item && item.tag) || '';
     document.getElementById('core-ib-port').value = (item && item.port) || FREE_IB_PORT;
     document.getElementById('core-ib-remark').value = (item && item.remark) || '';
+    var ccEl = document.getElementById('core-ib-country');
+    if (ccEl) ccEl.value = (item && item.country) || '';
     var en = form.querySelector('[name="enabled"]');
     if (en) en.checked = !item || item.enabled !== false;
+    syncCoreIbSubPreview();
     document.getElementById('core-ib-net').value = (item && item.network) || 'raw';
     document.getElementById('core-ib-sec').value = (item && item.security) || 'none';
     document.getElementById('core-ib-fp').value = (item && item.fingerprint) || 'firefox';
@@ -860,6 +889,9 @@ function openCoreRouteEdit(r) {
   on(document.getElementById('core-ib-proto'), 'change', syncCoreIbFields);
   on(document.getElementById('core-ib-net'), 'change', syncCoreIbFields);
   on(document.getElementById('core-ib-sec'), 'change', syncCoreIbFields);
+  on(document.getElementById('core-ib-country'), 'change', syncCoreIbSubPreview);
+  on(document.getElementById('core-ib-remark'), 'input', syncCoreIbSubPreview);
+  on(document.getElementById('core-ib-tag'), 'input', syncCoreIbSubPreview);
   on(document.getElementById('core-ob-tabs'), 'click', function (e) {
     var a = e.target.closest('a[data-ob-mode]');
     if (!a) return;

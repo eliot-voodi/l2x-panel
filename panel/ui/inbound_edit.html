@@ -54,17 +54,24 @@
         <label class="f">Имя в подписке (remark)</label>
         <input name="remark" id="ib_remark" value="{{ ib.remark }}" placeholder="Frankfurt / DE-1">
       </div>
-      <div style="max-width:7rem">
-        <label class="f">Страна</label>
-        <input name="country" id="ib_country" value="{{ ib.country or '' }}" maxlength="2"
-               style="text-transform:uppercase" placeholder="DE" pattern="[A-Za-z]{0,2}"
-               title="ISO-код страны → флаг в подписке">
+      <div style="max-width:16rem">
+        <label class="f">Флаг</label>
+        <select name="country" id="ib_country" title="Флаг в названии подключения у пользователя">
+          {% set cur_cc = (ib.country or '')|upper %}
+          {% set ns = namespace(found=false) %}
+          {% for fc in flag_choices() %}
+          <option value="{{ fc.code }}" {% if fc.code == cur_cc %}{% set ns.found = true %}selected{% endif %}>{{ fc.flag }} {% if fc.code %}{{ fc.code }} — {% endif %}{{ fc.label }}</option>
+          {% endfor %}
+          {% if cur_cc and not ns.found %}
+          <option value="{{ cur_cc }}" selected>{{ flag_emoji(cur_cc) }} {{ cur_cc }}</option>
+          {% endif %}
+        </select>
       </div>
       <div style="align-self:end;padding-bottom:.35rem;min-width:3rem">
         <span id="ib_flag_preview" style="font-size:1.6rem;line-height:1" title="Превью в подписке">{{ flag_emoji(ib.country or '') if ib.country else '🌐' }}</span>
       </div>
     </div>
-    <div class="hint">В клиенте будет: <b id="ib_sub_preview">{{ (flag_emoji(ib.country) ~ ' ' if ib.country else '') }}{{ ib.remark or ib.tag }}</b>. Outbound/нода больше не подставляются в имя (только если у клиента несколько подключений — через « · »).</div>
+    <div class="hint">В клиенте будет: <b id="ib_sub_preview">{{ (flag_emoji(ib.country) ~ ' ' if ib.country else '') }}{{ ib.remark or ib.tag }}</b>. Флаг + название inbound — так профиль виден в подписке и у пользователя.</div>
     <div class="mt">
       <label class="check"><input type="checkbox" name="direct" value="1" id="ib_direct" {% if ib.direct %}checked{% endif %}>
         Напрямую на порт (без nginx :443)</label>
@@ -750,14 +757,14 @@
     }
     function sync() {
       var code = (cc.value || '').trim().toUpperCase();
-      cc.value = code;
       var name = (rm.value || '').trim() || 'inbound';
       var f = /^[A-Z]{2}$/.test(code) ? flagEmoji(code) : '';
       flag.textContent = f || '🌐';
       prev.textContent = f ? (f + ' ' + name) : name;
     }
-    cc.addEventListener('input', sync);
+    cc.addEventListener('change', sync);
     rm.addEventListener('input', sync);
+    sync();
   })();
 </script>
 {% endblock %}

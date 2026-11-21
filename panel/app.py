@@ -1107,7 +1107,8 @@ def qr_svg(text: str, scale: int = 4) -> str:
 for _name, _fn in {
     "t": t, "fmt_dt": fmt_dt, "ago": ago, "dt_input": dt_input, "fmt_ts": fmt_ts, "fmt_rate": fmt_rate, "fmt_uptime": fmt_uptime, "qr_svg": qr_svg,
     "format_traffic": xray.format_traffic, "bytes_to_gb": xray.bytes_to_gb, "country_code": xray.country_code,
-    "flag_emoji": xray.flag_emoji, "outbound_label": xray.outbound_label, "client_status": xray.client_status,
+    "flag_emoji": xray.flag_emoji, "flag_choices": xray.flag_choices,
+    "outbound_label": xray.outbound_label, "client_status": xray.client_status,
     "client_used_bytes": xray.client_used_bytes, "gb_to_bytes": xray.gb_to_bytes, "days_left": xray.days_left,
     "inbound_used_bytes": xray.inbound_used_bytes, "inbound_access_ok": xray.inbound_access_ok,
     "list_mode": xray.list_mode,
@@ -2831,6 +2832,8 @@ def _core_inbound_form_patch(form, ib: dict, *, is_new: bool = False) -> str | N
         return "Tag: латиница/цифры/._-"
     ib["tag"] = tag
     ib["remark"] = str(form.get("remark") or tag).strip()
+    cc = str(form.get("country") or "").strip().upper()
+    ib["country"] = cc if re.fullmatch(r"[A-Z]{2}", cc) else ""
     ib["enabled"] = form.get("enabled") == "1"
     ib["port"] = _int(form.get("port"), int(ib.get("port") or 0))
     if reason := xray.port_forbidden_reason(ib["port"], ib):
@@ -7951,6 +7954,7 @@ def core_edit_page(core_id: str, request: Request):
                 "id": i.get("id"),
                 "tag": i.get("tag") or "",
                 "remark": i.get("remark") or "",
+                "country": i.get("country") or "",
                 "protocol": i.get("protocol") or "vless",
                 "port": i.get("port") or "",
                 "enabled": i.get("enabled", True),
