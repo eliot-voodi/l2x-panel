@@ -482,6 +482,40 @@ def _edit_core_banner(request: Request) -> dict | None:
     }
 
 
+def _editing_core() -> bool:
+    """True while session/context targets a non-master core profile."""
+    return bool(str(_EDIT_CORE_CV.get() or "").strip())
+
+
+def _apply_xray_after_config(**kwargs) -> dict:
+    """Apply master Xray after config edits — skipped in core-edit mode.
+
+    Core slices must not be loaded into the master's running Xray, otherwise
+    «Схема трафика» and master clients break. Core profiles are pushed via Sync.
+    """
+    if _editing_core():
+        return {"ok": True, "skipped_core_edit": True}
+    return _apply_xray(_load_store(), **kwargs)
+
+
+def _cores_scope_ctx(request: Request) -> dict:
+    """PasarGuard-style core selector context for network pages."""
+    store = _load_store()
+    try:
+        cores_mod.ensure_cores(store)
+    except Exception:
+        pass
+    cores = list(store.get("cores") or [])
+    cid = str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "").strip()
+    active = cores_mod.core_by_id(store, cid) if cid else None
+    return {
+        "cores_list": cores,
+        "active_core_id": (active or {}).get("id") or "",
+        "active_core_name": (active or {}).get("name") or "",
+        "core_scope_master": not bool(active),
+    }
+
+
 FRONT_CERT_RETRY = 3600
 _front_cert_tried: dict[str, float] = {}
 
@@ -3024,7 +3058,8 @@ async def inbounds_page(request: Request):
         rows.append({**ib, "n_clients": n_clients, "used": xray.inbound_used_bytes(ib),
                      "ok": xray.inbound_access_ok(ib), "lint": lint})
     xtest = await run_in_threadpool(inbound_lint.xray_dry_test, store)
-    return page(request, "inbounds.html", active="inbounds", items=rows, store=store, xtest=xtest)
+    return page(request, "inbounds.html", active="inbounds", items=rows, store=store, xtest=xtest,
+                **_cores_scope_ctx(request))
 
 
 def _inbound_check_model(store: dict, form) -> tuple[dict, list[dict]]:
@@ -3151,7 +3186,7 @@ async def inbound_save(request: Request):
         elif old_tag != ib["tag"]:
             for c in store["clients"]:
                 c["inbounds"] = [ib["tag"] if x == old_tag else x for x in c.get("inbounds") or []]
-    result = _apply_xray(_load_store())
+    result = _apply_xray_after_config()
     st = ib.get("stream") or {}
     act = "создан" if not ib_id else "обновлён"
     _tg_change(
@@ -3161,7 +3196,10 @@ async def inbound_save(request: Request):
         f"{tgbot.escape(st.get('network') or '')}/{tgbot.escape(st.get('security') or '')} · "
         f"fp=<code>{tgbot.escape(st.get('fingerprint') or '')}</code>",
     )
-    flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён{prop_note}", result))
+    if result.get("skipped_core_edit"):
+        flash(request, f"Inbound {ib['tag']} сохранён в ядро{prop_note} (Xray мастера не тронут)", "info")
+    else:
+        flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён{prop_note}", result))
     return go("/inbounds")
 
 
@@ -3209,9 +3247,12 @@ def inbound_action(ib_id: int, action: str, request: Request):
         else:
             flash(request, "Неизвестное действие", "error")
             return go("/inbounds")
-    result = _apply_xray(_load_store())
+    result = _apply_xray_after_config()
     _tg_change(f"📥 Inbound <b>{tgbot.escape(tag)}</b>: {what}")
-    flash(request, *_ok_msg(f"Inbound {tag}: {action}", result))
+    if result.get("skipped_core_edit"):
+        flash(request, f"Inbound {tag}: {action} (в ядре)", "info")
+    else:
+        flash(request, *_ok_msg(f"Inbound {tag}: {action}", result))
     return go("/inbounds")
 
 
@@ -4464,7 +4505,7 @@ def outbounds_page(request: Request):
               for o in store["outbounds_custom"]}
     return page(request, "outbounds.html", active="outbounds", items=rows, nord_countries=[], custom=custom,
                 dialer_tags=[r["tag"] for r in rows], ss_methods=P.SS_METHODS, fingerprints=P.FINGERPRINTS,
-                pia=_pia_account_view())
+                pia=_pia_account_view(), **_cores_scope_ctx(request))
 
 
 @app.post("/outbounds/parse")
@@ -4741,15 +4782,20 @@ async def outbound_add(request: Request):
     if err:
         flash(request, err, "error")
         return go("/outbounds")
-    xr = _apply_xray(_load_store(), xray_only=True)
+    xr = _apply_xray_after_config(xray_only=True)
     if not xr.get("ok"):
-        with mutate() as store:
-            store["outbounds_custom"] = previous
+        # Only roll back master when we were editing master (not a core profile)
+        if not xr.get("skipped_core_edit"):
+            with mutate(edit_core_id="") as store:
+                store["outbounds_custom"] = previous
         flash(request, f"Outbound {tag} не сохранён — Xray отклонил конфиг: {xr.get('error')}", "error")
         return go("/outbounds")
     act = "обновлён" if edit_tag else "добавлен"
     _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b> {act}")
-    flash(request, f"Outbound {tag} {act}{prop_note}", "info")
+    if xr.get("skipped_core_edit"):
+        flash(request, f"Outbound {tag} {act} в ядре{prop_note} (мастер/схема не изменены)", "info")
+    else:
+        flash(request, f"Outbound {tag} {act}{prop_note}", "info")
     return go("/outbounds")
 
 
@@ -4939,13 +4985,16 @@ def outbound_action(tag: str, action: str, request: Request):
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: в подписке вкл/выкл")
         flash(request, f"{tag}: sub", "info")
         return go("/outbounds")
-    xr = _apply_xray(_load_store(), xray_only=True) if need_xray else {"ok": True}
+    xr = _apply_xray_after_config(xray_only=True) if need_xray else {"ok": True}
     labels = {
         "delete": "удалён", "toggle": "вкл/выкл",
     }
     if action in labels:
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: {labels[action]}")
-    flash(request, *_ok_msg(f"{tag}: {action}", xr))
+    if xr.get("skipped_core_edit"):
+        flash(request, f"{tag}: {action} (в ядре)", "info")
+    else:
+        flash(request, *_ok_msg(f"{tag}: {action}", xr))
     return go("/outbounds")
 
 
@@ -4960,7 +5009,7 @@ def balancers_page(request: Request):
     active = {k: xray.balancer_member_tags(store, b) for k, b in bals.items()}
     return page(request, "balancers.html", active="balancers", balancers=bals, active_members=active,
                 custom=store["outbounds_custom"], watchdog_sec=WATCHDOG_INTERVAL, store=store,
-                default_balancer_labels=xray.BALANCER_LABELS)
+                default_balancer_labels=xray.BALANCER_LABELS, **_cores_scope_ctx(request))
 
 
 @app.post("/balancers/{key}")
@@ -4991,7 +5040,7 @@ async def balancers_save(key: str, request: Request):
             b["expected"] = max(1, _int(form.get("expected"), 1))
             b["max_rtt"] = str(form.get("max_rtt") or "1s")
             b["tolerance"] = _float(form.get("tolerance"), 0.15)
-    xr = _apply_xray(_load_store(), xray_only=True)
+    xr = _apply_xray_after_config(xray_only=True)
     with_state = "вкл" if form.get("enabled") == "1" else "выкл"
     label_txt = str(form.get("label") or "").strip() or key
     _tg_change(
@@ -5000,7 +5049,10 @@ async def balancers_save(key: str, request: Request):
         f"direct_pool={'да' if form.get('sub_direct_pool') == '1' else 'нет'} · "
         f"fallback=<code>{tgbot.escape(str(form.get('fallback') or 'direct'))}</code>",
     )
-    flash(request, *_ok_msg(f"{key} сохранён", xr))
+    if xr.get("skipped_core_edit"):
+        flash(request, f"{key} сохранён в ядро (мастер/схема не изменены)", "info")
+    else:
+        flash(request, *_ok_msg(f"{key} сохранён", xr))
     return go("/balancers")
 
 
@@ -5010,12 +5062,14 @@ async def balancers_save(key: str, request: Request):
 def schema_page(request: Request):
     if redir := _require(request):
         return redir
+    # Always master live store — never core edit slices (PasarGuard node cores ≠ panel schema)
     store = _load_store()
     import traffic_schema as tschema
     schema = tschema.build_schema(store, online=ONLINE)
     return page(
         request, "traffic_schema.html", active="schema",
         schema=schema, store=store,
+        schema_master_only=True,
     )
 
 
@@ -5135,7 +5189,8 @@ def routing_page(request: Request):
                 geo_cfg=store["settings"].get("geo_update") or {},
                 geo_state=store.get("geo_update_state") or {},
                 geo_packs=ops.GEO_PACKS,
-                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5])
+                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5],
+                **_cores_scope_ctx(request))
 
 
 @app.post("/routing")
@@ -5159,12 +5214,13 @@ async def routing_add(request: Request):
             store["routes"].pop()
             flash(request, lint_err, "error")
             return go("/routing")
-    xr = _apply_xray(_load_store(), xray_only=True)
+    xr = _apply_xray_after_config(xray_only=True)
     _tg_change(
         f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> добавлено",
         f"→ <code>{tgbot.escape(str(rule.get('outbound') or 'direct'))}</code>",
     )
-    flash(request, *_ok_msg(f"Правило {name} добавлено", xr))
+    flash(request, *_ok_msg(f"Правило {name} добавлено", xr) if not xr.get("skipped_core_edit")
+          else (f"Правило {name} добавлено в ядро", "info"))
     return go("/routing")
 
 
@@ -5197,13 +5253,14 @@ async def routing_save(name: str, request: Request):
             routes[idx] = prev
             flash(request, lint_err, "error")
             return go("/routing")
-    xr = _apply_xray(_load_store(), xray_only=True)
+    xr = _apply_xray_after_config(xray_only=True)
     _tg_change(
         f"🗺 Routing: правило <b>{tgbot.escape(name)}</b> изменено"
         + (f" → <b>{tgbot.escape(new_name)}</b>" if new_name != name else ""),
         f"→ <code>{tgbot.escape(str(rule.get('outbound') or 'direct'))}</code>",
     )
-    flash(request, *_ok_msg(f"Правило {new_name} сохранено", xr))
+    flash(request, *_ok_msg(f"Правило {new_name} сохранено", xr) if not xr.get("skipped_core_edit")
+          else (f"Правило {new_name} сохранено в ядро", "info"))
     return go("/routing")
 
 
@@ -5224,9 +5281,10 @@ def routing_preset(key: str, request: Request):
             store["routes"].pop(0)
             flash(request, lint_err, "error")
             return go("/routing")
-    xr = _apply_xray(_load_store(), xray_only=True)
+    xr = _apply_xray_after_config(xray_only=True)
     _tg_change(f"🗺 Routing: preset <b>{tgbot.escape(preset['name'])}</b> добавлен")
-    flash(request, *_ok_msg(f"Добавлено {preset['name']}", xr))
+    flash(request, *_ok_msg(f"Добавлено {preset['name']}", xr) if not xr.get("skipped_core_edit")
+          else (f"Добавлено {preset['name']} в ядро", "info"))
     return go("/routing")
 
 
@@ -5258,9 +5316,10 @@ def routing_action(name: str, action: str, request: Request):
             what = "ниже"
         else:
             return go(nxt)
-    xr = _apply_xray(_load_store(), xray_only=True)
+    xr = _apply_xray_after_config(xray_only=True)
     _tg_change(f"🗺 Routing: <b>{tgbot.escape(name)}</b> — {tgbot.escape(what)}")
-    flash(request, *_ok_msg(f"{name}: {action}", xr))
+    flash(request, *_ok_msg(f"{name}: {action}", xr) if not xr.get("skipped_core_edit")
+          else (f"{name}: {action} (ядро)", "info"))
     return go(nxt)
 
 
@@ -5287,7 +5346,8 @@ def xray_page(request: Request):
         ctx["geo_state"] = store.get("geo_update_state") or {}
         ctx["geo_packs"] = ops.GEO_PACKS
     return page(request, "xray.html", active="xray", tab=tab, store=store, xs=xray.xray_status(),
-                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5], **ctx)
+                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:5],
+                **ctx, **_cores_scope_ctx(request))
 
 
 @app.post("/xray/settings")
@@ -5353,8 +5413,12 @@ async def xray_settings_save(request: Request):
             return go(f"/xray?tab={section}")
     if section != "geo_custom":
         # apply_config always runs xray -test + live restart check; rejects/rolls back on failure
-        xr = _apply_xray(_load_store(), xray_only=True)
-        flash(request, *_ok_msg("Настройки Xray применены", xr))
+        # In core-edit mode only the core profile is updated — master Xray stays intact.
+        xr = _apply_xray_after_config(xray_only=True)
+        if xr.get("skipped_core_edit"):
+            flash(request, "Настройки сохранены в ядро (Xray мастера / схема не тронуты)", "info")
+        else:
+            flash(request, *_ok_msg("Настройки Xray применены", xr))
     else:
         flash(request, "Сохранено", "info")
     return go(f"/xray?tab={section}")
@@ -7661,10 +7725,55 @@ def cores_page(request: Request):
     )
 
 
+CORE_EDITOR_TABS = (
+    ("general", "Основные"),
+    ("inbounds", "Входящие"),
+    ("outbounds", "Исходящие"),
+    ("routing", "Маршрутизация"),
+    ("balancers", "Балансировщики"),
+    ("dns", "DNS"),
+    ("advanced", "Дополнительно"),
+)
+
+
+def _core_section_path(section: str) -> str:
+    return {
+        "inbounds": "/inbounds",
+        "outbounds": "/outbounds",
+        "routing": "/routing",
+        "balancers": "/balancers",
+        "dns": "/xray?tab=dns",
+        "advanced": "/xray?tab=template",
+    }.get(section, "")
+
+
 @app.get("/cores/{core_id}", response_class=HTMLResponse)
 def core_edit_page(core_id: str, request: Request):
     if redir := _require(request):
         return redir
+    tab = str(request.query_params.get("tab") or "general").strip().lower()
+    if tab not in {t[0] for t in CORE_EDITOR_TABS}:
+        tab = "general"
+    # PasarGuard: section tabs open the network editors scoped to this core
+    if tab in ("inbounds", "outbounds", "routing", "balancers", "dns", "advanced"):
+        with mutate(edit_core_id="") as store:
+            core = cores_mod.core_by_id(store, core_id)
+        if not core:
+            flash(request, "Ядро не найдено", "error")
+            return go("/cores")
+        if core.get("inherit_master"):
+            flash(
+                request,
+                f"«{core.get('name')}» наследует мастер — сначала сохраните снимок (снимите «наследует»), "
+                f"чтобы править {tab}",
+                "error",
+            )
+            return go(f"/cores/{core_id}?tab=general")
+        request.session[cores_mod.EDIT_CORE_SESSION] = core_id
+        dest = _core_section_path(tab)
+        flash(request, f"Ядро «{core.get('name')}»: редактирование — {tab}", "info")
+        return go(dest or f"/cores/{core_id}")
+
     with mutate(edit_core_id="") as store:
         cores_mod.ensure_cores(store)
     store = _load_store()
@@ -7673,6 +7782,11 @@ def core_edit_page(core_id: str, request: Request):
         flash(request, "Ядро не найдено", "error")
         return go("/cores")
     usage = cores_mod.cores_usage(store).get(core_id, 0)
+    # Preview slices (live master if inherit)
+    view = store if core.get("inherit_master") else cores_mod.store_view_for_core_edit(store, core_id)
+    bals = view.get("balancers") or {}
+    if not isinstance(bals, dict):
+        bals = {}
     return page(
         request, "core_edit.html", active="nodes",
         core=core,
@@ -7684,7 +7798,47 @@ def core_edit_page(core_id: str, request: Request):
         is_master=nodes_mod.is_master(store),
         nodes_tab="cores",
         editing=str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "") == core_id,
+        core_tab=tab,
+        core_tabs=CORE_EDITOR_TABS,
+        preview_inbounds=list(view.get("inbounds") or []),
+        preview_outbounds=list(view.get("outbounds_custom") or []),
+        preview_routes=list(view.get("routes") or []),
+        preview_balancers=bals,
+        preview_dns=view.get("dns") or {},
     )
+
+
+@app.post("/cores/scope")
+async def cores_scope(request: Request):
+    """Switch PasarGuard-style core scope for network pages (or back to master)."""
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    cid = str(form.get("core_id") or "").strip()
+    nxt = str(form.get("next") or "/outbounds").strip() or "/outbounds"
+    if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
+        nxt = "/outbounds"
+    if not cid:
+        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        flash(request, "Контекст: мастер (live) — схема трафика / Xray панели", "info")
+        return go(nxt)
+    with mutate(edit_core_id="") as store:
+        core = cores_mod.core_by_id(store, cid)
+    if not core:
+        flash(request, "Ядро не найдено", "error")
+        return go(nxt)
+    if core.get("inherit_master"):
+        request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
+        flash(
+            request,
+            f"«{core.get('name')}» наследует мастер — правите мастер (live). "
+            f"Для своего профиля: Ядра → снимите «наследует».",
+            "info",
+        )
+        return go(nxt)
+    request.session[cores_mod.EDIT_CORE_SESSION] = cid
+    flash(request, f"Контекст ядра «{core.get('name')}»: Outbounds / маршруты / балансировщики", "info")
+    return go(nxt)
 
 
 @app.post("/cores/add")

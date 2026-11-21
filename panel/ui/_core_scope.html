@@ -1,0 +1,27 @@
+{# PasarGuard-style core selector for Inbounds / Outbounds / Routing / Balancers / DNS #}
+{% if cores_list is defined and cores_list %}
+<div class="card" style="padding:.65rem 1rem;margin-bottom:.85rem">
+  <form method="post" action="{{ bp }}/cores/scope" class="row" style="align-items:end;gap:.75rem;flex-wrap:wrap;margin:0">
+    <input type="hidden" name="next" value="{{ cur_path }}">
+    <div style="min-width:14rem;flex:1">
+      <label class="f">Конфигурация ядра</label>
+      <select name="core_id" onchange="this.form.submit()">
+        <option value="" {% if core_scope_master %}selected{% endif %}>Мастер (live) — схема трафика</option>
+        {% for c in cores_list %}
+        <option value="{{ c.id }}" {% if active_core_id == c.id %}selected{% endif %}>
+          {{ c.name }}{% if c.inherit_master %} · наследует{% endif %}{% if c.is_default %} · default{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="hint" style="margin:0;flex:2;min-width:12rem">
+      {% if core_scope_master %}
+      Сейчас правите <b>мастер</b> (используется в «Схеме трафика» и Xray панели).
+      {% else %}
+      Сейчас правите ядро <b>{{ active_core_name }}</b> — Sync на ноды; Xray мастера не меняется.
+      <a href="{{ bp }}/cores/{{ active_core_id }}">настройки ядра</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+{% endif %}

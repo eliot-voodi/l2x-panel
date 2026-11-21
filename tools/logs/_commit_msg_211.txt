@@ -1,0 +1,4 @@
+v2.1.1: Core-scoped outbounds/routing/balancers; keep traffic schema on master.
+
+PasarGuard-style core editor tabs and network-page core selector. Config
+edits in core mode skip master Xray apply so schema stays intact.

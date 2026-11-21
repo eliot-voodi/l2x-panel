@@ -54,6 +54,7 @@
 </style>
 {% endblock %}
 {% block content %}
+{% include "_core_scope.html" %}
 {% if xtest is defined and xtest %}
   {% if xtest.ok %}
   <div class="card" style="border-color:var(--ok);background:var(--ok-soft);padding:.7rem 1rem;margin-bottom:.85rem">

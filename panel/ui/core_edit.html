@@ -3,14 +3,13 @@
 {% import "_icons.html" as ic %}
 {% block title %}Ядро · {{ core.name }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ core.name }}{% endblock %}
-{% block page_sub %}Настройки ядра как в PasarGuard: exclude / fallbacks / config / policy{% endblock %}
+{% block page_sub %}Редактор ядра (PasarGuard): входящие, исходящие, маршруты, балансировщики{% endblock %}
 {% block top_actions %}
 <a class="btn ghost" href="{{ bp }}/cores">← Ядра</a>
-{% if not core.inherit_master %}
-<form method="post" action="{{ bp }}/cores/{{ core.id }}/edit-mode" style="display:inline">
-  <button class="btn">{% if editing %}Продолжить правку{% else %}Править срезы{% endif %}</button>
+<form method="post" action="{{ bp }}/cores/{{ core.id }}/sync-nodes" style="display:inline"
+      onsubmit="return confirm('Sync всех нод с этим ядром?')">
+  <button class="btn" {% if not usage %}disabled{% endif %}>Sync ноды ({{ usage }})</button>
 </form>
-{% endif %}
 {% endblock %}
 {% block content %}
 
@@ -22,6 +21,14 @@
 {% if not is_master %}
 <div class="card"><div class="badge warn">Только на master</div></div>
 {% else %}
+
+{# PasarGuard core-editor section nav #}
+<div class="tabs">
+  {% for key, label in core_tabs %}
+  <a href="{{ bp }}/cores/{{ core.id }}{% if key != 'general' %}?tab={{ key }}{% endif %}"
+     class="{% if core_tab == key or (key == 'general' and not core_tab) %}active{% endif %}">{{ label }}</a>
+  {% endfor %}
+</div>
 
 <div class="card">
   <div class="flex between" style="flex-wrap:wrap;gap:.75rem;align-items:center">
@@ -38,54 +45,93 @@
             onsubmit="return confirm('Перезаписать срезы ядра с мастера?')">
         <button class="btn ghost sm">С мастера</button>
       </form>
-      <form method="post" action="{{ bp }}/cores/{{ core.id }}/sync-nodes"
-            onsubmit="return confirm('Sync всех нод с этим ядром?')">
-        <button class="btn sm" {% if not usage %}disabled{% endif %}>Sync ноды ({{ usage }})</button>
-      </form>
     </div>
   </div>
-  <div class="row mt small" style="gap:1rem;flex-wrap:wrap">
-    <span class="badge">in {{ summary.inbounds }}</span>
-    <span class="badge">out {{ summary.outbounds }}</span>
-    <span class="badge">rt {{ summary.routes }}</span>
-    <span class="badge">bal {{ summary.balancers }}</span>
-    {% if summary.exclude %}<span class="badge warn">exclude {{ summary.exclude }}</span>{% endif %}
-    {% if summary.fallbacks %}<span class="badge">fallback {{ summary.fallbacks }}</span>{% endif %}
+  <div class="hint mt">
+    Вкладки <b>Исходящие / Маршрутизация / Балансировщики</b> открывают редактор в контексте этого ядра
+    (как core-editor в PasarGuard). «Схема трафика» всегда считает <b>мастер (live)</b>.
+  </div>
+</div>
+
+{# —— Preview panels (general tab) —— #}
+<div class="grid g2">
+  <div class="card">
+    <div class="card-head"><h3>Исходящие</h3>
+      <a class="btn ghost sm" href="{{ bp }}/cores/{{ core.id }}?tab=outbounds">Открыть</a>
+    </div>
+    {% if preview_outbounds %}
+    <table><thead><tr><th>Tag</th><th>Протокол</th></tr></thead><tbody>
+      {% for o in preview_outbounds[:12] %}
+      <tr><td class="mono">{{ o.tag }}</td><td class="small">{{ (o.config or {}).protocol or o.kind or '—' }}</td></tr>
+      {% endfor %}
+    </tbody></table>
+    {% if preview_outbounds|length > 12 %}<div class="dim small">… ещё {{ preview_outbounds|length - 12 }}</div>{% endif %}
+    {% else %}<div class="empty">Нет outbounds</div>{% endif %}
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Маршрутизация</h3>
+      <a class="btn ghost sm" href="{{ bp }}/cores/{{ core.id }}?tab=routing">Открыть</a>
+    </div>
+    {% if preview_routes %}
+    <table><thead><tr><th>Правило</th><th>→</th></tr></thead><tbody>
+      {% for r in preview_routes[:12] %}
+      <tr><td>{{ r.name }}</td><td class="mono small">{{ r.outbound or 'direct' }}</td></tr>
+      {% endfor %}
+    </tbody></table>
+    {% else %}<div class="empty">Нет правил</div>{% endif %}
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Балансировщики</h3>
+      <a class="btn ghost sm" href="{{ bp }}/cores/{{ core.id }}?tab=balancers">Открыть</a>
+    </div>
+    {% if preview_balancers %}
+    <table><thead><tr><th>Key</th><th>Tag</th><th></th></tr></thead><tbody>
+      {% for k, b in preview_balancers.items() %}
+      <tr>
+        <td class="mono">{{ k }}</td>
+        <td class="mono small">{{ b.tag or k }}</td>
+        <td>{% if b.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody></table>
+    {% else %}<div class="empty">Нет балансировщиков</div>{% endif %}
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Входящие</h3>
+      <a class="btn ghost sm" href="{{ bp }}/cores/{{ core.id }}?tab=inbounds">Открыть</a>
+    </div>
+    {% if preview_inbounds %}
+    <table><thead><tr><th>Tag</th><th>Port</th></tr></thead><tbody>
+      {% for i in preview_inbounds[:12] %}
+      <tr><td class="mono">{{ i.tag }}</td><td>{{ i.port or '—' }}</td></tr>
+      {% endfor %}
+    </tbody></table>
+    {% else %}<div class="empty">Нет inbounds</div>{% endif %}
   </div>
 </div>
 
 <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/save" style="max-width:920px">
   <input type="hidden" name="stay" value="1">
-  <h3>Основные</h3>
+  <h3>Основные (CoreConfig)</h3>
   <div class="row">
     <div style="flex:2"><label class="f">Название</label><input name="name" value="{{ core.name }}" required></div>
     <div style="flex:2"><label class="f">Комментарий</label><input name="remark" value="{{ core.remark or '' }}"></div>
     <div>
       <label class="f">Тип ядра</label>
-      <select name="engine">
-        <option value="xray" selected>Xray</option>
-      </select>
+      <select name="engine"><option value="xray" selected>Xray</option></select>
     </div>
   </div>
   <div class="mt">
-    {{ m.check('inherit_master', core.inherit_master, 'Наследует мастер (Sync = живые Inbounds/Outbounds/маршруты мастера)') }}
+    {{ m.check('inherit_master', core.inherit_master, 'Наследует мастер (live). Снимите, чтобы править Outbounds/маршруты/балансировщики отдельно.') }}
   </div>
-  <div class="hint">Как в PasarGuard: у ноды выбирается ядро; конфиг ядра уходит на ноду при Sync / start.</div>
 
-  <h3 class="mt">Исключённые inbound (exclude_inbound_tags)</h3>
-  <div class="hint">Теги, которые <b>не</b> управляются и <b>не</b> пушатся на ноду (аналог XRAY_EXCLUDE_INBOUND_TAGS).</div>
+  <h3 class="mt">exclude_inbound_tags</h3>
   <textarea name="exclude_inbound_tags" class="mono" rows="2" placeholder="INBOUND_X INBOUND_Y">{{ (core.exclude_inbound_tags or [])|join(' ') }}</textarea>
-  {% if inbound_tags %}
-  <div class="dim small mt">Известные теги:
-    {% for t in inbound_tags %}<code>{{ t }}</code>{% if not loop.last %} {% endif %}{% endfor %}
-  </div>
-  {% endif %}
 
-  <h3 class="mt">Fallback inbound (fallbacks_inbound_tags)</h3>
-  <div class="hint">Теги inbound с массивом fallbacks (аналог XRAY_FALLBACKS_INBOUND_TAG).</div>
+  <h3 class="mt">fallbacks_inbound_tags</h3>
   <textarea name="fallbacks_inbound_tags" class="mono" rows="2" placeholder="VLESS-FALLBACK">{{ (core.fallbacks_inbound_tags or [])|join(' ') }}</textarea>
 
-  <h3 class="mt">Policy / логи (как в документации ядра)</h3>
+  <h3 class="mt">Policy / логи</h3>
   <div class="row">
     <div>
       <label class="f">loglevel</label>
@@ -98,27 +144,24 @@
     </div>
   </div>
   <div class="mt">
-    {{ m.check('stats_user_online', (core.xray_settings or {}).get('stats_user_online', True), 'statsUserOnline — онлайн IP пользователей (policy.levels.0)') }}
+    {{ m.check('stats_user_online', (core.xray_settings or {}).get('stats_user_online', True), 'statsUserOnline') }}
     {{ m.check('access_log', (core.xray_settings or {}).access_log, 'Access log') }}
     {{ m.check('dns_log', (core.xray_settings or {}).dns_log, 'DNS log') }}
   </div>
 
-  <h3 class="mt">Config JSON overlay (PasarGuard <code>config</code>)</h3>
-  <div class="hint">Доп. JSON Xray, мержится в итоговый конфиг (template_patch). Пустой <code>{}</code> — без overlay.
-    Валидация тегов/портов/Reality как в <a href="https://docs.pasarguard.org/ru/panel/core/" target="_blank" rel="noopener">доке PasarGuard</a>.</div>
-  <textarea name="config_json" class="mono" rows="14" style="font-size:.78rem;width:100%">{{ config_json }}</textarea>
-
+  <h3 class="mt">config JSON overlay</h3>
+  <textarea name="config_json" class="mono" rows="12" style="font-size:.78rem;width:100%">{{ config_json }}</textarea>
   <div class="actions mt"><button class="btn">Сохранить</button></div>
 </form>
 
 <div class="actions" style="flex-wrap:wrap;margin:.5rem 0 1.2rem;gap:.5rem">
   {% if not summary.is_default %}
   <form method="post" action="{{ bp }}/cores/{{ core.id }}/default"
-        onsubmit="return confirm('Сделать ядром по умолчанию для новых нод?')">
+        onsubmit="return confirm('Сделать ядром по умолчанию?')">
     <button class="btn ghost">Сделать default</button>
   </form>
   <form method="post" action="{{ bp }}/cores/{{ core.id }}/delete"
-        onsubmit="return confirm('Удалить ядро? Ноды перейдут на default.')">
+        onsubmit="return confirm('Удалить ядро?')">
     <button class="btn danger">Удалить</button>
   </form>
   {% endif %}
@@ -134,14 +177,5 @@
   </ul>
 </div>
 {% endif %}
-
-<details class="card">
-  <summary style="cursor:pointer"><b>Как править Inbounds / Outbounds / Маршруты</b></summary>
-  <div class="hint mt">
-    1. Снимите «Наследует мастер» и сохраните (или «С мастера» → снимок).<br>
-    2. Нажмите <b>Править срезы</b> — откроются Inbounds/Outbounds/… в контексте этого ядра.<br>
-    3. После правок — <b>Sync ноды</b> или Sync в карточке ноды.
-  </div>
-</details>
 {% endif %}
 {% endblock %}

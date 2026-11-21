@@ -2,7 +2,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}{{ t('Схема трафика') }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ t('Схема') }}{% endblock %}
-{% block page_sub %}устройство → протокол → фильтр → правила → выход{% endblock %}
+{% block page_sub %}устройство → протокол → фильтр → правила → выход · всегда мастер (live){% endblock %}
 {% block top_actions %}
   <div class="seg" id="view-seg">
     <a href="#" data-view="schema" class="active">Схема</a>
@@ -148,6 +148,7 @@
         Выходы: работают {{ schema.stats.exits_up }} из {{ schema.stats.exits_total }}
       </span>
       <span class="sch-hint">На схеме — только выбранный клиент и фактический путь к назначению. Перетаскивайте узлы, колёсико — масштаб, пустое место — панорама.</span>
+      <span class="badge" title="Схема всегда по live-конфигу мастера; ядра нод сюда не подмешиваются">мастер live</span>
     </div>
 
     <div class="sch-board" id="sch-board">

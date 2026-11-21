@@ -15,6 +15,7 @@
 </div>
 {% endblock %}
 {% block content %}
+{% include "_core_scope.html" %}
 <div class="tabs">
   {% for k, l in [('general', 'Общие'), ('dns', 'DNS'), ('reverse', 'Reverse'), ('template', t('Шаблон')), ('geo', 'Geo'), ('core', t('Ядро'))] %}
   <a href="?tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>

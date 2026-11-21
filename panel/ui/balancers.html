@@ -6,6 +6,7 @@
 {% block page_sub %}Пинг / нагрузка / Direct-пул в подписке · watchdog каждые {{ watchdog_sec }} с{% endblock %}
 {% block top_actions %}<form method="post" action="{{ bp }}/xray/apply"><button class="btn ghost">{{ ic.icon('refresh') }}{{ t('Применить') }} Xray</button></form>{% endblock %}
 {% block content %}
+{% include "_core_scope.html" %}
 <div class="grid g2">
 {% for key, b in balancers.items() %}
   {% set act = active_members.get(key) or [] %}
