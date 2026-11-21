@@ -1647,7 +1647,14 @@ def client_inbounds(store: dict, client: dict) -> list[dict]:
     capable = client_capable_inbounds(store)
     if not wanted:
         return capable
-    return [i for i in capable if i["tag"] in wanted]
+    # Case-insensitive: UI / legacy data may store BUHAREST vs Buharest
+    want = {str(t).strip().lower() for t in wanted if str(t).strip()}
+    return [i for i in capable if str(i.get("tag") or "").strip().lower() in want]
+
+
+def client_inbound_tags(store: dict, client: dict) -> set[str]:
+    """Lowercased inbound tags assigned to the client (for build_config matching)."""
+    return {str(i.get("tag") or "").strip().lower() for i in client_inbounds(store, client) if i.get("tag")}
 
 
 # ---------------------------------------------------------------- client groups
@@ -2899,12 +2906,16 @@ def build_config(store: dict) -> dict:
     active_clients = [c for c in clients if client_access_ok(c)]
 
     inbounds: list[dict] = []
+    # Match by tag (case-insensitive), not object identity — core views / agent
+    # copies are different dicts with the same tag.
+    client_ib_tags = {id(c): client_inbound_tags(store, c) for c in active_clients}
     for ib in inbounds_model:
         if not inbound_access_ok(ib):
             continue
+        ib_tag_l = str(ib.get("tag") or "").strip().lower()
         identities: list[dict] = []
         for c in active_clients:
-            if ib in client_inbounds(store, c):
+            if ib_tag_l and ib_tag_l in client_ib_tags.get(id(c), set()):
                 identities.extend(client_identities(store, c, ib))
         built = P.build_inbound(ib, identities)
         # Panel routes (domain / protocol / ads / geo) need sniffing every time —

@@ -3516,8 +3516,17 @@ def _client_form(form, store: dict, client: dict) -> str | None:
     if client["doh_in_tunnel"] and not client["doh_enabled"]:
         client["doh_enabled"] = True
     client["group_id"] = gid
-    known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
-    sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
+    # Map selected tags onto real inbound tags (preserve canonical casing).
+    known_ib_map = {
+        str(i["tag"]).strip().lower(): str(i["tag"])
+        for i in xray.client_capable_inbounds(store)
+        if i.get("tag")
+    }
+    sel_ib = []
+    for raw in form.getlist("inbounds"):
+        key = str(raw or "").strip().lower()
+        if key in known_ib_map and known_ib_map[key] not in sel_ib:
+            sel_ib.append(known_ib_map[key])
     ib_mode = str(form.get("ib_mode") or "all").strip().lower()
     if ib_mode not in ("all", "select"):
         ib_mode = "all"
@@ -4049,8 +4058,16 @@ def _group_form(form, store: dict, group: dict) -> str | None:
     group["select_mode"] = "all"
     group["allowed_tags"] = []
     group["outbound"] = ""
-    known_ib = {i["tag"] for i in xray.client_capable_inbounds(store)}
-    sel_ib = [str(x) for x in form.getlist("inbounds") if str(x) in known_ib]
+    known_ib_map = {
+        str(i["tag"]).strip().lower(): str(i["tag"])
+        for i in xray.client_capable_inbounds(store)
+        if i.get("tag")
+    }
+    sel_ib = []
+    for raw in form.getlist("inbounds"):
+        key = str(raw or "").strip().lower()
+        if key in known_ib_map and known_ib_map[key] not in sel_ib:
+            sel_ib.append(known_ib_map[key])
     ib_mode = str(form.get("ib_mode") or "all").strip().lower()
     if ib_mode not in ("all", "select"):
         ib_mode = "all"

@@ -2269,6 +2269,14 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             master_url = f"https://{pub}/{bp}" if bp else f"https://{pub}"
     except Exception:
         pass
+    # Groups are required on the agent to resolve client inbound assignments
+    # (otherwise personal lists / missing group_id yield empty Xray clients).
+    try:
+        import xray_runtime as _xray_g
+        groups_out = list(_xray_g.ensure_groups(store) or [])
+    except Exception:
+        groups_out = list(store.get("groups") or [])
+
     out = {
         "mirror": mirror,
         "nat": nat,
@@ -2278,6 +2286,7 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         # Former masters accept this push as demotion→agent (no SSH reinstall).
         "demote_to_agent": True,
         "clients": (clients if (node.get("sync_clients", True) or dc) and not nat else []) + bridge_clients,
+        "groups": groups_out if (node.get("sync_clients", True) or dc) and not nat else [],
         "inbounds": inbounds if node.get("sync_inbounds", True) or bridge_on or dc else [],
         "outbounds_custom": customs,
         "routes": routes,
@@ -3029,6 +3038,8 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
 def apply_agent_payload(store: dict, payload: dict, apply_config) -> dict:
     if payload.get("clients") is not None:
         store["clients"] = payload["clients"]
+    if payload.get("groups") is not None:
+        store["groups"] = payload["groups"]
     if payload.get("inbounds") is not None:
         inbounds = payload["inbounds"]
         # Safety: force inbound domains to this agent's public host (master may still send its own)
