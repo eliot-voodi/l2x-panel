@@ -2422,6 +2422,72 @@ def _apply_cosmetic_path(store: dict, client: dict, ib: dict, ep: dict) -> None:
     ep["path"] = f"{cosmetic}?{query}" if sep and query else cosmetic
 
 
+def _core_id_for_inbound(store: dict, ib: dict) -> str:
+    """Core id that owns this inbound (from ``_core_id`` marker or tag match)."""
+    cid = str(ib.get("_core_id") or "").strip()
+    if cid:
+        return cid
+    tag = str(ib.get("tag") or "").strip()
+    if not tag:
+        return ""
+    try:
+        import cores as cores_mod
+        for core in cores_mod.ensure_cores(store) or []:
+            if not isinstance(core, dict) or core.get("inherit_master"):
+                continue
+            for raw in core.get("inbounds") or []:
+                if isinstance(raw, dict) and str(raw.get("tag") or "") == tag:
+                    return str(core.get("id") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str]) -> tuple[str, dict | None]:
+    """If inbound belongs to a Direct node's core, return (node_domain, remapped_ib).
+
+    Subscription must dial the node (e.g. ``buh.ro0t.dev``), not the panel host
+    (``web.ro0t.dev``). Bridge/tunnel nodes keep the master domain.
+    """
+    try:
+        import nodes as nodes_mod
+    except Exception:
+        return "", None
+    # Explicit share_host that is already a non-master domain wins.
+    try:
+        import front as front_mod
+        explicit = front_mod.normalize_host(ib.get("share_host") or "")
+    except Exception:
+        explicit = str(ib.get("share_host") or "").strip().lower()
+    if explicit and explicit not in master_hosts:
+        return explicit, None
+
+    cid = _core_id_for_inbound(store, ib)
+    if not cid:
+        return "", None
+    best = None
+    for node in nodes_mod.ensure_list(store):
+        if str(node.get("core_id") or "").strip() != cid:
+            continue
+        if not nodes_mod.uses_direct_connect(node):
+            continue
+        dom = nodes_mod.node_public_domain(node) or ""
+        if not dom:
+            continue
+        best = (dom, node)
+        break
+    if not best:
+        return "", None
+    dom, _node = best
+    try:
+        remapped = nodes_mod.remap_inbounds_for_host(
+            [ib], new_host=dom, old_hosts=master_hosts,
+        )
+        return dom, (remapped[0] if remapped else None)
+    except Exception:
+        return dom, None
+
+
 def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
     if not client_access_ok(client):
         return []
@@ -2444,6 +2510,8 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
     # Several identities from one inbound (or several inbounds) → append outbound label
     multi_idents = multi or any(len(client_identities(store, client, i)) > 1 for i in ibs)
     for ib in ibs:
+        core_host, core_ib = _direct_node_host_for_inbound(store, ib, master_hosts)
+        ib_base = core_ib or ib
         for ident in client_identities(store, client, ib):
             if ident["main"]:
                 ob = client_default_outbound(store, client)
@@ -2493,19 +2561,19 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 )
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
                 ident_use = ident
-            ib_use = ib
-            host_use = host
+            ib_use = ib_base
+            host_use = core_host or host
             if dc_host:
                 host_use = dc_host
                 try:
                     import nodes as nodes_mod
                     remapped = nodes_mod.remap_inbounds_for_host(
-                        [ib], new_host=dc_host, old_hosts=master_hosts,
+                        [ib_base], new_host=dc_host, old_hosts=master_hosts,
                     )
                     if remapped:
                         ib_use = remapped[0]
                 except Exception:
-                    ib_use = ib
+                    ib_use = ib_base
             ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
             if ep:
                 _apply_cosmetic_path(store, client, ib_use, ep)
