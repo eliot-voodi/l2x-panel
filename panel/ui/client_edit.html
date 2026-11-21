@@ -161,10 +161,13 @@
       <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
       <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
     </div>
-    <div class="hint mb0">Здесь только <b>точки входа этой панели</b> (куда клиент стучится на этот хост). Ноду <b>+Direct</b> сюда назначать не нужно — см. блок «Подключения в подписке» ниже. Inbound «Direct → master egress» — служебный для агентов, не для пользователей.</div>
+    <div class="hint mb0">Точки входа: мастер + уникальные tag из снимков <b>Ядер</b>. Ноду <b>+Direct</b> сюда назначать не нужно — см. «Подключения в подписке». Inbound «Direct → master egress» — служебный.</div>
     {% for ib in inbounds %}
       <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if group %}{% if ib_mode == 'select' and ib.tag in (c.inbounds or []) %}checked{% endif %}{% else %}{% if ib_mode == 'all' or ib.tag in (c.inbounds or []) %}checked{% endif %}{% endif %}>
-        <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }} <span class="dim small">:{{ ib.port }}</span></label><br>
+        <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }}
+        <span class="dim small">:{{ ib.port }}</span>
+        {% if ib._from_core %}<span class="badge warn">ядро: {{ ib._from_core }}</span>{% endif %}
+      </label><br>
     {% else %}<div class="dim">Нет inbounds для клиентов</div>{% endfor %}
     {% if group %}<div class="hint">По умолчанию — inbounds группы. «Дописать» добавляет личные поверх группы. «Снять все» — снова только группа.</div>{% endif %}
   </div>

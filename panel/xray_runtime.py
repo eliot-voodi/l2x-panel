@@ -1569,12 +1569,57 @@ def inbound_access_ok(ib: dict) -> bool:
     return True
 
 
+def _is_client_capable_inbound(ib: dict) -> bool:
+    if not isinstance(ib, dict) or ib.get("_system"):
+        return False
+    tag = str(ib.get("tag") or "").strip()
+    if not tag:
+        return False
+    return ib.get("protocol") in P.USER_PROTOCOLS + ("wireguard", "socks", "http")
+
+
 def client_capable_inbounds(store: dict) -> list[dict]:
-    return [
-        i for i in ensure_inbounds(store)
-        if i["protocol"] in P.USER_PROTOCOLS + ("wireguard", "socks", "http")
-        and not i.get("_system")
-    ]
+    """Inbounds assignable to clients/groups.
+
+    Master live list first (same object refs — needed by ``build_config`` identity
+    checks), then unique tags from non-inherit core snapshots so groups can assign
+    inbounds that exist only on node cores.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i in ensure_inbounds(store):
+        if not _is_client_capable_inbound(i):
+            continue
+        tag = str(i.get("tag") or "")
+        if tag in seen:
+            continue
+        seen.add(tag)
+        out.append(i)
+    try:
+        import cores as cores_mod
+        for core in cores_mod.ensure_cores(store) or []:
+            if not isinstance(core, dict) or core.get("inherit_master"):
+                continue
+            cname = str(core.get("name") or core.get("id") or "core")
+            cid = str(core.get("id") or "")
+            for raw in cores_mod.apply_exclude_inbounds(list(core.get("inbounds") or []), core):
+                if not _is_client_capable_inbound(raw):
+                    continue
+                tag = str(raw.get("tag") or "")
+                if tag in seen:
+                    continue
+                seen.add(tag)
+                ib = copy.deepcopy(raw)
+                try:
+                    P.ensure_inbound_shape(ib)
+                except Exception:
+                    pass
+                ib["_from_core"] = cname
+                ib["_core_id"] = cid
+                out.append(ib)
+    except Exception:
+        pass
+    return out
 
 
 def client_inbounds(store: dict, client: dict) -> list[dict]:
