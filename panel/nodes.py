@@ -3695,8 +3695,25 @@ def remap_inbounds_for_host(
         if not isinstance(stream, dict):
             continue
         tls = stream.get("tls")
-        if isinstance(tls, dict) and tls.get("server_name"):
-            tls["server_name"] = _swap(str(tls.get("server_name") or ""))
+        if isinstance(tls, dict):
+            if tls.get("server_name"):
+                tls["server_name"] = _swap(str(tls.get("server_name") or ""))
+            # Absolute cert paths often embed the master domain
+            # (/etc/l2xpanel/certs/msk.ro0t.dev.crt) — rewrite for the node or nginx -t fails.
+            for ckey in ("cert_file", "key_file"):
+                cpath = str(tls.get(ckey) or "")
+                if not cpath:
+                    continue
+                new_path = cpath
+                for oh in old:
+                    if oh and oh in new_path:
+                        new_path = new_path.replace(oh, new_host)
+                # Still references a foreign host → drop so cert_for(share_host) fills local files
+                if any(h and h != new_host and h in new_path for h in old):
+                    new_path = ""
+                tls[ckey] = new_path
+            if not tls.get("cert_file"):
+                tls["key_file"] = ""
         reality = stream.get("reality")
         if isinstance(reality, dict):
             names = reality.get("server_names")
