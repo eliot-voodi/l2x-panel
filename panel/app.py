@@ -9463,7 +9463,7 @@ def _node_push_job(
                 ),
             }
         if clients_only:
-            payload = nodes_mod.build_clients_sync_payload(store, node, xray.build_config)
+            payload = nodes_mod.build_clients_sync_payload(store, node)
         else:
             payload = nodes_mod.build_payload(store, node, xray.build_config)
         node_snap = dict(node)
@@ -9473,6 +9473,28 @@ def _node_push_job(
         is_mirror = bool(node.get("mirror"))
     # Network I/O must not hold mutate()/STORE_LOCK
     push_timeout = int(timeout) if timeout is not None else 120
+    # User changes → dedicated /agent/clients API (no full sync)
+    if clients_only:
+        res = nodes_mod.push_clients(node_snap, payload, timeout=push_timeout)
+        with mutate() as store:
+            for n in nodes_mod.ensure_list(store):
+                if n.get("id") != node_id:
+                    continue
+                n["last_sync"] = nodes_mod.now_iso()
+                n["last_ok"] = bool(res.get("ok"))
+                n["last_error"] = "" if res.get("ok") else str(res.get("error") or "clients API fail")[:400]
+                if res.get("ok"):
+                    n["last_warning"] = ""
+                break
+        ok = bool(res.get("ok"))
+        log = f"{label}: clients API {'OK' if ok else res.get('error') or 'fail'}"
+        if not ok:
+            _tg_admin(
+                f"❌ Clients API <b>{tgbot.escape(name)}</b>: {tgbot.escape(str(res.get('error') or 'fail'))}\n"
+                f"<i>{tgbot.escape(label)}</i>",
+                flag="notify_nodes",
+            )
+        return {"ok": ok, "log": log, "error": "" if ok else str(res.get("error") or ""), "warnings": []}
     res = nodes_mod.push(node_snap, payload, master_host=host, timeout=push_timeout)
     warns = list(res.get("warnings") or [])
     # Master-side hint when DoH is on but this was a non-mirror push (settings not sent)
@@ -10877,6 +10899,79 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
     if hold_front_commit and res.get("_front_staged") is not None:
         out["_front_staged"] = res["_front_staged"]
     return out
+
+
+@app.post("/agent/clients")
+async def agent_clients(request: Request):
+    """Master → node: users only (limits/expiry/enable). No full sync / nginx.
+
+    Called automatically after any client change on the master.
+    """
+    store, err = _agent_auth(request)
+    if err:
+        return err
+    if nodes_mod.is_master(store):
+        return JSONResponse(
+            {"ok": False, "error": "master rejects /agent/clients (this host is master)"},
+            status_code=403,
+        )
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+
+    def _run() -> dict:
+        keep_tags: set[str] = set()
+        if payload.get("direct_connect"):
+            keep_tags.add(nodes_mod.MASTER_EGRESS_TAG)
+            dc_tag0 = str(payload.get("direct_connect_tag") or "").strip()
+            if dc_tag0:
+                keep_tags.add(dc_tag0)
+        mirror = bool(payload.get("mirror"))
+        with mutate() as st:
+            if payload.get("clients") is not None:
+                st["clients"] = (
+                    list(payload["clients"]) if mirror
+                    else nodes_mod._agent_safe_clients(
+                        payload["clients"],
+                        keep_tags=keep_tags,
+                        direct_self_tag=str(payload.get("direct_connect_tag") or "").strip()
+                        if payload.get("direct_connect") else "",
+                    )
+                )
+            if payload.get("groups") is not None:
+                st["groups"] = list(payload["groups"] or [])
+            ns = st.setdefault("settings", {}).setdefault("nodes", {})
+            if payload.get("direct_connect") is not None:
+                ns["direct_connect"] = bool(payload.get("direct_connect"))
+            dc_tag = str(payload.get("direct_connect_tag") or "").strip()
+            if dc_tag:
+                ns["direct_connect_tag"] = dc_tag
+            if payload.get("node_id"):
+                ns["upstream_node_id"] = str(payload.get("node_id"))
+            master_url = str(payload.get("master_url") or "").rstrip("/")
+            if master_url:
+                ns["upstream_master_url"] = master_url
+                ns["master_pull_url"] = master_url
+        # Hot user sync only — no nginx / full rebuild
+        res = _apply_xray(_load_store(), clients_only=True)
+        err_txt = res.get("error") or ""
+        try:
+            err_txt = xray.clean_xray_error(err_txt) or err_txt
+        except Exception:
+            pass
+        return {
+            "ok": bool(res.get("ok")),
+            "error": err_txt,
+            "clients_api": True,
+            "hot_clients": bool(res.get("hot_clients")),
+            "n_clients": len((_load_store().get("clients") or [])),
+        }
+
+    out = await run_in_threadpool(_run)
+    return JSONResponse(out, headers={"Connection": "close"})
 
 
 @app.post("/agent/apply")

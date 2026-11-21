@@ -2460,23 +2460,57 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     return out
 
 
-def build_clients_sync_payload(store: dict, node: dict, build_config) -> dict:
-    """Lightweight push: clients + groups only (limits/expiry/enable) for fast node sync.
+def build_clients_sync_payload(store: dict, node: dict, build_config=None) -> dict:
+    """Clients+groups only for ``POST /agent/clients`` — no full config sync.
 
-    Agent applies with HandlerService hot user sync — no full Xray/nginx rebuild.
+    Does not include inbounds/outbounds/routes/nginx — node hot-applies users only.
     """
-    full = build_payload(store, node, build_config)
+    dc = uses_direct_connect(node)
+    mirror = bool(node.get("mirror"))
+    nat = bool(node.get("nat"))
+    self_tag = node_outbound_tag(node)
+    keep_tags = {self_tag, MASTER_EGRESS_TAG} if dc else {MASTER_EGRESS_TAG}
+    if mirror:
+        clients = [dict(c) for c in (store.get("clients") or []) if isinstance(c, dict)]
+    else:
+        clients = _agent_safe_clients(
+            store.get("clients") or [],
+            keep_tags=keep_tags,
+            direct_self_tag=self_tag if dc else "",
+        )
+    bridge_clients: list[dict] = []
+    bridge_on = bool(node.get("as_outbound")) and not uses_reverse(node) and not uses_l2x_tunnel(node) and not nat
+    if bridge_on:
+        ensure_bridge(node)
+        bridge_clients = [{
+            "email": f"bridge@{slugify(node.get('name') or 'node')}",
+            "uuid": node["bridge_uuid"], "enabled": True, "inbounds": ["node-bridge"],
+            "outbound": "direct", "limit_gb": 0, "limit_ip": 0, "limit_hwid": 0,
+            "sub_enabled": False, "comment": "node bridge (auto)",
+        }]
+    try:
+        import xray_runtime as _xray_g
+        groups_out = list(_xray_g.ensure_groups(store) or [])
+    except Exception:
+        groups_out = list(store.get("groups") or [])
+    master_url = ""
+    try:
+        import front as front_mod
+        pub = _normalize_domain(front_mod.public_domain(store) or "")
+        if pub:
+            bp = str((((store.get("settings") or {}).get("panel") or {}).get("base_path") or "")).strip().strip("/")
+            master_url = f"https://{pub}/{bp}" if bp else f"https://{pub}"
+    except Exception:
+        pass
+    sync_users = (node.get("sync_clients", True) or dc) and not nat
     return {
-        "clients_only_sync": True,
-        "demote_to_agent": True,
-        "mirror": bool(full.get("mirror")),
-        "nat": bool(full.get("nat")),
-        "direct_connect": bool(full.get("direct_connect")),
-        "direct_connect_tag": str(full.get("direct_connect_tag") or ""),
-        "master_url": str(full.get("master_url") or ""),
-        "node_id": full.get("node_id"),
-        "clients": list(full.get("clients") or []),
-        "groups": list(full.get("groups") or []),
+        "clients": (clients if sync_users else []) + bridge_clients,
+        "groups": groups_out if sync_users else [],
+        "node_id": node.get("id"),
+        "direct_connect": dc,
+        "direct_connect_tag": self_tag if dc else "",
+        "mirror": mirror,
+        "master_url": master_url,
         "pushed_at": now_iso(),
     }
 
@@ -2498,8 +2532,78 @@ def agent_apply_url(node: dict) -> str:
     return agent_endpoint(node, "agent/apply")
 
 
+def agent_clients_url(node: dict) -> str:
+    """Lightweight users API — limits/expiry without full sync."""
+    return agent_endpoint(node, "agent/clients")
+
+
 def agent_update_url(node: dict) -> str:
     return agent_endpoint(node, "agent/update")
+
+
+def push_clients(node: dict, payload: dict, timeout: int = 8) -> dict:
+    """POST /agent/clients — users only, no full /agent/apply sync.
+
+    Falls back to ``/agent/apply`` with ``clients_only_sync`` if the node is on an
+    older build that does not yet expose ``/agent/clients`` (HTTP 404).
+    """
+    token = node.get("token") or ""
+    if not token:
+        return {"ok": False, "error": "нет token ноды"}
+    timeout = max(1, int(timeout or 8))
+    data = json.dumps(payload, ensure_ascii=False).encode()
+
+    def _post(url: str) -> dict:
+        if not url:
+            return {"ok": False, "error": "нет url ноды"}
+        req = urllib.request.Request(url, data=data, method="POST", headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "L2XPanel-ClientsSync/1.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = {"ok": resp.status < 300, "raw": body[:500]}
+                if not isinstance(parsed, dict):
+                    parsed = {"ok": False, "error": "bad response"}
+                ok = bool(parsed.get("ok", resp.status < 300))
+                if not ok and not parsed.get("error"):
+                    parsed["error"] = body[:300] or f"HTTP {resp.status}"
+                parsed["ok"] = ok
+                return parsed
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            try:
+                parsed = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            err = str((parsed or {}).get("error") or body or exc)
+            return {"ok": False, "error": err, "status": int(getattr(exc, "code", 0) or 0)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    res = _post(agent_clients_url(node))
+    if res.get("ok"):
+        return res
+    # Older agent / wrong upstream: reuse apply fast-path
+    if int(res.get("status") or 0) == 404 or "not found" in str(res.get("error") or "").lower():
+        fb = dict(payload)
+        fb["clients_only_sync"] = True
+        fb["demote_to_agent"] = True
+        data = json.dumps(fb, ensure_ascii=False).encode()
+        res2 = _post(agent_apply_url(node))
+        if res2.get("ok"):
+            res2["fallback_apply"] = True
+        return res2
+    return res
 
 
 def agent_manage_url(node: dict) -> str:
