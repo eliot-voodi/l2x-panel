@@ -2695,6 +2695,8 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
         return "Tag: латиница/цифры/._-"
     ib["tag"] = tag
     ib["remark"] = str(form.get("remark") or tag).strip()
+    cc = str(form.get("country") or "").strip().upper()
+    ib["country"] = cc if re.fullmatch(r"[A-Z]{2}", cc) else ""
     ib["enabled"] = form.get("enabled") == "1"
     ib["direct"] = form.get("direct") == "1"
     ib["listen"] = P.inbound_listen(ib)
@@ -9374,7 +9376,12 @@ def _agent_apply_payload(payload: dict, *, hold_front_commit: bool = False) -> d
         if payload.get("clients") is not None:
             st["clients"] = (
                 list(payload["clients"]) if mirror
-                else nodes_mod._agent_safe_clients(payload["clients"], keep_tags=keep_tags)
+                else nodes_mod._agent_safe_clients(
+                    payload["clients"],
+                    keep_tags=keep_tags,
+                    direct_self_tag=str(payload.get("direct_connect_tag") or "").strip()
+                    if payload.get("direct_connect") else "",
+                )
             )
         if payload.get("inbounds") is not None:
             inbounds = payload["inbounds"]

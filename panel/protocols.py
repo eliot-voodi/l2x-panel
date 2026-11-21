@@ -269,6 +269,7 @@ def default_inbound(protocol: str = "vless", port: int = 10443, tag: str = "vles
         "id": 0,
         "tag": tag,
         "remark": tag,
+        "country": "",  # ISO-3166 alpha-2 → flag emoji in subscription name
         "enabled": True,
         "listen": INBOUND_LISTEN,
         "port": port,

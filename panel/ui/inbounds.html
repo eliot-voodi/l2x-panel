@@ -83,7 +83,7 @@
     {% for ib in items %}
       <tr>
         <td><span class="dot {% if ib.enabled and ib.ok %}on{% endif %}" title="{{ 'включён' if ib.enabled else 'выключен' }}"></span></td>
-        <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit"><b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div>{% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}{% if ib.lint and ib.lint.errors %}<span class="badge err" title="{{ ib.lint.title }}">{{ ib.lint.errors }} err</span>{% elif ib.lint and ib.lint.warnings %}<span class="badge warn" title="{{ ib.lint.title }}">{{ ib.lint.warnings }} warn</span>{% endif %}</td>
+        <td><a href="{{ bp }}/inbounds/{{ ib.id }}/edit">{% if ib.country %}<span title="{{ ib.country }}">{{ flag_emoji(ib.country) }}</span> {% endif %}<b>{{ ib.remark or ib.tag }}</b></a><div class="dim small mono">{{ ib.tag }}</div>{% if P.is_max_speed_inbound(ib) %}<span class="badge ok">макс. скорость</span>{% endif %}{% if ib.lint and ib.lint.errors %}<span class="badge err" title="{{ ib.lint.title }}">{{ ib.lint.errors }} err</span>{% elif ib.lint and ib.lint.warnings %}<span class="badge warn" title="{{ ib.lint.title }}">{{ ib.lint.warnings }} warn</span>{% endif %}</td>
         <td><span class="badge accent">{{ ib.protocol }}</span></td>
         {% set fm = P.front_mode(ib) %}
         <td class="mono" title="{% if P.is_direct(ib) %}напрямую 0.0.0.0:{{ ib.port }} (без nginx){% elif fm %}nginx :443 → 127.0.0.1:{{ ib.port }}{% else %}только 127.0.0.1{% endif %}">{% if fm %}443 → {% endif %}{{ ib.port }}{% if P.is_direct(ib) %} <span class="badge warn">direct</span>{% endif %}{% if fm == 'http' and ib.share_host %}<div class="hint">{{ ib.share_host }}{{ P.front_http_path(ib) }}</div>{% endif %}</td>
@@ -126,7 +126,7 @@
         <button type="button" class="ib-row" onclick="toggleInbound(this)" aria-expanded="false">
           <span class="dot {% if ib.enabled and ib.ok %}on{% endif %}"></span>
           <span class="meta">
-            <b>{{ ib.remark or ib.tag }}</b>
+            <b>{% if ib.country %}{{ flag_emoji(ib.country) }} {% endif %}{{ ib.remark or ib.tag }}</b>
             <span class="dim small mono">{{ ib.tag }} · {{ ib.protocol }}{% if ib.protocol in P.USER_PROTOCOLS %} / {{ ib.stream.network }}{% endif %}</span>
           </span>
           {% if ib.lint and ib.lint.errors %}<span class="badge err" title="{{ ib.lint.title }}">err</span>{% elif ib.lint and ib.lint.warnings %}<span class="badge warn" title="{{ ib.lint.title }}">warn</span>{% elif P.is_max_speed_inbound(ib) %}<span class="badge ok">скорость</span>{% else %}<span class="badge accent">{{ ib.protocol }}</span>{% endif %}

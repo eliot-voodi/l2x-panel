@@ -275,6 +275,43 @@ def flag_emoji(code: str) -> str:
     return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
 
 
+def inbound_sub_label(ib: dict | None) -> str:
+    """Subscription profile name: optional country flag + inbound remark."""
+    if not isinstance(ib, dict):
+        return "inbound"
+    name = str(ib.get("remark") or ib.get("tag") or "inbound").strip() or "inbound"
+    cc = country_code(ib)
+    if cc:
+        return f"{flag_emoji(cc)} {name}"
+    return name
+
+
+def subscription_profile_remark(
+    store: dict,
+    client: dict,
+    ib: dict,
+    *,
+    outbound_tag: str = "",
+    outbound_label_text: str = "",
+    quota_suffix: str = "",
+    with_outbound: bool = False,
+) -> str:
+    """Build the `#remark` shown in client apps for a subscription link.
+
+    Primary name is always the inbound (custom remark + country flag).
+    Outbound/node label is appended only when needed to disambiguate.
+    """
+    base = inbound_sub_label(ib)
+    ob = str(outbound_tag or "").strip()
+    label = str(outbound_label_text or "").strip()
+    if with_outbound and ob and ob != "direct":
+        if not label:
+            label = outbound_label(store, ob)
+        if label:
+            base = f"{base} · {label}"
+    return f"{base}{quota_suffix or ''}"
+
+
 # ---------------------------------------------------------------- balancers
 
 BALANCER_LEAST_PING = "lb_least_ping"
@@ -1427,6 +1464,9 @@ def ensure_inbounds(store: dict) -> list[dict]:
     next_id = max([int(i.get("id") or 0) for i in inbounds] + [0]) + 1
     for ib in inbounds:
         P.ensure_inbound_shape(ib)
+        ib.setdefault("country", "")
+        cc = str(ib.get("country") or "").strip().upper()
+        ib["country"] = cc if re.fullmatch(r"[A-Z]{2}", cc) else ""
         if not ib.get("id"):
             ib["id"] = next_id
             next_id += 1
@@ -2081,8 +2121,16 @@ def selectable_outbound_tags(store: dict, *, include_system: bool = True) -> lis
         if b.get("enabled", True):
             out.append({"tag": b["tag"], "label": outbound_label(store, b["tag"]), "kind": "balancer"})
     for o in store.get("outbounds_custom") or []:
-        out.append({"tag": o["tag"], "label": outbound_label(store, o["tag"]), "kind": "custom",
-                    "status": custom_outbound_status(o)})
+        kind = "custom"
+        if o.get("kind") == "node" or str(o.get("tag") or "").startswith("node_"):
+            kind = "node"
+        status = custom_outbound_status(o)
+        if o.get("direct_connect") or o.get("kind") == "local_direct":
+            status = "Direct" if status in ("connected", "enabled", "", None) else status
+        out.append({
+            "tag": o["tag"], "label": outbound_label(store, o["tag"]), "kind": kind,
+            "status": status, "direct_connect": bool(o.get("direct_connect") or o.get("kind") == "local_direct"),
+        })
     return out
 
 
@@ -2192,6 +2240,20 @@ def client_identities(store: dict, client: dict, ib: dict) -> list[dict]:
         return [main]
     if ib["protocol"] in ("socks", "http"):
         return [main]
+    # Direct-connect primary: share link dials the node host with email~node_* UUID.
+    # Keep that identity in Xray even when subscription_entries skips the default tag.
+    default = client_default_outbound(store, client)
+    dc_host, _dc_node = _direct_connect_endpoint_host(store, default)
+    if dc_host and default and default != "direct":
+        ident_uuid = P.identity_uuid(client["uuid"], default)
+        main = {
+            "uuid": ident_uuid,
+            "email": f"{client['email']}~{default}",
+            "password": P.derived_password(ident_uuid),
+            "main": True,
+            "tag": default,
+            "label": outbound_label(store, default),
+        }
     out = [main]
     for e in subscription_entries(store, client):
         out.append({"uuid": e["uuid"], "email": e["email"], "password": e["password"], "main": False, "tag": e["tag"], "label": e["label"]})
@@ -2214,7 +2276,11 @@ def tag_quota_suffix(client: dict, tag: str) -> str:
 
 
 def _direct_connect_endpoint_host(store: dict, tag: str) -> tuple[str, dict | None]:
-    """If tag is a direct_connect node outbound, return (node_host, remapped_ib_helper_node)."""
+    """If tag is a direct_connect node outbound, return (node_host, remapped_ib_helper_node).
+
+    On a Direct agent the nodes registry is empty — fall back to
+    ``settings.nodes.direct_connect_tag`` + local public host.
+    """
     tag = str(tag or "").strip()
     if not tag:
         return "", None
@@ -2223,6 +2289,17 @@ def _direct_connect_endpoint_host(store: dict, tag: str) -> tuple[str, dict | No
         node = nodes_mod.node_by_outbound_tag(store, tag)
         if nodes_mod.uses_direct_connect(node):
             return nodes_mod.node_public_domain(node) or "", node
+        ns = (store.get("settings") or {}).get("nodes") or {}
+        if ns.get("direct_connect") and str(ns.get("direct_connect_tag") or "").strip() == tag:
+            host = ""
+            try:
+                import front as front_mod
+                host = front_mod.public_domain(store) or ""
+            except Exception:
+                host = ""
+            if not host:
+                host = str(((store.get("settings") or {}).get("panel") or {}).get("public_host") or "")
+            return str(host or "").strip(), None
     except Exception:
         pass
     return "", None
@@ -2260,8 +2337,9 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
     except Exception:
         master_hosts = set()
     pool_hidden = direct_pool_hidden_member_tags(store)
+    # Several identities from one inbound (or several inbounds) → append outbound label
+    multi_idents = multi or any(len(client_identities(store, client, i)) > 1 for i in ibs)
     for ib in ibs:
-        prefix = f"[{ib.get('remark') or ib['tag']}] " if multi else ""
         for ident in client_identities(store, client, ib):
             if ident["main"]:
                 ob = client_default_outbound(store, client)
@@ -2279,9 +2357,11 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                         # Keep balancer identity (email~lb_*) — node_* UUID is absent when
                         # the client is only allowed the balancer tag.
                         pool_label = balancer_display_label(store, bal_main)
-                        remark = (
-                            f"{prefix}{client['email']} · {pool_label}"
-                            f"{tag_quota_suffix(client, ob)}"
+                        remark = subscription_profile_remark(
+                            store, client, ib,
+                            outbound_tag=ob, outbound_label_text=pool_label,
+                            quota_suffix=tag_quota_suffix(client, ob),
+                            with_outbound=multi_idents,
                         )
                         ident_use = {
                             "uuid": P.identity_uuid(client["uuid"], ob),
@@ -2309,9 +2389,27 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                             _apply_cosmetic_path(store, client, ib_use, ep)
                             eps.extend(P._apply_external_proxy(ep, ib_use))
                         continue
-                remark = f"{prefix}{client['email']} · {outbound_label(store, ob)}{tag_quota_suffix(client, ob)}"
+                remark = subscription_profile_remark(
+                    store, client, ib,
+                    outbound_tag=ob,
+                    quota_suffix=tag_quota_suffix(client, ob),
+                    # Main profile: inbound name only (even for Direct node)
+                    with_outbound=False,
+                )
                 dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
-                ident_use = ident
+                # Direct node as основная: dial node host with email~node_* (agent local_direct)
+                if dc_host and ob and ob != "direct":
+                    ident_uuid = P.identity_uuid(client["uuid"], ob)
+                    ident_use = {
+                        "uuid": ident_uuid,
+                        "email": f"{client['email']}~{ob}",
+                        "password": P.derived_password(ident_uuid),
+                        "main": True,
+                        "tag": ob,
+                        "label": outbound_label(store, ob),
+                    }
+                else:
+                    ident_use = ident
             else:
                 tag = str(ident.get("tag") or "")
                 # Covered by Direct-pool balancer → only the pool link is emitted
@@ -2322,18 +2420,35 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                     pick = pick_direct_pool_tag(store, bal)
                     if not pick:
                         # No live Direct members — fall back to classic master balancer link
-                        remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, tag)}"
+                        remark = subscription_profile_remark(
+                            store, client, ib,
+                            outbound_tag=tag,
+                            outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
+                            quota_suffix=tag_quota_suffix(client, tag),
+                            with_outbound=True,
+                        )
                         dc_host, _dc_node = "", None
                         ident_use = ident
                     else:
                         # Keep lb_* identity; only the dial host follows least-load pick.
                         pool_label = balancer_display_label(store, bal)
-                        remark = f"{prefix}{pool_label}{tag_quota_suffix(client, tag)}"
+                        remark = subscription_profile_remark(
+                            store, client, ib,
+                            outbound_tag=tag, outbound_label_text=pool_label,
+                            quota_suffix=tag_quota_suffix(client, tag),
+                            with_outbound=True,
+                        )
                         ident_use = dict(ident)
                         ident_use["label"] = pool_label
                         dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
                 else:
-                    remark = f"{prefix}{ident['label']}{tag_quota_suffix(client, tag)}"
+                    remark = subscription_profile_remark(
+                        store, client, ib,
+                        outbound_tag=tag,
+                        outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
+                        quota_suffix=tag_quota_suffix(client, tag),
+                        with_outbound=True,
+                    )
                     dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
                     ident_use = ident
             ib_use = ib
@@ -2816,6 +2931,14 @@ def build_config(store: dict) -> dict:
                 "type": "field", "user": [c["email"]],
                 **_route_target(store, ob, known_outbounds=known_outbounds),
             })
+            # Direct-connect primary identity is email~node_* (see client_identities)
+            dc_host, _ = _direct_connect_endpoint_host(store, ob)
+            if dc_host:
+                rules.append({
+                    "type": "field",
+                    "user": [f"{c['email']}~{ob}"],
+                    **_route_target(store, ob, known_outbounds=known_outbounds),
+                })
     rules.extend(per_inbound_rules)
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})
 

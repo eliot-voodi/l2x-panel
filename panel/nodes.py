@@ -1839,18 +1839,45 @@ def sync_all_node_outbounds(store: dict) -> None:
 
 
 def _agent_safe_clients(
-    clients: list[dict], *, keep_node: bool = False, keep_tags: set[str] | None = None,
+    clients: list[dict],
+    *,
+    keep_node: bool = False,
+    keep_tags: set[str] | None = None,
+    direct_self_tag: str = "",
 ) -> list[dict]:
-    """Remap dangling legacy/foreign outbound tags to direct on an agent."""
+    """Remap dangling legacy/foreign outbound tags on an agent.
+
+    On a Direct-connect agent, balancers / other ``node_*`` tags would steal the
+    main identity away from ``local_direct`` — remap them to ``direct_self_tag``.
+    """
     keep = {t for t in (keep_tags or set()) if t}
+    self_tag = str(direct_self_tag or "").strip()
+    if self_tag:
+        keep.add(self_tag)
     out = []
     for c in clients or []:
         c = dict(c)
         ob = (c.get("outbound") or "direct").strip()
         if ob.startswith("l2tp_"):
             c["outbound"] = "direct"
+        elif self_tag and (ob.startswith("lb_") or (ob.startswith("node_") and ob != self_tag)):
+            # Direct agent: main UUID must exit locally (or via master backhaul), not a balancer
+            c["outbound"] = self_tag
         elif ob.startswith("node_") and not keep_node and ob not in keep:
             c["outbound"] = "direct"
+        # Keep allowed_tags that still resolve; drop foreign node_* not in keep
+        if self_tag or keep:
+            allowed = []
+            for t in c.get("allowed_tags") or []:
+                ts = str(t or "").strip()
+                if not ts:
+                    continue
+                if ts.startswith("node_") and not keep_node and ts not in keep:
+                    continue
+                allowed.append(ts)
+            if self_tag and self_tag not in allowed:
+                allowed.append(self_tag)
+            c["allowed_tags"] = allowed
         out.append(c)
     return out
 
@@ -1984,7 +2011,10 @@ def agent_runtime_store(store: dict) -> dict:
         keep_tags.add(MASTER_EGRESS_TAG)
     s.pop("l2tp", None)
     s["clients"] = _agent_safe_clients(
-        s.get("clients") or [], keep_node=keep_node, keep_tags=keep_tags,
+        s.get("clients") or [],
+        keep_node=keep_node,
+        keep_tags=keep_tags,
+        direct_self_tag=dc_tag if ns.get("direct_connect") else "",
     )
     routes = _agent_safe_routes(
         s.get("routes") or [], keep_node=keep_node, keep_tags=keep_tags,
@@ -2117,7 +2147,11 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         balancers = json.loads(json.dumps(store.get("balancers") or {}))
         peers = [_peer_node_export(n) for n in ensure_list(store) if n.get("id") != node.get("id")]
     else:
-        clients = _agent_safe_clients(store.get("clients") or [], keep_tags=keep_tags)
+        clients = _agent_safe_clients(
+            store.get("clients") or [],
+            keep_tags=keep_tags,
+            direct_self_tag=self_tag if dc else "",
+        )
         customs = []
         for o in store.get("outbounds_custom") or []:
             if o.get("tag") in (self_tag, MASTER_EGRESS_TAG) or o.get("kind") in ("node", "master_egress", "local_direct"):

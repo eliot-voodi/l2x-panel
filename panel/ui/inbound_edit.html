@@ -48,7 +48,22 @@
       </div>
       <div><label class="f">Tag</label><input name="tag" value="{{ ib.tag }}" required pattern="[A-Za-z0-9._-]+"></div>
     </div>
-    <label class="f">Remark (имя в подписке)</label><input name="remark" value="{{ ib.remark }}">
+    <div class="row">
+      <div style="flex:1">
+        <label class="f">Имя в подписке (remark)</label>
+        <input name="remark" id="ib_remark" value="{{ ib.remark }}" placeholder="Frankfurt / DE-1">
+      </div>
+      <div style="max-width:7rem">
+        <label class="f">Страна</label>
+        <input name="country" id="ib_country" value="{{ ib.country or '' }}" maxlength="2"
+               style="text-transform:uppercase" placeholder="DE" pattern="[A-Za-z]{0,2}"
+               title="ISO-код страны → флаг в подписке">
+      </div>
+      <div style="align-self:end;padding-bottom:.35rem;min-width:3rem">
+        <span id="ib_flag_preview" style="font-size:1.6rem;line-height:1" title="Превью в подписке">{{ flag_emoji(ib.country or '') if ib.country else '🌐' }}</span>
+      </div>
+    </div>
+    <div class="hint">В клиенте будет: <b id="ib_sub_preview">{{ (flag_emoji(ib.country) ~ ' ' if ib.country else '') }}{{ ib.remark or ib.tag }}</b>. Outbound/нода больше не подставляются в имя (только если у клиента несколько подключений — через « · »).</div>
     <div class="mt">
       <label class="check"><input type="checkbox" name="direct" value="1" id="ib_direct" {% if ib.direct %}checked{% endif %}>
         Напрямую на порт (без nginx :443)</label>
@@ -716,6 +731,32 @@
       render({ issues: INITIAL_ISSUES, xray: {} });
     }
     setTimeout(runCheck, 200);
+  })();
+
+  (function () {
+    var cc = document.getElementById('ib_country');
+    var rm = document.getElementById('ib_remark');
+    var flag = document.getElementById('ib_flag_preview');
+    var prev = document.getElementById('ib_sub_preview');
+    if (!cc || !rm || !flag || !prev) return;
+    function flagEmoji(code) {
+      code = String(code || '').toUpperCase();
+      if (!/^[A-Z]{2}$/.test(code)) return '🌐';
+      return String.fromCodePoint(
+        0x1F1E6 + code.charCodeAt(0) - 65,
+        0x1F1E6 + code.charCodeAt(1) - 65
+      );
+    }
+    function sync() {
+      var code = (cc.value || '').trim().toUpperCase();
+      cc.value = code;
+      var name = (rm.value || '').trim() || 'inbound';
+      var f = /^[A-Z]{2}$/.test(code) ? flagEmoji(code) : '';
+      flag.textContent = f || '🌐';
+      prev.textContent = f ? (f + ' ' + name) : name;
+    }
+    cc.addEventListener('input', sync);
+    rm.addEventListener('input', sync);
   })();
 </script>
 {% endblock %}

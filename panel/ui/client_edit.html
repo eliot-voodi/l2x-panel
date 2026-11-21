@@ -161,6 +161,7 @@
       <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
       <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
     </div>
+    <div class="hint mb0">Здесь только <b>точки входа этой панели</b> (куда клиент стучится на этот хост). Ноду <b>+Direct</b> сюда назначать не нужно — см. блок «Подключения в подписке» ниже. Inbound «Direct → master egress» — служебный для агентов, не для пользователей.</div>
     {% for ib in inbounds %}
       <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if group %}{% if ib_mode == 'select' and ib.tag in (c.inbounds or []) %}checked{% endif %}{% else %}{% if ib_mode == 'all' or ib.tag in (c.inbounds or []) %}checked{% endif %}{% endif %}>
         <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }} <span class="dim small">:{{ ib.port }}</span></label><br>
@@ -178,7 +179,8 @@
       (<b>{{ outbound_label(store, eff_outbound or group.outbound or 'direct') }}</b>{% if group_select_mode == 'all' %}: все{% elif group.allowed_tags %}: {% for t in group.allowed_tags %}{{ outbound_label(store, t) }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}: только основная{% endif %}).
       Ручной выбор необязателен. «Снять все» сбрасывает личные extras на группу.</div>
     {% else %}
-    <div class="hint mb0">«Основная» всегда в подписке (галочка для неё не нужна). Галочки — только дополнительные конфиги.</div>
+    <div class="hint mb0">«Основная» всегда в подписке (галочка для неё не нужна). Галочки — только дополнительные конфиги.
+      Чтобы клиент ходил <b>напрямую на ноду</b> (+Direct): в <a href="{{ bp }}/nodes">Nodes</a> включите <b>+Direct</b> у ноды, затем выберите её как <b>Основная</b> здесь. Маршруты/лимиты остаются с мастера; выход «Мастер» на ноде — через backhaul.</div>
     {% endif %}
     <div class="flex" style="gap:.4rem;margin:.6rem 0">
       <button type="button" class="btn sm ghost" data-check-all="allowed_tags" data-mode="select_mode">Выделить все</button>
@@ -201,7 +203,7 @@
           <td><input type="checkbox" name="allowed_tags" value="{{ tg.tag }}"
             {% if is_main %}disabled{% elif group %}{% if select_mode == 'select' and tg.tag in (c.allowed_tags or []) %}checked{% endif %}{% else %}{% if select_mode == 'all' and not is_main and tg.kind != 'system' %}checked{% elif select_mode == 'select' and tg.tag in (c.allowed_tags or []) and not is_main %}checked{% endif %}{% endif %}></td>
           <td>{% if group %}<span class="dim" title="Основная из группы">—</span>{% else %}<input type="radio" name="main_outbound" value="{{ tg.tag }}" {% if is_main %}checked{% endif %} title="Основная ссылка">{% endif %}</td>
-          <td>{{ tg.label }} {% if tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.kind == 'system' %}<span class="badge">system</span>{% elif tg.status and tg.status not in ('connected', 'enabled') %}<span class="badge">{{ tg.status }}</span>{% endif %}</td>
+          <td>{{ tg.label }} {% if tg.direct_connect %}<span class="badge ok" title="Клиент → нода напрямую, маршруты с мастера">Direct</span>{% elif tg.kind == 'balancer' %}<span class="badge">авто</span>{% elif tg.kind == 'system' %}<span class="badge">system</span>{% elif tg.kind == 'node' %}<span class="badge">node</span>{% endif %}{% if tg.status and tg.status not in ('connected', 'enabled', 'Direct') %} <span class="badge">{{ tg.status }}</span>{% endif %}</td>
           {% if not is_new %}
           <td class="small nowrap">{{ format_traffic(tg.used) }}{% if tg.exceeded %} <span class="badge err">исчерпан</span>{% endif %}</td>
           <td class="small nowrap">{{ format_traffic(tg.daily_used) }}{% if tg.daily_exceeded %} <span class="badge warn">день</span>{% endif %}</td>
