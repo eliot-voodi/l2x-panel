@@ -2660,9 +2660,113 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
             if ep:
                 if remap_to:
                     ep["address"] = remap_to
+                ep["_core_id"] = _core_id_for_inbound(store, ib) or ""
+                ep["_inbound_tag"] = str(ib.get("tag") or "")
                 _apply_cosmetic_path(store, client, ib_use, ep)
                 eps.extend(P._apply_external_proxy(ep, ib_use))
     return eps
+
+
+def client_json_subscription_profiles(
+    store: dict,
+    client: dict,
+    extras: dict | None = None,
+    *,
+    doh_url: str = "",
+    doh_in_tunnel: bool = False,
+    remarks: str = "",
+    flat: bool = False,
+) -> list | dict:
+    """Build ``?format=json`` payload: custom per-core profiles + auto endpoint configs.
+
+    When any core has Custom JSON enabled, always returns a **list** of profiles.
+    Otherwise: ``flat`` → list of per-endpoint configs; default → unified Ascella-style dict.
+    """
+    if not client_access_ok(client):
+        return [] if flat else {}
+
+    master_hosts: set[str] = set()
+    try:
+        import nodes as nodes_mod
+        master_hosts = nodes_mod.master_public_domains(store)
+    except Exception:
+        nodes_mod = None  # type: ignore
+        master_hosts = set()
+
+    try:
+        import front as front_mod
+        default_host = front_mod.public_domain(store) or public_host()
+    except Exception:
+        default_host = public_host()
+
+    try:
+        import cores as cores_mod
+    except Exception:
+        cores_mod = None  # type: ignore
+
+    profiles: list[dict] = []
+    custom_core_ids: set[str] = set()
+    custom_done: set[tuple[str, str]] = set()
+
+    ibs = [i for i in client_inbounds(store, client) if inbound_access_ok(i)]
+    for ib in ibs:
+        if cores_mod is None:
+            break
+        cid = _core_id_for_inbound(store, ib)
+        if not cid:
+            continue
+        core = cores_mod.core_by_id(store, cid)
+        if not isinstance(core, dict):
+            continue
+        if not core.get("sub_custom_json"):
+            continue
+        tmpl = str(core.get("sub_custom_json_template") or "").strip()
+        if not tmpl:
+            continue
+        core_host, _core_ib, _node = _direct_node_host_for_inbound(store, ib, master_hosts)
+        host_use = core_host or default_host
+        key = (cid, host_use)
+        if key in custom_done:
+            custom_core_ids.add(cid)
+            continue
+        remark = inbound_sub_label(ib) or str(core.get("name") or "profile")
+        try:
+            cfg = P.render_sub_custom_json(
+                tmpl, client=client, host=host_use, remark=remark,
+            )
+        except Exception:
+            cfg = None
+        if not isinstance(cfg, dict):
+            continue
+        custom_done.add(key)
+        custom_core_ids.add(cid)
+        profiles.append(cfg)
+
+    usable_eps = [
+        e for e in client_endpoints(store, client)
+        if e.get("protocol") != "wireguard"
+        and (e.get("_core_id") or "") not in custom_core_ids
+    ]
+
+    if custom_core_ids:
+        # Custom cores force array mode: append auto profiles for remaining endpoints
+        for e in usable_eps:
+            try:
+                profiles.append(
+                    P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel)
+                )
+            except Exception:
+                pass
+        return profiles
+
+    if flat:
+        return [
+            P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel)
+            for e in usable_eps
+        ]
+    return P.xray_unified_client_config(
+        usable_eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=remarks,
+    )
 
 
 def subscription_links(store: dict, client: dict, host: str | None = None) -> list[str]:

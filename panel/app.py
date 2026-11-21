@@ -2756,19 +2756,14 @@ def _sub_response(request: Request, token: str) -> Response:
         doh_tunnel = True
     if fmt == "json":
         # Default: one Ascella-style profile (cascade balancers + routing).
-        # ?flat=1 → legacy array of per-endpoint configs.
+        # ?flat=1 → array of per-endpoint configs.
+        # Cores with Custom JSON → always an array (custom profile per core/node + auto).
         flat = str(request.query_params.get("flat") or "").lower() in ("1", "true", "yes")
-        usable = [e for e in eps if e.get("protocol") != "wireguard"]
-        if flat:
-            payload: object = [
-                P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_tunnel)
-                for e in usable
-            ]
-        else:
-            title = s.get("title") or f"{app_title()} · {client['email']}"
-            payload = P.xray_unified_client_config(
-                usable, extras, doh_url=doh_url, doh_in_tunnel=doh_tunnel, remarks=title,
-            )
+        title = s.get("title") or f"{app_title()} · {client['email']}"
+        payload = xray.client_json_subscription_profiles(
+            store, client, extras,
+            doh_url=doh_url, doh_in_tunnel=doh_tunnel, remarks=title, flat=flat,
+        )
         body = json.dumps(payload, ensure_ascii=False, indent=2)
         return Response(body, media_type="application/json", headers=headers)
     if fmt == "clash":
@@ -8181,6 +8176,7 @@ CORE_EDITOR_TABS = (
     ("routing", "Маршрутизация"),
     ("balancers", "Балансировщики"),
     ("dns", "DNS"),
+    ("subjson", "Подписка"),
     ("advanced", "Дополнительно"),
 )
 
@@ -8851,6 +8847,10 @@ async def cores_action(core_id: str, action: str, request: Request):
             data["dns_log"] = "1" if form.get("dns_log") else "0"
             was_inherit = bool(core.get("inherit_master"))
             data["inherit_master"] = "1" if form.get("inherit_master") else "0"
+            if form.get("sub_custom_json_form"):
+                data["sub_custom_json_form"] = "1"
+                data["sub_custom_json"] = "1" if form.get("sub_custom_json") else "0"
+                data["sub_custom_json_template"] = str(form.get("sub_custom_json_template") or "")
             errs = cores_mod.update_core_settings(core, data)
             # Turning off inherit without slices → snapshot master (PasarGuard fixed config)
             if not errs and was_inherit and not core.get("inherit_master"):
@@ -8914,7 +8914,12 @@ async def cores_action(core_id: str, action: str, request: Request):
                 flash(request, f"Sync ядра «{core.get('name')}»: {ok_n}/{len(nodes)} нод", "info")
         else:
             flash(request, "Неизвестное действие", "error")
-    return go(f"/cores/{core_id}" if go_edit or action == "save" else "/cores")
+    if go_edit or action == "save":
+        tab = str(form.get("tab") or "").strip().lower()
+        if tab in {t[0] for t in CORE_EDITOR_TABS}:
+            return go(_core_back(core_id, tab))
+        return go(f"/cores/{core_id}")
+    return go("/cores")
 
 
 def _node_xray_check_one(node: dict) -> dict:

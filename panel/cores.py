@@ -128,6 +128,8 @@ def snapshot_from_master(store: dict, *, name: str = "Default", remark: str = ""
         "fallbacks_inbound_tags": [],
         # PasarGuard ``config`` — advanced Xray JSON overlay (merged as template_patch)
         "config": {},
+        "sub_custom_json": False,
+        "sub_custom_json_template": "",
         "inbounds": _filter_inbounds(store.get("inbounds")),
         "outbounds_custom": _filter_outbounds(store.get("outbounds_custom")),
         "routes": copy.deepcopy(store.get("routes") or []),
@@ -168,6 +170,10 @@ def ensure_cores(store: dict) -> list[dict]:
         c.setdefault("inherit_master", False)
         c.setdefault("is_default", False)
         c.setdefault("sort_order", idx)
+        c.setdefault("sub_custom_json", False)
+        if not isinstance(c.get("sub_custom_json_template"), str):
+            c["sub_custom_json_template"] = str(c.get("sub_custom_json_template") or "")
+        c["sub_custom_json"] = bool(c.get("sub_custom_json"))
         c["exclude_inbound_tags"] = parse_tag_set(c.get("exclude_inbound_tags"))
         c["fallbacks_inbound_tags"] = parse_tag_set(c.get("fallbacks_inbound_tags"))
         if not isinstance(c.get("config"), dict):
@@ -412,6 +418,8 @@ def create_core(
             "exclude_inbound_tags": [],
             "fallbacks_inbound_tags": [],
             "config": {},
+            "sub_custom_json": False,
+            "sub_custom_json_template": "",
             **_empty_slices(),
             "created_at": now_iso(),
             "updated_at": now_iso(),
@@ -504,6 +512,28 @@ def update_core_settings(core: dict, form: dict) -> list[str]:
                         core["config"] = parsed
             except json.JSONDecodeError as exc:
                 errors.append(f"Некорректный JSON: {exc}")
+
+    # Client subscription Custom JSON (per-core template → ?format=json profiles)
+    if "sub_custom_json_form" in form or "sub_custom_json_template" in form:
+        core["sub_custom_json"] = str(form.get("sub_custom_json") or "") in ("1", "true", "on", "yes")
+        core["sub_custom_json_template"] = str(form.get("sub_custom_json_template") or "")
+        if core["sub_custom_json"] and core["sub_custom_json_template"].strip():
+            try:
+                import protocols as P
+                probe = P.render_sub_custom_json(
+                    core["sub_custom_json_template"],
+                    client={
+                        "uuid": "00000000-0000-0000-0000-000000000001",
+                        "email": "probe",
+                        "password": "probe",
+                    },
+                    host="example.com",
+                    remark="probe",
+                )
+                if probe is None:
+                    errors.append("Custom JSON: невалидный JSON после подстановки плейсхолдеров")
+            except Exception as exc:
+                errors.append(f"Custom JSON: {exc}")
 
     # Validate exclude/fallback tags against known inbounds when not inheriting
     if not core.get("inherit_master"):

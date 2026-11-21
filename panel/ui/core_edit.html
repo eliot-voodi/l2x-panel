@@ -421,6 +421,39 @@
 </section>
 
 {# ===================== ADVANCED ===================== #}
+{# ===================== SUBSCRIPTION CUSTOM JSON ===================== #}
+<section class="core-panel {% if core_tab == 'subjson' %}active{% endif %}" data-panel="subjson">
+  <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/save" style="max-width:960px">
+    <input type="hidden" name="stay" value="1">
+    <input type="hidden" name="tab" value="subjson">
+    <input type="hidden" name="sub_custom_json_form" value="1">
+    <h3>Custom JSON в подписке</h3>
+    <div class="hint">
+      Если включено, пользователи в <code>?format=json</code> получают этот шаблон как отдельный профиль
+      (на каждую ноду с этим ядром — со своим <code>{{ '{{host}}' }}</code>).
+      Авто-генерация из inbounds этого ядра тогда не добавляется.
+    </div>
+    <div class="mt">
+      {{ m.check('sub_custom_json', core.sub_custom_json, 'Custom JSON') }}
+    </div>
+    <div class="mt">
+      <label class="f">Шаблон клиентского Xray JSON</label>
+      <textarea name="sub_custom_json_template" class="mono" rows="22" spellcheck="false"
+                placeholder='{"remarks":"Japan","outbounds":[{"protocol":"vless","tag":"proxy","settings":{"vnext":[{"address":"NODE_HOST","port":443,"users":[{"id":"CLIENT_UUID","encryption":"none"}]}]}}]}'>{{ core.sub_custom_json_template or '' }}</textarea>
+    </div>
+    <div class="hint mt">
+      Плейсхолдеры (внутри строковых значений JSON):
+      <code>{{ '{{uuid}}' }}</code>,
+      <code>{{ '{{email}}' }}</code>,
+      <code>{{ '{{password}}' }}</code>,
+      <code>{{ '{{host}}' }}</code> — домен ноды,
+      <code>{{ '{{remark}}' }}</code>,
+      <code>{{ '{{uuid:TAG}}' }}</code> — identity для <code>email~TAG</code>.
+    </div>
+    <div class="actions mt"><button class="btn">Сохранить</button></div>
+  </form>
+</section>
+
 <section class="core-panel {% if core_tab == 'advanced' %}active{% endif %}" data-panel="advanced">
   <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/panel/advanced/save" style="max-width:920px">
     <h3>Patch конфигурации (template)</h3>

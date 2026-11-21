@@ -1545,6 +1545,64 @@ def _client_dns_servers(*, doh_url: str = "", doh_in_tunnel: bool = False) -> li
     ]
 
 
+_SUB_JSON_PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+def _json_escape_unquoted(val: str) -> str:
+    """Escape a value for safe insertion inside an already-quoted JSON string."""
+    return json.dumps(str(val), ensure_ascii=False)[1:-1]
+
+
+def render_sub_custom_json(
+    template: str,
+    *,
+    client: dict,
+    host: str,
+    remark: str = "",
+) -> dict | None:
+    """Render a per-core Custom JSON subscription template into a client config dict.
+
+    Placeholders (use inside JSON string values):
+      {{uuid}} {{email}} {{password}} {{host}} {{remark}} {{uuid:TAG}}
+    """
+    raw = str(template or "").strip()
+    if not raw:
+        return None
+    uuid = str((client or {}).get("uuid") or "")
+    email = str((client or {}).get("email") or "")
+    password = str((client or {}).get("password") or "")
+    host_s = str(host or "").strip()
+    remark_s = str(remark or "").strip()
+
+    def _repl(match: re.Match[str]) -> str:
+        key = (match.group(1) or "").strip()
+        if key == "uuid":
+            return _json_escape_unquoted(uuid)
+        if key == "email":
+            return _json_escape_unquoted(email)
+        if key == "password":
+            return _json_escape_unquoted(password)
+        if key == "host":
+            return _json_escape_unquoted(host_s)
+        if key == "remark":
+            return _json_escape_unquoted(remark_s)
+        if key.startswith("uuid:"):
+            tag = key.split(":", 1)[1].strip()
+            return _json_escape_unquoted(identity_uuid(uuid, tag) if tag else uuid)
+        return match.group(0)
+
+    text = _SUB_JSON_PLACEHOLDER_RE.sub(_repl, raw)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if remark_s and not data.get("remarks"):
+        data["remarks"] = remark_s
+    return data
+
+
 def xray_client_config(ep: dict, extras: dict | None = None, *, doh_url: str = "", doh_in_tunnel: bool = False) -> dict:
     """Full client config for a single-endpoint JSON subscription item."""
     proxy = _endpoint_to_named_outbound(ep, "proxy")
