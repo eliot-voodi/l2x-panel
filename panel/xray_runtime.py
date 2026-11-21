@@ -336,8 +336,8 @@ def default_balancers() -> dict:
             "tag": BALANCER_LEAST_LOAD, "enabled": True, "strategy": "leastLoad", "members": [],
             "probe_url": "https://www.gstatic.com/generate_204", "probe_interval": "20s",
             "expected": 1, "max_rtt": "1s", "tolerance": 0.15, "fallback": "direct",
-            # One sub link → live Direct node with least online sessions (rename via label).
-            "label": "Зарубеж", "sub_direct_pool": True,
+            # Label is admin-only; balancers never appear in user subscriptions.
+            "label": "Зарубеж", "sub_direct_pool": False,
         },
         # Spreads connections across currently live outbounds (panel health gate + Xray random).
         "random": {
@@ -371,7 +371,8 @@ def ensure_balancers(store: dict) -> dict:
         cur["strategy"] = default["strategy"]
         if not isinstance(cur.get("label"), str):
             cur["label"] = str(cur.get("label") or "")
-        cur["sub_direct_pool"] = bool(cur.get("sub_direct_pool"))
+        # Routing-only: never expose balancers / Direct-pools in subscriptions.
+        cur["sub_direct_pool"] = False
     return bals
 
 
@@ -449,21 +450,11 @@ def pick_direct_pool_tag(store: dict, balancer: dict) -> str:
 
 
 def direct_pool_hidden_member_tags(store: dict) -> set[str]:
-    """Node tags covered by an enabled Direct-pool balancer — omit as separate sub links."""
-    hidden: set[str] = set()
-    for b in ensure_balancers(store).values():
-        if not b.get("enabled", True) or not b.get("sub_direct_pool"):
-            continue
-        hidden.update(direct_pool_candidate_tags(store, b))
-        # Also hide configured members even if currently offline (avoid stale solo links)
-        for tag in balancer_member_tags(store, b, healthy_only=False):
-            try:
-                import nodes as nodes_mod
-                if nodes_mod.uses_direct_connect(nodes_mod.node_by_outbound_tag(store, tag)):
-                    hidden.add(tag)
-            except Exception:
-                pass
-    return hidden
+    """Formerly hid Direct nodes covered by a sub Direct-pool balancer.
+
+    Balancers no longer appear in subscriptions, so members are never hidden here.
+    """
+    return set()
 
 
 PROBE_HISTORY_N = 20  # rolling window for outbound packet-loss %
@@ -688,13 +679,9 @@ def outbound_ok_for_sub(store: dict, tag: str, *, _seen: set[str] | None = None)
                 return True
         return custom_outbound_healthy(o, max_loss_pct=cfg["max_loss_pct"])
 
-    for b in ensure_balancers(store).values():
-        if b.get("tag") != tag:
-            continue
-        if not b.get("enabled", True):
-            return False
-        # Enabled balancers always appear in subscription. Empty pool → Xray fallback.
-        return True
+    # Balancers are for routing only — never as subscription profiles.
+    if balancer_by_tag(store, tag):
+        return False
 
     return True
 
@@ -2155,8 +2142,9 @@ def renew_client_period(client: dict, *, now: datetime | None = None) -> None:
 
 
 def selectable_outbound_tags(store: dict, *, include_system: bool = True) -> list[dict]:
-    """Outbounds shown in client/group «Подключения в подписке».
+    """Outbounds historically shown in client/group subscription pickers.
 
+    Balancers are excluded — they are routing-only and must not appear to users.
     ``direct`` is a system tag (opt-in): selectable in UI, but not auto-added when
     mode is «все» / when freezing new outbound tags onto users.
     """
@@ -2164,9 +2152,6 @@ def selectable_outbound_tags(store: dict, *, include_system: bool = True) -> lis
     out: list[dict] = []
     if include_system:
         out.append({"tag": "direct", "label": outbound_label(store, "direct"), "kind": "system"})
-    for b in store["balancers"].values():
-        if b.get("enabled", True):
-            out.append({"tag": b["tag"], "label": outbound_label(store, b["tag"]), "kind": "balancer"})
     for o in store.get("outbounds_custom") or []:
         kind = "custom"
         if o.get("kind") == "node" or str(o.get("tag") or "").startswith("node_"):
@@ -2243,8 +2228,9 @@ def apply_tag_to_users(store: dict, *, kind: str, tag: str, propagate: bool) -> 
 
 
 def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = False) -> list[dict]:
-    """Extra subscription identities (balancers / custom outbounds / opt-in direct).
+    """Extra subscription identities (custom outbounds / opt-in direct).
 
+    Balancers are routing-only and never appear in client subscriptions.
     Primary («основная») is emitted separately as the main identity — skipped here
     so the same outbound does not appear twice. Unhealthy outbounds omitted.
     ``direct`` is included only when explicitly listed in allowed_tags (not mode «все»).
@@ -2253,17 +2239,21 @@ def subscription_entries(store: dict, client: dict, *, ignore_quota: bool = Fals
         return []
     if not ignore_quota and not client_access_ok(client):
         return []
-    tags = [b["tag"] for b in ensure_balancers(store).values() if b.get("enabled", True)]
-    tags += [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
+    # Balancers intentionally omitted — they exist for Xray routing rules only.
+    tags = [o["tag"] for o in store.get("outbounds_custom") or [] if o.get("enabled", True) and o.get("in_sub", True)]
     # Opt-in system outbound: only when explicitly selected (non-empty allowed list).
     eff = client_effective_allowed_tags(store, client)
     if "direct" in eff and "direct" not in tags:
         tags = ["direct"] + tags
     # Main («основная») is already emitted as the primary identity — do not duplicate it.
     default = client_default_outbound(store, client)
+    if balancer_by_tag(store, default):
+        default = "direct"
     entries = []
     for tag in tags:
         if tag == default:
+            continue
+        if balancer_by_tag(store, tag):
             continue
         if not ignore_quota and not tag_allowed_for_client(store, client, tag):
             continue
@@ -2421,50 +2411,13 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                 ob = client_default_outbound(store, client)
                 if ob == NONE_TAG:
                     continue
+                # Balancers are routing-only — never emit a balancer profile to the user.
+                if balancer_by_tag(store, ob):
+                    ob = "direct"
                 if ob != "direct" and not tag_allowed_for_client(store, client, ob):
                     continue
                 if ob != "direct" and not outbound_ok_for_sub(store, ob):
                     continue
-                # Main link may itself be a Direct-pool balancer
-                bal_main = balancer_by_tag(store, ob) if ob != "direct" else None
-                if bal_main and bal_main.get("sub_direct_pool"):
-                    pick = pick_direct_pool_tag(store, bal_main)
-                    if pick:
-                        # Keep balancer identity (email~lb_*) — node_* UUID is absent when
-                        # the client is only allowed the balancer tag.
-                        pool_label = balancer_display_label(store, bal_main)
-                        remark = subscription_profile_remark(
-                            store, client, ib,
-                            outbound_tag=ob, outbound_label_text=pool_label,
-                            quota_suffix=tag_quota_suffix(client, ob),
-                            with_outbound=multi_idents,
-                        )
-                        ident_use = {
-                            "uuid": P.identity_uuid(client["uuid"], ob),
-                            "email": f"{client['email']}~{ob}",
-                            "password": P.derived_password(P.identity_uuid(client["uuid"], ob)),
-                            "main": True,
-                            "tag": ob,
-                            "label": pool_label,
-                        }
-                        dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
-                        ib_use, host_use = ib, host
-                        if dc_host:
-                            host_use = dc_host
-                            try:
-                                import nodes as _nodes_dc
-                                remapped = _nodes_dc.remap_inbounds_for_host(
-                                    [ib], new_host=dc_host, old_hosts=master_hosts,
-                                )
-                                if remapped:
-                                    ib_use = remapped[0]
-                            except Exception:
-                                ib_use = ib
-                        ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
-                        if ep:
-                            _apply_cosmetic_path(store, client, ib_use, ep)
-                            eps.extend(P._apply_external_proxy(ep, ib_use))
-                        continue
                 remark = subscription_profile_remark(
                     store, client, ib,
                     outbound_tag=ob,
@@ -2488,45 +2441,20 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
                     ident_use = ident
             else:
                 tag = str(ident.get("tag") or "")
-                # Covered by Direct-pool balancer → only the pool link is emitted
+                # Balancers never appear as separate subscription profiles.
+                if balancer_by_tag(store, tag):
+                    continue
                 if tag in pool_hidden:
                     continue
-                bal = balancer_by_tag(store, tag)
-                if bal and bal.get("sub_direct_pool"):
-                    pick = pick_direct_pool_tag(store, bal)
-                    if not pick:
-                        # No live Direct members — fall back to classic master balancer link
-                        remark = subscription_profile_remark(
-                            store, client, ib,
-                            outbound_tag=tag,
-                            outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
-                            quota_suffix=tag_quota_suffix(client, tag),
-                            with_outbound=True,
-                        )
-                        dc_host, _dc_node = "", None
-                        ident_use = ident
-                    else:
-                        # Keep lb_* identity; only the dial host follows least-load pick.
-                        pool_label = balancer_display_label(store, bal)
-                        remark = subscription_profile_remark(
-                            store, client, ib,
-                            outbound_tag=tag, outbound_label_text=pool_label,
-                            quota_suffix=tag_quota_suffix(client, tag),
-                            with_outbound=True,
-                        )
-                        ident_use = dict(ident)
-                        ident_use["label"] = pool_label
-                        dc_host, _dc_node = _direct_connect_endpoint_host(store, pick)
-                else:
-                    remark = subscription_profile_remark(
-                        store, client, ib,
-                        outbound_tag=tag,
-                        outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
-                        quota_suffix=tag_quota_suffix(client, tag),
-                        with_outbound=True,
-                    )
-                    dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
-                    ident_use = ident
+                remark = subscription_profile_remark(
+                    store, client, ib,
+                    outbound_tag=tag,
+                    outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
+                    quota_suffix=tag_quota_suffix(client, tag),
+                    with_outbound=True,
+                )
+                dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
+                ident_use = ident
             ib_use = ib
             host_use = host
             if dc_host:

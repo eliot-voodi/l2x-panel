@@ -5135,7 +5135,7 @@ async def balancers_save(key: str, request: Request):
         b = xray.ensure_balancers(store)[key]
         b["enabled"] = form.get("enabled") == "1"
         b["label"] = str(form.get("label") or "").strip()[:80]
-        b["sub_direct_pool"] = form.get("sub_direct_pool") == "1"
+        b["sub_direct_pool"] = False  # routing-only — never in user subscription
         b["probe_url"] = str(form.get("probe_url") or b["probe_url"]).strip()
         b["probe_interval"] = str(form.get("probe_interval") or b["probe_interval"]).strip()
         raw_fb = str(form.get("fallback") or "direct").strip()
@@ -5158,7 +5158,6 @@ async def balancers_save(key: str, request: Request):
     _tg_change(
         f"⚖ Balancer <b>{tgbot.escape(key)}</b> сохранён ({with_state})",
         f"label=<code>{tgbot.escape(label_txt)}</code> · "
-        f"direct_pool={'да' if form.get('sub_direct_pool') == '1' else 'нет'} · "
         f"fallback=<code>{tgbot.escape(str(form.get('fallback') or 'direct'))}</code>",
     )
     if xr.get("skipped_core_edit"):
@@ -8297,7 +8296,7 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
             elif action == "save":
                 b["enabled"] = form.get("enabled") == "1"
                 b["label"] = str(form.get("label") or "").strip()[:80]
-                b["sub_direct_pool"] = form.get("sub_direct_pool") == "1"
+                b["sub_direct_pool"] = False  # routing-only — never in user subscription
                 b["probe_url"] = str(form.get("probe_url") or b.get("probe_url") or "").strip()
                 b["probe_interval"] = str(form.get("probe_interval") or b.get("probe_interval") or "").strip()
                 raw_fb = str(form.get("fallback") or "direct").strip()

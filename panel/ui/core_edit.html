@@ -341,11 +341,11 @@
         <h3>{{ b.label or b.tag or key }}</h3>
         <span class="badge {% if b.enabled %}ok{% endif %}">{{ 'включён' if b.enabled else 'выключен' }}</span>
       </div>
-      <div class="small muted">strategy <code>{{ b.strategy or key }}</code> · tag <code>{{ b.tag or key }}</code></div>
+      <div class="small muted">strategy <code>{{ b.strategy or key }}</code> · tag <code>{{ b.tag or key }}</code> · только маршрутизация</div>
       <div class="mt">{{ m.check('enabled', b.enabled, 'Включён') }}</div>
-      <label class="f">Название в подписке</label>
-      <input name="label" value="{{ b.label or '' }}" maxlength="80">
-      <div class="mt">{{ m.check('sub_direct_pool', b.sub_direct_pool, 'Direct-пул в подписке') }}</div>
+      <label class="f">Название (в панели)</label>
+      <input name="label" value="{{ b.label or '' }}" maxlength="80" placeholder="для себя">
+      <div class="hint">Балансировщик не показывается пользователям в подписке — только как outbound в правилах маршрутизации.</div>
       {% if key != 'random' %}
       <div class="row">
         <div><label class="f">Probe URL</label><input name="probe_url" value="{{ b.probe_url or '' }}"></div>
