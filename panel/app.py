@@ -1673,7 +1673,7 @@ _LAST_TRAFFIC_DIRECT_PUSH = 0.0
 _DIRECT_SYNC_LOCK = threading.Lock()
 _DIRECT_SYNC_PENDING = ""
 _DIRECT_SYNC_THREAD: threading.Thread | None = None
-# Fast apply for client/config fan-out (Direct HTTP). Heavy provision keeps longer timeouts.
+# Fast apply for client fan-out. Heavy provision keeps longer timeouts.
 DIRECT_PUSH_TIMEOUT = int(os.environ.get("L2XPANEL_DIRECT_PUSH_TIMEOUT", "8"))
 
 
@@ -1685,7 +1685,7 @@ def _push_direct_nodes_clients(
     timeout: int | None = None,
     wait: bool = False,
 ) -> None:
-    """Push client list to Direct nodes in parallel (background by default)."""
+    """Push clients to all nodes that sync users (Direct / mirror / sync_clients)."""
     global _LAST_QUOTA_DIRECT_PUSH
     store = store or _load_store()
     if not nodes_mod.is_master(store):
@@ -1694,11 +1694,9 @@ def _push_direct_nodes_clients(
     skip = {str(x) for x in (exclude_ids or set()) if x}
     timeout = int(timeout if timeout is not None else DIRECT_PUSH_TIMEOUT)
     jobs: list[tuple[str, str]] = []
-    for node in nodes_mod.direct_connect_nodes(store):
-        if not node.get("enabled", True) or not node.get("id"):
-            continue
-        nid = str(node["id"])
-        if nid in skip:
+    for node in nodes_mod.client_sync_nodes(store):
+        nid = str(node.get("id") or "")
+        if not nid or nid in skip:
             continue
         name = node.get("name") or nid[:8]
         jobs.append((nid, f"{name}: {reason}"))
@@ -1712,7 +1710,7 @@ def _push_direct_nodes_clients(
             pass
 
     threads = [
-        threading.Thread(target=_one, args=(nid, label), daemon=True, name=f"direct-push-{nid[:8]}")
+        threading.Thread(target=_one, args=(nid, label), daemon=True, name=f"node-push-{nid[:8]}")
         for nid, label in jobs
     ]
     for t in threads:
@@ -1724,36 +1722,37 @@ def _push_direct_nodes_clients(
 
 
 def _schedule_direct_sync(reason: str = "client") -> None:
-    """Coalesce master→Direct fan-out in background (near-instant, non-blocking)."""
+    """Push latest clients to nodes immediately in background (non-blocking)."""
     global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
     store = _load_store()
     if not nodes_mod.is_master(store):
         return
-    if not nodes_mod.direct_connect_nodes(store):
+    if not nodes_mod.client_sync_nodes(store):
         return
     with _DIRECT_SYNC_LOCK:
-        _DIRECT_SYNC_PENDING = str(reason or "sync")
+        _DIRECT_SYNC_PENDING = str(reason or "client")
         alive = _DIRECT_SYNC_THREAD is not None and _DIRECT_SYNC_THREAD.is_alive()
         if alive:
             return
 
         def _run() -> None:
             global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
-            # Tiny coalesce window so burst edits = one push
-            time.sleep(0.15)
+            # Minimal coalesce so multi-field form save = one push
+            time.sleep(0.05)
             with _DIRECT_SYNC_LOCK:
-                why = _DIRECT_SYNC_PENDING or "sync"
+                why = _DIRECT_SYNC_PENDING or "client"
                 _DIRECT_SYNC_PENDING = ""
             try:
-                _push_direct_nodes_clients(_load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=False)
+                _push_direct_nodes_clients(
+                    _load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=False,
+                )
             finally:
                 with _DIRECT_SYNC_LOCK:
                     _DIRECT_SYNC_THREAD = None
-                    # Another schedule arrived while we pushed — run again
                     if _DIRECT_SYNC_PENDING:
                         _schedule_direct_sync(_DIRECT_SYNC_PENDING)
 
-        _DIRECT_SYNC_THREAD = threading.Thread(target=_run, daemon=True, name="direct-sync")
+        _DIRECT_SYNC_THREAD = threading.Thread(target=_run, daemon=True, name="client-node-sync")
         _DIRECT_SYNC_THREAD.start()
 
 
@@ -4423,7 +4422,8 @@ def client_action(email: str, action: str, request: Request):
             return go("/clients")
     need_xray = action not in ("regen_sub", "clear_ips", "clear_hwids")
     result = _apply_xray(_load_store(), clients_only=True) if need_xray else {"ok": True}
-    if need_xray:
+    # Always fan-out user record (enabled/uuid/limits/delete) so nodes stay current
+    if action not in ("clear_ips", "clear_hwids"):
         _schedule_direct_sync("client-action")
     _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
     flash(request, *_ok_msg(f"{email}: {action}", result))
@@ -7542,7 +7542,8 @@ async def rest_api(path: str, request: Request):
                 return _api_err(err)
             st["clients"].append(c)
             xray.ensure_wg_peer(st, c)
-        res = _apply_xray(_load_store(), xray_only=True)
+        res = _apply_xray(_load_store(), clients_only=True)
+        _schedule_direct_sync("api-client-add")
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if parts == ["clients", "bulkAdd"] and request.method == "POST":
         # One xray apply for many clients — used by loadtest (avoids nginx drop per add).
@@ -7570,7 +7571,8 @@ async def rest_api(path: str, request: Request):
                 xray.ensure_wg_peer(st, c)
                 have.add(email)
                 created.append(c)
-        res = _apply_xray(_load_store(), xray_only=True)
+        res = _apply_xray(_load_store(), clients_only=True)
+        _schedule_direct_sync("api-client-bulkAdd")
         store2 = _load_store()
         return _api_ok(
             [_public_client(store2, next(x for x in store2["clients"] if x["email"] == c["email"])) for c in created],
@@ -7590,7 +7592,8 @@ async def rest_api(path: str, request: Request):
                     keep.append(c)
             st["clients"] = keep
         if removed:
-            _apply_xray(_load_store(), xray_only=True)
+            _apply_xray(_load_store(), clients_only=True)
+            _schedule_direct_sync("api-client-bulkDelete")
         return _api_ok({"removed": removed})
     if len(parts) == 3 and parts[:2] == ["clients", "update"] and request.method == "POST":
         with mutate() as st:
@@ -7600,7 +7603,8 @@ async def rest_api(path: str, request: Request):
             err = _api_apply_client(st, c, data)
             if err:
                 return _api_err(err)
-        res = _apply_xray(_load_store(), xray_only=True)
+        res = _apply_xray(_load_store(), clients_only=True)
+        _schedule_direct_sync("api-client-update")
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if len(parts) == 3 and parts[0] == "clients" and parts[1] in ("delete", "reset") and request.method in ("POST", "DELETE"):
         with mutate() as st:
@@ -7611,13 +7615,15 @@ async def rest_api(path: str, request: Request):
                 st["clients"].remove(c)
             else:
                 xray.reset_client_traffic(c)
-        _apply_xray(_load_store(), xray_only=True)
+        _apply_xray(_load_store(), clients_only=True)
+        _schedule_direct_sync(f"api-client-{parts[1]}")
         return _api_ok(None, f"{parts[1]} ok")
     if parts == ["clients", "resetAll"] and request.method == "POST":
         with mutate() as st:
             for c in st["clients"]:
                 xray.reset_client_traffic(c)
-        _apply_xray(_load_store(), xray_only=True)
+        _apply_xray(_load_store(), clients_only=True)
+        _schedule_direct_sync("api-client-resetAll")
         return _api_ok(None, "reset all")
     if parts == ["outbounds", "list"]:
         return _api_ok({"tags": xray.all_outbound_tags(store), "traffic": store.get("outbound_traffic") or {},

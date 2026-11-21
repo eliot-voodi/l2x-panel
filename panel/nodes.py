@@ -126,6 +126,23 @@ def direct_connect_nodes(store: dict) -> list[dict]:
     return [n for n in ensure_list(store) if uses_direct_connect(n)]
 
 
+def client_sync_nodes(store: dict) -> list[dict]:
+    """Nodes that must receive master client list on every user change.
+
+    Direct-connect, mirror standby, and any agent with ``sync_clients``.
+    Tunnel-only (Go agent, no panel apply) is skipped.
+    """
+    out: list[dict] = []
+    for n in ensure_list(store):
+        if not isinstance(n, dict) or not n.get("enabled", True) or not n.get("id"):
+            continue
+        if is_tunnel_only_node(n):
+            continue
+        if uses_direct_connect(n) or n.get("mirror") or n.get("sync_clients", True):
+            out.append(n)
+    return out
+
+
 def ensure_node_master_egress(node: dict) -> dict:
     """Per-node UUID for dialing master's backhaul (Direct → egress via master IP)."""
     if not node.get("master_egress_uuid"):
