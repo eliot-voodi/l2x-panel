@@ -1722,43 +1722,48 @@ def _push_direct_nodes_clients(
             t.join(timeout=max(1, timeout) + 3)
 
 
+_CLIENT_SYNC_GEN = 0
+
+
 def _schedule_direct_sync(reason: str = "client") -> None:
-    """Push latest clients to nodes immediately in background (non-blocking)."""
-    global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
+    """After any master client save: push clients to nodes automatically (background).
+
+    Always non-blocking for the HTTP request. If a push is already running, the
+    latest save is queued and sent right after (so the node always gets the
+    newest limits/expiry).
+    """
+    global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD, _CLIENT_SYNC_GEN
     store = _load_store()
     if not nodes_mod.is_master(store):
         return
     if not nodes_mod.client_sync_nodes(store):
         return
     with _DIRECT_SYNC_LOCK:
-        _DIRECT_SYNC_PENDING = str(reason or "client")
+        _CLIENT_SYNC_GEN += 1
+        _DIRECT_SYNC_PENDING = str(reason or "client-save")
         alive = _DIRECT_SYNC_THREAD is not None and _DIRECT_SYNC_THREAD.is_alive()
         if alive:
             return
 
         def _run() -> None:
-            global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
-            with _DIRECT_SYNC_LOCK:
-                why = _DIRECT_SYNC_PENDING or "client"
-            # User edits (limits/expiry) go out immediately; background traffic sync may coalesce briefly
-            urgent = str(why).startswith((
-                "client", "api-", "group", "limit", "xray-clients", "quota",
-            ))
-            if not urgent:
-                time.sleep(0.05)
-            with _DIRECT_SYNC_LOCK:
-                why = _DIRECT_SYNC_PENDING or why or "client"
-                _DIRECT_SYNC_PENDING = ""
-            try:
-                # wait=True so a second edit during push is re-queued after apply finishes
-                _push_direct_nodes_clients(
-                    _load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=True,
-                )
-            finally:
+            global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD, _CLIENT_SYNC_GEN
+            while True:
                 with _DIRECT_SYNC_LOCK:
+                    why = _DIRECT_SYNC_PENDING or "client-save"
+                    gen = _CLIENT_SYNC_GEN
+                    _DIRECT_SYNC_PENDING = ""
+                try:
+                    _push_direct_nodes_clients(
+                        _load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=True,
+                    )
+                except Exception:
+                    pass
+                with _DIRECT_SYNC_LOCK:
+                    # Another save happened while we pushed — send again
+                    if _CLIENT_SYNC_GEN != gen or _DIRECT_SYNC_PENDING:
+                        continue
                     _DIRECT_SYNC_THREAD = None
-                    if _DIRECT_SYNC_PENDING:
-                        _schedule_direct_sync(_DIRECT_SYNC_PENDING)
+                    return
 
         _DIRECT_SYNC_THREAD = threading.Thread(target=_run, daemon=True, name="client-node-sync")
         _DIRECT_SYNC_THREAD.start()
@@ -4153,6 +4158,7 @@ async def client_save(request: Request):
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
     result = _apply_xray(_load_store(), clients_only=True)
+    # Automatic immediate sync of limits/expiry/clients to all nodes (background)
     _schedule_direct_sync("client-save")
     act = "создан" if not original else "обновлён"
     bits = []
