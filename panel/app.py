@@ -8190,9 +8190,23 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                 mode = str(form.get("mode") or "link").strip()
                 remark = str(form.get("remark") or "").strip()
                 country = str(form.get("country") or "").strip().upper()
+                link_raw = str(form.get("link") or "").strip()
+                json_raw = str(form.get("json") or "").strip()
                 try:
-                    if mode == "link":
-                        ep = P.link_to_endpoint(str(form.get("link") or ""))
+                    existing = next((x for x in outs if str(x.get("tag") or "") == edit_tag), None) if edit_tag else None
+                    # Edit without new link/JSON → keep current config, update meta only
+                    if edit_tag and existing and (
+                        (mode == "link" and not link_raw) or (mode == "json" and not json_raw)
+                    ):
+                        config = dict(existing.get("config") or {})
+                        proto = str(config.get("protocol") or existing.get("kind") or "custom")
+                        info = str(existing.get("info") or proto)
+                        if not tag:
+                            tag = edit_tag
+                    elif mode == "link":
+                        if not link_raw:
+                            raise ValueError("Вставьте ссылку или переключитесь на JSON")
+                        ep = P.link_to_endpoint(link_raw)
                         remark = remark or str(ep.get("remark") or "").strip()
                         proto = str(ep.get("protocol") or "vless")
                         if not tag:
@@ -8206,7 +8220,7 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                         config = P.endpoint_to_xray_outbound(ep, tag)
                         info = f"{proto} {ep.get('address')}:{ep.get('port')}"
                     else:
-                        config = json.loads(str(form.get("json") or "{}"))
+                        config = json.loads(json_raw or "{}")
                         if not isinstance(config, dict) or not config.get("protocol"):
                             raise ValueError("в JSON нет protocol")
                         proto = str(config.get("protocol") or "custom")

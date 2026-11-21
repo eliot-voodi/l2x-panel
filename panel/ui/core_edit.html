@@ -171,7 +171,7 @@
 <section class="core-panel {% if core_tab == 'inbounds' %}active{% endif %}" data-panel="inbounds">
   <div class="card-head" style="margin-bottom:.75rem">
     <h3 style="margin:0">Входящие</h3>
-    <button type="button" class="btn sm" onclick="openCoreInbound()">{{ ic.icon('plus') }}Добавить</button>
+    <button type="button" class="btn sm js-ib-add">{{ ic.icon('plus') }}Добавить</button>
   </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
@@ -186,8 +186,8 @@
             <td>{% if i.enabled is not defined or i.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
-                <button type="button" class="btn ghost icon" title="Изменить"
-                        onclick="openCoreInbound('{{ i.id }}')">{{ ic.icon('edit') }}</button>
+                <button type="button" class="btn ghost icon js-ib-edit" title="Изменить"
+                        data-id="{{ i.id }}">{{ ic.icon('edit') }}</button>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/toggle">
                   <input type="hidden" name="id" value="{{ i.id }}">
                   <button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button>
@@ -208,107 +208,13 @@
     </div>
   </div>
   <div class="hint">После добавления/правки нажмите <b>Применить</b> вверху страницы.</div>
-
-  <dialog id="dlg-core-ib" style="max-width:760px;width:calc(100% - 1.5rem)">
-    <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/save" id="form-core-ib">
-      <input type="hidden" name="id" id="core-ib-id" value="">
-      <div class="card-head"><h3 id="core-ib-title">Новый inbound</h3>
-        <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
-      <div class="row">
-        <div><label class="f">Протокол</label>
-          <select name="protocol" id="core-ib-proto">
-            {% for p in protocols %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
-          </select></div>
-        <div><label class="f">Tag</label><input name="tag" id="core-ib-tag" required pattern="[A-Za-z0-9._-]+"></div>
-        <div style="max-width:110px"><label class="f">Port</label><input name="port" id="core-ib-port" type="number" min="1" max="65535" value="{{ free_ib_port }}"></div>
-      </div>
-      <div class="row">
-        <div><label class="f">Название</label><input name="remark" id="core-ib-remark"></div>
-        <div>{{ m.check('enabled', True, 'Включён') }}</div>
-      </div>
-
-      <div class="row" data-ib-show="stream">
-        <div><label class="f">Network</label>
-          <select name="network" id="core-ib-net">
-            {% for n in networks if n != 'hysteria' %}<option value="{{ n }}">{{ n }}</option>{% endfor %}
-          </select></div>
-        <div><label class="f">Security</label>
-          <select name="security" id="core-ib-sec">
-            {% for s in securities %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
-          </select></div>
-        <div><label class="f">Fingerprint</label>
-          <select name="client_fp" id="core-ib-fp">
-            {% for f in fingerprints %}<option value="{{ f }}">{{ f }}</option>{% endfor %}
-          </select></div>
-      </div>
-
-      <div class="row" data-ib-show="vless">
-        <div><label class="f">Flow</label>
-          <select name="flow" id="core-ib-flow"><option value="">нет</option><option>xtls-rprx-vision</option></select></div>
-      </div>
-
-      <div class="row" data-ib-show="ss">
-        <div><label class="f">SS method</label>
-          <select name="ss_method" id="core-ib-ss-method">
-            {% for s in ('aes-128-gcm','aes-256-gcm','chacha20-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm') %}
-            <option value="{{ s }}">{{ s }}</option>{% endfor %}
-          </select></div>
-        <div style="flex:0 0 auto"><label class="f">&nbsp;</label>
-          <label class="check"><input type="checkbox" name="ss_regen" id="core-ib-ss-regen" value="1"> Перегенерировать пароль</label></div>
-      </div>
-
-      <div class="row" data-ib-show="ws">
-        <div><label class="f">WS path</label><input name="ws_path" id="core-ib-ws-path" value="/"></div>
-        <div><label class="f">WS host</label><input name="ws_host" id="core-ib-ws-host"></div>
-      </div>
-      <div class="row" data-ib-show="grpc">
-        <div><label class="f">gRPC service</label><input name="grpc_service" id="core-ib-grpc" value="grpc"></div>
-      </div>
-      <div class="row" data-ib-show="xhttp">
-        <div><label class="f">XHTTP path</label><input name="xh_path" id="core-ib-xh-path" value="/"></div>
-        <div><label class="f">XHTTP host</label><input name="xh_host" id="core-ib-xh-host"></div>
-      </div>
-      <div class="row" data-ib-show="httpupgrade">
-        <div><label class="f">HTTPUpgrade path</label><input name="hu_path" id="core-ib-hu-path" value="/"></div>
-        <div><label class="f">HTTPUpgrade host</label><input name="hu_host" id="core-ib-hu-host"></div>
-      </div>
-
-      <div data-ib-show="reality" id="core-ib-reality">
-        <h3 class="mt">Reality</h3>
-        <div class="row">
-          <div><label class="f">Dest</label><input name="r_dest" id="core-ib-rdest" value="www.cloudflare.com:443"></div>
-          <div><label class="f">Server names</label><input name="r_names" id="core-ib-rnames" value="www.cloudflare.com"></div>
-        </div>
-        <div class="row">
-          <div style="flex:2"><label class="f">Short IDs</label>
-            <div class="flex" style="gap:.4rem">
-              <input name="r_sids" id="core-ib-rsids" class="mono" style="flex:1">
-              <button type="button" class="btn ghost sm" onclick="coreRegenShortIds()">↻</button>
-            </div></div>
-        </div>
-        <div class="row">
-          <div><label class="f">Private key</label>
-            <div class="flex" style="gap:.4rem">
-              <input name="r_priv" id="core-ib-rpriv" class="mono" style="flex:1">
-            </div></div>
-          <div><label class="f">Public key</label>
-            <input name="r_pub" id="core-ib-rpub" class="mono"></div>
-        </div>
-        <div class="actions" style="margin-top:.5rem">
-          <button type="button" class="btn ghost sm" onclick="coreRegenReality()">Перегенерировать ключи Reality</button>
-        </div>
-      </div>
-
-      <div class="actions mt"><button class="btn" id="core-ib-submit">Добавить</button></div>
-    </form>
-  </dialog>
 </section>
 
 {# ===================== OUTBOUNDS ===================== #}
 <section class="core-panel {% if core_tab == 'outbounds' %}active{% endif %}" data-panel="outbounds">
   <div class="card-head" style="margin-bottom:.75rem">
     <h3 style="margin:0">Исходящие</h3>
-    <button type="button" class="btn sm" onclick="openCoreOutbound()">{{ ic.icon('plus') }}Добавить</button>
+    <button type="button" class="btn sm js-ob-add">{{ ic.icon('plus') }}Добавить</button>
   </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
@@ -324,8 +230,8 @@
             <td>{% if o.enabled is not defined or o.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
-                <button type="button" class="btn ghost icon" title="Изменить"
-                        onclick="openCoreOutbound({{ o.tag|tojson }})">{{ ic.icon('edit') }}</button>
+                <button type="button" class="btn ghost icon js-ob-edit" title="Изменить"
+                        data-tag="{{ o.tag }}">{{ ic.icon('edit') }}</button>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/sub">
                   <input type="hidden" name="tag" value="{{ o.tag }}">
                   <button class="btn ghost icon" title="В подписке">{{ ic.icon('link') }}</button>
@@ -350,37 +256,6 @@
     </div>
   </div>
   <div class="hint">Новый outbound создаётся выключенным. Затем <b>Применить</b>.</div>
-
-  <dialog id="dlg-core-ob" style="max-width:720px;width:calc(100% - 1.5rem)">
-    <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/save" id="form-core-ob">
-      <input type="hidden" name="edit_tag" id="core-ob-edit" value="">
-      <input type="hidden" name="mode" id="core-ob-mode" value="link">
-      <div class="card-head"><h3 id="core-ob-title">Новый outbound</h3>
-        <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
-      <div class="tabs" id="core-ob-tabs">
-        <a href="#" data-ob-mode="link" class="active">Ссылка</a>
-        <a href="#" data-ob-mode="json">JSON</a>
-      </div>
-      <div class="row">
-        <div><label class="f">Tag</label><input name="tag" id="core-ob-tag" pattern="[A-Za-z0-9._-]*" placeholder="из названия ссылки"></div>
-        <div><label class="f">Название</label><input name="remark" id="core-ob-remark"></div>
-        <div style="max-width:90px"><label class="f">Страна</label><input name="country" id="core-ob-country" maxlength="2" style="text-transform:uppercase"></div>
-      </div>
-      <div class="hint" id="core-ob-tag-hint">Tag можно менять. Из ссылки подставится из #fragment (например Romania-Wi-Fi).</div>
-      <div data-ob-pane="link">
-        <label class="f">Ссылка</label>
-        <div class="flex" style="gap:.4rem">
-          <input name="link" id="core-ob-link" style="flex:1" placeholder="vless:// vmess:// trojan:// ss:// …">
-          <button type="button" class="btn ghost sm" onclick="coreParseObLink()">Разобрать</button>
-        </div>
-      </div>
-      <div data-ob-pane="json" hidden>
-        <label class="f">Xray outbound JSON</label>
-        <textarea name="json" id="core-ob-json" class="mono" rows="14" spellcheck="false" placeholder='{"protocol":"vless","settings":{…}}'></textarea>
-      </div>
-      <div class="actions mt"><button class="btn" id="core-ob-submit">Добавить</button></div>
-    </form>
-  </dialog>
 </section>
 
 {# ===================== ROUTING ===================== #}
@@ -556,6 +431,132 @@
   </form>
 </section>
 
+{# Dialogs outside .core-panel — showModal fails inside display:none ancestors #}
+<dialog id="dlg-core-ib" style="max-width:760px;width:calc(100% - 1.5rem)">
+  <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/save" id="form-core-ib">
+    <input type="hidden" name="id" id="core-ib-id" value="">
+    <div class="card-head"><h3 id="core-ib-title">Новый inbound</h3>
+      <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+    <div class="row">
+      <div><label class="f">Протокол</label>
+        <select name="protocol" id="core-ib-proto">
+          {% for p in protocols %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+        </select></div>
+      <div><label class="f">Tag</label><input name="tag" id="core-ib-tag" required pattern="[A-Za-z0-9._-]+"></div>
+      <div style="max-width:110px"><label class="f">Port</label><input name="port" id="core-ib-port" type="number" min="1" max="65535" value="{{ free_ib_port }}"></div>
+    </div>
+    <div class="row">
+      <div><label class="f">Название</label><input name="remark" id="core-ib-remark"></div>
+      <div>{{ m.check('enabled', True, 'Включён') }}</div>
+    </div>
+
+    <div class="row" data-ib-show="stream">
+      <div><label class="f">Network</label>
+        <select name="network" id="core-ib-net">
+          {% for n in networks if n != 'hysteria' %}<option value="{{ n }}">{{ n }}</option>{% endfor %}
+        </select></div>
+      <div><label class="f">Security</label>
+        <select name="security" id="core-ib-sec">
+          {% for s in securities %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+        </select></div>
+      <div><label class="f">Fingerprint</label>
+        <select name="client_fp" id="core-ib-fp">
+          {% for f in fingerprints %}<option value="{{ f }}">{{ f }}</option>{% endfor %}
+        </select></div>
+    </div>
+
+    <div class="row" data-ib-show="vless">
+      <div><label class="f">Flow</label>
+        <select name="flow" id="core-ib-flow"><option value="">нет</option><option>xtls-rprx-vision</option></select></div>
+    </div>
+
+    <div class="row" data-ib-show="ss">
+      <div><label class="f">SS method</label>
+        <select name="ss_method" id="core-ib-ss-method">
+          {% for s in ('aes-128-gcm','aes-256-gcm','chacha20-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm') %}
+          <option value="{{ s }}">{{ s }}</option>{% endfor %}
+        </select></div>
+      <div style="flex:0 0 auto"><label class="f">&nbsp;</label>
+        <label class="check"><input type="checkbox" name="ss_regen" id="core-ib-ss-regen" value="1"> Перегенерировать пароль</label></div>
+    </div>
+
+    <div class="row" data-ib-show="ws">
+      <div><label class="f">WS path</label><input name="ws_path" id="core-ib-ws-path" value="/"></div>
+      <div><label class="f">WS host</label><input name="ws_host" id="core-ib-ws-host"></div>
+    </div>
+    <div class="row" data-ib-show="grpc">
+      <div><label class="f">gRPC service</label><input name="grpc_service" id="core-ib-grpc" value="grpc"></div>
+    </div>
+    <div class="row" data-ib-show="xhttp">
+      <div><label class="f">XHTTP path</label><input name="xh_path" id="core-ib-xh-path" value="/"></div>
+      <div><label class="f">XHTTP host</label><input name="xh_host" id="core-ib-xh-host"></div>
+    </div>
+    <div class="row" data-ib-show="httpupgrade">
+      <div><label class="f">HTTPUpgrade path</label><input name="hu_path" id="core-ib-hu-path" value="/"></div>
+      <div><label class="f">HTTPUpgrade host</label><input name="hu_host" id="core-ib-hu-host"></div>
+    </div>
+
+    <div data-ib-show="reality" id="core-ib-reality">
+      <h3 class="mt">Reality</h3>
+      <div class="row">
+        <div><label class="f">Dest</label><input name="r_dest" id="core-ib-rdest" value="www.cloudflare.com:443"></div>
+        <div><label class="f">Server names</label><input name="r_names" id="core-ib-rnames" value="www.cloudflare.com"></div>
+      </div>
+      <div class="row">
+        <div style="flex:2"><label class="f">Short IDs</label>
+          <div class="flex" style="gap:.4rem">
+            <input name="r_sids" id="core-ib-rsids" class="mono" style="flex:1">
+            <button type="button" class="btn ghost sm" onclick="coreRegenShortIds()">↻</button>
+          </div></div>
+      </div>
+      <div class="row">
+        <div><label class="f">Private key</label>
+          <div class="flex" style="gap:.4rem">
+            <input name="r_priv" id="core-ib-rpriv" class="mono" style="flex:1">
+          </div></div>
+        <div><label class="f">Public key</label>
+          <input name="r_pub" id="core-ib-rpub" class="mono"></div>
+      </div>
+      <div class="actions" style="margin-top:.5rem">
+        <button type="button" class="btn ghost sm" onclick="coreRegenReality()">Перегенерировать ключи Reality</button>
+      </div>
+    </div>
+
+    <div class="actions mt"><button class="btn" id="core-ib-submit">Добавить</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-core-ob" style="max-width:720px;width:calc(100% - 1.5rem)">
+  <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/save" id="form-core-ob">
+    <input type="hidden" name="edit_tag" id="core-ob-edit" value="">
+    <input type="hidden" name="mode" id="core-ob-mode" value="link">
+    <div class="card-head"><h3 id="core-ob-title">Новый outbound</h3>
+      <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+    <div class="tabs" id="core-ob-tabs">
+      <a href="#" data-ob-mode="link" class="active">Ссылка</a>
+      <a href="#" data-ob-mode="json">JSON</a>
+    </div>
+    <div class="row">
+      <div><label class="f">Tag</label><input name="tag" id="core-ob-tag" pattern="[A-Za-z0-9._-]*" placeholder="из названия ссылки"></div>
+      <div><label class="f">Название</label><input name="remark" id="core-ob-remark"></div>
+      <div style="max-width:90px"><label class="f">Страна</label><input name="country" id="core-ob-country" maxlength="2" style="text-transform:uppercase"></div>
+    </div>
+    <div class="hint" id="core-ob-tag-hint">Tag можно менять. Из ссылки подставится из #fragment (например Romania-Wi-Fi).</div>
+    <div data-ob-pane="link">
+      <label class="f">Ссылка</label>
+      <div class="flex" style="gap:.4rem">
+        <input name="link" id="core-ob-link" style="flex:1" placeholder="vless:// vmess:// trojan:// ss:// …">
+        <button type="button" class="btn ghost sm" onclick="coreParseObLink()">Разобрать</button>
+      </div>
+    </div>
+    <div data-ob-pane="json" hidden>
+      <label class="f">Xray outbound JSON</label>
+      <textarea name="json" id="core-ob-json" class="mono" rows="14" spellcheck="false" placeholder='{"protocol":"vless","settings":{…}}'></textarea>
+    </div>
+    <div class="actions mt"><button class="btn" id="core-ob-submit">Добавить</button></div>
+  </form>
+</dialog>
+
 <script>
 (function () {
   var tabs = document.getElementById('core-tabs');
@@ -680,165 +681,207 @@ function openCoreRouteEdit(r) {
   document.getElementById('dlg-core-route-edit').showModal();
 }
 
-var CORE_IB = {{ (core_ib_map or {})|tojson }};
-var CORE_OB = {{ (core_ob_map or {})|tojson }};
-var FREE_IB_PORT = {{ (free_ib_port or 10443)|tojson }};
-var BP = {{ bp|tojson }};
+</script>
+<script type="application/json" id="core-ib-data">{{ (core_ib_map or {})|tojson }}</script>
+<script type="application/json" id="core-ob-data">{{ (core_ob_map or {})|tojson }}</script>
+<script>
+(function () {
+  var FREE_IB_PORT = {{ (free_ib_port or 10443)|int }};
+  var BP = {{ bp|tojson }};
+  var CORE_IB = {};
+  var CORE_OB = {};
+  try { CORE_IB = JSON.parse(document.getElementById('core-ib-data').textContent || '{}') || {}; } catch (e) { CORE_IB = {}; }
+  try { CORE_OB = JSON.parse(document.getElementById('core-ob-data').textContent || '{}') || {}; } catch (e) { CORE_OB = {}; }
 
-function coreSlugTag(s) {
-  s = String(s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-  s = s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-._]+|[-._]+$/g, '').slice(0, 40);
-  if (!s || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$/.test(s)) return '';
-  return s;
-}
-
-function syncCoreIbFields() {
-  var proto = document.getElementById('core-ib-proto').value;
-  var net = document.getElementById('core-ib-net').value;
-  var sec = document.getElementById('core-ib-sec').value;
-  var streamProtos = { vless: 1, vmess: 1, trojan: 1 };
-  document.querySelectorAll('[data-ib-show]').forEach(function (el) {
-    var key = el.getAttribute('data-ib-show');
-    var on = false;
-    if (key === 'stream') on = !!streamProtos[proto];
-    else if (key === 'vless') on = proto === 'vless';
-    else if (key === 'ss') on = proto === 'shadowsocks';
-    else if (key === 'ws') on = !!streamProtos[proto] && net === 'ws';
-    else if (key === 'grpc') on = !!streamProtos[proto] && net === 'grpc';
-    else if (key === 'xhttp') on = !!streamProtos[proto] && net === 'xhttp';
-    else if (key === 'httpupgrade') on = !!streamProtos[proto] && net === 'httpupgrade';
-    else if (key === 'reality') on = !!streamProtos[proto] && sec === 'reality';
-    el.hidden = !on;
-  });
-  // hysteria / ss: lock network/security options where needed
-  var secEl = document.getElementById('core-ib-sec');
-  if (proto === 'hysteria') {
-    document.getElementById('core-ib-net').value = 'hysteria';
-    secEl.value = 'tls';
+  function coreSlugTag(s) {
+    s = String(s || '');
+    try { s = s.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch (e) {}
+    s = s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-._]+|[-._]+$/g, '').slice(0, 40);
+    if (!s || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$/.test(s)) return '';
+    return s;
   }
-}
 
-function coreRegenReality() {
-  fetch(BP + '/api/keys/reality', { credentials: 'same-origin' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      if (d.private_key) document.getElementById('core-ib-rpriv').value = d.private_key;
-      if (d.public_key) document.getElementById('core-ib-rpub').value = d.public_key;
-    }).catch(function () {});
-}
-function coreRegenShortIds() {
-  fetch(BP + '/api/keys/shortids', { credentials: 'same-origin' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      var ids = d.short_ids || d.ids || d;
-      if (Array.isArray(ids)) {
-        document.getElementById('core-ib-rsids').value = ids.filter(Boolean).join(',');
-      } else if (typeof ids === 'string') {
-        document.getElementById('core-ib-rsids').value = ids.split(/[\s,]+/).filter(Boolean).join(',');
-      }
-    }).catch(function () {});
-}
-
-function openCoreInbound(id) {
-  var form = document.getElementById('form-core-ib');
-  var item = id ? CORE_IB[String(id)] : null;
-  form.reset();
-  document.getElementById('core-ib-id').value = item ? (item.id || '') : '';
-  document.getElementById('core-ib-title').textContent = item ? ('Изменить ' + (item.tag || '')) : 'Новый inbound';
-  document.getElementById('core-ib-submit').textContent = item ? 'Сохранить' : 'Добавить';
-  document.getElementById('core-ib-proto').value = (item && item.protocol) || 'vless';
-  document.getElementById('core-ib-tag').value = (item && item.tag) || '';
-  document.getElementById('core-ib-port').value = (item && item.port) || FREE_IB_PORT;
-  document.getElementById('core-ib-remark').value = (item && item.remark) || '';
-  var en = form.querySelector('[name="enabled"]');
-  if (en) en.checked = !item || item.enabled !== false;
-  document.getElementById('core-ib-net').value = (item && item.network) || 'raw';
-  document.getElementById('core-ib-sec').value = (item && item.security) || 'none';
-  document.getElementById('core-ib-fp').value = (item && item.fingerprint) || 'firefox';
-  document.getElementById('core-ib-flow').value = (item && item.flow) || '';
-  document.getElementById('core-ib-ws-path').value = (item && item.ws_path) || '/';
-  document.getElementById('core-ib-ws-host').value = (item && item.ws_host) || '';
-  document.getElementById('core-ib-xh-path').value = (item && item.xhttp_path) || '/';
-  document.getElementById('core-ib-xh-host').value = (item && item.xhttp_host) || '';
-  document.getElementById('core-ib-rdest').value = (item && item.r_dest) || 'www.cloudflare.com:443';
-  document.getElementById('core-ib-rnames').value = (item && item.r_sni) || 'www.cloudflare.com';
-  document.getElementById('core-ib-rsids').value = (item && item.r_short) || '';
-  document.getElementById('core-ib-rpriv').value = (item && item.r_private) || '';
-  document.getElementById('core-ib-rpub').value = (item && item.r_public) || '';
-  syncCoreIbFields();
-  document.getElementById('dlg-core-ib').showModal();
-}
-document.getElementById('core-ib-proto').addEventListener('change', syncCoreIbFields);
-document.getElementById('core-ib-net').addEventListener('change', syncCoreIbFields);
-document.getElementById('core-ib-sec').addEventListener('change', syncCoreIbFields);
-
-function setCoreObMode(mode) {
-  document.getElementById('core-ob-mode').value = mode;
-  document.querySelectorAll('#core-ob-tabs a').forEach(function (a) {
-    a.classList.toggle('active', a.getAttribute('data-ob-mode') === mode);
-  });
-  document.querySelectorAll('[data-ob-pane]').forEach(function (p) {
-    p.hidden = p.getAttribute('data-ob-pane') !== mode;
-  });
-}
-document.getElementById('core-ob-tabs').addEventListener('click', function (e) {
-  var a = e.target.closest('a[data-ob-mode]');
-  if (!a) return;
-  e.preventDefault();
-  setCoreObMode(a.getAttribute('data-ob-mode'));
-});
-
-function coreParseObLink(opts) {
-  opts = opts || {};
-  var link = document.getElementById('core-ob-link').value;
-  if (!link) return;
-  var fd = new FormData();
-  fd.append('link', link);
-  fetch(BP + '/outbounds/parse', { method: 'POST', body: fd, credentials: 'same-origin' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      if (!d.ok) {
-        if (!opts.silent) alert(d.error || 'Не удалось разобрать ссылку');
-        return;
-      }
-      var remark = d.remark || '';
-      var remarkEl = document.getElementById('core-ob-remark');
-      if (remark && (!remarkEl.value || opts.force)) remarkEl.value = remark;
-      var tagEl = document.getElementById('core-ob-tag');
-      if (!tagEl.value || tagEl.value === 'ob' || tagEl.value === 'proxy' || opts.force) {
-        var slug = coreSlugTag(remark) || coreSlugTag((d.config && d.config.protocol) || 'proxy');
-        if (slug) tagEl.value = slug;
-      }
-      if (d.config) {
-        try { document.getElementById('core-ob-json').value = JSON.stringify(d.config, null, 2); } catch (e) {}
-      }
-    })
-    .catch(function () { if (!opts.silent) alert('Ошибка запроса'); });
-}
-document.getElementById('core-ob-link').addEventListener('change', function () { coreParseObLink({ silent: true, force: true }); });
-document.getElementById('core-ob-link').addEventListener('paste', function () {
-  setTimeout(function () { coreParseObLink({ silent: true, force: true }); }, 50);
-});
-
-function openCoreOutbound(tag) {
-  var item = tag ? CORE_OB[tag] : null;
-  document.getElementById('core-ob-edit').value = tag || '';
-  document.getElementById('core-ob-title').textContent = tag ? ('Изменить ' + tag) : 'Новый outbound';
-  document.getElementById('core-ob-submit').textContent = tag ? 'Сохранить' : 'Добавить';
-  document.getElementById('core-ob-tag').value = tag || '';
-  document.getElementById('core-ob-tag').readOnly = false;
-  document.getElementById('core-ob-remark').value = (item && item.remark) || '';
-  document.getElementById('core-ob-country').value = (item && item.country) || '';
-  document.getElementById('core-ob-link').value = '';
-  try {
-    document.getElementById('core-ob-json').value = item && item.config
-      ? JSON.stringify(item.config, null, 2) : '';
-  } catch (e) {
-    document.getElementById('core-ob-json').value = '';
+  function syncCoreIbFields() {
+    var protoEl = document.getElementById('core-ib-proto');
+    var netEl = document.getElementById('core-ib-net');
+    var secEl = document.getElementById('core-ib-sec');
+    if (!protoEl || !netEl || !secEl) return;
+    var proto = protoEl.value;
+    var net = netEl.value;
+    var sec = secEl.value;
+    var streamProtos = { vless: 1, vmess: 1, trojan: 1 };
+    document.querySelectorAll('[data-ib-show]').forEach(function (el) {
+      var key = el.getAttribute('data-ib-show');
+      var on = false;
+      if (key === 'stream') on = !!streamProtos[proto];
+      else if (key === 'vless') on = proto === 'vless';
+      else if (key === 'ss') on = proto === 'shadowsocks';
+      else if (key === 'ws') on = !!streamProtos[proto] && net === 'ws';
+      else if (key === 'grpc') on = !!streamProtos[proto] && net === 'grpc';
+      else if (key === 'xhttp') on = !!streamProtos[proto] && net === 'xhttp';
+      else if (key === 'httpupgrade') on = !!streamProtos[proto] && net === 'httpupgrade';
+      else if (key === 'reality') on = !!streamProtos[proto] && sec === 'reality';
+      el.hidden = !on;
+    });
+    if (proto === 'hysteria') {
+      netEl.value = 'hysteria';
+      secEl.value = 'tls';
+    }
   }
-  setCoreObMode(tag ? 'json' : 'link');
-  document.getElementById('dlg-core-ob').showModal();
-}
+
+  window.coreRegenReality = function () {
+    fetch(BP + '/api/keys/reality', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.private_key) document.getElementById('core-ib-rpriv').value = d.private_key;
+        if (d.public_key) document.getElementById('core-ib-rpub').value = d.public_key;
+      }).catch(function () {});
+  };
+  window.coreRegenShortIds = function () {
+    fetch(BP + '/api/keys/shortids', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var ids = d.short_ids || d.ids || d;
+        if (Array.isArray(ids)) {
+          document.getElementById('core-ib-rsids').value = ids.filter(Boolean).join(',');
+        } else if (typeof ids === 'string') {
+          document.getElementById('core-ib-rsids').value = ids.split(/[\s,]+/).filter(Boolean).join(',');
+        }
+      }).catch(function () {});
+  };
+
+  window.openCoreInbound = function (id) {
+    var form = document.getElementById('form-core-ib');
+    var dlg = document.getElementById('dlg-core-ib');
+    if (!form || !dlg) { alert('Форма inbound не найдена'); return; }
+    var item = id ? CORE_IB[String(id)] : null;
+    form.reset();
+    document.getElementById('core-ib-id').value = item ? (item.id || '') : '';
+    document.getElementById('core-ib-title').textContent = item ? ('Изменить ' + (item.tag || '')) : 'Новый inbound';
+    document.getElementById('core-ib-submit').textContent = item ? 'Сохранить' : 'Добавить';
+    document.getElementById('core-ib-proto').value = (item && item.protocol) || 'vless';
+    document.getElementById('core-ib-tag').value = (item && item.tag) || '';
+    document.getElementById('core-ib-port').value = (item && item.port) || FREE_IB_PORT;
+    document.getElementById('core-ib-remark').value = (item && item.remark) || '';
+    var en = form.querySelector('[name="enabled"]');
+    if (en) en.checked = !item || item.enabled !== false;
+    document.getElementById('core-ib-net').value = (item && item.network) || 'raw';
+    document.getElementById('core-ib-sec').value = (item && item.security) || 'none';
+    document.getElementById('core-ib-fp').value = (item && item.fingerprint) || 'firefox';
+    document.getElementById('core-ib-flow').value = (item && item.flow) || '';
+    document.getElementById('core-ib-ws-path').value = (item && item.ws_path) || '/';
+    document.getElementById('core-ib-ws-host').value = (item && item.ws_host) || '';
+    document.getElementById('core-ib-xh-path').value = (item && item.xhttp_path) || '/';
+    document.getElementById('core-ib-xh-host').value = (item && item.xhttp_host) || '';
+    document.getElementById('core-ib-rdest').value = (item && item.r_dest) || 'www.cloudflare.com:443';
+    document.getElementById('core-ib-rnames').value = (item && item.r_sni) || 'www.cloudflare.com';
+    document.getElementById('core-ib-rsids').value = (item && item.r_short) || '';
+    document.getElementById('core-ib-rpriv').value = (item && item.r_private) || '';
+    document.getElementById('core-ib-rpub').value = (item && item.r_public) || '';
+    syncCoreIbFields();
+    dlg.showModal();
+  };
+
+  function setCoreObMode(mode) {
+    var modeEl = document.getElementById('core-ob-mode');
+    if (modeEl) modeEl.value = mode;
+    document.querySelectorAll('#core-ob-tabs a').forEach(function (a) {
+      a.classList.toggle('active', a.getAttribute('data-ob-mode') === mode);
+    });
+    document.querySelectorAll('[data-ob-pane]').forEach(function (p) {
+      p.hidden = p.getAttribute('data-ob-pane') !== mode;
+    });
+  }
+
+  window.coreParseObLink = function (opts) {
+    opts = opts || {};
+    var linkEl = document.getElementById('core-ob-link');
+    if (!linkEl || !linkEl.value) return;
+    var fd = new FormData();
+    fd.append('link', linkEl.value);
+    fetch(BP + '/outbounds/parse', { method: 'POST', body: fd, credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) {
+          if (!opts.silent) alert(d.error || 'Не удалось разобрать ссылку');
+          return;
+        }
+        var remark = d.remark || '';
+        var remarkEl = document.getElementById('core-ob-remark');
+        if (remarkEl && remark && (!remarkEl.value || opts.force)) remarkEl.value = remark;
+        var tagEl = document.getElementById('core-ob-tag');
+        if (tagEl && (!tagEl.value || tagEl.value === 'ob' || tagEl.value === 'proxy' || opts.force)) {
+          var slug = coreSlugTag(remark) || coreSlugTag((d.config && d.config.protocol) || 'proxy');
+          if (slug) tagEl.value = slug;
+        }
+        if (d.config) {
+          try { document.getElementById('core-ob-json').value = JSON.stringify(d.config, null, 2); } catch (e) {}
+        }
+      })
+      .catch(function () { if (!opts.silent) alert('Ошибка запроса'); });
+  };
+
+  window.openCoreOutbound = function (tag) {
+    var dlg = document.getElementById('dlg-core-ob');
+    if (!dlg) { alert('Форма outbound не найдена'); return; }
+    tag = tag == null ? '' : String(tag);
+    var item = tag ? (CORE_OB[tag] || null) : null;
+    if (tag && !item) {
+      // fallback: case / whitespace mismatch
+      var keys = Object.keys(CORE_OB || {});
+      for (var i = 0; i < keys.length; i++) {
+        if (keys[i] === tag || String(keys[i]).trim() === tag.trim()) { item = CORE_OB[keys[i]]; tag = keys[i]; break; }
+      }
+    }
+    document.getElementById('core-ob-edit').value = tag || '';
+    document.getElementById('core-ob-title').textContent = tag ? ('Изменить ' + tag) : 'Новый outbound';
+    document.getElementById('core-ob-submit').textContent = tag ? 'Сохранить' : 'Добавить';
+    document.getElementById('core-ob-tag').value = tag || '';
+    document.getElementById('core-ob-tag').readOnly = false;
+    document.getElementById('core-ob-remark').value = (item && item.remark) || '';
+    document.getElementById('core-ob-country').value = (item && item.country) || '';
+    document.getElementById('core-ob-link').value = '';
+    try {
+      document.getElementById('core-ob-json').value = item && item.config
+        ? JSON.stringify(item.config, null, 2) : '';
+    } catch (e) {
+      document.getElementById('core-ob-json').value = '';
+    }
+    setCoreObMode(tag ? 'json' : 'link');
+    try {
+      if (typeof dlg.showModal === 'function') dlg.showModal();
+      else { dlg.setAttribute('open', ''); }
+    } catch (e) {
+      alert('Не удалось открыть окно: ' + e);
+    }
+  };
+
+  function on(el, ev, fn) { if (el) el.addEventListener(ev, fn); }
+  on(document.getElementById('core-ib-proto'), 'change', syncCoreIbFields);
+  on(document.getElementById('core-ib-net'), 'change', syncCoreIbFields);
+  on(document.getElementById('core-ib-sec'), 'change', syncCoreIbFields);
+  on(document.getElementById('core-ob-tabs'), 'click', function (e) {
+    var a = e.target.closest('a[data-ob-mode]');
+    if (!a) return;
+    e.preventDefault();
+    setCoreObMode(a.getAttribute('data-ob-mode'));
+  });
+  on(document.getElementById('core-ob-link'), 'change', function () { coreParseObLink({ silent: true, force: true }); });
+  on(document.getElementById('core-ob-link'), 'paste', function () {
+    setTimeout(function () { coreParseObLink({ silent: true, force: true }); }, 50);
+  });
+
+  document.addEventListener('click', function (e) {
+    var ibAdd = e.target.closest('.js-ib-add');
+    if (ibAdd) { e.preventDefault(); openCoreInbound(); return; }
+    var ibEdit = e.target.closest('.js-ib-edit');
+    if (ibEdit) { e.preventDefault(); openCoreInbound(ibEdit.getAttribute('data-id')); return; }
+    var obAdd = e.target.closest('.js-ob-add');
+    if (obAdd) { e.preventDefault(); openCoreOutbound(); return; }
+    var obEdit = e.target.closest('.js-ob-edit');
+    if (obEdit) { e.preventDefault(); openCoreOutbound(obEdit.getAttribute('data-tag') || ''); return; }
+  });
+})();
 </script>
 
 {% endif %}
