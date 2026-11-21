@@ -4170,15 +4170,33 @@ def update_online(store: dict, online: dict[str, dict[str, int]]) -> dict[str, l
                 row[str(ip)] = max(int(row.get(str(ip)) or 0), int(ts or 0))
         online = merged
     result: dict[str, list[str]] = {}
+    online = online or {}
     for client in store.get("clients") or []:
         ensure_client(client)
-        emails = {client["email"]} | {e["email"] for e in subscription_entries(store, client, ignore_quota=True)}
+        base = str(client.get("email") or "")
+        if not base:
+            continue
+        # Direct nodes report ``email~node_*``; subscription_entries often empty
+        # (inbounds-only model) — match base + any ``email~…`` keys.
+        prefix = base + "~"
+        now_ts = int(now.timestamp())
         ips: dict[str, int] = {}
-        for email in emails:
-            for ip, ts in (online.get(email) or {}).items():
-                ips[ip] = max(ips.get(ip, 0), ts)
+        for email, ipmap in online.items():
+            em = str(email or "")
+            if em != base and not em.startswith(prefix):
+                continue
+            if not isinstance(ipmap, dict):
+                continue
+            for ip, ts in ipmap.items():
+                if not ip:
+                    continue
+                ts_i = int(ts or 0)
+                # Drop stale agent IPs (no fresh report for >2 min)
+                if ts_i and (now_ts - ts_i) > 120:
+                    continue
+                ips[str(ip)] = max(int(ips.get(str(ip)) or 0), ts_i)
         if ips:
-            result[client["email"]] = sorted(ips, key=lambda i: ips[i])
+            result[base] = sorted(ips, key=lambda i: ips[i])
             client["last_online"] = now.isoformat()
             log = client.setdefault("ips", {})
             for ip, ts in ips.items():

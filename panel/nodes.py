@@ -1549,6 +1549,7 @@ def apply_direct_tag_traffic(
             except Exception:
                 daily = None
 
+        saw_activity = False
         for email in list(candidates):
             cur = traffic.get(email)
             if not isinstance(cur, dict) and email == base:
@@ -1566,12 +1567,21 @@ def apply_direct_tag_traffic(
                 changed = True
                 d_up = int(row.get("up") or 0) - before_up
                 d_down = int(row.get("down") or 0) - before_down
+                if d_up or d_down:
+                    saw_activity = True
                 if daily is not None and (d_up or d_down):
                     daily["up"] = int(daily.get("up") or 0) + max(0, d_up)
                     daily["down"] = int(daily.get("down") or 0) + max(0, d_down)
                     trow = daily.setdefault("by_tag", {}).setdefault(tag, {"up": 0, "down": 0})
                     trow["up"] = int(trow.get("up") or 0) + max(0, d_up)
                     trow["down"] = int(trow.get("down") or 0) + max(0, d_down)
+
+        # Online IPs for this client on this tag (email or email~tag)
+        for key in (base, f"{base}{suffix}"):
+            ipmap = online.get(key)
+            if isinstance(ipmap, dict) and ipmap:
+                saw_activity = True
+                break
 
         if by:
             up = sum(int(r.get("up") or 0) for r in by.values() if isinstance(r, dict))
@@ -1580,8 +1590,15 @@ def apply_direct_tag_traffic(
                 tr["up"], tr["down"] = up, down
                 changed = True
 
-    if online:
+        if saw_activity:
+            client["last_online"] = now_iso()
+            changed = True
+
+    # None = leave previous online snapshot; {} = everyone offline on this node
+    if online is not None:
         bucket = store.setdefault("_agent_online", {})
+        before = {k: dict(v) for k, v in bucket.items()
+                  if str(k).endswith(suffix) and isinstance(v, dict)}
         for k in list(bucket.keys()):
             if str(k).endswith(suffix):
                 bucket.pop(k, None)
@@ -1595,7 +1612,10 @@ def apply_direct_tag_traffic(
                 bucket[em] = {str(k): int(v or 0) for k, v in ips.items()}
             elif isinstance(ips, list):
                 bucket[em] = {str(ip): 0 for ip in ips}
-        changed = True
+        after = {k: dict(v) for k, v in bucket.items()
+                 if str(k).endswith(suffix) and isinstance(v, dict)}
+        if after != before:
+            changed = True
 
     return changed
 
@@ -3038,6 +3058,9 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
     # Transient network / busy agent / nginx reload mid-response: retry.
     # "Remote end closed without response" happens when the agent reloads nginx
     # while the apply JSON is still flushing through that same nginx to us.
+    # Keep caller timeout (fast Direct sync must not inflate to 180s).
+    _timeout = max(1, int(timeout or 60))
+    _retry_timeout = _timeout if _timeout <= 20 else max(_timeout, 180)
     _transient = (
         "timed out", "timeout", "temporarily", "connection reset",
         "remote end closed", "remotdisconnected", "connection aborted",
@@ -3047,13 +3070,13 @@ def push(node: dict, payload: dict, timeout: int = 60, master_host: str = "") ->
         "remote end closed", "remotdisconnected", "connection aborted", "broken pipe",
     )
     if not result.get("ok") and any(x in err.lower() for x in _transient):
-        time.sleep(1.5)
-        result = _push_once(node, payload, timeout=max(timeout, 180))
+        time.sleep(0.4 if _timeout <= 20 else 1.5)
+        result = _push_once(node, payload, timeout=_retry_timeout)
         err = str(result.get("error") or "")
     # Still dropped: wait for deferred nginx reload on the agent, then one more try.
     if not result.get("ok") and any(x in err.lower() for x in _drop):
-        time.sleep(2.5)
-        result = _push_once(node, payload, timeout=max(timeout, 180))
+        time.sleep(0.8 if _timeout <= 20 else 2.5)
+        result = _push_once(node, payload, timeout=_retry_timeout)
         err = str(result.get("error") or "")
     # Final fallback: /health up ⇒ apply almost certainly committed; silent soft-ok
     # (no warn badge — the cut response is an infrastructure race, not an admin issue).

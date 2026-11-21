@@ -659,6 +659,15 @@ def _apply_xray(
         if geo.get("unknown"):
             note += f"; нет источника для {', '.join(geo['unknown'])} — добавьте в Xray → Geo"
         result = {**result, "warning": "; ".join(x for x in (result.get("warning"), note) if x)}
+    # Master client hot-apply → fan-out to Direct nodes in background (non-blocking)
+    if result.get("ok") and prefer_clients_only and not is_agent:
+        try:
+            if nodes_mod.is_master(store):
+                sync_fn = globals().get("_schedule_direct_sync")
+                if callable(sync_fn):
+                    sync_fn("xray-clients")
+        except Exception:
+            pass
     return result
 
 
@@ -1661,35 +1670,92 @@ def _expiry_warnings(store: dict) -> None:
 
 _LAST_QUOTA_DIRECT_PUSH = 0.0
 _LAST_TRAFFIC_DIRECT_PUSH = 0.0
+_DIRECT_SYNC_LOCK = threading.Lock()
+_DIRECT_SYNC_PENDING = ""
+_DIRECT_SYNC_THREAD: threading.Thread | None = None
+# Fast apply for client/config fan-out (Direct HTTP). Heavy provision keeps longer timeouts.
+DIRECT_PUSH_TIMEOUT = int(os.environ.get("L2XPANEL_DIRECT_PUSH_TIMEOUT", "8"))
 
 
 def _push_direct_nodes_clients(
-    store: dict,
+    store: dict | None = None,
     *,
     reason: str = "quota",
     exclude_ids: set[str] | None = None,
+    timeout: int | None = None,
+    wait: bool = False,
 ) -> None:
-    """Push client list to Direct nodes so limited/expired users are removed from Xray there."""
+    """Push client list to Direct nodes in parallel (background by default)."""
     global _LAST_QUOTA_DIRECT_PUSH
+    store = store or _load_store()
     if not nodes_mod.is_master(store):
         return
     host = public_host()
     skip = {str(x) for x in (exclude_ids or set()) if x}
-    pushed = False
+    timeout = int(timeout if timeout is not None else DIRECT_PUSH_TIMEOUT)
+    jobs: list[tuple[str, str]] = []
     for node in nodes_mod.direct_connect_nodes(store):
         if not node.get("enabled", True) or not node.get("id"):
             continue
         nid = str(node["id"])
         if nid in skip:
             continue
+        name = node.get("name") or nid[:8]
+        jobs.append((nid, f"{name}: {reason}"))
+    if not jobs:
+        return
+
+    def _one(nid: str, label: str) -> None:
         try:
-            name = node.get("name") or nid[:8]
-            _node_push_job(nid, f"{name}: {reason}", host)
-            pushed = True
+            _node_push_job(nid, label, host, timeout=timeout)
         except Exception:
             pass
-    if pushed:
-        _LAST_QUOTA_DIRECT_PUSH = time.time()
+
+    threads = [
+        threading.Thread(target=_one, args=(nid, label), daemon=True, name=f"direct-push-{nid[:8]}")
+        for nid, label in jobs
+    ]
+    for t in threads:
+        t.start()
+    _LAST_QUOTA_DIRECT_PUSH = time.time()
+    if wait:
+        for t in threads:
+            t.join(timeout=max(1, timeout) + 3)
+
+
+def _schedule_direct_sync(reason: str = "client") -> None:
+    """Coalesce master→Direct fan-out in background (near-instant, non-blocking)."""
+    global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
+    store = _load_store()
+    if not nodes_mod.is_master(store):
+        return
+    if not nodes_mod.direct_connect_nodes(store):
+        return
+    with _DIRECT_SYNC_LOCK:
+        _DIRECT_SYNC_PENDING = str(reason or "sync")
+        alive = _DIRECT_SYNC_THREAD is not None and _DIRECT_SYNC_THREAD.is_alive()
+        if alive:
+            return
+
+        def _run() -> None:
+            global _DIRECT_SYNC_PENDING, _DIRECT_SYNC_THREAD
+            # Tiny coalesce window so burst edits = one push
+            time.sleep(0.15)
+            with _DIRECT_SYNC_LOCK:
+                why = _DIRECT_SYNC_PENDING or "sync"
+                _DIRECT_SYNC_PENDING = ""
+            try:
+                _push_direct_nodes_clients(_load_store(), reason=why, timeout=DIRECT_PUSH_TIMEOUT, wait=False)
+            finally:
+                with _DIRECT_SYNC_LOCK:
+                    _DIRECT_SYNC_THREAD = None
+                    # Another schedule arrived while we pushed — run again
+                    if _DIRECT_SYNC_PENDING:
+                        _schedule_direct_sync(_DIRECT_SYNC_PENDING)
+
+        _DIRECT_SYNC_THREAD = threading.Thread(target=_run, daemon=True, name="direct-sync")
+        _DIRECT_SYNC_THREAD.start()
+
 
 
 def _clients_access_map(store: dict) -> dict[str, bool]:
@@ -4080,6 +4146,7 @@ async def client_save(request: Request):
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
     result = _apply_xray(_load_store(), clients_only=True)
+    _schedule_direct_sync("client-save")
     act = "создан" if not original else "обновлён"
     bits = []
     if c.get("limit_gb"):
@@ -4175,6 +4242,7 @@ async def clients_bulk(request: Request):
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
     result = _apply_xray(_load_store(), clients_only=True)
+    _schedule_direct_sync("clients-bulk")
     _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
@@ -4287,6 +4355,7 @@ async def groups_save(request: Request):
             flash(request, err, "error")
             return go(f"/groups/{g['id']}/edit" if gid else "/groups/new")
     result = _apply_xray(_load_store(), clients_only=True)
+    _schedule_direct_sync("group")
     _tg_change(f"👥 Группа <b>{tgbot.escape(g['name'])}</b> сохранена")
     flash(request, *_ok_msg(f"Группа «{g['name']}» сохранена", result))
     return go(f"/groups/{g['id']}/edit")
@@ -4307,6 +4376,7 @@ def groups_delete(gid: str, request: Request):
             if str(c.get("group_id") or "") == gid:
                 c["group_id"] = ""
     result = _apply_xray(_load_store(), xray_only=True)
+    _schedule_direct_sync("group-delete")
     _tg_change(f"👥 Группа <b>{tgbot.escape(str(name))}</b> удалена")
     flash(request, *_ok_msg(f"Группа «{name}» удалена", result))
     return go("/groups")
@@ -4353,6 +4423,8 @@ def client_action(email: str, action: str, request: Request):
             return go("/clients")
     need_xray = action not in ("regen_sub", "clear_ips", "clear_hwids")
     result = _apply_xray(_load_store(), clients_only=True) if need_xray else {"ok": True}
+    if need_xray:
+        _schedule_direct_sync("client-action")
     _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
@@ -9335,7 +9407,7 @@ async def nodes_provision(request: Request):
     return go("/nodes")
 
 
-def _node_push_job(node_id: str, label: str, host: str):
+def _node_push_job(node_id: str, label: str, host: str, timeout: int | None = None):
     """Push config to one node outside STORE_LOCK (avoids deadlock / hung panel)."""
     with mutate() as store:
         node = next((n for n in nodes_mod.ensure_list(store) if n.get("id") == node_id), None)
@@ -9367,7 +9439,8 @@ def _node_push_job(node_id: str, label: str, host: str):
         doh_on = bool((store.get("settings") or {}).get("doh", {}).get("enabled"))
         is_mirror = bool(node.get("mirror"))
     # Network I/O must not hold mutate()/STORE_LOCK
-    res = nodes_mod.push(node_snap, payload, master_host=host, timeout=120)
+    push_timeout = int(timeout) if timeout is not None else 120
+    res = nodes_mod.push(node_snap, payload, master_host=host, timeout=push_timeout)
     warns = list(res.get("warnings") or [])
     # Master-side hint when DoH is on but this was a non-mirror push (settings not sent)
     if doh_on and not is_mirror and res.get("ok") and not node_snap.get("nat"):
@@ -10788,7 +10861,7 @@ async def agent_report(request: Request):
     Master merges counters, enforces quotas, returns access map, and fans out
     client state to other Direct nodes in near real-time.
     """
-    global _LAST_TRAFFIC_DIRECT_PUSH
+    global ONLINE, _LAST_TRAFFIC_DIRECT_PUSH
     store = _load_store()
     try:
         body = await request.json()
@@ -10826,6 +10899,11 @@ async def agent_report(request: Request):
             )
             node["last_ok"] = True
             node["last_seen"] = nodes_mod.now_iso()
+            # Refresh online immediately from agent report (email~node_* → UI)
+            try:
+                ONLINE = xray.update_online(st, xray.query_online())
+            except Exception:
+                pass
             st["_events"] = []
             if xray.enforce_quotas(st):
                 quota_hit = True
@@ -10837,13 +10915,12 @@ async def agent_report(request: Request):
             blocked = [email for email, ok in access.items() if not ok]
     if err_code:
         return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
-    # Fan-out: quota → all Direct immediately; traffic → debounce so other nodes
-    # keep counters fresh for local kick.
+    # Fan-out: quota → all Direct immediately; traffic → near-instant sync to peers
     try:
         st2 = _load_store()
         if quota_hit:
             _push_direct_nodes_clients(st2, reason="quota-fanout", exclude_ids={node_id})
-        elif changed and (time.time() - float(_LAST_TRAFFIC_DIRECT_PUSH or 0)) >= 5:
+        elif changed and (time.time() - float(_LAST_TRAFFIC_DIRECT_PUSH or 0)) >= 1:
             _LAST_TRAFFIC_DIRECT_PUSH = time.time()
             _push_direct_nodes_clients(st2, reason="traffic-sync", exclude_ids={node_id})
     except Exception:
