@@ -153,6 +153,15 @@ def default_settings() -> dict:
             "legacy_tls_ports": [],
             "domain": "", "cert_file": "", "key_file": "", "update_hours": 1, "title": "",
             "support_url": "", "announce": "", "show_page": True,
+            # Happ UI: caption + buttons on the traffic bar
+            "web_page_url": "",       # profile-web-page-url — left (i) button
+            "announce_url": "",      # clickable announce
+            "sub_info_text": "",     # advanced banner (needs Provider ID)
+            "sub_info_color": "blue",
+            "sub_info_button_text": "",
+            "sub_info_button_link": "",
+            "sub_expire": False,
+            "sub_expire_button_link": "",
             "json_fragment": "", "json_noise": "", "json_mux": "",
             "hwid_required": False, "hwid_fallback": "device", "migrate_url": False, "happ_provider_id": "",
             # Hide disconnected / high-loss outbounds from subscription until healthy again
@@ -2665,9 +2674,41 @@ def _sub_response(request: Request, token: str) -> Response:
         "cache-control": "no-store",
     }
     if s.get("support_url"):
-        headers["support-url"] = s["support_url"]
+        headers["support-url"] = str(s["support_url"]).strip()
+    web_page = str(s.get("web_page_url") or "").strip()
+    if web_page:
+        headers["profile-web-page-url"] = web_page
     if s.get("announce"):
-        headers["announce"] = "base64:" + base64.b64encode(s["announce"].encode()).decode()
+        headers["announce"] = "base64:" + base64.b64encode(str(s["announce"]).encode("utf-8")).decode()
+    announce_url = str(s.get("announce_url") or "").strip()
+    if announce_url:
+        headers["announce-url"] = announce_url
+    # Advanced Happ banner / expire (Provider ID recommended)
+    info_text = str(s.get("sub_info_text") or "").strip()
+    if info_text:
+        try:
+            info_text.encode("ascii")
+            headers["sub-info-text"] = info_text[:200]
+        except UnicodeEncodeError:
+            headers["sub-info-text"] = "base64:" + base64.b64encode(info_text.encode("utf-8")).decode()
+        color = str(s.get("sub_info_color") or "blue").strip().lower()
+        if color in ("red", "blue", "green"):
+            headers["sub-info-color"] = color
+        btn_text = str(s.get("sub_info_button_text") or "").strip()
+        btn_link = str(s.get("sub_info_button_link") or "").strip()
+        if btn_text:
+            try:
+                btn_text.encode("ascii")
+                headers["sub-info-button-text"] = btn_text[:25]
+            except UnicodeEncodeError:
+                headers["sub-info-button-text"] = "base64:" + base64.b64encode(btn_text.encode("utf-8")).decode()
+        if btn_link:
+            headers["sub-info-button-link"] = btn_link
+    if s.get("sub_expire"):
+        headers["sub-expire"] = "1"
+        exp_link = str(s.get("sub_expire_button_link") or "").strip()
+        if exp_link:
+            headers["sub-expire-button-link"] = exp_link
     if s.get("happ_provider_id"):
         headers["providerid"] = s["happ_provider_id"]
     hwid_required = bool(s.get("hwid_required"))
@@ -7068,8 +7109,20 @@ async def settings_save(request: Request):
                 "legacy_jwt_secrets": jwt_list,
                 "domain": front.public_domain({"settings": s}) or front.normalize_host(str(form.get("domain") or "")),
                 "cert_file": "", "key_file": "", "update_hours": _int(form.get("update_hours"), 1),
-                "title": str(form.get("title") or ""), "support_url": str(form.get("support_url") or ""),
-                "announce": str(form.get("announce") or ""), "show_page": form.get("show_page") == "1",
+                "title": str(form.get("title") or ""), "support_url": str(form.get("support_url") or "").strip(),
+                "announce": str(form.get("announce") or "").strip(), "show_page": form.get("show_page") == "1",
+                "web_page_url": str(form.get("web_page_url") or "").strip(),
+                "announce_url": str(form.get("announce_url") or "").strip(),
+                "sub_info_text": str(form.get("sub_info_text") or "").strip(),
+                "sub_info_color": (
+                    str(form.get("sub_info_color") or "blue").strip().lower()
+                    if str(form.get("sub_info_color") or "").strip().lower() in ("red", "blue", "green")
+                    else "blue"
+                ),
+                "sub_info_button_text": str(form.get("sub_info_button_text") or "").strip()[:25],
+                "sub_info_button_link": str(form.get("sub_info_button_link") or "").strip(),
+                "sub_expire": form.get("sub_expire") == "1",
+                "sub_expire_button_link": str(form.get("sub_expire_button_link") or "").strip(),
                 "json_fragment": str(form.get("json_fragment") or "").strip(),
                 "json_noise": str(form.get("json_noise") or "").strip(),
                 "json_mux": str(form.get("json_mux") or "").strip(),

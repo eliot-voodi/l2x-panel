@@ -50,11 +50,51 @@
     <div style="max-width:160px"><label class="f">Интервал обновления, ч</label><input name="update_hours" type="number" min="1" value="{{ sb.update_hours }}"></div>
   </div>
   <div class="row">
-    <div><label class="f">Ссылка поддержки</label><input name="support_url" value="{{ sb.support_url }}" placeholder="https://t.me/…"></div>
     <div style="max-width:160px"><label class="f">Путь</label><input name="path" value="{{ sb.path }}" placeholder="sub"></div>
   </div>
-  <label class="f">Объявление (announce)</label><input name="announce" value="{{ sb.announce }}">
   <div class="hint">Канонические ссылки: <code>https://{{ public_host or 'домен' }}/{{ sb.path or 'sub' }}/&lt;token&gt;</code> (:443). Форматы: base64, <code>?format=plain|json|clash|singbox|html</code>.</div>
+
+  <h3 class="mt">Happ: подпись и кнопки</h3>
+  <div class="hint">
+    Текст под полоской трафика и кнопки слева/справа (ℹ сайт, ✈ Telegram/поддержка).
+    Расширенный баннер с кнопкой работает при заданном <b>Happ Provider ID</b>.
+  </div>
+  <label class="f">Подпись (announce)</label>
+  <textarea name="announce" rows="2" maxlength="200" placeholder="Покупка и продление на сайте brathe.cc и бот тг @brathe_vpn_bot">{{ sb.announce }}</textarea>
+  <div class="row">
+    <div><label class="f">Ссылка подписи (announce-url)</label>
+      <input name="announce_url" value="{{ sb.announce_url or '' }}" placeholder="https://brathe.cc"></div>
+    <div><label class="f">Кнопка слева — сайт (profile-web-page-url)</label>
+      <input name="web_page_url" value="{{ sb.web_page_url or '' }}" placeholder="https://brathe.cc"></div>
+  </div>
+  <div class="row">
+    <div><label class="f">Кнопка справа — поддержка (support-url)</label>
+      <input name="support_url" value="{{ sb.support_url }}" placeholder="https://t.me/brathe_vpn_bot"></div>
+  </div>
+
+  <h4 class="mt">Расширенный баннер (Provider ID)</h4>
+  <label class="f">Текст баннера (sub-info-text)</label>
+  <textarea name="sub_info_text" rows="2" maxlength="200" placeholder="Покупка и продление — кнопка ниже">{{ sb.sub_info_text or '' }}</textarea>
+  <div class="row">
+    <div style="max-width:160px">
+      <label class="f">Цвет</label>
+      {% set sic = sb.sub_info_color or 'blue' %}
+      <select name="sub_info_color">
+        <option value="blue" {% if sic == 'blue' %}selected{% endif %}>blue</option>
+        <option value="green" {% if sic == 'green' %}selected{% endif %}>green</option>
+        <option value="red" {% if sic == 'red' %}selected{% endif %}>red</option>
+      </select>
+    </div>
+    <div><label class="f">Текст кнопки (≤25)</label>
+      <input name="sub_info_button_text" value="{{ sb.sub_info_button_text or '' }}" maxlength="25" placeholder="Купить / продлить"></div>
+    <div><label class="f">Ссылка кнопки</label>
+      <input name="sub_info_button_link" value="{{ sb.sub_info_button_link or '' }}" placeholder="https://brathe.cc или https://t.me/…"></div>
+  </div>
+  <div class="row mt">
+    <div>{{ m.check('sub_expire', sb.sub_expire if sb.sub_expire is defined else false, 'Показывать блок «подписка истекает» (за 3 дня)') }}</div>
+    <div><label class="f">Ссылка кнопки «Продлить»</label>
+      <input name="sub_expire_button_link" value="{{ sb.sub_expire_button_link or '' }}" placeholder="https://brathe.cc"></div>
+  </div>
 
   <h3 class="mt">Совместимость старых ссылок</h3>
   <div class="hint">Токен клиента при миграции сохраняется. Если в старой панели путь был не <code>/sub/</code> (например <code>/zdgdjmy3kho5i6qg/</code>) и/или порт <code>2096</code> — укажите их здесь, чтобы старые URL продолжили открываться без смены у пользователей.</div>
