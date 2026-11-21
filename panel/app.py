@@ -1663,6 +1663,8 @@ def _expiry_warnings(store: dict) -> None:
 
 _LAST_QUOTA_DIRECT_PUSH = 0.0
 _LAST_TRAFFIC_DIRECT_PUSH = 0.0
+# Agent-side: revision of the last clients payload pulled from master (change detection)
+_PULLED_CLIENTS_REV = ""
 _DIRECT_SYNC_LOCK = threading.Lock()
 _DIRECT_SYNC_PENDING = ""
 _DIRECT_SYNC_THREAD: threading.Thread | None = None
@@ -1857,7 +1859,7 @@ def _watchdog_cycle() -> None:
 
 def _direct_agent_quota_cycle() -> None:
     """Direct node: count traffic locally → kick on limit → sync master (+ access map)."""
-    global ONLINE
+    global ONLINE, _PULLED_CLIENTS_REV
     need_kick = False
     events: list[dict] = []
     report_body: dict | None = None
@@ -1885,6 +1887,9 @@ def _direct_agent_quota_cycle() -> None:
                     "traffic": traffic,
                     "online": online_map,
                     "reported_at": nodes_mod.now_iso(),
+                    # Tell master which clients revision we already have → it only
+                    # ships the full list back when something actually changed.
+                    "clients_rev": _PULLED_CLIENTS_REV,
                 }
         # Do NOT harvest_traffic for clients on Direct agents (would double-count
         # master-synced totals). Still refresh online / IP limits locally.
@@ -1919,6 +1924,23 @@ def _direct_agent_quota_cycle() -> None:
         return
     if not isinstance(resp, dict) or not resp.get("ok"):
         return
+    # Agent-initiated pull: master shipped fresh clients/groups → apply on the node.
+    # This converges all user data (limits, expiry, enable, block) with no admin action.
+    rev = str(resp.get("clients_rev") or "").strip()
+    if resp.get("clients") is not None and rev and rev != _PULLED_CLIENTS_REV:
+        try:
+            _agent_store_clients({
+                "clients": resp.get("clients"),
+                "groups": resp.get("groups"),
+                "direct_connect": resp.get("direct_connect"),
+                "direct_connect_tag": resp.get("direct_connect_tag"),
+                "mirror": resp.get("mirror"),
+            })
+            _PULLED_CLIENTS_REV = rev
+        except Exception:
+            pass
+    elif rev:
+        _PULLED_CLIENTS_REV = rev
     access = resp.get("access") if isinstance(resp.get("access"), dict) else {}
     if not access:
         return
@@ -1930,6 +1952,60 @@ def _direct_agent_quota_cycle() -> None:
             # Master may block due to traffic counted on other nodes
             if any(not xray.client_access_ok(c) for c in (store.get("clients") or []) if isinstance(c, dict)):
                 _apply_xray(store, clients_only=True)
+
+
+def _agent_store_clients(payload: dict) -> dict:
+    """Apply a clients-sync payload on a node (hot user sync, no full rebuild).
+
+    Shared by the ``/agent/clients`` push endpoint and the agent-initiated pull
+    embedded in the ``/agent/report`` response.
+    """
+    keep_tags: set[str] = set()
+    if payload.get("direct_connect"):
+        keep_tags.add(nodes_mod.MASTER_EGRESS_TAG)
+        dc_tag0 = str(payload.get("direct_connect_tag") or "").strip()
+        if dc_tag0:
+            keep_tags.add(dc_tag0)
+    mirror = bool(payload.get("mirror"))
+    with mutate() as st:
+        if payload.get("clients") is not None:
+            st["clients"] = (
+                list(payload["clients"]) if mirror
+                else nodes_mod._agent_safe_clients(
+                    payload["clients"],
+                    keep_tags=keep_tags,
+                    direct_self_tag=str(payload.get("direct_connect_tag") or "").strip()
+                    if payload.get("direct_connect") else "",
+                )
+            )
+        if payload.get("groups") is not None:
+            st["groups"] = list(payload["groups"] or [])
+        ns = st.setdefault("settings", {}).setdefault("nodes", {})
+        if payload.get("direct_connect") is not None:
+            ns["direct_connect"] = bool(payload.get("direct_connect"))
+        dc_tag = str(payload.get("direct_connect_tag") or "").strip()
+        if dc_tag:
+            ns["direct_connect_tag"] = dc_tag
+        if payload.get("node_id"):
+            ns["upstream_node_id"] = str(payload.get("node_id"))
+        master_url = str(payload.get("master_url") or "").rstrip("/")
+        if master_url:
+            ns["upstream_master_url"] = master_url
+            ns["master_pull_url"] = master_url
+    # Hot user sync only — no nginx / full rebuild
+    res = _apply_xray(_load_store(), clients_only=True)
+    err_txt = res.get("error") or ""
+    try:
+        err_txt = xray.clean_xray_error(err_txt) or err_txt
+    except Exception:
+        pass
+    return {
+        "ok": bool(res.get("ok")),
+        "error": err_txt,
+        "clients_api": True,
+        "hot_clients": bool(res.get("hot_clients")),
+        "n_clients": len((_load_store().get("clients") or [])),
+    }
 
 
 def _agent_direct_connect_report(store: dict | None = None) -> None:
@@ -10938,55 +11014,7 @@ async def agent_clients(request: Request):
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
 
-    def _run() -> dict:
-        keep_tags: set[str] = set()
-        if payload.get("direct_connect"):
-            keep_tags.add(nodes_mod.MASTER_EGRESS_TAG)
-            dc_tag0 = str(payload.get("direct_connect_tag") or "").strip()
-            if dc_tag0:
-                keep_tags.add(dc_tag0)
-        mirror = bool(payload.get("mirror"))
-        with mutate() as st:
-            if payload.get("clients") is not None:
-                st["clients"] = (
-                    list(payload["clients"]) if mirror
-                    else nodes_mod._agent_safe_clients(
-                        payload["clients"],
-                        keep_tags=keep_tags,
-                        direct_self_tag=str(payload.get("direct_connect_tag") or "").strip()
-                        if payload.get("direct_connect") else "",
-                    )
-                )
-            if payload.get("groups") is not None:
-                st["groups"] = list(payload["groups"] or [])
-            ns = st.setdefault("settings", {}).setdefault("nodes", {})
-            if payload.get("direct_connect") is not None:
-                ns["direct_connect"] = bool(payload.get("direct_connect"))
-            dc_tag = str(payload.get("direct_connect_tag") or "").strip()
-            if dc_tag:
-                ns["direct_connect_tag"] = dc_tag
-            if payload.get("node_id"):
-                ns["upstream_node_id"] = str(payload.get("node_id"))
-            master_url = str(payload.get("master_url") or "").rstrip("/")
-            if master_url:
-                ns["upstream_master_url"] = master_url
-                ns["master_pull_url"] = master_url
-        # Hot user sync only — no nginx / full rebuild
-        res = _apply_xray(_load_store(), clients_only=True)
-        err_txt = res.get("error") or ""
-        try:
-            err_txt = xray.clean_xray_error(err_txt) or err_txt
-        except Exception:
-            pass
-        return {
-            "ok": bool(res.get("ok")),
-            "error": err_txt,
-            "clients_api": True,
-            "hot_clients": bool(res.get("hot_clients")),
-            "n_clients": len((_load_store().get("clients") or [])),
-        }
-
-    out = await run_in_threadpool(_run)
+    out = await run_in_threadpool(lambda: _agent_store_clients(payload))
     return JSONResponse(out, headers={"Connection": "close"})
 
 
@@ -11070,11 +11098,13 @@ async def agent_report(request: Request):
         return JSONResponse({"ok": False, "error": "not master"}, status_code=403)
     if not node_id or not token:
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    sent_rev = str(body.get("clients_rev") or "").strip()
     err_code, err_msg = 0, ""
     changed = False
     quota_hit = False
     access: dict[str, bool] = {}
     blocked: list[str] = []
+    node_snap: dict | None = None
     with mutate() as st:
         node = next((n for n in nodes_mod.ensure_list(st) if n.get("id") == node_id), None)
         if not node or not node.get("enabled", True):
@@ -11105,25 +11135,42 @@ async def agent_report(request: Request):
                     pass
             access = _clients_access_map(st)
             blocked = [email for email, ok in access.items() if not ok]
+            node_snap = dict(node)
     if err_code:
         return JSONResponse({"ok": False, "error": err_msg}, status_code=err_code)
-    # Fan-out: quota → all Direct immediately; traffic → near-instant sync to peers
-    try:
-        st2 = _load_store()
-        if quota_hit:
-            _push_direct_nodes_clients(st2, reason="quota-fanout", exclude_ids={node_id})
-        elif changed and (time.time() - float(_LAST_TRAFFIC_DIRECT_PUSH or 0)) >= 1:
-            _LAST_TRAFFIC_DIRECT_PUSH = time.time()
-            _push_direct_nodes_clients(st2, reason="traffic-sync", exclude_ids={node_id})
-    except Exception:
-        pass
-    return {
+    # Agent-initiated pull: return authoritative clients/groups + revision so the
+    # node applies the latest user data itself (no admin action, no full sync).
+    out = {
         "ok": True,
         "changed": bool(changed),
         "quota_enforced": bool(quota_hit),
         "access": access,
         "blocked": blocked,
     }
+    try:
+        st2 = _load_store()
+        node2 = next((n for n in nodes_mod.ensure_list(st2) if n.get("id") == node_id), None)
+        if node2 is not None:
+            cpayload = nodes_mod.build_clients_sync_payload(st2, node2)
+            rev = nodes_mod.clients_payload_rev(cpayload)
+            out["clients_rev"] = rev
+            if rev != sent_rev:
+                # Only ship the list when it actually changed since the agent's last pull
+                out["clients"] = cpayload.get("clients") or []
+                out["groups"] = cpayload.get("groups") or []
+                out["direct_connect"] = cpayload.get("direct_connect")
+                out["direct_connect_tag"] = cpayload.get("direct_connect_tag")
+                out["mirror"] = cpayload.get("mirror")
+    except Exception:
+        pass
+    # Keep legacy instant push only on quota (belt-and-suspenders); routine traffic
+    # convergence now rides the pull response above.
+    try:
+        if quota_hit:
+            _push_direct_nodes_clients(_load_store(), reason="quota-fanout", exclude_ids={node_id})
+    except Exception:
+        pass
+    return out
 
 
 

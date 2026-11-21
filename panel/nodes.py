@@ -2515,6 +2515,19 @@ def build_clients_sync_payload(store: dict, node: dict, build_config=None) -> di
     }
 
 
+def clients_payload_rev(payload: dict) -> str:
+    """Stable hash of a clients-sync payload (clients + groups) for change detection."""
+    import hashlib
+    try:
+        blob = json.dumps(
+            {"clients": payload.get("clients") or [], "groups": payload.get("groups") or []},
+            sort_keys=True, ensure_ascii=False, default=str,
+        ).encode("utf-8")
+    except Exception:
+        blob = repr(payload).encode("utf-8", "replace")
+    return hashlib.sha1(blob).hexdigest()
+
+
 def agent_endpoint(node: dict, path: str) -> str:
     """Agent API under the node's secret base_path (nginx only proxies that prefix)."""
     base = (node.get("url") or "").rstrip("/")
