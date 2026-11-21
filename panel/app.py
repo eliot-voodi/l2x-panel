@@ -659,15 +659,8 @@ def _apply_xray(
         if geo.get("unknown"):
             note += f"; нет источника для {', '.join(geo['unknown'])} — добавьте в Xray → Geo"
         result = {**result, "warning": "; ".join(x for x in (result.get("warning"), note) if x)}
-    # Master client hot-apply → fan-out to Direct nodes in background (non-blocking)
-    if result.get("ok") and prefer_clients_only and not is_agent:
-        try:
-            if nodes_mod.is_master(store):
-                sync_fn = globals().get("_schedule_direct_sync")
-                if callable(sync_fn):
-                    sync_fn("xray-clients")
-        except Exception:
-            pass
+    # Do not auto-fanout from apply itself — explicit save/action/API hooks call
+    # _push_clients_after_save so every user edit always starts its own /agent/clients push.
     return result
 
 
@@ -1723,6 +1716,29 @@ def _push_direct_nodes_clients(
 
 
 _CLIENT_SYNC_GEN = 0
+
+
+def _push_clients_after_save(reason: str = "client-save") -> None:
+    """Always POST /agent/clients after a user edit (new thread every save).
+
+    No coalesce — overlapping saves each push; last apply on the node wins.
+    This avoids missed updates when a previous sync thread was still running.
+    """
+    store = _load_store()
+    if not nodes_mod.is_master(store) or not nodes_mod.client_sync_nodes(store):
+        return
+
+    def _run() -> None:
+        try:
+            _push_direct_nodes_clients(
+                _load_store(), reason=reason, timeout=DIRECT_PUSH_TIMEOUT, wait=True,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_run, daemon=True, name=f"clients-api-{str(reason)[:20]}",
+    ).start()
 
 
 def _schedule_direct_sync(reason: str = "client") -> None:
@@ -4158,8 +4174,8 @@ async def client_save(request: Request):
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
     result = _apply_xray(_load_store(), clients_only=True)
-    # Automatic immediate sync of limits/expiry/clients to all nodes (background)
-    _schedule_direct_sync("client-save")
+    # Always push users via /agent/clients right after save (do not rely only on coalesce)
+    _push_clients_after_save("client-save")
     act = "создан" if not original else "обновлён"
     bits = []
     if c.get("limit_gb"):
@@ -4255,7 +4271,7 @@ async def clients_bulk(request: Request):
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
     result = _apply_xray(_load_store(), clients_only=True)
-    _schedule_direct_sync("clients-bulk")
+    _push_clients_after_save("clients-bulk")
     _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
@@ -4368,7 +4384,7 @@ async def groups_save(request: Request):
             flash(request, err, "error")
             return go(f"/groups/{g['id']}/edit" if gid else "/groups/new")
     result = _apply_xray(_load_store(), clients_only=True)
-    _schedule_direct_sync("group")
+    _push_clients_after_save("group")
     _tg_change(f"👥 Группа <b>{tgbot.escape(g['name'])}</b> сохранена")
     flash(request, *_ok_msg(f"Группа «{g['name']}» сохранена", result))
     return go(f"/groups/{g['id']}/edit")
@@ -4389,7 +4405,7 @@ def groups_delete(gid: str, request: Request):
             if str(c.get("group_id") or "") == gid:
                 c["group_id"] = ""
     result = _apply_xray(_load_store(), xray_only=True)
-    _schedule_direct_sync("group-delete")
+    _push_clients_after_save("group-delete")
     _tg_change(f"👥 Группа <b>{tgbot.escape(str(name))}</b> удалена")
     flash(request, *_ok_msg(f"Группа «{name}» удалена", result))
     return go("/groups")
@@ -4438,7 +4454,7 @@ def client_action(email: str, action: str, request: Request):
     result = _apply_xray(_load_store(), clients_only=True) if need_xray else {"ok": True}
     # Always fan-out user record (enabled/uuid/limits/delete) so nodes stay current
     if action not in ("clear_ips", "clear_hwids"):
-        _schedule_direct_sync("client-action")
+        _push_clients_after_save("client-action")
     _tg_change(f"👤 Клиент <b>{tgbot.escape(email)}</b>: {what}")
     flash(request, *_ok_msg(f"{email}: {action}", result))
     if action == "delete":
@@ -7557,7 +7573,7 @@ async def rest_api(path: str, request: Request):
             st["clients"].append(c)
             xray.ensure_wg_peer(st, c)
         res = _apply_xray(_load_store(), clients_only=True)
-        _schedule_direct_sync("api-client-add")
+        _push_clients_after_save("api-client-add")
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if parts == ["clients", "bulkAdd"] and request.method == "POST":
         # One xray apply for many clients — used by loadtest (avoids nginx drop per add).
@@ -7586,7 +7602,7 @@ async def rest_api(path: str, request: Request):
                 have.add(email)
                 created.append(c)
         res = _apply_xray(_load_store(), clients_only=True)
-        _schedule_direct_sync("api-client-bulkAdd")
+        _push_clients_after_save("api-client-bulkAdd")
         store2 = _load_store()
         return _api_ok(
             [_public_client(store2, next(x for x in store2["clients"] if x["email"] == c["email"])) for c in created],
@@ -7607,7 +7623,7 @@ async def rest_api(path: str, request: Request):
             st["clients"] = keep
         if removed:
             _apply_xray(_load_store(), clients_only=True)
-            _schedule_direct_sync("api-client-bulkDelete")
+            _push_clients_after_save("api-client-bulkDelete")
         return _api_ok({"removed": removed})
     if len(parts) == 3 and parts[:2] == ["clients", "update"] and request.method == "POST":
         with mutate() as st:
@@ -7618,7 +7634,7 @@ async def rest_api(path: str, request: Request):
             if err:
                 return _api_err(err)
         res = _apply_xray(_load_store(), clients_only=True)
-        _schedule_direct_sync("api-client-update")
+        _push_clients_after_save("api-client-update")
         return _api_ok(_public_client(_load_store(), c), res.get("error", ""))
     if len(parts) == 3 and parts[0] == "clients" and parts[1] in ("delete", "reset") and request.method in ("POST", "DELETE"):
         with mutate() as st:
@@ -7630,14 +7646,14 @@ async def rest_api(path: str, request: Request):
             else:
                 xray.reset_client_traffic(c)
         _apply_xray(_load_store(), clients_only=True)
-        _schedule_direct_sync(f"api-client-{parts[1]}")
+        _push_clients_after_save(f"api-client-{parts[1]}")
         return _api_ok(None, f"{parts[1]} ok")
     if parts == ["clients", "resetAll"] and request.method == "POST":
         with mutate() as st:
             for c in st["clients"]:
                 xray.reset_client_traffic(c)
         _apply_xray(_load_store(), clients_only=True)
-        _schedule_direct_sync("api-client-resetAll")
+        _push_clients_after_save("api-client-resetAll")
         return _api_ok(None, "reset all")
     if parts == ["outbounds", "list"]:
         return _api_ok({"tags": xray.all_outbound_tags(store), "traffic": store.get("outbound_traffic") or {},
