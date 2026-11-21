@@ -2858,6 +2858,12 @@ def _core_inbound_form_patch(form, ib: dict, *, is_new: bool = False) -> str | N
         ib["settings"] = s
     if proto == "vless" and "flow" in form:
         s["flow"] = str(form.get("flow") or "")
+    if proto == "shadowsocks":
+        if "ss_method" in form:
+            method = str(form.get("ss_method") or s.get("method") or "aes-128-gcm")
+            if method != s.get("method") or form.get("ss_regen") == "1" or not s.get("password"):
+                s["password"] = P.ss_server_key(method)
+            s["method"] = method
     ws = st.get("ws")
     if not isinstance(ws, dict):
         ws = {}
@@ -2866,6 +2872,20 @@ def _core_inbound_form_patch(form, ib: dict, *, is_new: bool = False) -> str | N
         ws["path"] = str(form.get("ws_path") or "/")
     if "ws_host" in form:
         ws["host"] = str(form.get("ws_host") or "")
+    grpc = st.get("grpc")
+    if not isinstance(grpc, dict):
+        grpc = {}
+        st["grpc"] = grpc
+    if "grpc_service" in form:
+        grpc["service_name"] = str(form.get("grpc_service") or "grpc")
+    hu = st.get("httpupgrade")
+    if not isinstance(hu, dict):
+        hu = {}
+        st["httpupgrade"] = hu
+    if "hu_path" in form:
+        hu["path"] = str(form.get("hu_path") or "/")
+    if "hu_host" in form:
+        hu["host"] = str(form.get("hu_host") or "")
     xh = st.get("xhttp")
     if not isinstance(xh, dict):
         xh = {}
@@ -2889,18 +2909,19 @@ def _core_inbound_form_patch(form, ib: dict, *, is_new: bool = False) -> str | N
             sids = [x for x in str(form.get("r_sids") or "").replace(",", " ").split() if x]
             if sids:
                 r["short_ids"] = sids
-        if "r_priv" in form and str(form.get("r_priv") or "").strip():
-            r["private_key"] = str(form.get("r_priv") or "").strip()
-        if "r_pub" in form and str(form.get("r_pub") or "").strip():
-            r["public_key"] = str(form.get("r_pub") or "").strip()
-        r["fingerprint"] = fp
-        if is_new and not r.get("private_key"):
+        if form.get("r_regen") == "1" or (is_new and not str(form.get("r_priv") or "").strip()):
             keys = xray.generate_reality_keys()
             if isinstance(keys, dict) and keys.get("private_key"):
                 r["private_key"] = keys["private_key"]
                 r["public_key"] = keys.get("public_key") or ""
-            if not r.get("short_ids"):
-                r["short_ids"] = [xray.generate_short_id()]
+        else:
+            if "r_priv" in form and str(form.get("r_priv") or "").strip():
+                r["private_key"] = str(form.get("r_priv") or "").strip()
+            if "r_pub" in form and str(form.get("r_pub") or "").strip():
+                r["public_key"] = str(form.get("r_pub") or "").strip()
+        r["fingerprint"] = fp
+        if not r.get("short_ids"):
+            r["short_ids"] = xray.generate_short_ids(8) if hasattr(xray, "generate_short_ids") else [xray.generate_short_id()]
     return None
 
 
@@ -4730,6 +4751,22 @@ def _unique_outbound_tag(store: dict, base: str) -> str:
         if xray.TAG_RE.match(cand) and cand not in used:
             return cand
     raise ValueError("не удалось подобрать свободный tag")
+
+
+def _suggest_outbound_tag(store: dict, *, remark: str = "", protocol: str = "", prefer: str = "") -> str:
+    """Build a valid unique tag from remark / protocol (never bare «ob» when remark exists)."""
+    for cand in (prefer, remark, protocol, "proxy"):
+        raw = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(cand or "").strip()).strip(".-_")
+        if not raw:
+            continue
+        stem = raw[:40].rstrip(".-_") or ""
+        if not stem or not xray.TAG_RE.match(stem):
+            continue
+        used = set(xray.all_outbound_tags(store)) | {"api"}
+        if stem not in used:
+            return stem
+        return _unique_outbound_tag(store, stem)
+    return _unique_outbound_tag(store, protocol or "proxy")
 
 
 def _clone_custom_outbound(store: dict, src: dict) -> dict:
@@ -8095,7 +8132,9 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                 if len(ibs) <= 1:
                     flash(request, "Нельзя удалить последний inbound", "error")
                     return go(back)
-                store["inbounds"] = [i for i in ibs if i.get("id") != ib_id]
+                # In-place: store[list] is aliased to core[list] during mutate
+                keep = [i for i in ibs if i.get("id") != ib_id]
+                ibs[:] = keep
                 flash(request, "Inbound удалён", "info")
             elif action == "save":
                 ib_id = _int(form.get("id"))
@@ -8131,16 +8170,21 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
         elif tab == "outbounds":
             outs = store.setdefault("outbounds_custom", [])
             tag = str(form.get("tag") or "").strip()
-            o = next((x for x in outs if x.get("tag") == tag), None)
-            if action == "toggle" and o:
-                o["enabled"] = not o.get("enabled", True)
-                flash(request, f"{tag}: {'вкл' if o['enabled'] else 'выкл'}", "info")
-            elif action == "delete" and o:
-                store["outbounds_custom"] = [x for x in outs if x.get("tag") != tag]
-                flash(request, f"{tag} удалён", "info")
-            elif action == "sub" and o:
-                o["in_sub"] = not o.get("in_sub", True)
-                flash(request, f"{tag}: подписка {'вкл' if o.get('in_sub', True) else 'выкл'}", "info")
+            if action in ("toggle", "delete", "sub"):
+                o = next((x for x in outs if str(x.get("tag") or "") == tag), None)
+                if not o:
+                    flash(request, f"Outbound «{tag or '?'}» не найден", "error")
+                    return go(back)
+                if action == "toggle":
+                    o["enabled"] = not o.get("enabled", True)
+                    flash(request, f"{tag}: {'вкл' if o['enabled'] else 'выкл'}", "info")
+                elif action == "delete":
+                    # In-place mutate — reassignment would lose the core slice alias
+                    outs[:] = [x for x in outs if str(x.get("tag") or "") != tag]
+                    flash(request, f"{tag} удалён", "info")
+                else:
+                    o["in_sub"] = not o.get("in_sub", True)
+                    flash(request, f"{tag}: подписка {'вкл' if o.get('in_sub', True) else 'выкл'}", "info")
             elif action == "save":
                 edit_tag = str(form.get("edit_tag") or "").strip()
                 mode = str(form.get("mode") or "link").strip()
@@ -8149,41 +8193,74 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                 try:
                     if mode == "link":
                         ep = P.link_to_endpoint(str(form.get("link") or ""))
-                        config = P.endpoint_to_xray_outbound(ep, tag or "ob")
-                        remark = remark or ep.get("remark") or tag
-                        info = f"{ep.get('protocol')} {ep.get('address')}:{ep.get('port')}"
+                        remark = remark or str(ep.get("remark") or "").strip()
+                        proto = str(ep.get("protocol") or "vless")
                         if not tag:
-                            tag = str(config.get("tag") or ep.get("protocol") or "ob")
+                            tag = _suggest_outbound_tag(
+                                store, remark=remark, protocol=proto, prefer="",
+                            )
+                        elif not xray.TAG_RE.match(tag):
+                            tag = _suggest_outbound_tag(
+                                store, remark=remark or tag, protocol=proto, prefer="",
+                            )
+                        config = P.endpoint_to_xray_outbound(ep, tag)
+                        info = f"{proto} {ep.get('address')}:{ep.get('port')}"
                     else:
                         config = json.loads(str(form.get("json") or "{}"))
                         if not isinstance(config, dict) or not config.get("protocol"):
                             raise ValueError("в JSON нет protocol")
-                        tag = tag or str(config.get("tag") or "").strip()
-                        info = str(config.get("protocol") or "custom")
+                        proto = str(config.get("protocol") or "custom")
+                        if not tag:
+                            tag = _suggest_outbound_tag(
+                                store,
+                                remark=remark or str(config.get("tag") or ""),
+                                protocol=proto,
+                            )
+                        info = proto
                     if not tag or not xray.TAG_RE.match(tag):
-                        raise ValueError("Tag: латиница/цифры/._-")
+                        raise ValueError("Tag: латиница/цифры/._- (1–41 символ)")
                     config = dict(config)
                     config.pop("tag", None)
                 except Exception as exc:
                     flash(request, f"Outbound: {exc}", "error")
                     return go(back)
                 if edit_tag:
-                    o = next((x for x in outs if x.get("tag") == edit_tag), None)
+                    o = next((x for x in outs if str(x.get("tag") or "") == edit_tag), None)
                     if not o:
                         flash(request, "Outbound не найден", "error")
                         return go(back)
+                    if tag != edit_tag:
+                        if any(str(x.get("tag") or "") == tag for x in outs):
+                            flash(request, f"Tag {tag} уже есть", "error")
+                            return go(back)
+                        # rename references in clients / groups / routes
+                        for c in store.get("clients") or []:
+                            if str(c.get("outbound") or "") == edit_tag:
+                                c["outbound"] = tag
+                            ats = c.get("allowed_tags")
+                            if isinstance(ats, list) and edit_tag in ats:
+                                c["allowed_tags"] = [tag if t == edit_tag else t for t in ats]
+                        for g in store.get("groups") or []:
+                            if str(g.get("outbound") or "") == edit_tag:
+                                g["outbound"] = tag
+                            ats = g.get("allowed_tags")
+                            if isinstance(ats, list) and edit_tag in ats:
+                                g["allowed_tags"] = [tag if t == edit_tag else t for t in ats]
+                        for r in store.get("routes") or []:
+                            if str(r.get("outbound") or "") == edit_tag:
+                                r["outbound"] = tag
+                        o["tag"] = tag
                     o.update({
                         "config": config,
-                        "remark": remark or edit_tag,
+                        "remark": remark or tag,
                         "country": country,
                         "info": info,
                     })
                     o.pop("last_test", None)
-                    flash(request, f"Outbound {edit_tag} сохранён", "info")
+                    flash(request, f"Outbound {tag} сохранён", "info")
                 else:
-                    if any(x.get("tag") == tag for x in outs):
-                        flash(request, f"Tag {tag} уже есть", "error")
-                        return go(back)
+                    if any(str(x.get("tag") or "") == tag for x in outs):
+                        tag = _suggest_outbound_tag(store, remark=remark, protocol=info.split()[0] if info else "proxy")
                     outs.append({
                         "tag": tag,
                         "remark": remark or tag,
@@ -8196,7 +8273,7 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                     })
                     flash(request, f"Outbound {tag} добавлен (выкл.)", "info")
             else:
-                flash(request, "Outbound не найден", "error")
+                flash(request, "Неизвестное действие", "error")
         elif tab == "routing":
             routes = store.setdefault("routes", [])
             name = str(form.get("name") or "").strip()
