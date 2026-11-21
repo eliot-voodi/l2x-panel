@@ -64,7 +64,7 @@ def inbound_issues(store: dict, ib: dict) -> list[dict]:
     if any(i.get("tag") == ib.get("tag") for i in others):
         _issue(out, "tag", ERROR, "Такой tag уже есть у другого inbound — Xray не запустится с дублями.")
     port = int(ib.get("port") or 0)
-    if reason := xray.port_forbidden_reason(port):
+    if reason := xray.port_forbidden_reason(port, ib):
         _issue(out, "port", ERROR, reason)
     elif any(int(i.get("port") or 0) == port for i in others):
         _issue(out, "port", ERROR, f"Порт {port} уже занят другим inbound — второй не сможет слушать.")

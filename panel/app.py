@@ -2689,7 +2689,7 @@ def _inbound_form_to_model(form, ib: dict) -> str | None:
     ib["direct"] = form.get("direct") == "1"
     ib["listen"] = P.inbound_listen(ib)
     ib["port"] = _int(form.get("port"), 0)
-    if reason := xray.port_forbidden_reason(ib["port"]):
+    if reason := xray.port_forbidden_reason(ib["port"], ib):
         return reason
     share = str(form.get("share_host") or "").strip().lower()
     share = re.sub(r"^[a-z]+://", "", share).split("/", 1)[0].split(":", 1)[0]

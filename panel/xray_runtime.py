@@ -1437,7 +1437,7 @@ def ensure_inbounds(store: dict) -> list[dict]:
         P.normalize_http_inbound(ib)
     # Inbounds from older versions (or pushed by a master node) may sit on a forbidden port
     for ib in inbounds:
-        if port_forbidden_reason(int(ib.get("port") or 0)):
+        if port_forbidden_reason(int(ib.get("port") or 0), ib):
             ib["port"] = free_inbound_port(store, exclude=ib)
     return inbounds
 
@@ -1455,10 +1455,22 @@ def system_ports() -> set[int]:
     return ports
 
 
-def port_forbidden_reason(port: int) -> str:
+def _udp_can_share_reserved(ib: dict | None) -> bool:
+    """Hysteria/mKCP are UDP-only — can share 443 with nginx (TCP) / nothing on UDP."""
+    if not ib:
+        return False
+    proto = str(ib.get("protocol") or "").lower()
+    net = str((ib.get("stream") or {}).get("network") or "").lower()
+    return proto in ("hysteria", "hysteria2") or net in ("hysteria", "kcp")
+
+
+def port_forbidden_reason(port: int, ib: dict | None = None) -> str:
     if not 1 <= port <= 65535:
         return "Порт 1..65535"
     if port in P.RESERVED_PORTS:
+        # UDP Hysteria/mKCP may use 443 alongside nginx TCP:443 (Ascella-style LTE).
+        if port == 443 and _udp_can_share_reserved(ib):
+            return ""
         return f"Порт {port} запрещён для inbound (22, 80, 443 заняты SSH и nginx)"
     if port in system_ports():
         return f"Порт {port} занят панелью"
@@ -1467,7 +1479,7 @@ def port_forbidden_reason(port: int) -> str:
 
 def free_inbound_port(store: dict, exclude: dict | None = None, start: int = 10000) -> int:
     used = {int(i.get("port") or 0) for i in store.get("inbounds") or [] if i is not exclude}
-    return next(p for p in range(start, 65535) if p not in used and not port_forbidden_reason(p))
+    return next(p for p in range(start, 65535) if p not in used and not port_forbidden_reason(p, exclude))
 
 
 def ensure_inbound_keys(ib: dict) -> None:
