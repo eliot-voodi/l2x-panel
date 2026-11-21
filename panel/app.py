@@ -3142,8 +3142,10 @@ def inbound_new(request: Request):
         lint_issues = inbound_lint.inbound_issues(store, ib)
     except Exception:
         lint_issues = []
+    nxt = _safe_next(request.query_params.get("next"), _core_editor_back(request, "inbounds") or "/inbounds")
     return page(request, "inbound_edit.html", active="nodes", ib=ib, is_new=True, store=store,
-                certs=ops.list_certs(), lint_issues=lint_issues, **_cores_scope_ctx(request))
+                certs=ops.list_certs(), lint_issues=lint_issues, form_next=nxt,
+                **_cores_scope_ctx(request))
 
 
 @app.get("/inbounds/{ib_id}/edit", response_class=HTMLResponse)
@@ -3154,13 +3156,15 @@ def inbound_edit(ib_id: int, request: Request):
     ib = xray.inbound_by_id(store, ib_id)
     if not ib:
         flash(request, "Inbound не найден", "error")
-        return go("/inbounds")
+        return go(_core_editor_back(request, "inbounds") or "/inbounds")
     try:
         lint_issues = inbound_lint.inbound_issues(store, ib)
     except Exception:
         lint_issues = []
+    nxt = _safe_next(request.query_params.get("next"), _core_editor_back(request, "inbounds") or "/inbounds")
     return page(request, "inbound_edit.html", active="nodes", ib=ib, is_new=False, store=store,
-                certs=ops.list_certs(), lint_issues=lint_issues, **_cores_scope_ctx(request))
+                certs=ops.list_certs(), lint_issues=lint_issues, form_next=nxt,
+                **_cores_scope_ctx(request))
 
 
 @app.post("/inbounds/save")
@@ -3196,9 +3200,15 @@ async def inbound_save(request: Request):
             bad = [i for i in inbound_lint.inbound_issues(store, ib) if i["level"] == inbound_lint.ERROR]
             if bad:
                 err = "Исправьте: " + "; ".join(i["msg"] for i in bad[:3])
+        ib_back = _safe_next(form.get("next"), "") or (
+            _core_editor_back(request, "inbounds") or "/inbounds"
+        )
         if err:
             flash(request, err, "error")
-            return go(f"/inbounds/{ib_id}/edit" if ib_id else "/inbounds/new")
+            edit_url = f"/inbounds/{ib_id}/edit" if ib_id else "/inbounds/new"
+            if form.get("next"):
+                edit_url += f"?next={str(form.get('next'))}"
+            return go(edit_url)
         if not ib_id:
             store["inbounds"].append(ib)
             propagate = form.get("propagate_users") == "1"
@@ -3224,7 +3234,10 @@ async def inbound_save(request: Request):
         flash(request, f"Inbound {ib['tag']} сохранён в ядро{prop_note} (Xray мастера не тронут)", "info")
     else:
         flash(request, *_ok_msg(f"Inbound {ib['tag']} сохранён{prop_note}", result))
-    return go("/inbounds")
+    nxt = _safe_next(form.get("next") or request.query_params.get("next"), "")
+    if not nxt:
+        nxt = _core_editor_back(request, "inbounds") or "/inbounds"
+    return go(nxt)
 
 
 @app.post("/inbounds/{ib_id}/{action}")
@@ -4527,9 +4540,10 @@ def outbounds_page(request: Request):
         r.setdefault("via", "")
     custom = {o["tag"]: {"config": o.get("config") or {}, "remark": o.get("remark") or "", "country": o.get("country") or ""}
               for o in store["outbounds_custom"]}
+    nxt = _safe_next(request.query_params.get("next"), _core_editor_back(request, "outbounds") or "")
     return page(request, "outbounds.html", active="nodes", items=rows, nord_countries=[], custom=custom,
                 dialer_tags=[r["tag"] for r in rows], ss_methods=P.SS_METHODS, fingerprints=P.FINGERPRINTS,
-                pia=_pia_account_view(), **_cores_scope_ctx(request))
+                pia=_pia_account_view(), form_next=nxt or "", **_cores_scope_ctx(request))
 
 
 @app.post("/outbounds/parse")
@@ -4755,20 +4769,20 @@ async def outbound_add(request: Request):
             raise ValueError("неизвестный режим")
     except Exception as exc:  # noqa: BLE001
         flash(request, f"Outbound: {exc}", "error")
-        return go("/outbounds")
+        return go(_safe_next(form.get("next"), _core_editor_back(request, "outbounds") or "/outbounds"))
     wrap_on = form.get("wrap_on") == "1"
     wrap_via = str(form.get("wrap_via") or "").strip()
     if wrap_on and wrap_via:
         known = set(xray.all_outbound_tags(_load_store()))
         if wrap_via not in known:
             flash(request, f"Outbound: неизвестный via «{wrap_via}»", "error")
-            return go("/outbounds")
+            return go(_safe_next(form.get("next"), _core_editor_back(request, "outbounds") or "/outbounds"))
     wrap_err = _apply_outbound_wrap(
         config, wrap_on=wrap_on, wrap_via=wrap_via, self_tag=edit_tag or tag,
     )
     if wrap_err:
         flash(request, f"Outbound: {wrap_err}", "error")
-        return go("/outbounds")
+        return go(_safe_next(form.get("next"), _core_editor_back(request, "outbounds") or "/outbounds"))
     prop_note = ""
     with mutate() as store:
         previous = json.loads(json.dumps(store["outbounds_custom"]))
@@ -4803,9 +4817,12 @@ async def outbound_add(request: Request):
                     if propagate else
                     f" · без автораздачи (зафиксировано {stats['clients']} клиентов / {stats['groups']} групп)"
                 )
+    ob_back = _safe_next(form.get("next") or request.query_params.get("next"), "") or (
+        _core_editor_back(request, "outbounds") or "/outbounds"
+    )
     if err:
         flash(request, err, "error")
-        return go("/outbounds")
+        return go(ob_back)
     xr = _apply_xray_after_config(xray_only=True)
     if not xr.get("ok"):
         # Only roll back master when we were editing master (not a core profile)
@@ -4813,14 +4830,14 @@ async def outbound_add(request: Request):
             with mutate(edit_core_id="") as store:
                 store["outbounds_custom"] = previous
         flash(request, f"Outbound {tag} не сохранён — Xray отклонил конфиг: {xr.get('error')}", "error")
-        return go("/outbounds")
+        return go(ob_back)
     act = "обновлён" if edit_tag else "добавлен"
     _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b> {act}")
     if xr.get("skipped_core_edit"):
         flash(request, f"Outbound {tag} {act} в ядре{prop_note} (мастер/схема не изменены)", "info")
     else:
         flash(request, f"Outbound {tag} {act}{prop_note}", "info")
-    return go("/outbounds")
+    return go(ob_back)
 
 
 @app.get("/outbounds/nord/countries")
@@ -4949,7 +4966,7 @@ def outbound_action(tag: str, action: str, request: Request):
             pass
         flash(request, f"{tag}: {'OK ' + str(res.get('ms')) + ' мс' if res['ok'] else 'ошибка ' + str(res.get('error'))}{loss}",
               "info" if res["ok"] else "error")
-        return go("/outbounds")
+        return go(_core_editor_back(request, "outbounds") or "/outbounds")
     if action == "reconnect":
         res = _pia_reconnect_one(tag)
         if res.get("ok"):
@@ -4957,7 +4974,7 @@ def outbound_action(tag: str, action: str, request: Request):
             flash(request, f"PIA reconnect {tag}: ok · {probe}", "info")
         else:
             flash(request, f"PIA reconnect {tag}: {res.get('error')}", "error")
-        return go("/outbounds")
+        return go(_core_editor_back(request, "outbounds") or "/outbounds")
     new_tag = ""
     clone_error = ""
     need_xray = True
@@ -4991,24 +5008,25 @@ def outbound_action(tag: str, action: str, request: Request):
                     store["outbounds_custom"].remove(o)
             else:
                 clone_error = "Неизвестное действие"
+    ob_back = _core_editor_back(request, "outbounds") or "/outbounds"
     if clone_error:
         flash(request, clone_error if action != "clone" else f"Копирование {tag}: {clone_error}", "error")
-        return go("/outbounds")
+        return go(ob_back)
     if action == "reset":
         flash(request, *_ok_msg(f"{tag}: reset", {"ok": True}))
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: сброс трафика")
-        return go("/outbounds")
+        return go(ob_back)
     if action == "clone":
         _tg_change(
             f"📤 Outbound <b>{tgbot.escape(tag)}</b>: скопирован → "
             f"<b>{tgbot.escape(new_tag)}</b> (выкл.)"
         )
         flash(request, f"Outbound {tag} скопирован → {new_tag} (выключен, не в подписке)", "info")
-        return go("/outbounds")
+        return go(ob_back)
     if action == "sub":
         _tg_change(f"📤 Outbound <b>{tgbot.escape(tag)}</b>: в подписке вкл/выкл")
         flash(request, f"{tag}: sub", "info")
-        return go("/outbounds")
+        return go(ob_back)
     xr = _apply_xray_after_config(xray_only=True) if need_xray else {"ok": True}
     labels = {
         "delete": "удалён", "toggle": "вкл/выкл",
@@ -5019,7 +5037,7 @@ def outbound_action(tag: str, action: str, request: Request):
         flash(request, f"{tag}: {action} (в ядре)", "info")
     else:
         flash(request, *_ok_msg(f"{tag}: {action}", xr))
-    return go("/outbounds")
+    return go(ob_back)
 
 
 # ================================================================ balancers
@@ -7804,20 +7822,29 @@ def core_edit_page(core_id: str, request: Request):
         patch_text = json.dumps(patch, ensure_ascii=False, indent=2) if patch else ""
     except Exception:
         patch_text = ""
+    sys_tags = set(getattr(nodes_mod, "_SYSTEM_INBOUND_TAGS", ()) or ()) | {"api"}
+    preview_ibs = [
+        i for i in (view.get("inbounds") or [])
+        if isinstance(i, dict)
+        and not i.get("_system")
+        and str(i.get("tag") or "") not in sys_tags
+    ]
+    route_clients = xray.route_picker_clients(view)
+    route_source_ips = xray.route_picker_source_ips(view)
     return page(
         request, "core_edit.html", active="nodes",
         core=core,
         summary=cores_mod.core_summary(core),
         usage=usage,
         nodes=cores_mod.nodes_for_core(store, core_id),
-        inbound_tags=cores_mod.preview_inbound_tags(store, core),
+        inbound_tags=[str(i.get("tag") or "") for i in preview_ibs if i.get("tag")],
         config_json=cores_mod.config_json_text(core),
         is_master=nodes_mod.is_master(store),
         nodes_tab="cores",
         editing=str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "") == core_id,
         core_tab=tab,
         core_tabs=CORE_EDITOR_TABS,
-        preview_inbounds=list(view.get("inbounds") or []),
+        preview_inbounds=preview_ibs,
         preview_outbounds=list(view.get("outbounds_custom") or []),
         preview_routes=list(view.get("routes") or []),
         preview_balancers=bals,
@@ -7825,7 +7852,16 @@ def core_edit_page(core_id: str, request: Request):
         preview_xray=xs,
         template_patch_text=patch_text,
         outbound_tags=xray.all_outbound_tags(view),
+        outbounds=xray.all_outbound_tags(view),
         view_store=view,
+        store=view,
+        route_clients=route_clients,
+        route_source_ips=route_source_ips,
+        has_applied=bool(core.get("applied_snapshot")),
+        applied_at=core.get("applied_at") or "",
+        core_next_inbounds=_core_back(core_id, "inbounds"),
+        core_next_outbounds=_core_back(core_id, "outbounds"),
+        core_next_routing=_core_back(core_id, "routing"),
     )
 
 
@@ -7870,6 +7906,21 @@ def _core_back(core_id: str, tab: str = "general") -> str:
     if tab == "general":
         return f"/cores/{core_id}"
     return f"/cores/{core_id}?tab={tab}"
+
+
+def _safe_next(raw: Any, default: str = "/") -> str:
+    nxt = str(raw or "").strip()
+    if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt or "://" in nxt:
+        return default
+    return nxt
+
+
+def _core_editor_back(request: Request, tab: str = "general") -> str | None:
+    """If editing a core profile, return /cores/{id}?tab=… for post-save redirects."""
+    cid = str(request.session.get(cores_mod.EDIT_CORE_SESSION) or "").strip()
+    if not cid:
+        return None
+    return _core_back(cid, tab)
 
 
 @app.post("/cores/{core_id}/panel/{tab}/{action}")
@@ -7968,6 +8019,23 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                 rule["enabled"] = True
                 routes.append(rule)
                 flash(request, f"Правило {rname} добавлено", "info")
+            elif action == "save":
+                rule, err = _route_rule_from_form(form)
+                if err or not rule:
+                    flash(request, err or "Ошибка формы", "error")
+                    return go(back)
+                old_name = str(form.get("old_name") or name or "").strip()
+                idx2 = next((i for i, r in enumerate(routes) if r.get("name") == old_name), None)
+                if idx2 is None:
+                    flash(request, "Правило не найдено", "error")
+                    return go(back)
+                rname = rule.get("name") or old_name
+                if rname != old_name and any(r.get("name") == rname for r in routes):
+                    flash(request, "Имя уже занято", "error")
+                    return go(back)
+                rule["name"] = rname
+                routes[idx2] = rule
+                flash(request, f"Правило {rname} сохранено", "info")
             else:
                 flash(request, "Неизвестное действие", "error")
         elif tab == "balancers":
@@ -8049,6 +8117,74 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
     # Master xray only when editing inherit/live master
     if inherit:
         _apply_xray(_load_store(), xray_only=True)
+    return go(back)
+
+
+@app.post("/cores/{core_id}/apply")
+async def cores_apply(core_id: str, request: Request):
+    """Validate core config (xray -test); on failure roll back to last applied snapshot."""
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только мастер", "error")
+        return go("/cores")
+    tab = str(request.query_params.get("tab") or "general").strip().lower()
+    back = _core_back(core_id, tab)
+
+    with mutate(edit_core_id="", history_section="cores", history_note="core apply") as store:
+        cores_mod.ensure_cores(store)
+        core = cores_mod.core_by_id(store, core_id)
+        if not core:
+            flash(request, "Ядро не найдено", "error")
+            return go("/cores")
+        prev = deepcopy(core.get("applied_snapshot")) if isinstance(core.get("applied_snapshot"), dict) else None
+        check = cores_mod.validate_and_build(store, core)
+        if not check.get("ok"):
+            if prev is not None:
+                cores_mod.restore_slices(store, core, prev)
+                flash(
+                    request,
+                    f"Применение отклонено — откат к предыдущей версии. Ошибка: {check.get('error') or 'invalid'}",
+                    "error",
+                )
+            else:
+                flash(
+                    request,
+                    f"Применение отклонено (нет сохранённой версии для отката): {check.get('error') or 'invalid'}",
+                    "error",
+                )
+            return go(back)
+        snap = cores_mod.snapshot_slices(store, core)
+        cores_mod.remember_applied(core, snap)
+
+    # Sync nodes that use this core (config already validated)
+    store = _load_store()
+    core = cores_mod.core_by_id(store, core_id) or {}
+    nodes = cores_mod.nodes_for_core(store, core_id)
+    host = public_host()
+    ok_n = 0
+    for n in nodes:
+        if not n.get("enabled", True):
+            continue
+        try:
+            payload = nodes_mod.build_payload(store, n, xray.build_config)
+            push = nodes_mod.push(n, payload, master_host=host)
+            if push.get("ok") or push.get("queued"):
+                ok_n += 1
+        except Exception:
+            pass
+    # Inherit cores also touch master live Xray
+    if core.get("inherit_master"):
+        xr = _apply_xray(_load_store(), xray_only=True)
+        if not xr.get("ok"):
+            flash(request, f"Конфиг ядра OK, но Xray мастера: {xr.get('error')}", "error")
+            return go(back)
+    flash(
+        request,
+        f"Ядро «{core.get('name')}» применено (xray -test OK)"
+        + (f", sync {ok_n}/{len(nodes)} нод" if nodes else ""),
+        "info",
+    )
     return go(back)
 
 

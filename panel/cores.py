@@ -12,6 +12,7 @@ import copy
 import json
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 CORE_SLICES = (
@@ -660,3 +661,80 @@ def preview_inbound_tags(store: dict, core: dict) -> list[str]:
     else:
         src = core.get("inbounds") or []
     return [str(i.get("tag") or "") for i in src if isinstance(i, dict) and i.get("tag")]
+
+
+def snapshot_slices(store: dict, core: dict) -> dict:
+    """Deep copy of config slices for this core (master live if inherit)."""
+    src = store if core.get("inherit_master") else core
+    out: dict[str, Any] = {}
+    for key in CORE_SLICES:
+        out[key] = copy.deepcopy(src.get(key))
+    out["exclude_inbound_tags"] = list(core.get("exclude_inbound_tags") or [])
+    out["fallbacks_inbound_tags"] = list(core.get("fallbacks_inbound_tags") or [])
+    out["config"] = copy.deepcopy(core.get("config") or {})
+    out["inherit_master"] = bool(core.get("inherit_master"))
+    return out
+
+
+def restore_slices(store: dict, core: dict, snap: dict | None) -> None:
+    """Restore slices from a previous apply snapshot."""
+    if not isinstance(snap, dict):
+        return
+    inherit = bool(snap.get("inherit_master", core.get("inherit_master")))
+    core["inherit_master"] = inherit
+    target = store if inherit else core
+    for key in CORE_SLICES:
+        if key not in snap:
+            continue
+        val = copy.deepcopy(snap[key])
+        if key in ("balancers", "dns", "xray_settings"):
+            target[key] = val if isinstance(val, dict) else {}
+        else:
+            target[key] = val if isinstance(val, list) else []
+    if "exclude_inbound_tags" in snap:
+        core["exclude_inbound_tags"] = list(snap.get("exclude_inbound_tags") or [])
+    if "fallbacks_inbound_tags" in snap:
+        core["fallbacks_inbound_tags"] = list(snap.get("fallbacks_inbound_tags") or [])
+    if "config" in snap:
+        core["config"] = copy.deepcopy(snap.get("config") or {})
+    core["updated_at"] = now_iso()
+
+
+def remember_applied(core: dict, snap: dict) -> None:
+    core["applied_snapshot"] = copy.deepcopy(snap)
+    core["applied_at"] = now_iso()
+
+
+def validate_and_build(store: dict, core: dict) -> dict:
+    """Build Xray JSON for this core and run ``xray run -test``.
+
+    Returns ``{ok, error, cfg?}``. Does not touch live master config file on failure.
+    """
+    errs = validate_core_slices(core if not core.get("inherit_master") else {
+        **core,
+        "inbounds": store.get("inbounds") or [],
+        "outbounds_custom": store.get("outbounds_custom") or [],
+    })
+    if errs:
+        return {"ok": False, "error": "; ".join(errs[:6])}
+    try:
+        import xray_runtime as xray
+    except Exception as exc:
+        return {"ok": False, "error": f"xray_runtime: {exc}"}
+    # Fake node view so build uses core slices
+    view = store_view_for_node(store, {"core_id": core.get("id"), "id": "_validate"})
+    try:
+        cfg = xray.build_config(view)
+    except Exception as exc:
+        return {"ok": False, "error": f"build_config: {exc}"}
+    test = xray.test_config(cfg)
+    # Drop temp file if any
+    try:
+        tmp = test.get("tmp")
+        if tmp is not None:
+            Path(tmp).unlink(missing_ok=True)
+    except Exception:
+        pass
+    if not test.get("ok"):
+        return {"ok": False, "error": test.get("error") or "xray -test failed", "cfg": cfg}
+    return {"ok": True, "error": "", "cfg": cfg}

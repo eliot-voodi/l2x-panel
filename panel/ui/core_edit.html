@@ -3,12 +3,16 @@
 {% import "_icons.html" as ic %}
 {% block title %}Ядро · {{ core.name }} · {{ app_name }}{% endblock %}
 {% block page_title %}{{ core.name }}{% endblock %}
-{% block page_sub %}Редактор ядра: вкладки меняют содержимое на этой странице{% endblock %}
+{% block page_sub %}Редактор ядра · после правок нажмите «Применить»{% endblock %}
 {% block top_actions %}
 <a class="btn ghost" href="{{ bp }}/cores">← Ядра</a>
+<form method="post" action="{{ bp }}/cores/{{ core.id }}/apply?tab={{ core_tab or 'general' }}" style="display:inline"
+      onsubmit="return confirm('Проверить конфиг (xray -test) и применить к нодам? При ошибке — откат к предыдущей версии.')">
+  <button class="btn">Применить</button>
+</form>
 <form method="post" action="{{ bp }}/cores/{{ core.id }}/sync-nodes" style="display:inline"
-      onsubmit="return confirm('Sync всех нод с этим ядром?')">
-  <button class="btn" {% if not usage %}disabled{% endif %}>Sync ноды ({{ usage }})</button>
+      onsubmit="return confirm('Sync всех нод с этим ядром (без повторной проверки)?')">
+  <button class="btn ghost" {% if not usage %}disabled{% endif %}>Sync ноды ({{ usage }})</button>
 </form>
 {% endblock %}
 {% block head %}
@@ -16,6 +20,11 @@
   .core-panel { display: none }
   .core-panel.active { display: block }
   .core-tabs a { cursor: pointer }
+  select.route-multi {
+    width: 100%; min-height: 7rem; font: inherit;
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px; padding: .35rem .45rem;
+  }
 </style>
 {% endblock %}
 {% block content %}
@@ -31,7 +40,6 @@
 
 {% set dns = preview_dns or {} %}
 {% set fake = dns.fakedns if dns.fakedns is mapping else {} %}
-{% set xs = preview_xray or {} %}
 
 <div class="card">
   <div class="flex between" style="flex-wrap:wrap;gap:.75rem;align-items:center">
@@ -40,9 +48,15 @@
         {% if summary.is_default %}<span class="badge ok">default</span>{% endif %}
         {% if core.inherit_master %}<span class="badge ok">наследует</span>{% else %}<span class="badge warn">снимок</span>{% endif %}
       </h3>
-      <div class="dim small mono">{{ core.id }} · {{ core.engine or 'xray' }} · нод: {{ usage }}</div>
+      <div class="dim small mono">{{ core.id }} · {{ core.engine or 'xray' }} · нод: {{ usage }}
+        {% if applied_at %} · применено {{ applied_at }}{% elif not has_applied %} · ещё не применялось{% endif %}
+      </div>
     </div>
     <div class="actions" style="flex-wrap:wrap">
+      <form method="post" action="{{ bp }}/cores/{{ core.id }}/apply?tab={{ core_tab or 'general' }}"
+            onsubmit="return confirm('Проверить и применить? При ошибке — откат.')">
+        <button class="btn sm">Применить</button>
+      </form>
       <form method="post" action="{{ bp }}/cores/{{ core.id }}/duplicate"><button class="btn ghost sm">Дублировать</button></form>
       <form method="post" action="{{ bp }}/cores/{{ core.id }}/refresh"
             onsubmit="return confirm('Перезаписать срезы ядра с мастера?')">
@@ -51,16 +65,12 @@
     </div>
   </div>
   <div class="hint mt">
-    Вкладки ниже переключают блоки на <b>этой же странице</b> (без перехода на /inbounds и т.п.).
-    {% if core.inherit_master %}
-    Сейчас ядро <b>наследует мастер</b> — правки Inbounds/Outbounds/маршрутов пишутся в live-мастер.
-    {% else %}
-    Снимок ядра независим от мастера; «Схема трафика» всегда считает мастер (live).
-    {% endif %}
+    Правки на вкладках сохраняются в профиль ядра. <b>Применить</b> запускает <code>xray -test</code>;
+    при ошибке конфиг откатывается к последней успешной версии.
+    {% if core.inherit_master %}Сейчас <b>наследует мастер</b> — правки пишутся в live-мастер.{% endif %}
   </div>
 </div>
 
-{# —— Sub-tabs (same URL /cores/{id}?tab=…) —— #}
 <div class="tabs core-tabs" id="core-tabs">
   {% for key, label in core_tabs %}
   <a href="{{ bp }}/cores/{{ core.id }}{% if key != 'general' %}?tab={{ key }}{% endif %}"
@@ -71,27 +81,48 @@
 
 {# ===================== GENERAL ===================== #}
 <section class="core-panel {% if core_tab == 'general' %}active{% endif %}" data-panel="general">
+  <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/save" style="max-width:720px">
+    <input type="hidden" name="stay" value="1">
+    <h3>Профиль</h3>
+    <div class="row">
+      <div style="flex:2"><label class="f">Название</label><input name="name" value="{{ core.name }}" required></div>
+      <div style="flex:2"><label class="f">Комментарий</label><input name="remark" value="{{ core.remark or '' }}"></div>
+    </div>
+    <div class="mt">
+      {{ m.check('inherit_master', core.inherit_master, 'Наследует мастер (live). Снимите, чтобы править срезы отдельно.') }}
+    </div>
+    <div class="actions mt"><button class="btn ghost">Сохранить профиль</button></div>
+  </form>
+
   <div class="grid g2">
     <div class="card">
-      <div class="card-head"><h3>Исходящие</h3>
-        <button type="button" class="btn ghost sm" data-goto="outbounds">Открыть</button>
-      </div>
-      {% if preview_outbounds %}
-      <table><thead><tr><th>Tag</th><th>Протокол</th></tr></thead><tbody>
-        {% for o in preview_outbounds[:12] %}
-        <tr><td class="mono">{{ o.tag }}</td><td class="small">{{ (o.config or {}).protocol or o.kind or '—' }}</td></tr>
+      <div class="card-head"><h3>Входящие</h3>
+        <button type="button" class="btn ghost sm" data-goto="inbounds">Открыть</button></div>
+      {% if preview_inbounds %}
+      <table><thead><tr><th>Tag</th><th>Port</th></tr></thead><tbody>
+        {% for i in preview_inbounds[:8] %}
+        <tr><td class="mono">{{ i.tag }}</td><td>{{ i.port or '—' }}</td></tr>
         {% endfor %}
       </tbody></table>
-      {% if preview_outbounds|length > 12 %}<div class="dim small">… ещё {{ preview_outbounds|length - 12 }}</div>{% endif %}
+      {% else %}<div class="empty">Нет inbounds</div>{% endif %}
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Исходящие</h3>
+        <button type="button" class="btn ghost sm" data-goto="outbounds">Открыть</button></div>
+      {% if preview_outbounds %}
+      <table><thead><tr><th>Tag</th><th>Тип</th></tr></thead><tbody>
+        {% for o in preview_outbounds[:8] %}
+        <tr><td class="mono">{{ o.tag }}</td><td class="small">{{ o.kind or (o.config or {}).protocol or '—' }}</td></tr>
+        {% endfor %}
+      </tbody></table>
       {% else %}<div class="empty">Нет outbounds</div>{% endif %}
     </div>
     <div class="card">
       <div class="card-head"><h3>Маршрутизация</h3>
-        <button type="button" class="btn ghost sm" data-goto="routing">Открыть</button>
-      </div>
+        <button type="button" class="btn ghost sm" data-goto="routing">Открыть</button></div>
       {% if preview_routes %}
       <table><thead><tr><th>Правило</th><th>→</th></tr></thead><tbody>
-        {% for r in preview_routes[:12] %}
+        {% for r in preview_routes[:8] %}
         <tr><td>{{ r.name }}</td><td class="mono small">{{ r.outbound or 'direct' }}</td></tr>
         {% endfor %}
       </tbody></table>
@@ -99,77 +130,28 @@
     </div>
     <div class="card">
       <div class="card-head"><h3>Балансировщики</h3>
-        <button type="button" class="btn ghost sm" data-goto="balancers">Открыть</button>
-      </div>
+        <button type="button" class="btn ghost sm" data-goto="balancers">Открыть</button></div>
       {% if preview_balancers %}
-      <table><thead><tr><th>Key</th><th>Tag</th><th></th></tr></thead><tbody>
+      <table><thead><tr><th>Key</th><th></th></tr></thead><tbody>
         {% for k, b in preview_balancers.items() %}
-        <tr>
-          <td class="mono">{{ k }}</td>
-          <td class="mono small">{{ b.tag or k }}</td>
-          <td>{% if b.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
-        </tr>
+        <tr><td class="mono">{{ k }}</td>
+          <td>{% if b.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td></tr>
         {% endfor %}
       </tbody></table>
-      {% else %}<div class="empty">Нет балансировщиков</div>{% endif %}
-    </div>
-    <div class="card">
-      <div class="card-head"><h3>Входящие</h3>
-        <button type="button" class="btn ghost sm" data-goto="inbounds">Открыть</button>
-      </div>
-      {% if preview_inbounds %}
-      <table><thead><tr><th>Tag</th><th>Port</th></tr></thead><tbody>
-        {% for i in preview_inbounds[:12] %}
-        <tr><td class="mono">{{ i.tag }}</td><td>{{ i.port or '—' }}</td></tr>
-        {% endfor %}
-      </tbody></table>
-      {% else %}<div class="empty">Нет inbounds</div>{% endif %}
+      {% else %}<div class="empty">Нет</div>{% endif %}
     </div>
   </div>
 
-  <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/save" style="max-width:920px">
-    <input type="hidden" name="stay" value="1">
-    <h3>Основные (CoreConfig)</h3>
-    <div class="row">
-      <div style="flex:2"><label class="f">Название</label><input name="name" value="{{ core.name }}" required></div>
-      <div style="flex:2"><label class="f">Комментарий</label><input name="remark" value="{{ core.remark or '' }}"></div>
-      <div>
-        <label class="f">Тип ядра</label>
-        <select name="engine"><option value="xray" selected>Xray</option></select>
-      </div>
-    </div>
-    <div class="mt">
-      {{ m.check('inherit_master', core.inherit_master, 'Наследует мастер (live). Снимите, чтобы править Outbounds/маршруты/балансировщики отдельно.') }}
-    </div>
-
-    <h3 class="mt">exclude_inbound_tags</h3>
-    <textarea name="exclude_inbound_tags" class="mono" rows="2" placeholder="INBOUND_X INBOUND_Y">{{ (core.exclude_inbound_tags or [])|join(' ') }}</textarea>
-
-    <h3 class="mt">fallbacks_inbound_tags</h3>
-    <textarea name="fallbacks_inbound_tags" class="mono" rows="2" placeholder="VLESS-FALLBACK">{{ (core.fallbacks_inbound_tags or [])|join(' ') }}</textarea>
-
-    <h3 class="mt">Policy / логи</h3>
-    <div class="row">
-      <div>
-        <label class="f">loglevel</label>
-        <select name="log_level">
-          {% set lvl = xs.log_level or 'warning' %}
-          {% for v in ['debug','info','warning','error','none'] %}
-          <option value="{{ v }}" {% if lvl == v %}selected{% endif %}>{{ v }}</option>
-          {% endfor %}
-        </select>
-      </div>
-    </div>
-    <div class="mt">
-      {{ m.check('stats_user_online', xs.get('stats_user_online', True), 'statsUserOnline') }}
-      {{ m.check('access_log', xs.access_log, 'Access log') }}
-      {{ m.check('dns_log', xs.dns_log, 'DNS log') }}
-    </div>
-
-    <h3 class="mt">config JSON overlay</h3>
-    <textarea name="config_json" class="mono" rows="12" style="font-size:.78rem;width:100%">{{ config_json }}</textarea>
-    <div class="actions mt"><button class="btn">Сохранить</button></div>
-  </form>
+  {% if nodes %}
+  <div class="card">
+    <h3>Ноды на этом ядре</h3>
+    <ul style="margin:0;padding-left:1.1rem">
+      {% for n in nodes %}
+      <li><b>{{ n.name }}</b> <span class="dim mono small">{{ n.domain or n.url }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
 
   <div class="actions" style="flex-wrap:wrap;margin:.5rem 0 1.2rem;gap:.5rem">
     {% if not summary.is_default %}
@@ -183,21 +165,14 @@
     </form>
     {% endif %}
   </div>
-
-  {% if nodes %}
-  <div class="card">
-    <h3>Ноды на этом ядре</h3>
-    <ul style="margin:0;padding-left:1.1rem">
-      {% for n in nodes %}
-      <li><b>{{ n.name }}</b> <span class="dim mono small">{{ n.domain or n.url }}</span></li>
-      {% endfor %}
-    </ul>
-  </div>
-  {% endif %}
 </section>
 
 {# ===================== INBOUNDS ===================== #}
 <section class="core-panel {% if core_tab == 'inbounds' %}active{% endif %}" data-panel="inbounds">
+  <div class="card-head" style="margin-bottom:.75rem">
+    <h3 style="margin:0">Входящие</h3>
+    <a class="btn sm" href="{{ bp }}/inbounds/new?next={{ core_next_inbounds|urlencode }}">{{ ic.icon('plus') }}Добавить</a>
+  </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
       <table>
@@ -205,12 +180,14 @@
         <tbody>
         {% for i in preview_inbounds %}
           <tr {% if i.enabled is defined and not i.enabled %}style="opacity:.5"{% endif %}>
-            <td class="mono"><b>{{ i.tag }}</b></td>
+            <td class="mono"><b>{{ i.tag }}</b>{% if i.remark %}<div class="dim small">{{ i.remark }}</div>{% endif %}</td>
             <td>{{ i.port or '—' }}</td>
             <td class="small">{{ i.protocol or '—' }}</td>
             <td>{% if i.enabled is not defined or i.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
+                <a class="btn ghost icon" title="Изменить"
+                   href="{{ bp }}/inbounds/{{ i.id }}/edit?next={{ core_next_inbounds|urlencode }}">{{ ic.icon('edit') }}</a>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/toggle">
                   <input type="hidden" name="id" value="{{ i.id }}">
                   <button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button>
@@ -224,17 +201,21 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="5" class="empty">Нет inbounds в этом ядре</td></tr>
+          <tr><td colspan="5" class="empty">Нет inbounds — нажмите «Добавить» или «С мастера»</td></tr>
         {% endfor %}
         </tbody>
       </table>
     </div>
   </div>
-  <div class="hint">Полное создание inbound — через снимок с мастера («С мастера») или снятие наследования после настройки мастера.</div>
+  <div class="hint">После добавления/правки нажмите <b>Применить</b> вверху страницы.</div>
 </section>
 
 {# ===================== OUTBOUNDS ===================== #}
 <section class="core-panel {% if core_tab == 'outbounds' %}active{% endif %}" data-panel="outbounds">
+  <div class="card-head" style="margin-bottom:.75rem">
+    <h3 style="margin:0">Исходящие</h3>
+    <a class="btn sm" href="{{ bp }}/outbounds?next={{ core_next_outbounds|urlencode }}">{{ ic.icon('plus') }}Добавить / редактор</a>
+  </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
       <table>
@@ -242,13 +223,15 @@
         <tbody>
         {% for o in preview_outbounds %}
           <tr {% if o.enabled is defined and not o.enabled %}style="opacity:.5"{% endif %}>
-            <td class="mono"><b>{{ o.tag }}</b>{% if o.label %}<div class="dim small">{{ o.label }}</div>{% endif %}</td>
+            <td class="mono"><b>{{ o.tag }}</b>{% if o.remark %}<div class="dim small">{{ o.remark }}</div>{% endif %}</td>
             <td><span class="badge">{{ o.kind or (o.config or {}).protocol or 'custom' }}</span>
               {% if o.in_sub %}<span class="badge ok">sub</span>{% endif %}
             </td>
             <td>{% if o.enabled is not defined or o.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
+                <a class="btn ghost icon" title="Изменить в редакторе"
+                   href="{{ bp }}/outbounds?next={{ core_next_outbounds|urlencode }}#edit={{ o.tag|urlencode }}">{{ ic.icon('edit') }}</a>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/sub">
                   <input type="hidden" name="tag" value="{{ o.tag }}">
                   <button class="btn ghost icon" title="В подписке">{{ ic.icon('link') }}</button>
@@ -272,10 +255,15 @@
       </table>
     </div>
   </div>
+  <div class="hint">Полное добавление/правка (ссылка, WARP, JSON) — в редакторе outbound’ов. Затем <b>Применить</b>.</div>
 </section>
 
 {# ===================== ROUTING ===================== #}
 <section class="core-panel {% if core_tab == 'routing' %}active{% endif %}" data-panel="routing">
+  <div class="card-head" style="margin-bottom:.75rem">
+    <h3 style="margin:0">Маршрутизация</h3>
+    <button type="button" class="btn sm" onclick="openCoreRouteAdd()">{{ ic.icon('plus') }}Правило</button>
+  </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
       <table>
@@ -294,6 +282,8 @@
             <td class="mono small">{{ r.outbound or r.outbound_tag or 'direct' }}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
+                <button type="button" class="btn ghost icon" title="Изменить"
+                        onclick='openCoreRouteEdit({{ r|tojson }})'>{{ ic.icon('edit') }}</button>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/routing/up">
                   <input type="hidden" name="name" value="{{ r.name }}">
                   <button class="btn ghost icon" {% if loop.first %}disabled{% endif %}>{{ ic.icon('up') }}</button>
@@ -322,42 +312,23 @@
     </div>
   </div>
 
-  <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/panel/routing/add" style="max-width:720px">
-    <h3>Добавить правило</h3>
-    <div class="row">
-      <div><label class="f">Имя</label><input name="name" required placeholder="direct-ru"></div>
-      <div>
-        <label class="f">→ Outbound</label>
-        <select name="outbound">
-          {% for t in outbound_tags %}
-          <option value="{{ t }}">{{ t }}</option>
-          {% else %}
-          <option value="direct">direct</option>
-          <option value="block">block</option>
-          {% endfor %}
-        </select>
-      </div>
-    </div>
-    <div class="row mt">
-      <div style="flex:2"><label class="f">domain (по строке / geosite:…)</label>
-        <textarea name="domain" class="mono" rows="3" placeholder="geosite:category-ru&#10;regexp:\\.ru$"></textarea></div>
-      <div style="flex:2"><label class="f">ip / geoip</label>
-        <textarea name="ip" class="mono" rows="3" placeholder="geoip:ru"></textarea></div>
-    </div>
-    <div class="row mt">
-      <div><label class="f">network</label><input name="network" placeholder="tcp,udp"></div>
-      <div><label class="f">port</label><input name="port" placeholder="443"></div>
-      <div>
-        <label class="f">protocol</label>
-        <div class="row" style="gap:.5rem;flex-wrap:wrap">
-          {% for p in ('http','tls','quic','bittorrent') %}
-          <label class="check small"><input type="checkbox" name="proto_{{ p }}" value="1">{{ p }}</label>
-          {% endfor %}
-        </div>
-      </div>
-    </div>
-    <div class="actions mt"><button class="btn">Добавить</button></div>
-  </form>
+  <dialog id="dlg-core-route-add" style="max-width:760px">
+    <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/routing/add" id="form-core-route-add">
+      <div class="card-head"><h3>Новое правило</h3>
+        <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+      {% include "_route_form_fields.html" %}
+      <div class="actions mt"><button class="btn">Добавить</button></div>
+    </form>
+  </dialog>
+  <dialog id="dlg-core-route-edit" style="max-width:760px">
+    <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/routing/save" id="form-core-route-edit">
+      <input type="hidden" name="old_name" id="core-route-old-name" value="">
+      <div class="card-head"><h3>Изменить правило</h3>
+        <button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()">✕</button></div>
+      {% include "_route_form_fields.html" %}
+      <div class="actions mt"><button class="btn">Сохранить</button></div>
+    </form>
+  </dialog>
 </section>
 
 {# ===================== BALANCERS ===================== #}
@@ -455,7 +426,7 @@
     <h3>Patch конфигурации (template)</h3>
     <textarea name="template_patch" class="mono" rows="18" spellcheck="false"
               placeholder='{"policy": {"levels": {"0": {"connIdle": 600}}}}'>{{ template_patch_text }}</textarea>
-    <div class="hint">JSON глубоко сливается поверх сгенерированного конфига ядра.</div>
+    <div class="hint">JSON глубоко сливается поверх сгенерированного конфига ядра. После сохранения — <b>Применить</b>.</div>
     <div class="actions mt"><button class="btn">Сохранить</button></div>
   </form>
 </section>
@@ -478,6 +449,10 @@
     if (push !== false) {
       try { history.replaceState({ coreTab: key }, '', url); } catch (e) {}
     }
+    var applyBase = {{ (bp ~ '/cores/' ~ core.id ~ '/apply')|tojson }};
+    document.querySelectorAll('form[action*="/apply"]').forEach(function (f) {
+      f.setAttribute('action', applyBase + '?tab=' + encodeURIComponent(key));
+    });
   }
 
   tabs.addEventListener('click', function (e) {
@@ -498,6 +473,103 @@
     showTab(q, false);
   });
 })();
+
+function _lines(v) {
+  if (!v) return '';
+  return Array.isArray(v) ? v.join('\n') : String(v);
+}
+function _list(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(String);
+  return String(v).split(/[\n,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+}
+function _selectMulti(sel, values) {
+  if (!sel) return;
+  var want = {};
+  _list(values).forEach(function (v) { want[v] = true; });
+  Array.prototype.forEach.call(sel.options, function (opt) {
+    opt.selected = !!want[opt.value];
+  });
+}
+function fillCoreRouteForm(form, r) {
+  form.querySelector('[name="name"]').value = r.name || '';
+  form.querySelector('[name="outbound"]').value = r.outbound || r.outbound_tag || 'direct';
+  form.querySelector('[name="domain"]').value = _lines(r.domain);
+  form.querySelector('[name="ip"]').value = _lines(r.ip);
+  _selectMulti(form.querySelector('select[name="user"]'), r.user);
+  var known = {};
+  var srcSel = form.querySelector('select[name="source"]');
+  if (srcSel) {
+    Array.prototype.forEach.call(srcSel.options, function (opt) { known[opt.value] = true; });
+  }
+  var picked = [];
+  var extra = [];
+  _list(r.source).forEach(function (ip) {
+    if (known[ip]) picked.push(ip); else extra.push(ip);
+  });
+  _selectMulti(srcSel, picked);
+  var extraEl = form.querySelector('[name="source_extra"]');
+  if (extraEl) extraEl.value = extra.join('\n');
+  form.querySelector('[name="network"]').value = r.network || '';
+  form.querySelector('[name="port"]').value = r.port || '';
+  var en = form.querySelector('[name="enabled"]');
+  if (en) en.checked = r.enabled !== false;
+  var protos = r.protocol || [];
+  ['http', 'tls', 'quic', 'bittorrent'].forEach(function (p) {
+    var cb = form.querySelector('[name="proto_' + p + '"]');
+    if (cb) cb.checked = protos.indexOf(p) >= 0;
+  });
+  var tags = r.inbound_tags || [];
+  var allIb = form.querySelector('[name="inbound_all"]');
+  if (allIb) allIb.checked = !!r.inbound_all;
+  form.querySelectorAll('[name="inbound_tags"]').forEach(function (cb) {
+    cb.checked = !r.inbound_all && tags.indexOf(cb.value) >= 0;
+    cb.disabled = !!r.inbound_all;
+  });
+}
+function toggleRouteInboundAll(allCb) {
+  var form = allCb && allCb.form;
+  if (!form) return;
+  var on = !!allCb.checked;
+  form.querySelectorAll('[name="inbound_tags"]').forEach(function (cb) {
+    cb.checked = on;
+    cb.disabled = on;
+  });
+}
+function syncRouteInboundAll(form) {
+  if (!form) return;
+  var allCb = form.querySelector('[name="inbound_all"]');
+  if (!allCb || allCb.checked) return;
+  var boxes = form.querySelectorAll('[name="inbound_tags"]');
+  if (!boxes.length) return;
+  var allOn = true;
+  Array.prototype.forEach.call(boxes, function (cb) {
+    if (!cb.checked) allOn = false;
+  });
+  if (allOn) {
+    allCb.checked = true;
+    toggleRouteInboundAll(allCb);
+  }
+}
+function openCoreRouteAdd() {
+  var form = document.getElementById('form-core-route-add');
+  if (form) {
+    form.reset();
+    _selectMulti(form.querySelector('select[name="user"]'), []);
+    _selectMulti(form.querySelector('select[name="source"]'), []);
+    var extra = form.querySelector('[name="source_extra"]');
+    if (extra) extra.value = '';
+    var allIb = form.querySelector('[name="inbound_all"]');
+    if (allIb) { allIb.checked = false; toggleRouteInboundAll(allIb); }
+  }
+  document.getElementById('dlg-core-route-add').showModal();
+}
+function openCoreRouteEdit(r) {
+  var form = document.getElementById('form-core-route-edit');
+  document.getElementById('core-route-old-name').value = r.name || '';
+  fillCoreRouteForm(form, r || {});
+  document.getElementById('dlg-core-route-edit').showModal();
+}
 </script>
 
 {% endif %}

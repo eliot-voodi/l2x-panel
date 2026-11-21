@@ -4,7 +4,7 @@
 {% set st = ib.stream %}{% set s = ib.settings %}{% set so = st.sockopt or {} %}{% set r = st.reality or {} %}{% set tls = st.tls or {} %}{% set xh = st.xhttp or {} %}{% set xm = xh.xmux or {} %}{% set sniff = ib.sniffing or {} %}
 {% block title %}Inbound {{ ib.tag }} · {{ app_name }}{% endblock %}
 {% block page_title %}{% if is_new %}{{ t('Новый inbound') }}{% else %}Inbound · {{ ib.remark or ib.tag }}{% endif %}{% endblock %}
-{% block page_sub %}<a href="{{ bp }}/inbounds">← все inbounds</a>{% endblock %}
+{% block page_sub %}<a href="{{ bp }}{{ form_next or '/inbounds' }}">← назад</a>{% endblock %}
 {% block head %}
 <style>
   .field-err { border-color: var(--danger) !important; box-shadow: 0 0 0 1px var(--danger) }
@@ -19,6 +19,7 @@
 {% block content %}
 <form method="post" action="{{ bp }}/inbounds/save" id="ibform">
 <input type="hidden" name="id" value="{{ ib.id if not is_new else '' }}">
+{% if form_next %}<input type="hidden" name="next" value="{{ form_next }}">{% endif %}
 <div id="lint_panel" class="card" style="margin-bottom:.85rem{% if not lint_issues %};display:none{% endif %}">
   <div class="flex between" style="gap:.75rem;flex-wrap:wrap">
     <div>

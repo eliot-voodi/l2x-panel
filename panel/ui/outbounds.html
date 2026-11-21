@@ -56,6 +56,12 @@
 {% endblock %}
 {% block content %}
 {% include "_core_scope.html" %}
+{% if form_next %}
+<div class="card" style="padding:.65rem 1rem;margin-bottom:.85rem">
+  <a class="btn ghost sm" href="{{ bp }}{{ form_next }}">← назад к ядру</a>
+  <span class="dim small">Редактируете outbound’ы снимка ядра</span>
+</div>
+{% endif %}
 <div class="card" style="padding:0">
   {# —— Desktop —— #}
   <div class="table-wrap ob-desktop">
@@ -150,6 +156,7 @@
     <input type="hidden" name="mode" id="mode" value="form">
     <input type="hidden" name="edit_tag" id="edit_tag" value="">
     <input type="hidden" name="json" id="ob-json-out">
+    {% if form_next %}<input type="hidden" name="next" value="{{ form_next }}">{% endif %}
 
     <div class="row">
       <div><label class="f">Tag</label><input name="tag" id="f-tag" pattern="[A-Za-z0-9._-]*" placeholder="my-proxy (для WARP/Nord — авто)"></div>
