@@ -30,6 +30,7 @@ TRACKED_KEYS = (
     "doh_bundle",
     "ip_bans",
     "reverse",
+    "cores",
 )
 
 _VOLATILE_CLIENT = {

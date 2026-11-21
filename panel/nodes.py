@@ -38,6 +38,8 @@ def ensure_list(store: dict) -> list[dict]:
         n.setdefault("as_outbound", False)
         # Public (non-NAT) node: clients dial the node host directly; quotas/routes stay on master
         n.setdefault("direct_connect", False)
+        # Pasarguard-style core profile id (inbounds/outbounds/routes for this node)
+        n.setdefault("core_id", "")
         # Name shown to end users in subscription / share links (falls back to name)
         n.setdefault("user_title", "")
         # Full standby copy of master (clients/outbounds/routes/…) while still acting as outbound
@@ -94,6 +96,12 @@ def ensure_list(store: dict) -> list[dict]:
             n["as_outbound"] = True
             n["sync_clients"] = True
             n["sync_inbounds"] = True
+    # Ensure cores exist and every node has a core_id (v2.0)
+    try:
+        import cores as cores_mod
+        cores_mod.ensure_cores(store)
+    except Exception:
+        pass
     return nodes
 
 
@@ -2093,7 +2101,11 @@ def _local_direct_outbound(node: dict) -> dict:
 
 
 def build_payload(store: dict, node: dict, build_config) -> dict:
-    """Config push for a remote agent. mirror=True → full master copy for fast failover."""
+    """Config push for a remote agent. mirror=True → full master copy for fast failover.
+
+    Non-mirror agents receive slices from the node's assigned **core** profile
+    (Pasarguard-style «Ядро»), while clients still come from the master.
+    """
     mirror = bool(node.get("mirror"))
     nat = bool(node.get("nat"))
     rv_on = uses_reverse(node)
@@ -2102,9 +2114,18 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
     if mirror or dc:
         node["sync_clients"] = True
         node["sync_inbounds"] = True
+    # Resolve core view (inbounds/outbounds/routes/…) — master clients stay global
+    try:
+        import cores as cores_mod
+        cores_mod.ensure_cores(store)
+        cfg_store = store if mirror else cores_mod.store_view_for_node(store, node)
+        core = None if mirror else cores_mod.core_for_node(store, node)
+    except Exception:
+        cfg_store = store
+        core = None
     # NAT/reverse/l2x tunnel: no bridge inbound — egress is reverse portal or SOCKS tunnel.
     bridge_on = bool(node.get("as_outbound")) and not rv_on and not tunnel_on
-    inbounds = list(store.get("inbounds") or []) if not nat else []
+    inbounds = list(cfg_store.get("inbounds") or []) if not nat else []
     # Never ship master-only system inbounds (reverse / master-backhaul) to agents
     inbounds = [
         i for i in inbounds
@@ -2140,11 +2161,11 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         # Full copy: keep outbound tags and all custom/node outbounds (except this node itself)
         clients = list(store.get("clients") or [])
         customs = [
-            o for o in (store.get("outbounds_custom") or [])
+            o for o in (cfg_store.get("outbounds_custom") or [])
             if o.get("tag") != self_tag and o.get("kind") != "master_egress" and o.get("tag") != MASTER_EGRESS_TAG
         ]
-        routes = list(store.get("routes") or [])
-        balancers = json.loads(json.dumps(store.get("balancers") or {}))
+        routes = list(cfg_store.get("routes") or [])
+        balancers = json.loads(json.dumps(cfg_store.get("balancers") or {}))
         peers = [_peer_node_export(n) for n in ensure_list(store) if n.get("id") != node.get("id")]
     else:
         clients = _agent_safe_clients(
@@ -2153,12 +2174,12 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
             direct_self_tag=self_tag if dc else "",
         )
         customs = []
-        for o in store.get("outbounds_custom") or []:
+        for o in cfg_store.get("outbounds_custom") or []:
             if o.get("tag") in (self_tag, MASTER_EGRESS_TAG) or o.get("kind") in ("node", "master_egress", "local_direct"):
                 continue
             customs.append(o)
-        routes = _agent_safe_routes(store.get("routes") or [], keep_tags=keep_tags)
-        balancers = _agent_safe_balancers(store.get("balancers") or {}, keep_tags=keep_tags)
+        routes = _agent_safe_routes(cfg_store.get("routes") or [], keep_tags=keep_tags)
+        balancers = _agent_safe_balancers(cfg_store.get("balancers") or {}, keep_tags=keep_tags)
         peers = None
     if dc:
         customs = [o for o in customs if o.get("tag") not in (self_tag, MASTER_EGRESS_TAG)]
@@ -2169,11 +2190,11 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         # Live Direct traffic: balancers/other nodes must not preempt local_direct / master
         try:
             import xray_runtime as _xray
-            bals = set(_xray.balancer_tags(store))
+            bals = set(_xray.balancer_tags(cfg_store))
         except Exception:
             bals = {
                 str((b or {}).get("tag") or "")
-                for b in (store.get("balancers") or {}).values()
+                for b in (cfg_store.get("balancers") or {}).values()
                 if isinstance(b, dict)
             }
             bals.discard("")
@@ -2239,12 +2260,14 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
         "outbounds_custom": customs,
         "routes": routes,
         "balancers": balancers,
-        "dns": store.get("dns") or {},
-        "xray_settings": store.get("xray_settings") or {},
+        "dns": cfg_store.get("dns") or {},
+        "xray_settings": cfg_store.get("xray_settings") or {},
         "settings": settings_out,
         "nodes": peers,
         "pushed_at": now_iso(),
         "node_id": node.get("id"),
+        "core_id": (core or {}).get("id") if core else (node.get("core_id") or ""),
+        "core_name": (core or {}).get("name") if core else "",
         "bridge": {
             "uuid": node.get("bridge_uuid"),
             "path": node.get("bridge_path"),

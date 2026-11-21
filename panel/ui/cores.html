@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}Ядра · {{ app_name }}{% endblock %}
+{% block page_title %}Ядра{% endblock %}
+{% block page_sub %}Профили настроек Xray для нод (inbounds / outbounds / маршруты). Нода получает выбранное ядро при Sync.{% endblock %}
+{% block top_actions %}
+{% if is_master %}
+<a class="btn ghost" href="{{ bp }}/nodes">{{ ic.icon('globe') }} Узлы</a>
+{% endif %}
+{% endblock %}
+{% block content %}
+
+<div class="tabs">
+  <a href="{{ bp }}/nodes" class="{% if nodes_tab != 'cores' %}active{% endif %}">{{ ic.icon('globe') }} Узлы</a>
+  <a href="{{ bp }}/cores" class="{% if nodes_tab == 'cores' %}active{% endif %}">{{ ic.icon('cpu') }} Ядра</a>
+</div>
+
+{% if not is_master %}
+<div class="card"><div class="badge warn">Ядра управляются только на master.</div></div>
+{% else %}
+
+<details class="card" open>
+  <summary style="cursor:pointer"><b>Как это работает</b></summary>
+  <div class="hint mt">
+    <b>Ядро</b> — именованный снимок настроек (inbounds, outbounds, routes, balancers, DNS), как в Pasarguard.
+    При установке ноды через SSH (мастер) авто-настройка сохраняется; на ноду назначается ядро.
+    <b>Наследует мастер</b> — при Sync уходит живой конфиг мастера.
+    Иначе — фиксированный снимок (обновите кнопкой «С мастерa»).
+  </div>
+</details>
+
+<form class="card" method="post" action="{{ bp }}/cores/add" style="max-width:640px">
+  <h3>Новое ядро</h3>
+  <div class="row">
+    <div style="flex:2"><label class="f">Название</label><input name="name" placeholder="EU Direct / FI Reality" required></div>
+    <div style="flex:2"><label class="f">Комментарий</label><input name="remark" placeholder="опционально"></div>
+  </div>
+  <div class="mt">{{ m.check('clone_master', True, 'Скопировать текущие настройки с мастера') }}</div>
+  <div class="actions mt"><button class="btn">{{ ic.icon('plus') }} Создать</button></div>
+</form>
+
+<div class="card" style="padding:0">
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Ядро</th><th>Режим</th><th>Состав</th><th>Ноды</th><th class="right">Действия</th>
+      </tr></thead>
+      <tbody>
+      {% for c in items %}
+        {% set s = c.summary or {} %}
+        <tr>
+          <td>
+            <b>{{ c.name }}</b>
+            {% if c.remark %}<div class="dim small">{{ c.remark }}</div>{% endif %}
+            <div class="dim small mono">{{ c.id }}</div>
+          </td>
+          <td>
+            {% if s.inherit_master %}
+            <span class="badge ok" title="Sync берёт живые настройки мастера">наследует</span>
+            {% else %}
+            <span class="badge warn" title="Фиксированный снимок">снимок</span>
+            {% endif %}
+            <div class="dim small">{{ c.engine or 'xray' }}</div>
+          </td>
+          <td class="small">
+            <span class="badge">in {{ s.inbounds or 0 }}</span>
+            <span class="badge">out {{ s.outbounds or 0 }}</span>
+            <span class="badge">rt {{ s.routes or 0 }}</span>
+            <span class="badge">bal {{ s.balancers or 0 }}</span>
+          </td>
+          <td>
+            <span class="mono">{{ c.usage or 0 }}</span>
+            {% if c.usage %}
+            <div class="dim small">
+              {% for n in nodes if n.core_id == c.id %}
+              {{ n.name }}{% if not loop.last %}, {% endif %}
+              {% endfor %}
+            </div>
+            {% endif %}
+          </td>
+          <td class="right">
+            <div class="flex" style="gap:.35rem;flex-wrap:wrap;justify-content:flex-end">
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/rename" class="flex" style="gap:.25rem;align-items:center">
+                <input name="name" value="{{ c.name }}" style="width:7.5rem;padding:.2rem .35rem;font-size:.75rem" title="Имя">
+                <input name="remark" value="{{ c.remark or '' }}" placeholder="…" style="width:5rem;padding:.2rem .35rem;font-size:.75rem" title="Комментарий">
+                <button class="btn ghost sm">OK</button>
+              </form>
+              {% if s.inherit_master %}
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/inherit"
+                    onsubmit="return confirm('Зафиксировать снимок с мастера? Ядро перестанет наследовать изменения.')">
+                <input type="hidden" name="inherit_master" value="0">
+                <button class="btn ghost sm">→ Снимок</button>
+              </form>
+              {% else %}
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/refresh"
+                    onsubmit="return confirm('Перезаписать ядро текущими настройками мастера?')">
+                <button class="btn ghost sm">С мастера</button>
+              </form>
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/inherit">
+                <input type="hidden" name="inherit_master" value="1">
+                <button class="btn ghost sm">→ Наследовать</button>
+              </form>
+              {% endif %}
+              <form method="post" action="{{ bp }}/cores/{{ c.id }}/delete"
+                    onsubmit="return confirm('Удалить ядро «{{ c.name }}»? Ноды перейдут на другое.')">
+                <button class="btn danger sm" {% if items|length <= 1 %}disabled title="Нельзя удалить последнее"{% endif %}>{{ ic.icon('trash') }}</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">Ядер нет</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

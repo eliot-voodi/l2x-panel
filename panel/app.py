@@ -38,6 +38,7 @@ import front
 import hwid
 import inbound_lint
 import migrate as migrate_mod
+import cores as cores_mod
 import nodes as nodes_mod
 import ops
 import protocols as P
@@ -7538,8 +7539,11 @@ def nodes_page(request: Request):
     with mutate() as store:
         nodes_mod.ensure_list(store)
         nodes_mod.agent_token(store)
+        cores_mod.ensure_cores(store)
     store = _load_store()
     running = NODES_JOB.get("id")
+    cores = list(store.get("cores") or [])
+    core_names = {c.get("id"): c.get("name") or c.get("id") for c in cores if c.get("id")}
     return page(request, "nodes.html", active="nodes", items=store["nodes"],
                 ns=store["settings"].get("nodes") or {},
                 is_master=nodes_mod.is_master(store),
@@ -7547,9 +7551,106 @@ def nodes_page(request: Request):
                 master_xray=_cached_master_xray(),
                 sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
                 tunnel_profiles=nodes_mod.TUNNEL_PROFILES,
+                cores=cores,
+                core_names=core_names,
+                nodes_tab="nodes",
                 update_queue=node_update_queue_snapshot(),
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
+
+
+@app.get("/cores", response_class=HTMLResponse)
+def cores_page(request: Request):
+    """Pasarguard-style «Ядра» — named Xray profiles assigned to nodes."""
+    if redir := _require(request):
+        return redir
+    with mutate() as store:
+        cores_mod.ensure_cores(store)
+        nodes_mod.ensure_list(store)
+    store = _load_store()
+    usage = cores_mod.cores_usage(store)
+    rows = []
+    for c in store.get("cores") or []:
+        if not isinstance(c, dict):
+            continue
+        summ = cores_mod.core_summary(c)
+        rows.append({
+            **c,
+            "usage": usage.get(c.get("id") or "", 0),
+            "summary": summ,
+        })
+    return page(
+        request, "cores.html", active="nodes",
+        items=rows,
+        is_master=nodes_mod.is_master(store),
+        nodes_tab="cores",
+        nodes=store.get("nodes") or [],
+    )
+
+
+@app.post("/cores/add")
+async def cores_add(request: Request):
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только мастер может управлять ядрами", "error")
+        return go("/cores")
+    form = await request.form()
+    name = str(form.get("name") or "").strip() or "Core"
+    remark = str(form.get("remark") or "").strip()
+    clone = form.get("clone_master") != "0"
+    with mutate(history_section="cores", history_note=f"create core {name}") as store:
+        core = cores_mod.create_core(store, name=name, remark=remark, clone_master=clone)
+    flash(request, f"Ядро «{core.get('name')}» создано", "info")
+    return go("/cores")
+
+
+@app.post("/cores/{core_id}/{action}")
+async def cores_action(core_id: str, action: str, request: Request):
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только мастер может управлять ядрами", "error")
+        return go("/cores")
+    form = {}
+    try:
+        form = await request.form()
+    except Exception:
+        form = {}
+    with mutate(history_section="cores", history_note=f"core {action}") as store:
+        cores_mod.ensure_cores(store)
+        core = cores_mod.core_by_id(store, core_id)
+        if not core and action != "delete":
+            flash(request, "Ядро не найдено", "error")
+            return go("/cores")
+        if action == "delete":
+            err = cores_mod.delete_core(store, core_id)
+            if err:
+                flash(request, err, "error")
+            else:
+                flash(request, "Ядро удалено", "info")
+        elif action == "rename":
+            cores_mod.rename_core(
+                core,
+                str(form.get("name") or core.get("name") or "Core"),
+                str(form.get("remark") or ""),
+            )
+            flash(request, f"Ядро переименовано: {core.get('name')}", "info")
+        elif action == "refresh":
+            cores_mod.refresh_core_from_master(store, core)
+            flash(request, f"«{core.get('name')}»: снимок обновлён с мастера", "info")
+        elif action == "inherit":
+            on = form.get("inherit_master") == "1"
+            cores_mod.set_inherit(core, on)
+            if on:
+                flash(request, f"«{core.get('name')}»: наследует живые настройки мастера", "info")
+            else:
+                # Snapshot current master so the core has real slices
+                cores_mod.refresh_core_from_master(store, core)
+                flash(request, f"«{core.get('name')}»: фиксированный снимок (не наследует)", "info")
+        else:
+            flash(request, "Неизвестное действие", "error")
+    return go("/cores")
 
 
 def _node_xray_check_one(node: dict) -> dict:
@@ -8014,9 +8115,11 @@ async def nodes_add(request: Request):
     with mutate() as store:
         mirror = form.get("mirror") == "1"
         direct_connect = form.get("direct_connect") == "1" and form.get("nat") != "1"
+        core_id = cores_mod.resolve_core_id(store, form.get("core_id"))
         node = {
             "id": str(uuid.uuid4()), "name": name, "url": origin, "token": token, "enabled": True,
             "user_title": str(form.get("user_title") or "").strip()[:80],
+            "core_id": core_id,
             "sync_clients": True if mirror or direct_connect else form.get("sync_clients") == "1",
             "sync_inbounds": True if mirror or direct_connect else form.get("sync_inbounds") == "1",
             "as_outbound": True if mirror or direct_connect or form.get("nat") == "1" else form.get("as_outbound") == "1",
@@ -8069,6 +8172,7 @@ async def nodes_provision(request: Request):
     nat = form.get("nat") == "1"
     direct_connect = form.get("direct_connect") == "1" and not nat
     sync_interval_min = nodes_mod.normalize_sync_interval(form.get("sync_interval_min"))
+    core_id_form = str(form.get("core_id") or "").strip()
     if nat:
         as_outbound = True
         mirror = False
@@ -8093,6 +8197,7 @@ async def nodes_provision(request: Request):
 
     master = _load_store()
     token = nodes_mod.agent_token(master)
+    core_id = cores_mod.resolve_core_id(master, core_id_form)
     # Ensure master has a stable agent token even when not in agent mode (used on remotes)
     with mutate() as store:
         nodes_mod.agent_token(store)
@@ -8115,6 +8220,7 @@ async def nodes_provision(request: Request):
             return {"ok": False, "error": res.get("error") or "provision failed", "log": res.get("log") or ""}
         node = res["node"]
         node["sync_interval_min"] = sync_interval_min
+        node["core_id"] = core_id
         if user_title:
             node["user_title"] = user_title
         if direct_connect and not nat:
@@ -8129,6 +8235,7 @@ async def nodes_provision(request: Request):
             if nat:
                 node["tunnel_mode"] = node.get("tunnel_mode") or "l2x_udp"
                 node["direct_connect"] = False
+            node["core_id"] = cores_mod.resolve_core_id(store, node.get("core_id") or core_id)
             nodes.append(node)
             nodes_mod.upsert_node_outbound(store, node)
             payload = nodes_mod.build_payload(store, node, xray.build_config)
@@ -8361,7 +8468,7 @@ async def nodes_action(node_id: str, action: str, request: Request):
             form = {}
 
     # --- quick local mutations (no network) ---
-    if action in ("delete", "toggle", "token", "schedule", "user_title"):
+    if action in ("delete", "toggle", "token", "schedule", "user_title", "core"):
         with mutate() as store:
             nodes = nodes_mod.ensure_list(store)
             node = next((n for n in nodes if n["id"] == node_id), None)
@@ -8395,6 +8502,12 @@ async def nodes_action(node_id: str, action: str, request: Request):
                 nodes_mod.upsert_node_outbound(store, node)
                 shown = nodes_mod.node_user_title(node)
                 flash(request, f"{node['name']}: название у пользователя — {shown}", "info")
+            elif action == "core":
+                cores_mod.ensure_cores(store)
+                cid = cores_mod.resolve_core_id(store, form.get("core_id"))
+                node["core_id"] = cid
+                cname = (cores_mod.core_by_id(store, cid) or {}).get("name") or cid
+                flash(request, f"{node['name']}: ядро — {cname}. Нажмите Sync.", "info")
             else:
                 new_tok = str(form.get("token") or "").strip()
                 if not new_tok:
