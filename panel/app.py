@@ -6971,6 +6971,72 @@ async def rest_api(path: str, request: Request):
         return _api_ok(ib) if ib else _api_err("not found", 404)
     if parts == ["inbounds", "onlines"]:
         return _api_ok(ONLINE)
+    if parts == ["inbounds", "add"] and request.method == "POST":
+        # Full inbound object (or list) — used to import templates / Ascella-like profiles.
+        payload = data.get("inbound") if isinstance(data.get("inbound"), dict) else data
+        items = data.get("inbounds") if isinstance(data.get("inbounds"), list) else None
+        batch = items if items is not None else ([payload] if isinstance(payload, dict) else [])
+        if not batch:
+            return _api_err("inbound object or inbounds[] required")
+        created: list[dict] = []
+        previous = None
+        with mutate() as st:
+            previous = json.loads(json.dumps(st.get("inbounds") or []))
+            used_ports = {int(i.get("port") or 0) for i in st.get("inbounds") or []}
+            used_tags = {str(i.get("tag") or "") for i in st.get("inbounds") or []}
+            next_id = max([int(i.get("id") or 0) for i in st.get("inbounds") or []] + [0]) + 1
+            for raw in batch:
+                if not isinstance(raw, dict):
+                    return _api_err("each inbound must be an object")
+                ib = P.default_inbound(str(raw.get("protocol") or "vless"))
+                # Deep-merge provided fields onto a shaped default
+                for k, v in raw.items():
+                    if k in ("id",):
+                        continue
+                    if k == "settings" and isinstance(v, dict):
+                        ib.setdefault("settings", {}).update(v)
+                    elif k == "stream" and isinstance(v, dict):
+                        st_ib = ib.setdefault("stream", {})
+                        for sk, sv in v.items():
+                            if isinstance(sv, dict) and isinstance(st_ib.get(sk), dict):
+                                st_ib[sk].update(sv)
+                            else:
+                                st_ib[sk] = sv
+                    else:
+                        ib[k] = v
+                P.ensure_inbound_shape(ib)
+                tag = str(ib.get("tag") or "").strip()
+                if not tag or not xray.TAG_RE.match(tag):
+                    return _api_err(f"bad tag: {tag!r}")
+                if tag in used_tags:
+                    return _api_err(f"tag already exists: {tag}")
+                try:
+                    port = int(ib.get("port") or 0)
+                except (TypeError, ValueError):
+                    return _api_err("bad port")
+                if port <= 0 or port in used_ports:
+                    return _api_err(f"port busy or invalid: {port}")
+                ib["id"] = next_id
+                next_id += 1
+                ib["listen"] = P.inbound_listen(ib)
+                xray.ensure_inbound_keys(ib)
+                bad = [i for i in inbound_lint.inbound_issues(st, ib) if i["level"] == inbound_lint.ERROR]
+                if bad:
+                    return _api_err("lint: " + "; ".join(i["msg"] for i in bad[:3]))
+                st.setdefault("inbounds", []).append(ib)
+                used_tags.add(tag)
+                used_ports.add(port)
+                created.append(ib)
+                # Freeze «all» client lists so new inbound is opt-in (same as UI without propagate)
+                xray.apply_tag_to_users(st, kind="inbound", tag=tag, propagate=False)
+        xr = _apply_xray(_load_store())
+        if not xr.get("ok"):
+            with mutate() as st:
+                if previous is not None:
+                    st["inbounds"] = previous
+            return _api_err(f"xray rejected: {xr.get('error')}", 500)
+        store2 = _load_store()
+        return _api_ok([xray.inbound_by_tag(store2, c["tag"]) for c in created])
     if parts == ["clients", "list"]:
         return _api_ok([_public_client(store, c) for c in store["clients"]])
     if len(parts) == 3 and parts[:2] == ["clients", "get"]:
