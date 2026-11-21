@@ -319,6 +319,49 @@ def inbound_sub_label(ib: dict | None) -> str:
     return name
 
 
+def _strip_leading_flag(text: str) -> str:
+    """Remove leading regional-indicator flag emoji (and following space)."""
+    s = str(text or "")
+    while len(s) >= 2 and 0x1F1E6 <= ord(s[0]) <= 0x1F1FF and 0x1F1E6 <= ord(s[1]) <= 0x1F1FF:
+        s = s[2:].lstrip(" \t-·|")
+    return s
+
+
+def core_sub_remark(
+    core: dict | None,
+    eps: list[dict] | None = None,
+    *,
+    fallback: str = "",
+) -> str:
+    """Profile title for JSON subscription: country flag + core/inbound name (Happ flag icon)."""
+    name = ""
+    cc = ""
+    if isinstance(core, dict):
+        name = str(core.get("name") or core.get("remark") or "").strip()
+        for ib in core.get("inbounds") or []:
+            if not isinstance(ib, dict) or not ib.get("enabled", True):
+                continue
+            if not cc:
+                cc = country_code(ib)
+            if not name:
+                name = str(ib.get("remark") or ib.get("tag") or "").strip()
+            if cc and name:
+                break
+    if not name and eps:
+        name = _strip_leading_flag(str((eps[0] or {}).get("remark") or "")).strip()
+    if not name:
+        name = str(fallback or "L2X").strip() or "L2X"
+    name = _strip_leading_flag(name).strip() or "L2X"
+    if not cc and eps:
+        # Try recover flag already present on endpoint remark
+        raw = str((eps[0] or {}).get("remark") or "")
+        if len(raw) >= 2 and 0x1F1E6 <= ord(raw[0]) <= 0x1F1FF:
+            return f"{raw[:2]} {name}".strip()
+    if cc:
+        return f"{flag_emoji(cc)} {name}".strip()
+    return name
+
+
 def subscription_profile_remark(
     store: dict,
     client: dict,
@@ -2751,11 +2794,7 @@ def client_json_subscription_profiles(
         if not eps:
             continue
         core = cores_mod.core_by_id(store, cid) if (cid and cores_mod) else None
-        title = ""
-        if isinstance(core, dict):
-            title = str(core.get("name") or core.get("remark") or "").strip()
-        if not title:
-            title = str(eps[0].get("remark") or remarks or "L2X").strip()
+        title = core_sub_remark(core if isinstance(core, dict) else None, eps, fallback=remarks or "L2X")
 
         tmpl = ""
         if isinstance(core, dict) and core.get("sub_custom_json"):
@@ -2785,6 +2824,8 @@ def client_json_subscription_profiles(
             except Exception:
                 cfg = None
             if isinstance(cfg, dict):
+                # Always pin flagged title — Happ reads remarks for the flag icon
+                cfg["remarks"] = title
                 profiles.append(cfg)
             continue
 
@@ -2821,7 +2862,7 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
     MAGIC_EMAIL = "__L2X_SUB_EMAIL__"
     MAGIC_PASS = "__L2X_SUB_PASSWORD__"
     cid = str((core or {}).get("id") or "")
-    title = str((core or {}).get("name") or (core or {}).get("remark") or "profile").strip() or "profile"
+    title = core_sub_remark(core, fallback="profile")
 
     eps: list[dict] = []
     for ib in (core.get("inbounds") or []):
@@ -2832,7 +2873,7 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
             # Force public host placeholder; keep per-inbound port/SNI/Reality keys.
             ib_use["share_host"] = MAGIC_HOST
             ident = {"uuid": MAGIC_UUID, "email": MAGIC_EMAIL, "password": MAGIC_PASS}
-            remark = inbound_sub_label(ib_use) or str(ib_use.get("tag") or title)
+            remark = inbound_sub_label(ib_use) or str(ib_use.get("tag") or _strip_leading_flag(title))
             ep = P.endpoint_for(ib_use, ident, MAGIC_HOST, remark)
             if not ep or ep.get("protocol") == "wireguard":
                 continue
