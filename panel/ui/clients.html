@@ -222,7 +222,7 @@
       <option value="">— без группы —</option>
       {% for g in groups or [] %}<option value="{{ g.id }}">{{ g.name }}</option>{% endfor %}
     </select>
-    <div class="hint">Inbounds берутся из группы (или все). Исходящие — в ядрах.</div>
+    <div class="hint">Ядра (и их inbound’ы) берутся из группы (или все). Маршруты — в ядрах.</div>
     <div class="actions mt"><button class="btn">Создать</button></div>
   </form>
 </dialog>

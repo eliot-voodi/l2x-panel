@@ -27,12 +27,12 @@
     <select name="group_id" id="client-group">
       <option value="">— без группы (личные настройки) —</option>
       {% for g in (groups or []) %}
-      <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.inbounds %} · {{ g.inbounds|length }} ib{% elif list_mode(g, list_key='inbounds', mode_key='ib_mode') == 'all' %} · все ib{% endif %}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
+      <option value="{{ g.id }}" {% if c.group_id == g.id %}selected{% endif %}>{{ g.name }}{% if g.cores %} · {{ g.cores|length }} {{ 'ядро' if g.cores|length == 1 else 'ядра' }}{% elif list_mode(g, list_key='cores', mode_key='core_mode') == 'all' %} · все ядра{% endif %}{% if g.comment %} — {{ g.comment }}{% endif %}</option>
       {% endfor %}
     </select>
-    <div class="hint">{% if groups %}Группа задаёт набор <b>inbounds</b>. Исходящие — в ядрах.
+    <div class="hint">{% if groups %}Группа задаёт набор <b>ядер</b> (все их inbound’ы). Маршруты — в ядрах.
       <a href="{{ bp }}/groups">Управление группами</a>.
-      {% else %}Групп пока нет — <a href="{{ bp }}/groups/new">создайте</a>, чтобы назначать inbounds.{% endif %}</div>
+      {% else %}Групп пока нет — <a href="{{ bp }}/groups/new">создайте</a>, чтобы назначать ядра.{% endif %}</div>
     <div class="mt">
       <input type="hidden" name="enabled" value="0">{{ m.check('enabled', c.enabled, t('Включён')) }}
       <input type="hidden" name="sub_enabled" value="0">{{ m.check('sub_enabled', c.sub_enabled, 'Подписка доступна') }}
@@ -135,7 +135,7 @@
     <div class="small">
       <div><span class="dim">Inbounds:</span> {% if eff_inbounds %}{{ eff_inbounds|join(', ') }}{% else %}все{% endif %}</div>
     </div>
-    <div class="hint mt">База inbounds из группы. Ниже можно дописать личные inbounds поверх группы.</div>
+    <div class="hint mt">База — inbound’ы ядер из группы. Ниже можно дописать личные inbounds поверх группы.</div>
   </div>
   {% endif %}
 

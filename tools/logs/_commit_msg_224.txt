@@ -1,0 +1,3 @@
+## v2.2.4 — Groups select Cores (not inbounds)
+
+Groups assign cores; inbound tags are derived from selected cores for subscriptions.

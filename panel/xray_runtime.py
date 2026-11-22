@@ -1719,9 +1719,58 @@ def client_inbound_tags(store: dict, client: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------- client groups
-# Groups assign inbounds only (outbounds / routing live in cores).
-# Empty inbounds on a group = all. Client without group_id keeps personal inbound lists.
-# Legacy allowed_tags / outbound fields may still exist in store; empty allowed_tags = all.
+# Groups assign **cores** (inbounds are derived from selected cores).
+# Empty cores / core_mode=all → all capable inbounds.
+# Legacy: group.inbounds + ib_mode still resolved until the group is re-saved.
+# Client without group_id keeps personal inbound lists.
+
+def _core_ids_covering_inbound_tags(store: dict, tags: list[str]) -> list[str]:
+    """Minimal set of core ids whose inbounds cover the given tags (legacy migrate)."""
+    want = {str(t or "").strip() for t in (tags or []) if str(t or "").strip()}
+    if not want:
+        return []
+    try:
+        import cores as cores_mod
+        cores = list(cores_mod.ensure_cores(store) or [])
+    except Exception:
+        return []
+    covered: set[str] = set()
+    picked: list[str] = []
+    # Prefer non-inherit cores that own the tag, then master
+    ranked = sorted(
+        [c for c in cores if isinstance(c, dict)],
+        key=lambda c: (1 if c.get("inherit_master") else 0, str(c.get("name") or "")),
+    )
+    for core in ranked:
+        cid = str(core.get("id") or "").strip()
+        if not cid:
+            continue
+        if core.get("inherit_master"):
+            have = {
+                str(ib.get("tag") or "").strip()
+                for ib in ensure_inbounds(store)
+                if _is_client_capable_inbound(ib) and ib.get("tag")
+            }
+        else:
+            try:
+                ibs = cores_mod.apply_exclude_inbounds(list(core.get("inbounds") or []), core)
+            except Exception:
+                ibs = list(core.get("inbounds") or [])
+            have = {
+                str(raw.get("tag") or "").strip()
+                for raw in ibs
+                if isinstance(raw, dict) and _is_client_capable_inbound(raw) and raw.get("tag")
+            }
+        hit = want & have
+        if not hit:
+            continue
+        if hit - covered:
+            picked.append(cid)
+            covered |= hit
+        if covered >= want:
+            break
+    return picked
+
 
 def ensure_groups(store: dict) -> list[dict]:
     groups = store.setdefault("groups", [])
@@ -1740,16 +1789,102 @@ def ensure_groups(store: dict) -> list[dict]:
             g["allowed_tags"] = []
         if not isinstance(g.get("inbounds"), list):
             g["inbounds"] = []
+        if not isinstance(g.get("cores"), list):
+            g["cores"] = []
         # Explicit modes: empty lists alone used to mean «all», which flipped
         # «выбранные» (only primary / partial) back to «все» after save.
         if g.get("ib_mode") not in ("all", "select"):
             g["ib_mode"] = "select" if g.get("inbounds") else "all"
         if g.get("select_mode") not in ("all", "select"):
             g["select_mode"] = "select" if g.get("allowed_tags") else "all"
+        if g.get("core_mode") not in ("all", "select"):
+            if g.get("cores"):
+                g["core_mode"] = "select"
+            elif g.get("ib_mode") == "select" and g.get("inbounds"):
+                # Legacy inbound pick → map tags to cores once
+                mapped = _core_ids_covering_inbound_tags(store, list(g.get("inbounds") or []))
+                if mapped:
+                    g["cores"] = mapped
+                    g["core_mode"] = "select"
+                else:
+                    # Keep resolving via legacy inbounds (see group_inbound_tags)
+                    g["core_mode"] = "all"
+            else:
+                g["core_mode"] = "all"
         g.setdefault("outbound", "")
         cleaned.append(g)
     store["groups"] = cleaned
     return cleaned
+
+
+def _inbound_tags_for_core_ids(store: dict, core_ids: list[str]) -> list[str]:
+    """Unique inbound tags belonging to the given cores (order preserved)."""
+    want = {str(x or "").strip() for x in (core_ids or []) if str(x or "").strip()}
+    if not want:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        import cores as cores_mod
+        cores = cores_mod.ensure_cores(store) or []
+    except Exception:
+        return []
+    for core in cores:
+        if not isinstance(core, dict):
+            continue
+        cid = str(core.get("id") or "").strip()
+        if cid not in want:
+            continue
+        if core.get("inherit_master"):
+            for ib in ensure_inbounds(store):
+                if not _is_client_capable_inbound(ib):
+                    continue
+                tag = str(ib.get("tag") or "").strip()
+                if tag and tag not in seen:
+                    seen.add(tag)
+                    out.append(tag)
+            continue
+        try:
+            ibs = cores_mod.apply_exclude_inbounds(list(core.get("inbounds") or []), core)
+        except Exception:
+            ibs = list(core.get("inbounds") or [])
+        for raw in ibs:
+            if not isinstance(raw, dict) or not _is_client_capable_inbound(raw):
+                continue
+            if not raw.get("enabled", True):
+                continue
+            tag = str(raw.get("tag") or "").strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                out.append(tag)
+    return out
+
+
+def group_inbound_tags(store: dict, group: dict | None) -> list[str]:
+    """Inbound tags granted by a group. Empty list = all capable inbounds.
+
+    Prefer ``cores`` / ``core_mode``. Legacy ``inbounds`` / ``ib_mode`` used when
+    the group was never saved with cores yet.
+    """
+    if not isinstance(group, dict):
+        return []
+    core_mode = str(group.get("core_mode") or "").strip().lower()
+    cores = [str(x).strip() for x in (group.get("cores") or []) if str(x).strip()]
+    if core_mode == "select":
+        if cores:
+            return _inbound_tags_for_core_ids(store, cores)
+        return []  # select with empty cores → none (form should prevent)
+    if core_mode == "all":
+        # If never migrated and still has explicit legacy inbound list, honor it
+        if not cores and list_mode(group, list_key="inbounds", mode_key="ib_mode") == "select":
+            legacy = [str(t).strip() for t in (group.get("inbounds") or []) if str(t).strip()]
+            if legacy:
+                return legacy
+        return []  # all
+    # core_mode unset — legacy only
+    if list_mode(group, list_key="inbounds", mode_key="ib_mode") == "select":
+        return [str(t).strip() for t in (group.get("inbounds") or []) if str(t).strip()]
+    return []
 
 
 def get_group(store: dict, group_id: str | None) -> dict | None:
@@ -1800,12 +1935,12 @@ def client_effective_allowed_tags(store: dict, client: dict) -> list[str]:
 def client_effective_inbounds(store: dict, client: dict) -> list[str]:
     """Inbound tags for the client. Empty list = all capable.
 
-    With a group: group list is the base; personal inbounds may add extras.
+    With a group: cores (→ inbound tags) are the base; personal inbounds may add extras.
     """
     personal = list(client.get("inbounds") or [])
     g = client_group(store, client)
     if g is not None:
-        return _merge_tag_lists(list(g.get("inbounds") or []), personal)
+        return _merge_tag_lists(group_inbound_tags(store, g), personal)
     return personal
 
 
@@ -1830,7 +1965,9 @@ def new_group(*, name: str = "", comment: str = "") -> dict:
         "comment": (comment or "").strip(),
         "allowed_tags": [],
         "inbounds": [],
+        "cores": [],
         "ib_mode": "all",
+        "core_mode": "all",
         "select_mode": "all",
         "outbound": "",
     }

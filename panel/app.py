@@ -4402,30 +4402,35 @@ def _group_form(form, store: dict, group: dict) -> str | None:
         return "Укажите название группы"
     group["name"] = name
     group["comment"] = str(form.get("comment") or "").strip()
-    # Outbounds are no longer assigned on groups — only inbounds.
+    # Groups assign cores; inbounds are derived. Outbounds live in cores.
     group["select_mode"] = "all"
     group["allowed_tags"] = []
     group["outbound"] = ""
-    known_ib_map = {
-        str(i["tag"]).strip().lower(): str(i["tag"])
-        for i in xray.client_capable_inbounds(store)
-        if i.get("tag")
+    known_cores = {
+        str(c.get("id") or "").strip(): c
+        for c in cores_mod.ensure_cores(store) or []
+        if isinstance(c, dict) and str(c.get("id") or "").strip()
     }
-    sel_ib = []
-    for raw in form.getlist("inbounds"):
-        key = str(raw or "").strip().lower()
-        if key in known_ib_map and known_ib_map[key] not in sel_ib:
-            sel_ib.append(known_ib_map[key])
-    ib_mode = str(form.get("ib_mode") or "all").strip().lower()
-    if ib_mode not in ("all", "select"):
-        ib_mode = "all"
-    group["ib_mode"] = ib_mode
-    if ib_mode == "all":
+    sel_cores: list[str] = []
+    for raw in form.getlist("cores"):
+        cid = str(raw or "").strip()
+        if cid in known_cores and cid not in sel_cores:
+            sel_cores.append(cid)
+    core_mode = str(form.get("core_mode") or "all").strip().lower()
+    if core_mode not in ("all", "select"):
+        core_mode = "all"
+    group["core_mode"] = core_mode
+    if core_mode == "all":
+        group["cores"] = []
         group["inbounds"] = []
+        group["ib_mode"] = "all"
     else:
-        if not sel_ib:
-            return "Отметьте хотя бы один inbound или выберите режим «все»"
-        group["inbounds"] = sel_ib
+        if not sel_cores:
+            return "Отметьте хотя бы одно ядро или выберите режим «все»"
+        group["cores"] = sel_cores
+        # Keep derived inbound tags for legacy readers / display
+        group["inbounds"] = xray._inbound_tags_for_core_ids(store, sel_cores)
+        group["ib_mode"] = "select"
     return None
 
 
@@ -4440,12 +4445,35 @@ def groups_page(request: Request):
         gid = str(c.get("group_id") or "")
         if gid:
             counts[gid] = counts.get(gid, 0) + 1
-    rows = [{**g, "clients": counts.get(str(g.get("id") or ""), 0)} for g in groups]
+    rows = []
+    for g in groups:
+        row = {**g, "clients": counts.get(str(g.get("id") or ""), 0)}
+        row["core_names"] = _group_core_names(store, g)
+        rows.append(row)
     return page(
         request, "groups.html", active="groups", items=rows, store=store,
         tags=xray.selectable_outbound_tags(store),
-        inbounds=xray.client_capable_inbounds(store),
+        cores=cores_mod.ensure_cores(store),
     )
+
+
+def _group_core_names(store: dict, group: dict) -> list[str]:
+    """Display names for cores selected on a group (or legacy inbound summary)."""
+    mode = xray.list_mode(group, list_key="cores", mode_key="core_mode")
+    if mode == "all":
+        # Legacy inbound-only select still shows as inbound tags until re-saved
+        if not (group.get("cores") or []) and xray.list_mode(group, list_key="inbounds", mode_key="ib_mode") == "select":
+            return list(group.get("inbounds") or [])[:12]
+        return []
+    ids = [str(x).strip() for x in (group.get("cores") or []) if str(x).strip()]
+    by_id = {str(c.get("id") or ""): c for c in cores_mod.ensure_cores(store) or [] if isinstance(c, dict)}
+    names: list[str] = []
+    for cid in ids:
+        c = by_id.get(cid)
+        if not c:
+            continue
+        names.append(str(c.get("name") or cid))
+    return names
 
 
 @app.get("/groups/new", response_class=HTMLResponse)
@@ -4457,7 +4485,7 @@ def groups_new(request: Request):
     return page(
         request, "group_edit.html", active="groups", g=g, is_new=True, store=store,
         tags=xray.selectable_outbound_tags(store),
-        inbounds=xray.client_capable_inbounds(store),
+        cores=cores_mod.ensure_cores(store),
         clients_count=0,
     )
 
@@ -4475,7 +4503,7 @@ def groups_edit(gid: str, request: Request):
     return page(
         request, "group_edit.html", active="groups", g=g, is_new=False, store=store,
         tags=xray.selectable_outbound_tags(store),
-        inbounds=xray.client_capable_inbounds(store),
+        cores=cores_mod.ensure_cores(store),
         clients_count=n,
     )
 

@@ -3,7 +3,7 @@
 {% import "_icons.html" as ic %}
 {% block title %}Группы · {{ app_name }}{% endblock %}
 {% block page_title %}Группы клиентов{% endblock %}
-{% block page_sub %}Набор inbounds для подписки{% endblock %}
+{% block page_sub %}Набор ядер для подписки{% endblock %}
 {% block top_actions %}
 <div class="actions">
   <a class="btn" href="{{ bp }}/groups/new">{{ ic.icon('plus') }}Новая группа</a>
@@ -11,9 +11,9 @@
 {% endblock %}
 {% block content %}
 <div class="hint" style="margin-bottom:1rem">
-  Группа задаёт, какие <b>inbounds</b> доступны клиенту
-  (мастер + входящие из снимков <b>Ядер</b>).
-  Исходящие и маршруты настраиваются в ядрах. Назначьте группу в карточке клиента или массово на странице Клиенты.
+  Группа задаёт, какие <b>ядра</b> доступны клиенту.
+  Все inbound’ы выбранных ядер попадают в подписку; маршруты — в настройках ядра.
+  Назначьте группу в карточке клиента или массово на странице Клиенты.
 </div>
 <div class="card" style="padding:0">
   <div class="table-wrap">
@@ -21,7 +21,7 @@
     <thead><tr>
       <th>Группа</th>
       <th>Клиентов</th>
-      <th>Inbounds</th>
+      <th>Ядра</th>
       <th class="right">{{ t('Действия') }}</th>
     </tr></thead>
     <tbody>
@@ -34,8 +34,9 @@
         </td>
         <td>{% if g.clients %}<span class="badge accent">{{ g.clients }}</span>{% else %}<span class="dim">0</span>{% endif %}</td>
         <td class="small">
-          {% if list_mode(g, list_key='inbounds', mode_key='ib_mode') == 'all' %}<span class="dim">все</span>
-          {% elif g.inbounds %}{{ g.inbounds|join(', ') }}{% else %}<span class="dim">—</span>{% endif %}
+          {% if list_mode(g, list_key='cores', mode_key='core_mode') == 'all' and not (g.core_names or []) %}
+            <span class="dim">все</span>
+          {% elif g.core_names %}{{ g.core_names|join(', ') }}{% else %}<span class="dim">—</span>{% endif %}
         </td>
         <td>
           <div class="actions" style="justify-content:flex-end">
@@ -47,7 +48,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="4" class="empty">Групп пока нет — создайте, чтобы назначать inbounds клиентам</td></tr>
+      <tr><td colspan="4" class="empty">Групп пока нет — создайте, чтобы назначать ядра клиентам</td></tr>
     {% endfor %}
     </tbody>
   </table>

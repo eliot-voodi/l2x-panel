@@ -12,7 +12,7 @@
 {% endif %}
 {% endblock %}
 {% block content %}
-{% set ib_mode = list_mode(g, list_key='inbounds', mode_key='ib_mode') %}
+{% set core_mode = list_mode(g, list_key='cores', mode_key='core_mode') %}
 <form method="post" action="{{ bp }}/groups/save">
   <input type="hidden" name="id" value="{{ '' if is_new else g.id }}">
   <div class="card">
@@ -21,27 +21,28 @@
       <div><label class="f">Название</label><input name="name" value="{{ g.name }}" required autofocus placeholder="Free / Premium / …"></div>
       <div><label class="f">Комментарий</label><input name="comment" value="{{ g.comment or '' }}" placeholder="для себя"></div>
     </div>
-    <div class="hint">Группа назначает клиентам только <b>inbounds</b>. Маршрутизация и исходящие настраиваются в <b>Ядрах</b>.</div>
+    <div class="hint">Группа назначает клиентам <b>ядра</b>. Все inbound’ы выбранных ядер попадают в подписку. Маршрутизация — внутри ядер.</div>
   </div>
 
   <div class="card">
-    <div class="card-head"><h3>Inbounds</h3>
-      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="all" {% if ib_mode == 'all' %}checked{% endif %}> все</label>
-        <label class="check" style="margin:0 .4rem"><input type="radio" name="ib_mode" value="select" {% if ib_mode == 'select' %}checked{% endif %}> выбранные</label></div>
+    <div class="card-head"><h3>Ядра</h3>
+      <div class="seg"><label class="check" style="margin:0 .4rem"><input type="radio" name="core_mode" value="all" {% if core_mode == 'all' %}checked{% endif %}> все</label>
+        <label class="check" style="margin:0 .4rem"><input type="radio" name="core_mode" value="select" {% if core_mode == 'select' %}checked{% endif %}> выбранные</label></div>
     </div>
-    <div class="hint">Список = мастер + входящие из снимков <b>Ядер</b> (уникальные tag). На ноду попадает inbound из назначенного ядра.</div>
+    <div class="hint">Клиент получит все входящие из выбранных ядер (новые inbound’ы на ядре появляются в подписке автоматически).</div>
     <div class="flex" style="gap:.4rem;margin-bottom:.6rem">
-      <button type="button" class="btn sm ghost" data-check-all="inbounds" data-mode="ib_mode">Выделить все</button>
-      <button type="button" class="btn sm ghost" data-uncheck-all="inbounds" data-mode="ib_mode">Снять все</button>
+      <button type="button" class="btn sm ghost" data-check-all="cores" data-mode="core_mode">Выделить все</button>
+      <button type="button" class="btn sm ghost" data-uncheck-all="cores" data-mode="core_mode">Снять все</button>
     </div>
-    {% for ib in inbounds %}
-      <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}" {% if ib_mode == 'all' or ib.tag in (g.inbounds or []) %}checked{% endif %}>
-        <span class="badge accent">{{ ib.protocol }}</span> {{ ib.remark or ib.tag }}
-        <span class="dim small mono">{{ ib.tag }}</span>
-        <span class="dim small">:{{ ib.port }}</span>
-        {% if ib._from_core %}<span class="badge warn" title="снимок ядра">ядро: {{ ib._from_core }}</span>{% else %}<span class="badge ok">мастер</span>{% endif %}
+    {% for c in cores or [] %}
+      <label class="check"><input type="checkbox" name="cores" value="{{ c.id }}" {% if core_mode == 'all' or c.id in (g.cores or []) %}checked{% endif %}>
+        <b>{{ c.name or c.id }}</b>
+        {% if c.inherit_master %}<span class="badge ok">мастер</span>{% else %}<span class="badge warn">standalone</span>{% endif %}
+        {% set n_ib = (c.inbounds or [])|length if not c.inherit_master else '—' %}
+        <span class="dim small">inbounds: {{ n_ib }}</span>
+        <span class="dim small mono">{{ c.id }}</span>
       </label><br>
-    {% else %}<div class="dim">Нет inbounds</div>{% endfor %}
+    {% else %}<div class="dim">Нет ядер — создайте на странице Ядра</div>{% endfor %}
   </div>
 
   <div class="actions"><button class="btn">{{ t('Сохранить') }}</button><a class="btn ghost" href="{{ bp }}/groups">{{ t('Отмена') }}</a></div>
@@ -77,15 +78,15 @@
     });
   });
   if (form) {
-    form.querySelectorAll('input[name="inbounds"]').forEach(function (c) {
-      c.addEventListener('change', function () { setMode('ib_mode', 'select'); });
+    form.querySelectorAll('input[name="cores"]').forEach(function (c) {
+      c.addEventListener('change', function () { setMode('core_mode', 'select'); });
     });
     form.addEventListener('submit', function (e) {
-      var ibSel = form.querySelector('input[name="ib_mode"][value="select"]');
-      var ibBoxes = form.querySelectorAll('input[name="inbounds"]');
-      if (ibSel && ibSel.checked && ibBoxes.length && !Array.prototype.some.call(ibBoxes, function (x) { return x.checked; })) {
+      var sel = form.querySelector('input[name="core_mode"][value="select"]');
+      var boxes = form.querySelectorAll('input[name="cores"]');
+      if (sel && sel.checked && boxes.length && !Array.prototype.some.call(boxes, function (x) { return x.checked; })) {
         e.preventDefault();
-        alert('Отметьте хотя бы один inbound или выберите режим «все»');
+        alert('Отметьте хотя бы одно ядро или выберите режим «все»');
       }
     });
   }
