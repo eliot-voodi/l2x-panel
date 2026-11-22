@@ -1496,26 +1496,34 @@ def _transport_rank(ep: dict) -> tuple:
 
 
 def _outbound_tag_for_ep(ep: dict, idx: int, used: set[str]) -> str:
-    proto = str(ep.get("protocol") or "")
-    net = str(ep.get("net") or "")
-    sec = str(ep.get("security") or "")
-    mode = str(ep.get("mode") or "")
-    if proto == "hysteria" or net == "hysteria":
-        base = "HY2"
-    elif net in ("raw", "tcp") and sec == "reality":
-        sni = str(ep.get("sni") or "").split(".")[0] or "reality"
-        base = f"REALITY-{sni}"[:24]
-    elif net == "xhttp" and sec == "reality":
-        base = "XH-REALITY"
-    elif net == "xhttp":
-        base = "XHTTP-LTE" if mode == "packet-up" else "XHTTP"
-    elif net == "ws":
-        base = "WS"
-    elif net == "grpc":
-        base = "GRPC"
+    """Client outbound tag: prefer inbound tag (Ascella-style), else transport name."""
+    ib = str(ep.get("_inbound_tag") or "").strip()
+    if ib:
+        base = re.sub(r"[^A-Za-z0-9_.-]", "-", ib).strip("-_.") or f"IB-{idx}"
     else:
-        base = f"{proto or 'ob'}-{net or 'net'}".upper()
-    base = re.sub(r"[^A-Za-z0-9_-]", "-", base).strip("-_") or f"OB-{idx}"
+        proto = str(ep.get("protocol") or "")
+        net = str(ep.get("net") or "")
+        sec = str(ep.get("security") or "")
+        mode = str(ep.get("mode") or "")
+        if proto == "hysteria" or net == "hysteria":
+            base = "HY2"
+        elif net in ("raw", "tcp") and sec == "reality":
+            sni = str(ep.get("sni") or "").split(".")[0] or "reality"
+            base = f"REALITY-{sni}"[:24]
+        elif net == "xhttp" and sec == "reality":
+            base = "XH-REALITY"
+        elif net == "xhttp":
+            base = "XHTTP-LTE" if mode == "packet-up" else "XHTTP"
+        elif net == "ws":
+            base = "WS"
+        elif net == "grpc":
+            base = "GRPC"
+        else:
+            base = f"{proto or 'ob'}-{net or 'net'}".upper()
+        base = re.sub(r"[^A-Za-z0-9_-]", "-", base).strip("-_") or f"OB-{idx}"
+    # Reserved client system tags
+    if base.lower() in ("proxy", "direct", "block", "dns-out", "socks", "http", "api"):
+        base = f"IB-{base}" if ib else f"OB-{idx}"
     tag = base
     n = 2
     while tag in used:
@@ -1683,12 +1691,6 @@ def xray_unified_client_config(
             "outbounds": [{"tag": "direct", "protocol": "freedom"}],
             "routing": {"rules": []},
         }
-    if len(eps) == 1:
-        cfg = xray_client_config(eps[0], extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel)
-        if remarks:
-            cfg["remarks"] = remarks
-        return cfg
-
     ordered = sorted(eps, key=_transport_rank)
     used_tags: set[str] = set()
     proxy_tags: list[str] = []
@@ -1700,26 +1702,35 @@ def xray_unified_client_config(
 
     balancers: list[dict] = []
     rules: list[dict] = []
-    for i, tag in enumerate(proxy_tags):
-        bal_tag = f"BAL-{i + 1}"
-        if i + 1 < len(proxy_tags):
-            loop_tag = f"LOOP-{i + 1}"
-            reroute = f"REROUTE-{i + 1}"
-            outbounds.append({"tag": loop_tag, "protocol": "loopback", "settings": {"inboundTag": reroute}})
-            balancers.append({
-                "tag": bal_tag,
-                "selector": [tag],
-                "fallbackTag": loop_tag,
-                "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
-            })
-            rules.append({"inboundTag": [reroute], "balancerTag": f"BAL-{i + 2}"})
-        else:
-            balancers.append({
-                "tag": bal_tag,
-                "selector": [tag],
-                "fallbackTag": proxy_tags[0],
-                "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
-            })
+    # Ascella cascade: one balancer per outbound, fallback → next via loopback
+    if len(proxy_tags) == 1:
+        balancers.append({
+            "tag": "BAL-1",
+            "selector": [proxy_tags[0]],
+            "fallbackTag": proxy_tags[0],
+            "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
+        })
+    else:
+        for i, tag in enumerate(proxy_tags):
+            bal_tag = f"BAL-{i + 1}"
+            if i + 1 < len(proxy_tags):
+                loop_tag = f"LOOP-{i + 1}"
+                reroute = f"REROUTE-{i + 1}"
+                outbounds.append({"tag": loop_tag, "protocol": "loopback", "settings": {"inboundTag": reroute}})
+                balancers.append({
+                    "tag": bal_tag,
+                    "selector": [tag],
+                    "fallbackTag": loop_tag,
+                    "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
+                })
+                rules.append({"inboundTag": [reroute], "balancerTag": f"BAL-{i + 2}"})
+            else:
+                balancers.append({
+                    "tag": bal_tag,
+                    "selector": [tag],
+                    "fallbackTag": proxy_tags[0],
+                    "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
+                })
 
     outbounds.extend([
         {"tag": "direct", "protocol": "freedom", "settings": {"userLevel": 8},
@@ -1765,12 +1776,13 @@ def xray_unified_client_config(
             "balancers": balancers,
             "rules": rules,
         },
+        # subjectSelector = outbound tags (= inbound tags) for client-side ping
         "burstObservatory": {
             "subjectSelector": list(proxy_tags),
             "pingConfig": {
                 "destination": "https://www.gstatic.com/generate_204",
                 "httpMethod": "GET",
-                "interval": "5m",
+                "interval": "1m",
                 "sampling": 1,
                 "timeout": "5s",
             },

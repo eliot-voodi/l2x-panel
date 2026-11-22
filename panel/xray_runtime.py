@@ -2831,6 +2831,7 @@ def client_json_subscription_profiles(
                     if isinstance(o, dict) and o.get("protocol") not in ("freedom", "blackhole", "dns", "loopback")
                 ]
             except Exception:
+                auto_cfg = {}
                 auto_obs = []
             try:
                 cfg = P.render_sub_custom_json(
@@ -2844,7 +2845,30 @@ def client_json_subscription_profiles(
                 cfg = None
             if isinstance(cfg, dict):
                 cfg["remarks"] = title
-                # Live-apply core balancers + routes (client → direct bypass)
+                # Dial outbounds + observatory must use inbound tags (not stale "proxy" from old templates)
+                if isinstance(auto_cfg, dict) and auto_obs:
+                    sys_tags = {"direct", "block", "dns-out", "DIRECT", "BLOCK"}
+                    sys_protos = ("freedom", "blackhole", "dns", "loopback")
+                    auto_dial_tags = {str(o.get("tag") or "") for o in auto_obs}
+                    extras_ob = [
+                        o for o in (cfg.get("outbounds") or [])
+                        if isinstance(o, dict)
+                        and str(o.get("tag") or "") not in auto_dial_tags
+                        and str(o.get("tag") or "") not in sys_tags
+                        and str(o.get("tag") or "").lower() != "proxy"
+                        and o.get("protocol") not in sys_protos
+                    ]
+                    auto_sys = [
+                        o for o in (auto_cfg.get("outbounds") or [])
+                        if isinstance(o, dict) and (
+                            o.get("protocol") in sys_protos or str(o.get("tag") or "") in sys_tags
+                        )
+                    ]
+                    cfg["outbounds"] = list(auto_obs) + extras_ob + auto_sys
+                    if auto_cfg.get("burstObservatory"):
+                        cfg["burstObservatory"] = auto_cfg["burstObservatory"]
+                    if auto_cfg.get("routing"):
+                        cfg["routing"] = auto_cfg["routing"]
                 cfg = merge_core_routing_into_client_cfg(cfg, core)
                 profiles.append(cfg)
             continue
@@ -2884,9 +2908,14 @@ def _proxy_tags_from_client_cfg(cfg: dict) -> list[str]:
 
 
 def _client_balancers_from_core(core: dict, proxy_tags: list[str]) -> list[dict]:
-    """Build Happ/Xray client balancers from core balancer settings (strategy + type)."""
+    """Build Happ/Xray client balancers from core balancer settings.
+
+    ``selector`` = inbound-derived outbound tags (client dials those hosts directly).
+    Panel ``members`` kept only when they match those tags; otherwise all proxy tags.
+    """
     if not proxy_tags:
         return []
+    proxy_set = set(proxy_tags)
     bals_src = core.get("balancers") if isinstance(core.get("balancers"), dict) else {}
     out: list[dict] = []
     # Prefer least_ping → least_load → random → others
@@ -2909,9 +2938,13 @@ def _client_balancers_from_core(core: dict, proxy_tags: list[str]) -> list[dict]
                 "least_load": "leastLoad",
                 "random": "random",
             }.get(key, "leastPing")
+        raw_members = [str(m).strip() for m in (b.get("members") or []) if str(m).strip()]
+        selector = [m for m in raw_members if m in proxy_set]
+        if not selector:
+            selector = list(proxy_tags)
         entry: dict[str, Any] = {
             "tag": tag,
-            "selector": list(proxy_tags),
+            "selector": selector,
             "strategy": {"type": strategy},
         }
         if strategy == "leastLoad":
@@ -2922,9 +2955,14 @@ def _client_balancers_from_core(core: dict, proxy_tags: list[str]) -> list[dict]
             }
         fb = str(b.get("fallback") or "direct").strip()
         if fb and fb not in ("none", ""):
-            entry["fallbackTag"] = "direct" if fb in ("direct", "block") or fb not in proxy_tags else fb
+            if fb in proxy_set:
+                entry["fallbackTag"] = fb
+            elif fb in ("direct", "block"):
+                entry["fallbackTag"] = "direct"
+            else:
+                entry["fallbackTag"] = selector[0]
         else:
-            entry["fallbackTag"] = proxy_tags[0]
+            entry["fallbackTag"] = selector[0]
         out.append(entry)
     return out
 
@@ -3020,6 +3058,24 @@ def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
         routing = {}
         cfg["routing"] = routing
 
+    # Always pin subjectSelector to inbound-derived outbound tags (never stale "proxy")
+    probe = "https://www.gstatic.com/generate_204"
+    for b in (core.get("balancers") or {}).values() if isinstance(core.get("balancers"), dict) else []:
+        if isinstance(b, dict) and b.get("enabled", True) and b.get("probe_url"):
+            probe = str(b["probe_url"])
+            break
+    cfg["burstObservatory"] = {
+        "subjectSelector": list(proxy_tags),
+        "pingConfig": {
+            "connectivity": "",
+            "destination": probe,
+            "httpMethod": "GET",
+            "interval": "1m",
+            "sampling": 1,
+            "timeout": "5s",
+        },
+    }
+
     # Drop Ascella cascade BAL-/LOOP-/REROUTE- scaffolding when using core balancers
     old_rules = [r for r in (routing.get("rules") or []) if isinstance(r, dict)]
     if client_bals:
@@ -3029,14 +3085,12 @@ def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
             btag = str(r.get("balancerTag") or "")
             if btag.startswith("BAL-") or str(r.get("inboundTag") or "").startswith("REROUTE"):
                 continue
-            # Strip loopback-only cascade hooks
             if isinstance(r.get("inboundTag"), list) and any(
                 str(t).startswith("REROUTE") for t in r["inboundTag"]
             ):
                 continue
             kept.append(r)
         old_rules = kept
-        # Remove loopback outbounds used only by Ascella cascade
         outs = [
             o for o in (cfg.get("outbounds") or [])
             if not (
@@ -3046,22 +3100,14 @@ def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
             )
         ]
         cfg["outbounds"] = outs
-        # Observatory / burstObservatory for leastPing
-        probe = "https://www.gstatic.com/generate_204"
-        for b in (core.get("balancers") or {}).values():
-            if isinstance(b, dict) and b.get("enabled", True) and b.get("probe_url"):
-                probe = str(b["probe_url"])
-                break
-        cfg["burstObservatory"] = {
-            "subjectSelector": list(proxy_tags),
-            "pingConfig": {
-                "destination": probe,
-                "httpMethod": "GET",
-                "interval": "1m",
-                "sampling": 1,
-                "timeout": "5s",
-            },
-        }
+        # refresh proxy_tags after stripping loops
+        proxy_tags = _proxy_tags_from_client_cfg(cfg)
+        cfg["burstObservatory"]["subjectSelector"] = list(proxy_tags)
+        for b in client_bals:
+            sel = [t for t in (b.get("selector") or []) if t in proxy_tags] or list(proxy_tags)
+            b["selector"] = sel
+            if b.get("fallbackTag") not in set(sel) | {"direct", "block"}:
+                b["fallbackTag"] = sel[0] if sel else "direct"
 
     core_rules: list[dict] = []
     for r in core.get("routes") or []:
