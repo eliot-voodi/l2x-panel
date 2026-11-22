@@ -744,7 +744,13 @@ def validate_and_build(store: dict, core: dict) -> dict:
     if not core.get("inherit_master"):
         try:
             import protocols as P
-            sni_notes = P.resolve_reality_sni_conflicts(core.get("inbounds") or [])
+            for ib in core.get("inbounds") or []:
+                if isinstance(ib, dict):
+                    P.ensure_inbound_shape(ib)
+                    fixed = P.fix_http_front_path(ib)
+                    if fixed:
+                        sni_notes.append(f"{ib.get('tag')}: Path → {fixed}")
+            sni_notes.extend(P.resolve_reality_sni_conflicts(core.get("inbounds") or []))
         except Exception:
             sni_notes = []
     errs = validate_core_slices(core if not core.get("inherit_master") else {

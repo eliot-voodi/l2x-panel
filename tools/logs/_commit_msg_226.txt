@@ -1,0 +1,3 @@
+## v2.2.6 — Fix WS Path `/` (Amsterdam-1 unreachable behind nginx)
+
+Auto-fix reserved HTTP front paths and strip Vision flow from WS/XHTTP inbounds.

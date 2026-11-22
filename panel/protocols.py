@@ -326,7 +326,50 @@ def ensure_inbound_shape(ib: dict) -> dict:
         s = ib.setdefault("settings", {})
         if not str(s.get("flow") or "").strip():
             s["flow"] = "xtls-rprx-vision"
+    else:
+        # WS/XHTTP/gRPC must not carry Vision flow
+        s = ib.setdefault("settings", {})
+        net = st.get("network") or "raw"
+        if net not in ("raw", "tcp") or (st.get("security") or "") != "reality":
+            if str(s.get("flow") or "").strip() == "xtls-rprx-vision":
+                s["flow"] = ""
+    # Path transports behind nginx cannot use "/" (reserved for panel)
+    fix_http_front_path(ib)
     return ib
+
+
+def fix_http_front_path(ib: dict) -> str:
+    """Ensure WS/xhttp/httpupgrade path is publishable on nginx :443. Returns new path or ''."""
+    if not isinstance(ib, dict):
+        return ""
+    if front_mode(ib) != "http":
+        return ""
+    st = ib.setdefault("stream", {})
+    net = st.get("network") or "raw"
+    if net not in FRONT_HTTP_NETWORKS and net != "grpc":
+        return ""
+    key = "grpc" if net == "grpc" else net
+    cfg = st.setdefault(key, {})
+    if net == "grpc":
+        cur = str(cfg.get("service_name") or "").strip()
+        path_now = front_http_path(ib)
+    else:
+        cur = str(cfg.get("path") or "/").strip() or "/"
+        path_now = front_http_path(ib)
+    # Collapse query-only paths like "/?=x" → "/" which is reserved
+    if path_now in ("/", "") or path_now.startswith("/sub") or path_now.startswith("/api"):
+        tag = re.sub(r"[^a-zA-Z0-9]+", "-", str(ib.get("tag") or "ws")).strip("-").lower() or "ws"
+        new_path = f"/{tag}"[:48]
+        if net == "grpc":
+            cfg["service_name"] = tag[:32]
+        else:
+            # Preserve user query suffix if they set one for cosmetics
+            q = ""
+            if "?" in cur:
+                q = cur.split("?", 1)[1]
+            cfg["path"] = f"{new_path}?{q}" if q else new_path
+        return cfg.get("path") or cfg.get("service_name") or new_path
+    return ""
 
 
 # Camouflage hosts for Reality SNI passthrough (nginx maps one SNI → one port).
