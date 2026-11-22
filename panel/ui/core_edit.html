@@ -427,9 +427,9 @@
     <h3>JSON-подписка для этого ядра</h3>
     <div class="hint">
       В подписке (Happ / <code>?format=json</code>) каждое ядро — <b>один профиль</b>.
-      Генерация: все inbound → outbounds; <b>балансировщики ядра</b> (leastPing/leastLoad/random) и
-      <b>правила маршрутизации</b>. Outbound <code>client</code> в маршрутах → <code>direct</code> у клиента (обход VPN).
-      При включённом Custom JSON Happ получает JSON автоматически.
+      Генерация (и кнопка <b>Применить</b>): все inbound → outbounds + <b>Ascella cascade</b>
+      (LOOP/REROUTE / leastLoad) + правила с outbound <code>client</code> → обход VPN.
+      <code>subjectSelector</code> = теги inbound. Happ JSON обновляется автоматически.
     </div>
     <div class="actions mt">
       <form method="post" action="{{ bp }}/cores/{{ core.id }}/subjson-generate" style="display:inline">

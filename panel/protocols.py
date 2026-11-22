@@ -936,7 +936,11 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
     if proto == "vless":
         s = ib.get("settings") or {}
         if supports_flow(ib):
-            ep["flow"] = s.get("flow") or ""
+            flow = str(s.get("flow") or "").strip()
+            # Reality+TCP without flow → Vision (Ascella / Happ expect it)
+            if not flow and sec == "reality" and net in ("raw", "tcp"):
+                flow = "xtls-rprx-vision"
+            ep["flow"] = flow
         enc = s.get("encryption") or "none"
         if enc and enc != "none":
             ep["encryption"] = enc

@@ -8794,6 +8794,14 @@ async def cores_apply(core_id: str, request: Request):
             return go(back)
         snap = cores_mod.snapshot_slices(store, core)
         cores_mod.remember_applied(core, snap)
+        # Auto-rebuild Custom JSON from all core inbounds (Ascella cascade + routes)
+        try:
+            tmpl = xray.build_core_custom_json_template(store, core)
+            core["sub_custom_json_template"] = tmpl
+            if core.get("inbounds"):
+                core["sub_custom_json"] = True
+        except Exception:
+            pass
 
     # Sync nodes that use this core (config already validated)
     store = _load_store()
@@ -8820,7 +8828,8 @@ async def cores_apply(core_id: str, request: Request):
     flash(
         request,
         f"Ядро «{core.get('name')}» применено (xray -test OK)"
-        + (f", sync {ok_n}/{len(nodes)} нод" if nodes else ""),
+        + (f", sync {ok_n}/{len(nodes)} нод" if nodes else "")
+        + (", Custom JSON обновлён" if core.get("sub_custom_json") else ""),
         "info",
     )
     return go(back)

@@ -2519,20 +2519,74 @@ def _core_id_for_inbound(store: dict, ib: dict) -> str:
     return ""
 
 
-def _node_for_inbound_core(store: dict, ib: dict) -> dict | None:
-    """Node that owns this inbound via ``core_id`` (Direct / standalone node cores)."""
+def _nodes_for_core_id(store: dict, cid: str) -> list[dict]:
     try:
         import nodes as nodes_mod
     except Exception:
-        return None
-    cid = _core_id_for_inbound(store, ib)
+        return []
+    cid = str(cid or "").strip()
     if not cid:
-        return None
-    for node in nodes_mod.ensure_list(store):
-        if str(node.get("core_id") or "").strip() != cid:
+        return []
+    return [
+        n for n in nodes_mod.ensure_list(store)
+        if isinstance(n, dict) and str(n.get("core_id") or "").strip() == cid
+    ]
+
+
+def _score_node_for_inbound(node: dict, store: dict, ib: dict) -> int:
+    """Prefer Direct node whose name/domain matches core/inbound (Amsterdam → am.ro0t.dev)."""
+    score = 0
+    if _subscription_should_dial_node(node):
+        score += 3
+    if node.get("direct_connect"):
+        score += 2
+    if node.get("enabled", True):
+        score += 1
+    name_slug = re.sub(r"[^a-z0-9]+", "", str(node.get("name") or "").lower())
+    dom = str(node.get("domain") or "").lower()
+    dom_label = dom.split(".")[0] if dom else ""
+    title_slug = re.sub(r"[^a-z0-9]+", "", str(node.get("user_title") or "").lower())
+    labels = [x for x in (name_slug, dom_label, title_slug) if len(x) >= 2]
+
+    hints: list[str] = []
+    cid = _core_id_for_inbound(store, ib)
+    if cid:
+        try:
+            import cores as cores_mod
+            core = cores_mod.core_by_id(store, cid)
+            if isinstance(core, dict):
+                hints.extend([str(core.get("name") or ""), str(core.get("remark") or "")])
+        except Exception:
+            pass
+    hints.extend([str(ib.get("tag") or ""), str(ib.get("remark") or "")])
+    for h in hints:
+        p = re.sub(r"[^a-z0-9]+", "", h.strip().lower())
+        if len(p) < 2:
             continue
-        return node
-    return None
+        for lab in labels:
+            # Amsterdam ↔ am, Buharest ↔ buh, am ↔ Amsterdam
+            if p.startswith(lab) or lab.startswith(p) or p.startswith(lab[: max(2, min(3, len(lab)))]):
+                score += 25
+                break
+            if lab in p or p in lab:
+                score += 15
+                break
+    return score
+
+
+def _node_for_inbound_core(store: dict, ib: dict) -> dict | None:
+    """Node that owns this inbound via ``core_id`` (Direct / standalone node cores).
+
+    When several nodes share one core, pick the best name/domain match
+    (avoids Amsterdam profile dialing ``buh.ro0t.dev``).
+    """
+    cid = _core_id_for_inbound(store, ib)
+    nodes = _nodes_for_core_id(store, cid)
+    if not nodes:
+        return None
+    if len(nodes) == 1:
+        return nodes[0]
+    return max(nodes, key=lambda n: _score_node_for_inbound(n, store, ib))
 
 
 def _direct_node_for_inbound(store: dict, ib: dict) -> dict | None:
@@ -2613,7 +2667,13 @@ def _direct_ident_for_tag(client: dict, tag: str, *, label: str = "") -> dict:
     }
 
 
-def client_endpoints(store: dict, client: dict, host: str | None = None) -> list[dict]:
+def client_endpoints(
+    store: dict,
+    client: dict,
+    host: str | None = None,
+    *,
+    inbounds: list[dict] | None = None,
+) -> list[dict]:
     if not client_access_ok(client):
         return []
     if not host:
@@ -2622,7 +2682,10 @@ def client_endpoints(store: dict, client: dict, host: str | None = None) -> list
             host = _front.public_domain(store) or public_host()
         except Exception:
             host = public_host()
-    ibs = [i for i in client_inbounds(store, client) if inbound_access_ok(i)]
+    if inbounds is not None:
+        ibs = [i for i in inbounds if isinstance(i, dict) and inbound_access_ok(i)]
+    else:
+        ibs = [i for i in client_inbounds(store, client) if inbound_access_ok(i)]
     multi = len(ibs) > 1
     eps = []
     master_hosts: set[str] = set()
@@ -2735,6 +2798,37 @@ def _json_profile_group_key(ep: dict, default_host: str = "") -> tuple[str, str]
     return cid, host
 
 
+def _client_endpoints_for_core_custom(
+    store: dict,
+    client: dict,
+    core: dict,
+    host: str | None = None,
+) -> list[dict]:
+    """All enabled core inbounds as dial endpoints for Custom JSON (ignore client checkboxes).
+
+    Happ Ascella-style profiles need every transport on the core so cascade LOOP/REROUTE works.
+    """
+    if not isinstance(core, dict):
+        return []
+    cid = str(core.get("id") or "")
+    core_ibs: list[dict] = []
+    for ib in (core.get("inbounds") or []):
+        if not isinstance(ib, dict) or not ib.get("enabled", True):
+            continue
+        ib_use = dict(ib)
+        if cid and not ib_use.get("_core_id"):
+            ib_use["_core_id"] = cid
+        core_ibs.append(ib_use)
+    if not core_ibs:
+        return []
+    eps = client_endpoints(store, client, host, inbounds=core_ibs)
+    if not cid:
+        return eps
+    # Prefer endpoints tagged with this core; fall back to all if remap lost _core_id
+    tagged = [e for e in eps if str(e.get("_core_id") or "") == cid]
+    return tagged or eps
+
+
 def client_prefers_json_sub(store: dict, client: dict) -> bool:
     """True when any core visible to the client has Custom JSON enabled."""
     try:
@@ -2819,11 +2913,16 @@ def client_json_subscription_profiles(
             tmpl = str(core.get("sub_custom_json_template") or "").strip()
         if tmpl:
             any_custom = True
-            # Optional {{outbounds}} — inject auto-built proxy outbounds from this core
-            auto_obs = []
+            # Always dial ALL core inbounds (Ascella cascade). Client checkboxes only
+            # decide whether this core appears in the sub — not which transports are listed.
+            full_eps = _client_endpoints_for_core_custom(
+                store, client, core, host or default_host,
+            ) or list(eps)
+            auto_obs: list[dict] = []
+            auto_cfg: dict = {}
             try:
                 auto_cfg = P.xray_unified_client_config(
-                    eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
+                    full_eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
                 )
                 auto_cfg = merge_core_routing_into_client_cfg(auto_cfg, core)
                 auto_obs = [
@@ -2845,30 +2944,20 @@ def client_json_subscription_profiles(
                 cfg = None
             if isinstance(cfg, dict):
                 cfg["remarks"] = title
-                # Dial outbounds + observatory must use inbound tags (not stale "proxy" from old templates)
+                # Prefer live Ascella cascade (outbounds + LOOP + routing) over stale template
                 if isinstance(auto_cfg, dict) and auto_obs:
-                    sys_tags = {"direct", "block", "dns-out", "DIRECT", "BLOCK"}
-                    sys_protos = ("freedom", "blackhole", "dns", "loopback")
-                    auto_dial_tags = {str(o.get("tag") or "") for o in auto_obs}
-                    extras_ob = [
-                        o for o in (cfg.get("outbounds") or [])
-                        if isinstance(o, dict)
-                        and str(o.get("tag") or "") not in auto_dial_tags
-                        and str(o.get("tag") or "") not in sys_tags
-                        and str(o.get("tag") or "").lower() != "proxy"
-                        and o.get("protocol") not in sys_protos
-                    ]
-                    auto_sys = [
-                        o for o in (auto_cfg.get("outbounds") or [])
-                        if isinstance(o, dict) and (
-                            o.get("protocol") in sys_protos or str(o.get("tag") or "") in sys_tags
-                        )
-                    ]
-                    cfg["outbounds"] = list(auto_obs) + extras_ob + auto_sys
+                    # Full auto outbounds (dial + LOOP + direct/block/dns) — no duplicates
+                    if isinstance(auto_cfg.get("outbounds"), list) and auto_cfg["outbounds"]:
+                        cfg["outbounds"] = list(auto_cfg["outbounds"])
                     if auto_cfg.get("burstObservatory"):
                         cfg["burstObservatory"] = auto_cfg["burstObservatory"]
                     if auto_cfg.get("routing"):
                         cfg["routing"] = auto_cfg["routing"]
+                    # Fill empty template sections from auto profile
+                    for key in ("dns", "inbounds", "log", "policy", "stats"):
+                        if cfg.get(key) in (None, {}, []):
+                            if auto_cfg.get(key) not in (None, {}, []):
+                                cfg[key] = auto_cfg[key]
                 cfg = merge_core_routing_into_client_cfg(cfg, core)
                 profiles.append(cfg)
             continue
@@ -3037,33 +3126,41 @@ def _client_rules_from_core_route(r: dict, *, proxy_tags: list[str], balancer_ta
 
 
 def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
-    """Inject core balancers (type/strategy) + routes into a client Xray JSON profile.
+    """Keep Ascella cascade balancers; inject core routes; pin subjectSelector to inbound tags.
 
-    - Enabled core balancers → ``routing.balancers`` with selector = all proxy outbounds
-    - Core routes → rules; outbound ``client`` → ``direct`` (bypass VPN on device)
-    - Catch-all uses the first core balancer when present
+    Client JSON shape matches Ascella: LOOP/REROUTE cascade + leastLoad per hop.
+    Core panel balancers are **server-side**; do not flatten them into one leastPing selector.
+    Core routes with outbound ``client`` → ``direct`` (bypass VPN on device).
     """
-    if not isinstance(cfg, dict) or not isinstance(core, dict):
+    if not isinstance(cfg, dict):
         return cfg
     proxy_tags = _proxy_tags_from_client_cfg(cfg)
     if not proxy_tags:
         return cfg
-
-    client_bals = _client_balancers_from_core(core, proxy_tags)
-    bal_tags = {b["tag"] for b in client_bals}
-    primary_bal = client_bals[0]["tag"] if client_bals else ""
 
     routing = cfg.setdefault("routing", {})
     if not isinstance(routing, dict):
         routing = {}
         cfg["routing"] = routing
 
-    # Always pin subjectSelector to inbound-derived outbound tags (never stale "proxy")
-    probe = "https://www.gstatic.com/generate_204"
-    for b in (core.get("balancers") or {}).values() if isinstance(core.get("balancers"), dict) else []:
-        if isinstance(b, dict) and b.get("enabled", True) and b.get("probe_url"):
-            probe = str(b["probe_url"])
+    # Ascella cascade balancers already in cfg from xray_unified_client_config
+    bals = [b for b in (routing.get("balancers") or []) if isinstance(b, dict)]
+    bal_tags = {str(b.get("tag") or "") for b in bals if b.get("tag")}
+    primary_bal = ""
+    for b in bals:
+        if str(b.get("tag") or "") == "BAL-1":
+            primary_bal = "BAL-1"
             break
+    if not primary_bal and bals:
+        primary_bal = str(bals[0].get("tag") or "")
+
+    probe = "https://www.gstatic.com/generate_204"
+    if isinstance(core, dict):
+        for b in (core.get("balancers") or {}).values() if isinstance(core.get("balancers"), dict) else []:
+            if isinstance(b, dict) and b.get("enabled", True) and b.get("probe_url"):
+                probe = str(b["probe_url"])
+                break
+
     cfg["burstObservatory"] = {
         "subjectSelector": list(proxy_tags),
         "pingConfig": {
@@ -3076,80 +3173,49 @@ def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
         },
     }
 
-    # Drop Ascella cascade BAL-/LOOP-/REROUTE- scaffolding when using core balancers
     old_rules = [r for r in (routing.get("rules") or []) if isinstance(r, dict)]
-    if client_bals:
-        routing["balancers"] = client_bals
-        kept: list[dict] = []
-        for r in old_rules:
-            btag = str(r.get("balancerTag") or "")
-            if btag.startswith("BAL-") or str(r.get("inboundTag") or "").startswith("REROUTE"):
-                continue
-            if isinstance(r.get("inboundTag"), list) and any(
-                str(t).startswith("REROUTE") for t in r["inboundTag"]
-            ):
-                continue
-            kept.append(r)
-        old_rules = kept
-        outs = [
-            o for o in (cfg.get("outbounds") or [])
-            if not (
-                isinstance(o, dict)
-                and o.get("protocol") == "loopback"
-                and str(o.get("tag") or "").startswith("LOOP-")
-            )
-        ]
-        cfg["outbounds"] = outs
-        # refresh proxy_tags after stripping loops
-        proxy_tags = _proxy_tags_from_client_cfg(cfg)
-        cfg["burstObservatory"]["subjectSelector"] = list(proxy_tags)
-        for b in client_bals:
-            sel = [t for t in (b.get("selector") or []) if t in proxy_tags] or list(proxy_tags)
-            b["selector"] = sel
-            if b.get("fallbackTag") not in set(sel) | {"direct", "block"}:
-                b["fallbackTag"] = sel[0] if sel else "direct"
-
     core_rules: list[dict] = []
-    for r in core.get("routes") or []:
-        if not isinstance(r, dict):
-            continue
-        core_rules.extend(
-            _client_rules_from_core_route(r, proxy_tags=proxy_tags, balancer_tags=bal_tags)
-        )
+    if isinstance(core, dict):
+        for r in core.get("routes") or []:
+            if not isinstance(r, dict):
+                continue
+            core_rules.extend(
+                _client_rules_from_core_route(r, proxy_tags=proxy_tags, balancer_tags=bal_tags)
+            )
 
-    # Split: keep system DNS/block rules; drop old panel ruleTag + catch-all (re-added below)
+    # Keep cascade REROUTE rules + system rules; drop previous panel ruleTags; keep/rebuild catch-all
     head: list[dict] = []
+    has_catch = False
     for r in old_rules:
         if r.get("ruleTag"):
-            continue  # previous core-route injection
+            continue
+        is_reroute = isinstance(r.get("inboundTag"), list) and any(
+            str(t).startswith("REROUTE") for t in (r.get("inboundTag") or [])
+        )
         is_catch = (
-            (r.get("balancerTag") and not r.get("domain") and not r.get("ip") and not r.get("protocol")
-             and not r.get("port") and r.get("network") in ("tcp,udp", "tcp", "udp", None, ""))
-            or (
-                r.get("outboundTag") in set(proxy_tags)
-                and r.get("network") == "tcp,udp"
-                and not r.get("domain")
-                and not r.get("ip")
-                and not r.get("protocol")
-            )
+            not is_reroute
+            and r.get("balancerTag")
+            and not r.get("domain") and not r.get("ip") and not r.get("protocol")
+            and not r.get("port")
+            and r.get("network") in ("tcp,udp", "tcp", "udp", None, "")
         )
         if is_catch:
+            has_catch = True
             continue
         head.append(r)
-    tail_default: list[dict] = []
 
+    tail: list[dict] = []
     if primary_bal:
-        tail_default.append({
-            "type": "field", "network": "tcp,udp", "balancerTag": primary_bal,
-        })
+        tail.append({"type": "field", "network": "tcp,udp", "balancerTag": primary_bal})
     elif proxy_tags:
-        tail_default.append({
-            "type": "field", "network": "tcp,udp", "outboundTag": proxy_tags[0],
-        })
+        tail.append({"type": "field", "network": "tcp,udp", "outboundTag": proxy_tags[0]})
+    elif has_catch:
+        pass
 
-    routing["rules"] = head + core_rules + tail_default
-    if client_bals:
-        routing["balancers"] = client_bals
+    # Insert core bypass rules before catch-all (after system + cascade hooks)
+    routing["rules"] = head + core_rules + tail
+    if bals:
+        routing["balancers"] = bals
     return cfg
 
 
@@ -3166,12 +3232,23 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
     cid = str((core or {}).get("id") or "")
     title = core_sub_remark(core, fallback="profile")
 
+    master_hosts: set[str] = set()
+    try:
+        import nodes as nodes_mod
+        master_hosts = nodes_mod.master_public_domains(store)
+    except Exception:
+        master_hosts = set()
+
     eps: list[dict] = []
     for ib in (core.get("inbounds") or []):
         if not isinstance(ib, dict) or not ib.get("enabled", True):
             continue
         try:
-            ib_use = dict(ib)
+            # Prefer node-remapped inbound (full Reality/TLS) when core is on a Direct node
+            _host, core_ib, _node = _direct_node_host_for_inbound(store, ib, master_hosts)
+            ib_use = dict(core_ib or ib)
+            if cid and not ib_use.get("_core_id"):
+                ib_use["_core_id"] = cid
             # Force public host placeholder; keep per-inbound port/SNI/Reality keys.
             ib_use["share_host"] = MAGIC_HOST
             ident = {"uuid": MAGIC_UUID, "email": MAGIC_EMAIL, "password": MAGIC_PASS}
@@ -3181,7 +3258,7 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
                 continue
             ep["address"] = MAGIC_HOST
             ep["_core_id"] = cid
-            ep["_inbound_tag"] = str(ib_use.get("tag") or "")
+            ep["_inbound_tag"] = str(ib.get("tag") or ib_use.get("tag") or "")
             if ep.get("uuid"):
                 ep["uuid"] = MAGIC_UUID
             if ep.get("password"):
@@ -3198,15 +3275,16 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
                 break
     if isinstance(client, dict) and eps:
         live_by_tag: dict[str, dict] = {}
-        for e in client_endpoints(store, client):
+        # Use all core inbounds (not client checkboxes) so new inbounds get filled too
+        for e in _client_endpoints_for_core_custom(store, client, core):
             tag = str(e.get("_inbound_tag") or "")
-            if tag and (not cid or (e.get("_core_id") or "") == cid):
+            if tag:
                 live_by_tag.setdefault(tag, e)
         for ep in eps:
             live = live_by_tag.get(str(ep.get("_inbound_tag") or ""))
             if not live:
                 continue
-            for k in ("sni", "pbk", "sid", "spx", "fp", "flow", "path", "host", "alpn", "mode"):
+            for k in ("sni", "pbk", "sid", "spx", "fp", "flow", "path", "host", "alpn", "mode", "encryption"):
                 if not ep.get(k) and live.get(k):
                     ep[k] = live[k]
 

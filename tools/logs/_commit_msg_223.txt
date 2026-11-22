@@ -1,0 +1,4 @@
+## v2.2.3 — Ascella cascade Custom JSON + Apply auto-regen + correct node host
+
+Custom JSON / ?format=json again matches Ascella: LOOP/REROUTE leastLoad cascade,
+all core inbounds as outbounds, correct Direct-node host, Apply auto-regens template.
