@@ -1,0 +1,790 @@
+// L2X Panel — нормализованная целевая модель PostgreSQL
+// Источник истины сегодня: store.json + admins.json + settings_versions/
+ // Paste into https://dbdiagram.io
+//
+// Принцип: ничего из текущего JSON-store не теряем.
+// Core slices — собственные копии (снимок), не FK на master inbounds
+// (inherit_master=false хранит независимый конфиг ядра).
+
+Project l2x_panel {
+  database_type: 'PostgreSQL'
+  Note: 'Целевая нормализованная модель v2.2. Runtime пока JSON. Surrogate UUID PK. Email — уникальный бизнес-ключ.'
+}
+
+// ═══════════════════════════════════════════
+// Админы (сейчас admins.json)
+// ═══════════════════════════════════════════
+
+Table admins {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  legacy_id       varchar [unique, note: 'token_urlsafe id из admins.json']
+  username        varchar [unique, not null]
+  password_hash   varchar [not null, note: 'bcrypt']
+  created_at      timestamptz [default: `now()`]
+  updated_at      timestamptz [default: `now()`]
+}
+
+Table admin_sessions {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  admin_id        uuid [ref: > admins.id, not null]
+  token_hash      varchar [unique, not null]
+  created_at      timestamptz [default: `now()`]
+  expires_at      timestamptz [not null]
+  last_seen       timestamptz
+  ip              inet
+  user_agent      text
+}
+
+// ═══════════════════════════════════════════
+// Клиенты
+// ═══════════════════════════════════════════
+
+Table clients {
+  id                  uuid [pk, default: `gen_random_uuid()`]
+  email               varchar [unique, not null, note: 'логин / идентичность']
+  uuid                uuid [not null, unique, note: 'базовый VLESS/VMess id']
+  password_enc        varchar [note: 'шифр. пароль Trojan/SS (сейчас plaintext в JSON)']
+  enabled             boolean [default: true]
+  sub_token           varchar [unique, note: '/sub/{token}']
+  link_token          varchar [note: 'косметический /u-<token>']
+  group_id            uuid [ref: > groups.id]
+  ib_mode             varchar [note: 'all | select']
+  select_mode         varchar [note: 'all | select']
+  outbound            varchar [note: 'default outbound tag']
+  limit_bytes         bigint [default: 0, note: 'было limit_gb → байты']
+  daily_limit_bytes   bigint [default: 0]
+  expire_at           timestamptz
+  start_on_first_use  boolean [default: false]
+  duration_days       int [default: 0]
+  reset_period        varchar [note: 'empty | daily | weekly | monthly']
+  next_reset          timestamptz
+  renew_on_reset      boolean [default: false]
+  on_expire           varchar [note: 'block|disable|delete|renew']
+  on_quota            varchar [note: 'block|disable|delete|renew']
+  limit_ip            int [default: 0]
+  limit_hwid          int [default: 0]
+  comment             text
+  tg_id               varchar
+  tg_username         varchar
+  tg_first_name       varchar
+  tg_last_name        varchar
+  tg_fio              varchar
+  sub_enabled         boolean [default: true]
+  doh_enabled         boolean [default: false]
+  doh_in_tunnel       boolean [default: false]
+  doh_token           varchar
+  wg_private_enc      varchar
+  wg_public           varchar
+  wg_ip               varchar
+  wg_index            int [default: 0]
+  first_connected_at  timestamptz [note: 'для start_on_first_use']
+  last_online         timestamptz
+  created_at          timestamptz [default: `now()`]
+  updated_at          timestamptz [default: `now()`]
+}
+
+Table client_inbounds {
+  client_id     uuid [ref: > clients.id, not null]
+  inbound_tag   varchar [ref: > inbounds.tag, not null]
+
+  Indexes {
+    (client_id, inbound_tag) [pk]
+  }
+  Note: 'clients.inbounds[] при ib_mode=select'
+}
+
+Table client_allowed_tags {
+  client_id     uuid [ref: > clients.id, not null]
+  outbound_tag  varchar [not null]
+
+  Indexes {
+    (client_id, outbound_tag) [pk]
+  }
+  Note: 'clients.allowed_tags[] при select_mode=select'
+}
+
+Table client_hwids {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  client_id     uuid [ref: > clients.id, not null]
+  hwid          varchar [not null, note: 'X-HWID или fp:app|os|model']
+  kind          varchar [note: 'hwid | device | ua']
+  first_seen    timestamptz
+  last_seen     timestamptz
+  ua            text
+  device_os     varchar
+  device_model  varchar
+
+  Indexes {
+    (client_id, hwid) [unique]
+  }
+}
+
+Table client_ips {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  client_id     uuid [ref: > clients.id, not null]
+  ip            inet [not null]
+  first_seen    timestamptz
+  last_seen     timestamptz
+
+  Indexes {
+    (client_id, ip) [unique]
+  }
+  Note: 'clients.ips map'
+}
+
+Table client_outbound_limits {
+  client_id     uuid [ref: > clients.id, not null]
+  outbound_tag  varchar [not null]
+  limit_bytes   bigint [not null]
+
+  Indexes {
+    (client_id, outbound_tag) [pk]
+  }
+  Note: 'clients.outbound_limits'
+}
+
+Table client_daily_outbound_limits {
+  client_id     uuid [ref: > clients.id, not null]
+  outbound_tag  varchar [not null]
+  limit_bytes   bigint [not null]
+
+  Indexes {
+    (client_id, outbound_tag) [pk]
+  }
+  Note: 'clients.daily_outbound_limits'
+}
+
+Table client_traffic {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  client_id       uuid [ref: > clients.id, not null]
+  period_start    timestamptz [not null]
+  period_end      timestamptz
+  upload_bytes    bigint [default: 0]
+  download_bytes  bigint [default: 0]
+  is_daily        boolean [default: false, note: 'daily bucket vs lifetime']
+  reset           boolean [default: false]
+  Note: 'traffic.up/down + daily. Партиционировать по period_start'
+
+  Indexes {
+    (client_id, period_start, is_daily)
+  }
+}
+
+Table client_traffic_by_email {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  client_id       uuid [ref: > clients.id, not null]
+  identity_email  varchar [not null, note: 'email~TAG identity в Xray stats']
+  upload_bytes    bigint [default: 0]
+  download_bytes  bigint [default: 0]
+  updated_at      timestamptz [default: `now()`]
+
+  Indexes {
+    (client_id, identity_email) [unique]
+  }
+  Note: 'traffic.by_email — не теряем разбивку по identity'
+}
+
+Table client_tag_exceeded {
+  client_id     uuid [ref: > clients.id, not null]
+  outbound_tag  varchar [not null]
+  exceeded_at   timestamptz
+  is_daily      boolean [default: false]
+
+  Indexes {
+    (client_id, outbound_tag, is_daily) [pk]
+  }
+  Note: 'tag_exceeded / daily_tag_exceeded'
+}
+
+// ═══════════════════════════════════════════
+// Группы
+// ═══════════════════════════════════════════
+
+Table groups {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  legacy_id     varchar [unique, note: 'старый g_…']
+  name          varchar [not null]
+  comment       text
+  ib_mode       varchar [note: 'all | select']
+  select_mode   varchar
+  outbound      varchar
+  created_at    timestamptz [default: `now()`]
+  updated_at    timestamptz [default: `now()`]
+}
+
+Table group_inbounds {
+  group_id      uuid [ref: > groups.id, not null]
+  inbound_tag   varchar [ref: > inbounds.tag, not null]
+
+  Indexes {
+    (group_id, inbound_tag) [pk]
+  }
+}
+
+Table group_allowed_tags {
+  group_id      uuid [ref: > groups.id, not null]
+  outbound_tag  varchar [not null]
+
+  Indexes {
+    (group_id, outbound_tag) [pk]
+  }
+}
+
+// ═══════════════════════════════════════════
+// Master network: inbounds / outbounds / routes / balancers
+// ═══════════════════════════════════════════
+
+Table inbounds {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  tag              varchar [unique, not null]
+  remark           varchar
+  country          varchar(2) [note: 'ISO → флаг в подписке']
+  enabled          boolean [default: true]
+  listen           varchar
+  port             int
+  protocol         varchar [note: 'vless|vmess|trojan|ss|hysteria|…']
+  share_host       varchar
+  outbound         varchar [note: 'legacy bind']
+  total_bytes      bigint [default: 0]
+  expire_at        timestamptz
+  traffic_reset    varchar
+  settings         jsonb [note: 'flow, ss_method, reality keys…']
+  stream           jsonb [note: 'network, security, tls/reality/ws…']
+  sniffing         jsonb
+  fallbacks        jsonb
+  external_proxies jsonb
+  created_at       timestamptz [default: `now()`]
+  updated_at       timestamptz [default: `now()`]
+  Note: 'store.inbounds[] — live master'
+}
+
+Table inbound_traffic {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  inbound_id      uuid [ref: > inbounds.id, not null]
+  period_start    timestamptz [not null]
+  upload_bytes    bigint [default: 0]
+  download_bytes  bigint [default: 0]
+  last_up         bigint [default: 0]
+  last_down       bigint [default: 0]
+
+  Indexes {
+    (inbound_id, period_start)
+  }
+}
+
+Table outbounds_custom {
+  tag               varchar [pk]
+  remark            varchar
+  country           varchar(2)
+  enabled           boolean [default: true]
+  in_subscription   boolean [default: false]
+  kind              varchar [note: 'proxy|node|local_direct|master_egress|…']
+  node_id           uuid [ref: > nodes.id, note: 'если outbound = нода']
+  config            jsonb [note: 'полный Xray outbound']
+  last_test         jsonb
+  tg_high_loss      boolean
+  pia_reconnected_at timestamptz
+  Note: 'store.outbounds_custom[]'
+}
+
+Table outbound_probe_history {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  outbound_tag    varchar [ref: > outbounds_custom.tag, not null]
+  probed_at       timestamptz [not null]
+  ok              boolean
+  rtt_ms          int
+  loss_pct        float
+  error           text
+
+  Indexes {
+    (outbound_tag, probed_at)
+  }
+  Note: 'outbounds_custom[].probe_history'
+}
+
+Table outbound_traffic {
+  outbound_tag    varchar [pk, note: 'tag или balancer']
+  upload_bytes    bigint [default: 0]
+  download_bytes  bigint [default: 0]
+  last_up         bigint [default: 0]
+  last_down       bigint [default: 0]
+  updated_at      timestamptz [default: `now()`]
+  Note: 'store.outbound_traffic{}'
+}
+
+Table routes {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  name          varchar
+  enabled       boolean [default: true]
+  outbound      varchar [note: 'tag или balancer']
+  domain        jsonb
+  ip            jsonb
+  port          varchar
+  network       varchar
+  protocol      jsonb
+  inbound_tag   jsonb
+  source        jsonb
+  user          jsonb
+  sort_order    int [default: 0]
+  Note: 'store.routes[]'
+}
+
+Table balancers {
+  key              varchar [pk, note: 'least_ping|least_load|random|custom']
+  tag              varchar [unique]
+  enabled          boolean [default: true]
+  strategy         varchar [note: 'leastPing|leastLoad|random']
+  members          jsonb [note: 'outbound tags[]']
+  probe_url        varchar
+  probe_interval   varchar
+  fallback         varchar
+  label            varchar
+  sub_direct_pool  boolean [default: false]
+  expected         int
+  max_rtt          varchar
+  tolerance        float
+  Note: 'store.balancers{}'
+}
+
+Table dns {
+  id      int [pk, default: 1]
+  config  jsonb [note: 'store.dns']
+}
+
+Table xray_settings {
+  id                  int [pk, default: 1]
+  stats_user_online   boolean
+  log_level           varchar
+  access_log          boolean
+  dns_log             boolean
+  template_patch      jsonb
+  Note: 'store.xray_settings'
+}
+
+Table reverse {
+  id        int [pk, default: 1]
+  bridges   jsonb
+  portals   jsonb
+  Note: 'store.reverse'
+}
+
+// ═══════════════════════════════════════════
+// Cores — снимки (не теряем независимые slices)
+// ═══════════════════════════════════════════
+
+Table cores {
+  id                       uuid [pk, default: `gen_random_uuid()`]
+  legacy_id                varchar [unique, note: 'core_…']
+  name                     varchar [not null]
+  remark                   varchar
+  engine                   varchar [default: 'xray']
+  inherit_master           boolean [default: false]
+  is_default               boolean [default: false]
+  sort_order               int [default: 0]
+  exclude_inbound_tags     jsonb
+  fallbacks_inbound_tags   jsonb
+  config                   jsonb [note: 'advanced overlay / PasarGuard config']
+  sub_custom_json          boolean [default: false]
+  sub_custom_json_template text
+  dns                      jsonb [note: 'core-local dns snapshot']
+  xray_settings            jsonb [note: 'core-local xray_settings snapshot']
+  created_at               timestamptz [default: `now()`]
+  updated_at               timestamptz [default: `now()`]
+  Note: 'store.cores[]. При inherit_master slices пустые / не используются'
+}
+
+// Полные копии inbound ядра (могут отличаться от master)
+Table core_inbounds {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  core_id          uuid [ref: > cores.id, not null]
+  tag              varchar [not null]
+  remark           varchar
+  country          varchar(2)
+  enabled          boolean [default: true]
+  listen           varchar
+  port             int
+  protocol         varchar
+  share_host       varchar
+  settings         jsonb
+  stream           jsonb
+  sniffing         jsonb
+  fallbacks        jsonb
+  external_proxies jsonb
+  sort_order       int [default: 0]
+
+  Indexes {
+    (core_id, tag) [unique]
+  }
+  Note: 'cores[].inbounds[] — snapshot, НЕ FK на master'
+}
+
+Table core_outbounds {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  core_id           uuid [ref: > cores.id, not null]
+  tag               varchar [not null]
+  remark            varchar
+  country           varchar(2)
+  enabled           boolean [default: true]
+  in_subscription   boolean
+  config            jsonb
+
+  Indexes {
+    (core_id, tag) [unique]
+  }
+  Note: 'cores[].outbounds_custom[] snapshot'
+}
+
+Table core_routes {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  core_id       uuid [ref: > cores.id, not null]
+  name          varchar
+  enabled       boolean [default: true]
+  outbound      varchar
+  domain        jsonb
+  ip            jsonb
+  port          varchar
+  network       varchar
+  protocol      jsonb
+  inbound_tag   jsonb
+  source        jsonb
+  user          jsonb
+  sort_order    int [default: 0]
+  Note: 'cores[].routes[] snapshot'
+}
+
+Table core_balancers {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  core_id          uuid [ref: > cores.id, not null]
+  key              varchar [not null]
+  tag              varchar
+  enabled          boolean
+  strategy         varchar
+  members          jsonb
+  probe_url        varchar
+  probe_interval   varchar
+  fallback         varchar
+  label            varchar
+  sub_direct_pool  boolean
+  expected         int
+  max_rtt          varchar
+  tolerance        float
+
+  Indexes {
+    (core_id, key) [unique]
+  }
+  Note: 'cores[].balancers snapshot'
+}
+
+// ═══════════════════════════════════════════
+// Nodes
+// ═══════════════════════════════════════════
+
+Table nodes {
+  id                  uuid [pk]
+  name                varchar [not null]
+  domain              varchar
+  url                 varchar
+  token_hash          varchar [note: 'sha256 agent token']
+  enabled             boolean [default: true]
+  role                varchar [default: 'agent']
+  core_id             uuid [ref: > cores.id]
+  sync_clients        boolean [default: true]
+  sync_inbounds       boolean [default: true]
+  as_outbound         boolean [default: false]
+  direct_connect      boolean [default: false]
+  mirror              boolean [default: false]
+  user_title          varchar
+  ssh_user            varchar
+  ssh_port            int [default: 22]
+  ssh_hostkey_fp      varchar
+  base_path           varchar
+  bridge_uuid         uuid
+  bridge_path         varchar
+  rv_uuid             uuid [note: 'xray reverse identity']
+  rv_mode             boolean [default: false]
+  nat                 boolean [default: false]
+  tunnel_mode         varchar [note: 'xray_reverse | l2x_udp | empty']
+  tunnel_profile      varchar
+  tunnel_agent_id     varchar
+  master_egress_uuid  uuid
+  sync_interval_min   int [default: 0]
+  created_at          timestamptz [default: `now()`]
+  updated_at          timestamptz [default: `now()`]
+  Note: 'store.nodes[]'
+}
+
+Table node_status {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  node_id           uuid [ref: > nodes.id, not null]
+  checked_at        timestamptz [not null]
+  online            boolean
+  fail_streak       int [default: 0]
+  last_seen         timestamptz
+  last_probe        timestamptz
+  last_probe_error  text
+  last_sync         timestamptz
+  last_pull         timestamptz
+  last_error        text
+  last_ok           boolean
+  panel_version     varchar
+  xray_version      varchar
+  xray_active       boolean
+  xray_latest       varchar
+  xray_available    boolean
+  xray_checked_at   timestamptz
+  last_update       timestamptz
+
+  Indexes {
+    (node_id, checked_at)
+  }
+  Note: 'текущий статус + история проб'
+}
+
+// ═══════════════════════════════════════════
+// Settings (развёртка jsonb + legacy blob)
+// ═══════════════════════════════════════════
+
+Table settings {
+  id      int [pk, default: 1]
+  Note: 'singleton row; секции ниже — 1:1 или jsonb fallback'
+}
+
+Table settings_panel {
+  settings_id     int [pk, ref: > settings.id, default: 1]
+  title           varchar
+  session_hours   float
+  timezone        varchar
+  lang            varchar
+  theme           varchar
+  base_path       varchar
+  public_host     varchar
+  extra_hosts     jsonb
+  extra_listen    jsonb
+}
+
+Table settings_sub {
+  settings_id              int [pk, ref: > settings.id, default: 1]
+  enabled                  boolean
+  path                     varchar
+  path_aliases             jsonb
+  legacy_ports             jsonb
+  legacy_tls_ports         jsonb
+  legacy_jwt_secrets       jsonb
+  domain                   varchar
+  update_hours             int
+  title                    varchar
+  support_url              varchar
+  announce                 text
+  announce_url             varchar
+  web_page_url             varchar
+  show_page                boolean
+  sub_info_text            text
+  sub_info_color           varchar
+  sub_info_button_text     varchar
+  sub_info_button_link     varchar
+  sub_expire               boolean
+  sub_expire_button_link   varchar
+  json_fragment            text
+  json_noise               text
+  json_mux                 text
+  hwid_required            boolean
+  hwid_fallback            varchar
+  migrate_url              boolean
+  happ_provider_id         varchar
+  hide_unhealthy           boolean
+  max_loss_pct             float
+  ob_probe_sec             int
+  json_default             boolean [note: 'опционально: default format=json']
+}
+
+Table settings_nodes {
+  settings_id          int [pk, ref: > settings.id, default: 1]
+  agent_enabled        boolean
+  agent_token_hash     varchar
+  role                 varchar [note: 'master | agent']
+  agent_manual_off     boolean
+  allow_master_manage  boolean
+}
+
+Table settings_tg {
+  settings_id   int [pk, ref: > settings.id, default: 1]
+  config        jsonb [note: 'tgbot.default_settings() целиком']
+}
+
+Table settings_webhooks {
+  settings_id   int [pk, ref: > settings.id, default: 1]
+  enabled       boolean
+  secret        varchar
+  urls          jsonb
+  events        jsonb
+}
+
+Table settings_iplimit {
+  settings_id        int [pk, ref: > settings.id, default: 1]
+  ban_minutes        int
+  max_conn_per_ip    int
+}
+
+Table settings_updates {
+  settings_id          int [pk, ref: > settings.id, default: 1]
+  panel_auto_check     boolean
+  panel_interval_hours int
+  xray_auto_check      boolean
+  xray_interval_hours  int
+  xray_include_prerelease boolean
+  geo_auto             boolean
+  geo_interval_hours   int
+}
+
+Table settings_security {
+  settings_id      int [pk, ref: > settings.id, default: 1]
+  totp_enabled     boolean
+  totp_secret_enc  varchar
+  trusted_proxies  jsonb
+}
+
+Table settings_doh {
+  settings_id     int [pk, ref: > settings.id, default: 1]
+  enabled         boolean
+  path_prefix     varchar
+  upstream        varchar
+  upstream_port   int
+  pihole_web      varchar
+  pihole_password_enc varchar
+  timeout_sec     int
+}
+
+Table settings_masterdns {
+  settings_id       int [pk, ref: > settings.id, default: 1]
+  enabled           boolean
+  domain            varchar
+  ns_hostname       varchar
+  ns_ip             varchar
+  listen            varchar
+  encryption_method int
+  encryption_key_enc varchar
+  resolvers         jsonb
+  client_listen_ip  varchar
+  client_listen_port int
+  protocol_type     varchar
+}
+
+Table settings_pia {
+  settings_id         int [pk, ref: > settings.id, default: 1]
+  username            varchar
+  password_enc        varchar
+  token_enc           varchar
+  token_expires_at    timestamptz
+  auto_refresh        boolean
+  reconnect_hours     int
+  last_refresh_at     timestamptz
+  last_reconnect_at   timestamptz
+  last_error          text
+  last_ok_at          timestamptz
+}
+
+Table settings_misc {
+  settings_id   int [pk, ref: > settings.id, default: 1]
+  front         jsonb
+  meta          jsonb
+  raw_extra     jsonb [note: 'любые будущие ключи settings.* без потери']
+}
+
+Table api_tokens {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  name          varchar
+  token_hash    varchar [unique, not null]
+  created_at    timestamptz [default: `now()`]
+  last_used_at  timestamptz
+  scopes        jsonb
+  Note: 'settings.api_tokens[]'
+}
+
+Table geo_custom {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  name          varchar [unique, not null]
+  url           varchar
+  kind          varchar [note: 'geosite|geoip|…']
+  meta          jsonb
+  Note: 'settings.geo_custom[]'
+}
+
+// ═══════════════════════════════════════════
+// Операционка / аудит / события
+// ═══════════════════════════════════════════
+
+Table ip_bans {
+  ip            inet [pk]
+  until         timestamptz
+  reason        text
+  hits          int [default: 1]
+  created_at    timestamptz [default: `now()`]
+  Note: 'store.ip_bans'
+}
+
+Table ip_ban_stats {
+  ip            inet [pk]
+  hits          int [default: 0]
+  last_hit      timestamptz
+  meta          jsonb
+  Note: 'store.ip_ban_stats'
+}
+
+Table panel_events {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  kind          varchar [not null, note: 'node|outbound|client|quota|…']
+  payload       jsonb [not null]
+  created_at    timestamptz [default: `now()`]
+  notified      boolean [default: false]
+  Note: 'store._events[] (эфемерные → персистентные)'
+}
+
+Table settings_versions {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  version       varchar [unique, note: 'имя файла / id версии']
+  section       varchar
+  note          text
+  actor         varchar
+  state         jsonb [not null, note: 'canonical_state snapshot']
+  created_at    timestamptz [default: `now()`]
+  Note: 'settings_versions/ + index.json'
+}
+
+Table audit_log {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  entity        varchar [not null]
+  entity_id     varchar
+  action        varchar [not null]
+  actor         varchar
+  changes       jsonb
+  created_at    timestamptz [default: `now()`]
+
+  Indexes {
+    (entity, entity_id, created_at)
+  }
+}
+
+Table panel_update_state {
+  id      int [pk, default: 1]
+  data    jsonb
+}
+
+Table xray_update_state {
+  id      int [pk, default: 1]
+  data    jsonb
+}
+
+Table host_metrics {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  recorded_at   timestamptz [not null]
+  cpu_pct       float
+  mem_pct       float
+  disk_pct      float
+  net_rx        bigint
+  net_tx        bigint
+  extra         jsonb
+  Note: 'history.json (sysmon) — минутная история'
+  Indexes {
+    recorded_at
+  }
+}
