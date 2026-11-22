@@ -317,7 +317,77 @@ def ensure_inbound_shape(ib: dict) -> dict:
         ib["sniffing"].setdefault(k, v)
     for k, v in base["traffic"].items():
         ib["traffic"].setdefault(k, v)
+    # Reality + TCP/raw without flow → Vision (required for Happ / XTLS clients)
+    if (
+        proto == "vless"
+        and (st.get("security") or "") == "reality"
+        and (st.get("network") or "raw") in ("raw", "tcp")
+    ):
+        s = ib.setdefault("settings", {})
+        if not str(s.get("flow") or "").strip():
+            s["flow"] = "xtls-rprx-vision"
     return ib
+
+
+# Camouflage hosts for Reality SNI passthrough (nginx maps one SNI → one port).
+REALITY_CAMOUFLAGE: list[tuple[str, str]] = [
+    ("www.cloudflare.com", "www.cloudflare.com:443"),
+    ("www.microsoft.com", "www.microsoft.com:443"),
+    ("www.samsung.com", "www.samsung.com:443"),
+    ("www.apple.com", "www.apple.com:443"),
+    ("dl.google.com", "dl.google.com:443"),
+    ("www.googletagmanager.com", "www.googletagmanager.com:443"),
+    ("gateway.icloud.com", "gateway.icloud.com:443"),
+    ("www.cloudflarestatus.com", "www.cloudflarestatus.com:443"),
+    ("cdnjs.cloudflare.com", "cdnjs.cloudflare.com:443"),
+    ("www.amazon.com", "www.amazon.com:443"),
+]
+
+
+def resolve_reality_sni_conflicts(inbounds: list | None) -> list[str]:
+    """Deduplicate Reality front SNIs so nginx can publish every inbound on :443.
+
+    Mutates conflicting inbounds (later ones get the next free camouflage host).
+    Returns human-readable notes (empty if nothing changed).
+    """
+    notes: list[str] = []
+    used: dict[str, str] = {}
+    for ib in inbounds or []:
+        if not isinstance(ib, dict) or not ib.get("enabled", True):
+            continue
+        if front_mode(ib) != "sni":
+            continue
+        st = ib.get("stream") or {}
+        if (st.get("security") or "") != "reality":
+            continue
+        ensure_inbound_shape(ib)
+        r = (ib.get("stream") or {}).setdefault("reality", {})
+        names = [str(n).strip().lower() for n in (r.get("server_names") or []) if str(n).strip()]
+        if not names:
+            continue
+        primary = names[0]
+        if primary not in used:
+            used[primary] = str(ib.get("tag") or "?")
+            continue
+        # Conflict with an earlier inbound — pick next free camouflage
+        new_name = ""
+        new_dest = ""
+        for cand_name, cand_dest in REALITY_CAMOUFLAGE:
+            if cand_name.lower() not in used:
+                new_name, new_dest = cand_name, cand_dest
+                break
+        if not new_name:
+            # Exhausted pool — synthesize a distinct microsoft subdomain-style name
+            new_name = f"www.msftconnecttest-{secrets.token_hex(2)}.com"
+            new_dest = f"{new_name}:443"
+        old = primary
+        r["server_names"] = [new_name]
+        r["dest"] = new_dest
+        used[new_name.lower()] = str(ib.get("tag") or "?")
+        notes.append(
+            f"{ib.get('tag')}: Reality SNI «{old}» занят ({used.get(old, '?')}) → «{new_name}»"
+        )
+    return notes
 
 
 # ---------------------------------------------------------------- keys / secrets

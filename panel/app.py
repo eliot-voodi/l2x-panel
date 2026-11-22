@@ -8526,9 +8526,15 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                     return go(back)
                 if is_new:
                     ibs.append(ib)
-                    flash(request, f"Inbound {ib.get('tag')} добавлен", "info")
+                # Unique Reality SNI per inbound (nginx :443 can only map one port per SNI)
+                sni_fix = P.resolve_reality_sni_conflicts(ibs)
+                if is_new:
+                    msg = f"Inbound {ib.get('tag')} добавлен"
                 else:
-                    flash(request, f"Inbound {ib.get('tag')} сохранён", "info")
+                    msg = f"Inbound {ib.get('tag')} сохранён"
+                if sni_fix:
+                    msg += " · " + "; ".join(sni_fix[:2])
+                flash(request, msg, "info")
             else:
                 flash(request, "Неизвестное действие", "error")
         elif tab == "outbounds":
@@ -8796,6 +8802,7 @@ async def cores_apply(core_id: str, request: Request):
         return go("/cores")
     tab = str(request.query_params.get("tab") or "general").strip().lower()
     back = _core_back(core_id, tab)
+    sni_notes: list[str] = []
 
     with mutate(edit_core_id="", history_section="cores", history_note="core apply") as store:
         cores_mod.ensure_cores(store)
@@ -8822,6 +8829,7 @@ async def cores_apply(core_id: str, request: Request):
             return go(back)
         snap = cores_mod.snapshot_slices(store, core)
         cores_mod.remember_applied(core, snap)
+        sni_notes = list(check.get("sni_notes") or [])
         # Auto-rebuild Custom JSON from all core inbounds (Ascella cascade + routes)
         try:
             tmpl = xray.build_core_custom_json_template(store, core)
@@ -8853,11 +8861,17 @@ async def cores_apply(core_id: str, request: Request):
         if not xr.get("ok"):
             flash(request, f"Конфиг ядра OK, но Xray мастера: {xr.get('error')}", "error")
             return go(back)
+    extra = ""
+    if sni_notes:
+        extra = " · SNI: " + "; ".join(sni_notes[:3])
+        if len(sni_notes) > 3:
+            extra += "…"
     flash(
         request,
         f"Ядро «{core.get('name')}» применено (xray -test OK)"
         + (f", sync {ok_n}/{len(nodes)} нод" if nodes else "")
-        + (", Custom JSON обновлён" if core.get("sub_custom_json") else ""),
+        + (", Custom JSON обновлён" if core.get("sub_custom_json") else "")
+        + extra,
         "info",
     )
     return go(back)

@@ -1,0 +1,3 @@
+## v2.2.5 — Reality SNI conflict fix (second inbound was unreachable)
+
+Auto-resolve duplicate Reality SNIs so nginx can publish every inbound; fill empty Vision flow.

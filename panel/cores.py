@@ -738,25 +738,32 @@ def remember_applied(core: dict, snap: dict) -> None:
 def validate_and_build(store: dict, core: dict) -> dict:
     """Build Xray JSON for this core and run ``xray run -test``.
 
-    Returns ``{ok, error, cfg?}``. Does not touch live master config file on failure.
+    Returns ``{ok, error, cfg?, sni_notes?}``. Does not touch live master config file on failure.
     """
+    sni_notes: list[str] = []
+    if not core.get("inherit_master"):
+        try:
+            import protocols as P
+            sni_notes = P.resolve_reality_sni_conflicts(core.get("inbounds") or [])
+        except Exception:
+            sni_notes = []
     errs = validate_core_slices(core if not core.get("inherit_master") else {
         **core,
         "inbounds": store.get("inbounds") or [],
         "outbounds_custom": store.get("outbounds_custom") or [],
     })
     if errs:
-        return {"ok": False, "error": "; ".join(errs[:6])}
+        return {"ok": False, "error": "; ".join(errs[:6]), "sni_notes": sni_notes}
     try:
         import xray_runtime as xray
     except Exception as exc:
-        return {"ok": False, "error": f"xray_runtime: {exc}"}
+        return {"ok": False, "error": f"xray_runtime: {exc}", "sni_notes": sni_notes}
     # Fake node view so build uses core slices
     view = store_view_for_node(store, {"core_id": core.get("id"), "id": "_validate"})
     try:
         cfg = xray.build_config(view)
     except Exception as exc:
-        return {"ok": False, "error": f"build_config: {exc}"}
+        return {"ok": False, "error": f"build_config: {exc}", "sni_notes": sni_notes}
     test = xray.test_config(cfg)
     # Drop temp file if any
     try:
@@ -766,5 +773,5 @@ def validate_and_build(store: dict, core: dict) -> dict:
     except Exception:
         pass
     if not test.get("ok"):
-        return {"ok": False, "error": test.get("error") or "xray -test failed", "cfg": cfg}
-    return {"ok": True, "error": "", "cfg": cfg}
+        return {"ok": False, "error": test.get("error") or "xray -test failed", "cfg": cfg, "sni_notes": sni_notes}
+    return {"ok": True, "error": "", "cfg": cfg, "sni_notes": sni_notes}
