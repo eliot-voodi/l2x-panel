@@ -345,7 +345,7 @@
       <div class="mt">{{ m.check('enabled', b.enabled, 'Включён') }}</div>
       <label class="f">Название (в панели)</label>
       <input name="label" value="{{ b.label or '' }}" maxlength="80" placeholder="для себя">
-      <div class="hint">Балансировщик не показывается пользователям в подписке — только как outbound в правилах маршрутизации.</div>
+      <div class="hint">В Custom JSON / Happ: strategy и тип этого балансировщика попадают в клиентский профиль (selector = все inbound ядра). В обычной base64-подписке не виден.</div>
       {% if key != 'random' %}
       <div class="row">
         <div><label class="f">Probe URL</label><input name="probe_url" value="{{ b.probe_url or '' }}"></div>
@@ -427,8 +427,9 @@
     <h3>JSON-подписка для этого ядра</h3>
     <div class="hint">
       В подписке (Happ / <code>?format=json</code>) каждое ядро — <b>один профиль</b>.
-      Кнопка ниже собирает <b>все inbound этого ядра</b> в outbounds + leastPing.
-      При включённом Custom JSON Happ получает JSON автоматически (не base64-ссылки).
+      Генерация: все inbound → outbounds; <b>балансировщики ядра</b> (leastPing/leastLoad/random) и
+      <b>правила маршрутизации</b>. Outbound <code>client</code> в маршрутах → <code>direct</code> у клиента (обход VPN).
+      При включённом Custom JSON Happ получает JSON автоматически.
     </div>
     <div class="actions mt">
       <form method="post" action="{{ bp }}/cores/{{ core.id }}/subjson-generate" style="display:inline">

@@ -1373,8 +1373,19 @@ def ensure_reverse_front_inbound(store: dict) -> dict | None:
     return shape
 
 
+# Route outbound «client»: only for subscription JSON — maps to freedom/direct on the phone.
+# Server Xray skips these rules (traffic already arrived via VPN).
+CLIENT_BYPASS_OUTBOUND = "client"
+CLIENT_BYPASS_ALIASES = frozenset({"client", "client_direct", "client-bypass", "bypass_vpn"})
+
+
+def is_client_bypass_outbound(tag: str | None) -> bool:
+    t = str(tag or "").strip().lower()
+    return t in CLIENT_BYPASS_ALIASES
+
+
 def all_outbound_tags(store: dict) -> list[str]:
-    tags = ["direct", "block"]
+    tags = ["direct", CLIENT_BYPASS_OUTBOUND, "block"]
     try:
         import nodes as nodes_mod
         tags.append(nodes_mod.MASTER_EGRESS_TAG)
@@ -1395,6 +1406,8 @@ def outbound_label(store: dict, tag: str) -> str:
         return balancer_display_label(store, b, tag=tag)
     if tag in BALANCER_LABELS:
         return BALANCER_LABELS[tag]
+    if is_client_bypass_outbound(tag):
+        return "📱 Client — обход VPN (direct у клиента)"
     if tag == "direct":
         return "🏠 Direct"
     if tag in ("master", "master_egress"):
@@ -1433,6 +1446,8 @@ def normalize_outbound_tag(tag: str | None) -> str:
     low = t.lower()
     if low in ("block", "blocked", "blackhole", "deny", "reject"):
         return "block"
+    if low in CLIENT_BYPASS_ALIASES:
+        return CLIENT_BYPASS_OUTBOUND
     if low in ("direct", "freedom", "passthrough"):
         return "direct"
     if low in ("master", "master_egress", "panel"):
@@ -1449,6 +1464,9 @@ def _route_target(store: dict, tag: str, *, known_outbounds: set[str] | None = N
     watchdog apply. Dead members are handled by Xray observatory + ``fallbackTag``.
     """
     tag = normalize_outbound_tag(tag)
+    if is_client_bypass_outbound(tag):
+        # Server: treat as direct only if somehow emitted; preferred path is skip in _rule_from_route
+        return {"outboundTag": "direct"}
     # On master, "master" means local freedom (panel IP). On Direct agents a real
     # master_egress dial outbound is present in known_outbounds.
     if tag in ("master", "master_egress"):
@@ -2807,6 +2825,7 @@ def client_json_subscription_profiles(
                 auto_cfg = P.xray_unified_client_config(
                     eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
                 )
+                auto_cfg = merge_core_routing_into_client_cfg(auto_cfg, core)
                 auto_obs = [
                     o for o in (auto_cfg.get("outbounds") or [])
                     if isinstance(o, dict) and o.get("protocol") not in ("freedom", "blackhole", "dns", "loopback")
@@ -2824,17 +2843,17 @@ def client_json_subscription_profiles(
             except Exception:
                 cfg = None
             if isinstance(cfg, dict):
-                # Always pin flagged title — Happ reads remarks for the flag icon
                 cfg["remarks"] = title
+                # Live-apply core balancers + routes (client → direct bypass)
+                cfg = merge_core_routing_into_client_cfg(cfg, core)
                 profiles.append(cfg)
             continue
 
         try:
-            profiles.append(
-                P.xray_unified_client_config(
-                    eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
-                )
+            cfg = P.xray_unified_client_config(
+                eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
             )
+            profiles.append(merge_core_routing_into_client_cfg(cfg, core if isinstance(core, dict) else None))
         except Exception:
             for e in eps:
                 try:
@@ -2849,6 +2868,243 @@ def client_json_subscription_profiles(
     if len(profiles) == 1 and not any_custom:
         return profiles[0]
     return profiles
+
+
+def _proxy_tags_from_client_cfg(cfg: dict) -> list[str]:
+    tags: list[str] = []
+    for o in cfg.get("outbounds") or []:
+        if not isinstance(o, dict):
+            continue
+        if o.get("protocol") in ("freedom", "blackhole", "dns", "loopback"):
+            continue
+        tag = str(o.get("tag") or "").strip()
+        if tag:
+            tags.append(tag)
+    return tags
+
+
+def _client_balancers_from_core(core: dict, proxy_tags: list[str]) -> list[dict]:
+    """Build Happ/Xray client balancers from core balancer settings (strategy + type)."""
+    if not proxy_tags:
+        return []
+    bals_src = core.get("balancers") if isinstance(core.get("balancers"), dict) else {}
+    out: list[dict] = []
+    # Prefer least_ping → least_load → random → others
+    order = ["least_ping", "least_load", "random"] + [
+        k for k in bals_src.keys() if k not in ("least_ping", "least_load", "random")
+    ]
+    seen: set[str] = set()
+    for key in order:
+        b = bals_src.get(key)
+        if not isinstance(b, dict) or not b.get("enabled", True):
+            continue
+        tag = str(b.get("tag") or "").strip() or f"lb_{key}"
+        if tag in seen:
+            continue
+        seen.add(tag)
+        strategy = str(b.get("strategy") or "").strip()
+        if strategy not in ("leastPing", "leastLoad", "random"):
+            strategy = {
+                "least_ping": "leastPing",
+                "least_load": "leastLoad",
+                "random": "random",
+            }.get(key, "leastPing")
+        entry: dict[str, Any] = {
+            "tag": tag,
+            "selector": list(proxy_tags),
+            "strategy": {"type": strategy},
+        }
+        if strategy == "leastLoad":
+            entry["strategy"]["settings"] = {
+                "expected": max(1, int(b.get("expected") or 1)),
+                "maxRTT": str(b.get("max_rtt") or "1s"),
+                "tolerance": float(b.get("tolerance") if b.get("tolerance") not in (None, "") else 0.15),
+            }
+        fb = str(b.get("fallback") or "direct").strip()
+        if fb and fb not in ("none", ""):
+            entry["fallbackTag"] = "direct" if fb in ("direct", "block") or fb not in proxy_tags else fb
+        else:
+            entry["fallbackTag"] = proxy_tags[0]
+        out.append(entry)
+    return out
+
+
+def _client_rules_from_core_route(r: dict, *, proxy_tags: list[str], balancer_tags: set[str]) -> list[dict]:
+    """Panel route → client JSON routing rules (``client`` outbound → direct)."""
+    if not r.get("enabled", True):
+        return []
+    target = normalize_outbound_tag(r.get("outbound") or r.get("outbound_tag") or "direct")
+    if is_client_bypass_outbound(target):
+        dest: dict[str, Any] = {"outboundTag": "direct"}
+    elif target in balancer_tags:
+        dest = {"balancerTag": target}
+    elif target == "block":
+        dest = {"outboundTag": "block"}
+    elif target == "direct":
+        dest = {"outboundTag": "direct"}
+    elif target in proxy_tags:
+        dest = {"outboundTag": target}
+    else:
+        # Server-only outbound (node/custom) — on client send via primary balancer or first proxy
+        if balancer_tags:
+            dest = {"balancerTag": next(iter(balancer_tags))}
+        elif proxy_tags:
+            dest = {"outboundTag": proxy_tags[0]}
+        else:
+            dest = {"outboundTag": "direct"}
+
+    base: dict[str, Any] = {"type": "field", **dest}
+    for key, xkey in (("protocol", "protocol"),):
+        val = r.get(key)
+        if not val:
+            continue
+        vals = val if isinstance(val, list) else [val]
+        if vals:
+            base[xkey] = vals
+    for key, xkey in (("network", "network"), ("port", "port")):
+        if r.get(key):
+            base[xkey] = str(r[key])
+
+    raw_domain = r.get("domain") or []
+    raw_ip = r.get("ip") or []
+    if not isinstance(raw_domain, list):
+        raw_domain = [raw_domain]
+    if not isinstance(raw_ip, list):
+        raw_ip = [raw_ip]
+    raw_domain = [_normalize_route_domain(v) for v in raw_domain if v]
+    raw_ip = [v for v in raw_ip if v]
+    # Keep geosite/geoip as-is for client (Happ ships geo assets)
+    domain_vals = [v for v in raw_domain if v]
+    ip_vals = [v for v in raw_ip if v]
+
+    arms: list[dict[str, Any]] = []
+    if domain_vals:
+        arms.append({"domain": domain_vals})
+    if ip_vals:
+        arms.append({"ip": ip_vals})
+    if not arms:
+        if any(k in base for k in ("protocol", "network", "port")):
+            arms.append({})
+        else:
+            return []
+
+    tag_base = re.sub(r"[^A-Za-z0-9_.-]", "_", str(r.get("name") or ""))[:56] if r.get("name") else ""
+    out: list[dict] = []
+    for i, arm in enumerate(arms):
+        rule = {**base, **arm}
+        if tag_base:
+            rule["ruleTag"] = tag_base if len(arms) == 1 else f"{tag_base}_{i + 1}"[:64]
+        out.append(rule)
+    return out
+
+
+def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
+    """Inject core balancers (type/strategy) + routes into a client Xray JSON profile.
+
+    - Enabled core balancers → ``routing.balancers`` with selector = all proxy outbounds
+    - Core routes → rules; outbound ``client`` → ``direct`` (bypass VPN on device)
+    - Catch-all uses the first core balancer when present
+    """
+    if not isinstance(cfg, dict) or not isinstance(core, dict):
+        return cfg
+    proxy_tags = _proxy_tags_from_client_cfg(cfg)
+    if not proxy_tags:
+        return cfg
+
+    client_bals = _client_balancers_from_core(core, proxy_tags)
+    bal_tags = {b["tag"] for b in client_bals}
+    primary_bal = client_bals[0]["tag"] if client_bals else ""
+
+    routing = cfg.setdefault("routing", {})
+    if not isinstance(routing, dict):
+        routing = {}
+        cfg["routing"] = routing
+
+    # Drop Ascella cascade BAL-/LOOP-/REROUTE- scaffolding when using core balancers
+    old_rules = [r for r in (routing.get("rules") or []) if isinstance(r, dict)]
+    if client_bals:
+        routing["balancers"] = client_bals
+        kept: list[dict] = []
+        for r in old_rules:
+            btag = str(r.get("balancerTag") or "")
+            if btag.startswith("BAL-") or str(r.get("inboundTag") or "").startswith("REROUTE"):
+                continue
+            # Strip loopback-only cascade hooks
+            if isinstance(r.get("inboundTag"), list) and any(
+                str(t).startswith("REROUTE") for t in r["inboundTag"]
+            ):
+                continue
+            kept.append(r)
+        old_rules = kept
+        # Remove loopback outbounds used only by Ascella cascade
+        outs = [
+            o for o in (cfg.get("outbounds") or [])
+            if not (
+                isinstance(o, dict)
+                and o.get("protocol") == "loopback"
+                and str(o.get("tag") or "").startswith("LOOP-")
+            )
+        ]
+        cfg["outbounds"] = outs
+        # Observatory / burstObservatory for leastPing
+        probe = "https://www.gstatic.com/generate_204"
+        for b in (core.get("balancers") or {}).values():
+            if isinstance(b, dict) and b.get("enabled", True) and b.get("probe_url"):
+                probe = str(b["probe_url"])
+                break
+        cfg["burstObservatory"] = {
+            "subjectSelector": list(proxy_tags),
+            "pingConfig": {
+                "destination": probe,
+                "httpMethod": "GET",
+                "interval": "1m",
+                "sampling": 1,
+                "timeout": "5s",
+            },
+        }
+
+    core_rules: list[dict] = []
+    for r in core.get("routes") or []:
+        if not isinstance(r, dict):
+            continue
+        core_rules.extend(
+            _client_rules_from_core_route(r, proxy_tags=proxy_tags, balancer_tags=bal_tags)
+        )
+
+    # Split: keep system DNS/block rules; drop old panel ruleTag + catch-all (re-added below)
+    head: list[dict] = []
+    for r in old_rules:
+        if r.get("ruleTag"):
+            continue  # previous core-route injection
+        is_catch = (
+            (r.get("balancerTag") and not r.get("domain") and not r.get("ip") and not r.get("protocol")
+             and not r.get("port") and r.get("network") in ("tcp,udp", "tcp", "udp", None, ""))
+            or (
+                r.get("outboundTag") in set(proxy_tags)
+                and r.get("network") == "tcp,udp"
+                and not r.get("domain")
+                and not r.get("ip")
+                and not r.get("protocol")
+            )
+        )
+        if is_catch:
+            continue
+        head.append(r)
+    tail_default: list[dict] = []
+
+    if primary_bal:
+        tail_default.append({
+            "type": "field", "network": "tcp,udp", "balancerTag": primary_bal,
+        })
+    elif proxy_tags:
+        tail_default.append({
+            "type": "field", "network": "tcp,udp", "outboundTag": proxy_tags[0],
+        })
+
+    routing["rules"] = head + core_rules + tail_default
+    if client_bals:
+        routing["balancers"] = client_bals
+    return cfg
 
 
 def build_core_custom_json_template(store: dict, core: dict, *, client: dict | None = None) -> str:
@@ -2909,6 +3165,7 @@ def build_core_custom_json_template(store: dict, core: dict, *, client: dict | N
                     ep[k] = live[k]
 
     cfg = P.xray_unified_client_config(eps, remarks=title)
+    cfg = merge_core_routing_into_client_cfg(cfg, core)
     text = json.dumps(cfg, ensure_ascii=False, indent=2)
     text = text.replace(MAGIC_UUID, "{{uuid}}")
     text = text.replace(MAGIC_HOST, "{{host}}")
@@ -3101,10 +3358,14 @@ def _rule_from_route(store: dict, r: dict, *, known_outbounds: set[str] | None =
 
     Xray ANDs attributes on one rule. Panel UI treats domain and IP as alternative
     match arms (OR) — emit separate rules when both are set, sharing other filters.
+
+    Outbound ``client`` is subscription-only (bypass VPN on phone) — skipped on server.
     """
     if not r.get("enabled", True):
         return []
     target = r.get("outbound") or r.get("outbound_tag") or "direct"
+    if is_client_bypass_outbound(target):
+        return []
     base: dict[str, Any] = {"type": "field", **_route_target(store, target, known_outbounds=known_outbounds)}
     for key, xkey in (("user", "user"), ("protocol", "protocol"),
                       ("source", "source"), ("inbound_tags", "inboundTag")):

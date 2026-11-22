@@ -4,6 +4,10 @@
   <div><label class="f">Outbound</label>
     <select name="outbound">{% for tag in outbounds %}<option value="{{ tag }}">{{ outbound_label(store, tag) }}</option>{% endfor %}</select></div>
 </div>
+<div class="hint">
+  <b>Client</b> — трафик в Custom JSON / Happ уходит <code>direct</code> (обход VPN на устройстве).
+  На сервере такое правило не применяется.
+</div>
 {{ m.check('enabled', True, 'Включено') }}
 <div class="row">
   <div><label class="f">Домены (по строке)</label>
