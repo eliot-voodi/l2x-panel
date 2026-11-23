@@ -40,9 +40,3 @@
 {% macro flabel(text, required=false) -%}
 <label class="f">{{ text }}{% if required %} <span class="req" title="обязательное поле">*</span>{% endif %}</label>
 {%- endmacro %}
-
-{% macro finput(name, value='', required=false, type='text', **kwargs) -%}
-<input name="{{ name }}" type="{{ type }}" value="{{ value }}"
-  {% if required %}required aria-required="true"{% endif %}
-  {% for k, v in kwargs.items() if v is not none %}{{ k|replace('_','-') }}="{{ v }}" {% endfor %}>
-{%- endmacro %}
