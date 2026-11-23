@@ -1974,11 +1974,9 @@ def endpoint_to_clash(ep: dict) -> dict | None:
             opts["v2ray-http-upgrade"] = True
         p["ws-opts"] = opts
     elif net == "grpc":
-        grpc_opts: dict[str, Any] = {"grpc-service-name": ep.get("service_name") or ""}
-        # Optional authority / Host for gRPC (nginx Path fronts often set Host=share domain)
-        if ep.get("host"):
-            grpc_opts["grpc-authority"] = ep["host"]
-        p["grpc-opts"] = grpc_opts
+        # Only documented Mihomo field — unknown keys (e.g. grpc-authority) can make
+        # some Meta builds skip the whole proxy on load.
+        p["grpc-opts"] = {"grpc-service-name": ep.get("service_name") or ""}
     sec = ep.get("security")
     if sec in ("tls", "reality"):
         p["tls"] = True

@@ -2886,17 +2886,33 @@ def _sub_response(request: Request, token: str) -> Response:
             headers["new-url"] = new_url
     fmt = (request.query_params.get("format") or "").lower()
     ua = (request.headers.get("user-agent") or "").lower()
-    accept = request.headers.get("accept") or ""
+    accept = (request.headers.get("accept") or "").lower()
     if not fmt:
-        if "clash" in ua or "mihomo" in ua or "stash" in ua:
+        # Clash/Mihomo family (YAML). Prefer this over json_default — Xray JSON profiles
+        # are for Happ; Mihomo cannot load them and converters often drop VLESS encryption.
+        if (
+            "clash" in ua
+            or "mihomo" in ua
+            or "stash" in ua
+            or "metacubex" in ua
+            or "flare.x" in ua
+            or "flclash" in ua
+        ):
             fmt = "clash"
         elif "sing-box" in ua or "sfa" in ua or "sfi" in ua:
             fmt = "singbox"
-        elif "happ" in ua or bool(s.get("json_default")):
-            # Happ expects full Xray JSON profiles (Ascella / Custom JSON), not base64 links
+        elif "happ" in ua:
+            # Happ expects full Xray JSON profiles (Ascella / Custom JSON)
             fmt = "json"
         elif xray.client_prefers_json_sub(store, client):
             fmt = "json"
+        elif bool(s.get("json_default")) and not any(
+            x in ua for x in ("go-http-client", "curl/", "wget/", "python-requests", "axios")
+        ):
+            # json_default is for human/VPN apps — not generic HTTP clients / converters
+            fmt = "json"
+        elif "text/yaml" in accept or "application/yaml" in accept:
+            fmt = "clash"
         elif "text/html" in accept and s.get("show_page", True) and "mozilla" in ua:
             fmt = "html"
     eps = xray.client_endpoints(store, client, s.get("domain") or None)
@@ -2979,9 +2995,17 @@ def _sub_response(request: Request, token: str) -> Response:
         body = json.dumps(payload, ensure_ascii=False, indent=2)
         return Response(body, media_type="application/json", headers=headers)
     if fmt == "clash":
+        cfg = P.clash_config(eps, doh_url=doh_url, doh_in_tunnel=doh_tunnel)
+        # Quote VLESS encryption — long mlkem/x25519 strings must stay intact for Mihomo
+        for prox in cfg.get("proxies") or []:
+            if isinstance(prox, dict) and prox.get("encryption"):
+                prox["encryption"] = str(prox["encryption"])
         body = yaml.safe_dump(
-            P.clash_config(eps, doh_url=doh_url, doh_in_tunnel=doh_tunnel),
-            allow_unicode=True, sort_keys=False,
+            cfg,
+            allow_unicode=True,
+            sort_keys=False,
+            width=10_000,
+            default_style=None,
         )
         headers["content-disposition"] = f'attachment; filename="{filename}.yaml"'
         return Response(body, media_type="text/yaml; charset=utf-8", headers=headers)
