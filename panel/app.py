@@ -2897,6 +2897,12 @@ def _sub_response(request: Request, token: str) -> Response:
             or "metacubex" in ua
             or "flare.x" in ua
             or "flclash" in ua
+            or "verge" in ua
+            or "koala" in ua
+            or "party" in ua
+            or "sparkle" in ua
+            or "shellcrash" in ua
+            or "prizrakbox" in ua
         ):
             fmt = "clash"
         elif "sing-box" in ua or "sfa" in ua or "sfi" in ua:

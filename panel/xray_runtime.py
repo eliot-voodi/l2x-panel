@@ -2678,16 +2678,25 @@ def _direct_connect_endpoint_host(store: dict, tag: str) -> tuple[str, dict | No
 
 
 def _apply_cosmetic_path(store: dict, client: dict, ib: dict, ep: dict) -> None:
-    """Swap subscription path to per-user /u-… (nginx rewrites to the real inbound path)."""
-    if not ep:
-        return
-    net = str(ep.get("net") or ((ib.get("stream") or {}).get("network") or ""))
-    if P.front_mode(ib) != "http" or net not in ("ws", "httpupgrade", "xhttp"):
-        return
-    real = str(ep.get("path") or P.front_http_path(ib) or "/")
-    _base, sep, query = real.partition("?")
-    cosmetic = client_cosmetic_path(store, client, ib)
-    ep["path"] = f"{cosmetic}?{query}" if sep and query else cosmetic
+    """Swap subscription path to per-user /u-… (nginx rewrites to the real inbound path).
+
+    Currently a no-op: agents without ``_location_user_path`` in front.py return 404
+    on ``/u-…`` while the real inbound path (e.g. ``/ws``) works. Restore the body
+    below once every path-node panel stages the cosmetic rewrite location.
+    """
+    _ = (store, client, ib, ep)
+    return
+    # --- restore when agents ≥ rewrite support ---
+    # if not ep:
+    #     return
+    # net = str(ep.get("net") or ((ib.get("stream") or {}).get("network") or ""))
+    # if P.front_mode(ib) != "http" or net not in ("ws", "httpupgrade", "xhttp"):
+    #     return
+    # real = str(ep.get("path") or P.front_http_path(ib) or "/")
+    # _base, sep, query = real.partition("?")
+    # cosmetic = client_cosmetic_path(store, client, ib)
+    # ep["path"] = f"{cosmetic}?{query}" if sep and query else cosmetic
+
 
 
 def _core_id_for_inbound(store: dict, ib: dict) -> str:

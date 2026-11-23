@@ -1311,7 +1311,7 @@ def _stream_params(ep: dict) -> dict:
     if sec in ("tls", "reality"):
         if ep.get("sni"):
             p["sni"] = ep["sni"]
-        p["fp"] = ep.get("fp") or "firefox"
+        p["fp"] = ep.get("fp") or ("chrome" if sec == "reality" else "firefox")
     if sec == "tls":
         if ep.get("alpn"):
             p["alpn"] = ep["alpn"]
@@ -1322,6 +1322,8 @@ def _stream_params(ep: dict) -> dict:
         if ep.get("sid"):
             p["sid"] = ep["sid"]
         p["spx"] = ep.get("spx") or "/"
+        # Never advertise hybrid ML-KEM in share links — RU DPI blocks that hello;
+        # Mihomo also ignores the query param today. Keep classical ClientHello.
     return p
 
 
@@ -2009,13 +2011,26 @@ def endpoint_to_clash(ep: dict) -> dict | None:
         p["tls"] = True
         if ep.get("sni"):
             p["servername" if proto != "trojan" else "sni"] = ep["sni"]
-        p["client-fingerprint"] = ep.get("fp") or "firefox"
+        # Reality on Xray ≥26.9.8: Mihomo needs chrome + support-x25519mlkem768,
+        # otherwise REALITY Authentication: false. (Classical-only pin to ≤26.7.28
+        # still fails Mihomo in practice; Xray clients are fine either way.)
+        if sec == "reality":
+            fp = (ep.get("fp") or "chrome").strip().lower()
+            if fp in ("firefox", "edge", "qq", "random", "ios", ""):
+                fp = "chrome"
+            p["client-fingerprint"] = fp
+        else:
+            p["client-fingerprint"] = ep.get("fp") or "firefox"
         if ep.get("alpn"):
             p["alpn"] = ep["alpn"].split(",")
         if ep.get("allow_insecure"):
             p["skip-cert-verify"] = True
     if sec == "reality":
-        p["reality-opts"] = {"public-key": ep.get("pbk") or "", "short-id": ep.get("sid") or ""}
+        p["reality-opts"] = {
+            "public-key": ep.get("pbk") or "",
+            "short-id": ep.get("sid") or "",
+            "support-x25519mlkem768": True,
+        }
     return p
 
 
@@ -2036,6 +2051,8 @@ def clash_config(endpoints: list[dict], *, doh_url: str = "", doh_in_tunnel: boo
         "allow-lan": False,
         "mode": "rule",
         "log-level": "warning",
+        # Force clients to re-fetch often so Reality ML-KEM flags are not stuck in cache
+        "profile-update-interval": 1,
         "proxies": proxies,
         "proxy-groups": [
             {"name": "PROXY", "type": "select", "proxies": ["AUTO", *names]},
