@@ -168,10 +168,11 @@
 </section>
 
 {# ===================== INBOUNDS ===================== #}
+{% set core_ib_next = '/cores/' ~ core.id ~ '?tab=inbounds' %}
 <section class="core-panel {% if core_tab == 'inbounds' %}active{% endif %}" data-panel="inbounds">
   <div class="card-head" style="margin-bottom:.75rem">
     <h3 style="margin:0">Входящие</h3>
-    <button type="button" class="btn sm js-ib-add">{{ ic.icon('plus') }}Добавить</button>
+    <a class="btn sm" href="{{ bp }}/inbounds/new?next={{ core_ib_next|urlencode }}">{{ ic.icon('plus') }}Добавить</a>
   </div>
   <div class="card" style="padding:0">
     <div class="table-wrap">
@@ -182,12 +183,16 @@
           <tr {% if i.enabled is defined and not i.enabled %}style="opacity:.5"{% endif %}>
             <td class="mono"><b>{% if i.country %}{{ flag_emoji(i.country) }} {% endif %}{{ i.tag }}</b>{% if i.remark %}<div class="dim small">{{ i.remark }}</div>{% endif %}</td>
             <td>{{ i.port or '—' }}</td>
-            <td class="small">{{ i.protocol or '—' }}</td>
+            <td class="small">{{ i.protocol or '—' }}
+              {% if not i.direct and (i.stream.security or 'none') == 'none' and (i.stream.network or '') in ('ws','grpc','httpupgrade','xhttp') %}
+              <span class="badge ok" title="В ссылке клиента: security=tls, :443 через nginx">nginx→tls</span>
+              {% elif i.direct %}<span class="badge">direct</span>{% endif %}
+            </td>
             <td>{% if i.enabled is not defined or i.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
-                <button type="button" class="btn ghost icon js-ib-edit" title="Изменить"
-                        data-id="{{ i.id }}">{{ ic.icon('edit') }}</button>
+                <a class="btn ghost icon" title="Изменить (полные настройки)"
+                   href="{{ bp }}/inbounds/{{ i.id }}/edit?next={{ core_ib_next|urlencode }}">{{ ic.icon('edit') }}</a>
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/inbounds/toggle">
                   <input type="hidden" name="id" value="{{ i.id }}">
                   <button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button>
@@ -207,7 +212,7 @@
       </table>
     </div>
   </div>
-  <div class="hint">После добавления/правки нажмите <b>Применить</b> вверху страницы.</div>
+  <div class="hint">Создание и правка — полная форма inbound (nginx / Reality / WS / uTLS и т.д.). Без «Напрямую на порт» в ссылке клиента подставляется <code>security=tls</code> на :443. После правок нажмите <b>Применить</b>.</div>
 </section>
 
 {# ===================== OUTBOUNDS ===================== #}
@@ -952,10 +957,6 @@ function openCoreRouteEdit(r) {
   });
 
   document.addEventListener('click', function (e) {
-    var ibAdd = e.target.closest('.js-ib-add');
-    if (ibAdd) { e.preventDefault(); openCoreInbound(); return; }
-    var ibEdit = e.target.closest('.js-ib-edit');
-    if (ibEdit) { e.preventDefault(); openCoreInbound(ibEdit.getAttribute('data-id')); return; }
     var obAdd = e.target.closest('.js-ob-add');
     if (obAdd) { e.preventDefault(); openCoreOutbound(); return; }
     var obEdit = e.target.closest('.js-ob-edit');

@@ -3346,6 +3346,14 @@ def _core_inbound_form_patch(form, ib: dict, *, is_new: bool = False) -> str | N
     cc = str(form.get("country") or "").strip().upper()
     ib["country"] = cc if re.fullmatch(r"[A-Z]{2}", cc) else ""
     ib["enabled"] = form.get("enabled") == "1"
+    # Via nginx when "direct" unchecked — client links get security=tls via endpoint_for
+    if "direct" in form or is_new:
+        ib["direct"] = form.get("direct") == "1"
+    ib["listen"] = P.inbound_listen(ib)
+    if "share_host" in form:
+        share = str(form.get("share_host") or "").strip().lower()
+        share = re.sub(r"^[a-z]+://", "", share).split("/", 1)[0].split(":", 1)[0]
+        ib["share_host"] = share
     ib["port"] = _int(form.get("port"), int(ib.get("port") or 0))
     if reason := xray.port_forbidden_reason(ib["port"], ib):
         return reason

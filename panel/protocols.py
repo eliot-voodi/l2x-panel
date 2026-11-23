@@ -1022,6 +1022,8 @@ def _apply_external_proxy(ep: dict, ib: dict) -> list[dict]:
     proxies = [p for p in (ib.get("external_proxies") or []) if (p.get("address") or p.get("dest"))]
     if not proxies:
         return [ep]
+    # Path via nginx: client always speaks TLS to :443 even when Xray security=none
+    nginx_tls = front_mode(ib) in ("http", "raw")
     out = []
     for i, p in enumerate(proxies):
         item = dict(ep)
@@ -1030,9 +1032,13 @@ def _apply_external_proxy(ep: dict, ib: dict) -> list[dict]:
             item["address"] = addr
         if p.get("port"):
             item["port"] = int(p["port"])
-        force = str(p.get("force_tls") or p.get("forceTls") or "").lower()
+        force = str(p.get("force_tls") or p.get("forceTls") or "").lower().strip()
         if force in ("tls", "reality"):
             item["security"] = force
+        elif force in ("none", "off", "false", "0"):
+            item["security"] = "none"
+        elif force in ("", "same") and nginx_tls and item.get("security") in (None, "", "none"):
+            item["security"] = "tls"
         remark = str(p.get("remark") or "").strip()
         if remark:
             item["remark"] = remark
@@ -1181,6 +1187,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
         # Keep explicit transport Host (ws/xhttp/httpupgrade) for client links.
         # Only fall back to the public domain when the inbound Host field is empty.
         transport_host = str(ep.get("host") or "").strip()
+        # Xray inbound uses security=none (nginx terminates TLS); client link MUST be tls.
         ep.update({
             "address": domain,
             "security": "tls",

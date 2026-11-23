@@ -449,7 +449,7 @@
 
 <div class="actions">
   <button class="btn" id="btn_save">{{ t('Сохранить') }} и применить</button>
-  <a class="btn ghost" href="{{ bp }}/inbounds">{{ t('Отмена') }}</a>
+  <a class="btn ghost" href="{{ bp }}{{ form_next or '/inbounds' }}">{{ t('Отмена') }}</a>
   {% if not is_new %}<a class="btn ghost" href="{{ bp }}/inbounds/{{ ib.id }}/export" target="_blank">Xray JSON</a>{% endif %}
 </div>
 </form>
@@ -513,7 +513,7 @@
     } else if ((sec === 'reality' || sec === 'tls')) {
       hint.textContent = 'SNI passthrough на :443. SNI Reality/TLS не должен совпадать с доменом панели. Для XHTTP+Reality security остаётся reality.';
     } else if (http) {
-      hint.innerHTML = 'Path через nginx: TLS снимает nginx, в Xray security=none. Несколько inbound на одном домене по Path.';
+      hint.innerHTML = 'Path через nginx: в Xray <code>security=none</code>, TLS снимает nginx. В <b>ссылке конфига</b> клиенту автоматически подставится <code>security=tls</code> на :443. Несколько inbound на одном домене по Path.';
     } else {
       hint.textContent = (p === 'vless' || p === 'trojan')
         ? 'raw на :443: TLS снимает Xray сертификатом публичного домена, остальное уходит в nginx (один такой inbound).'
