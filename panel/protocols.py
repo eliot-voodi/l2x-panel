@@ -1936,8 +1936,15 @@ def endpoint_to_clash(ep: dict) -> dict | None:
         p.update({"type": "vless", "uuid": ep["uuid"]})
         if ep.get("flow"):
             p["flow"] = ep["flow"]
+        # Mihomo: VLESS ML-KEM / X25519 encryption (NOT packet-encoding)
+        enc = str(ep.get("encryption") or "").strip()
+        if enc and enc.lower() != "none":
+            p["encryption"] = enc
+        # Prefer XUDP for VLESS UDP (Xray-compatible); independent of encryption
+        p["packet-encoding"] = "xudp"
     elif proto == "vmess":
         p.update({"type": "vmess", "uuid": ep["uuid"], "alterId": 0, "cipher": "auto"})
+        p["packet-encoding"] = "xudp"
     elif proto == "trojan":
         p.update({"type": "trojan", "password": ep["password"]})
     elif proto == "shadowsocks":
@@ -1957,7 +1964,7 @@ def endpoint_to_clash(ep: dict) -> dict | None:
         return None
     net = ep.get("net") or "raw"
     if net == "xhttp" or net == "kcp":
-        return None  # not supported by Mihomo
+        return None  # not supported by Mihomo (xhttp needs recent Meta; keep conservative)
     p["network"] = {"raw": "tcp", "httpupgrade": "ws"}.get(net, net)
     if net == "ws" or net == "httpupgrade":
         opts: dict[str, Any] = {"path": ep.get("path") or "/"}
@@ -1967,7 +1974,11 @@ def endpoint_to_clash(ep: dict) -> dict | None:
             opts["v2ray-http-upgrade"] = True
         p["ws-opts"] = opts
     elif net == "grpc":
-        p["grpc-opts"] = {"grpc-service-name": ep.get("service_name") or ""}
+        grpc_opts: dict[str, Any] = {"grpc-service-name": ep.get("service_name") or ""}
+        # Optional authority / Host for gRPC (nginx Path fronts often set Host=share domain)
+        if ep.get("host"):
+            grpc_opts["grpc-authority"] = ep["host"]
+        p["grpc-opts"] = grpc_opts
     sec = ep.get("security")
     if sec in ("tls", "reality"):
         p["tls"] = True
@@ -2029,8 +2040,14 @@ def endpoint_to_singbox(ep: dict) -> dict | None:
         o.update({"type": "vless", "uuid": ep["uuid"]})
         if ep.get("flow"):
             o["flow"] = ep["flow"]
+        enc = str(ep.get("encryption") or "").strip()
+        if enc and enc.lower() != "none":
+            # sing-box ≥1.12 / with VLESS encryption support
+            o["encryption"] = enc
+        o["packet_encoding"] = "xudp"
     elif proto == "vmess":
         o.update({"type": "vmess", "uuid": ep["uuid"], "security": "auto", "alter_id": 0})
+        o["packet_encoding"] = "xudp"
     elif proto == "trojan":
         o.update({"type": "trojan", "password": ep["password"]})
     elif proto == "shadowsocks":
