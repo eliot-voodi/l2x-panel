@@ -1096,7 +1096,11 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
             # Reality+TCP without flow → Vision (Ascella / Happ expect it)
             if not flow and sec == "reality" and net in ("raw", "tcp"):
                 flow = "xtls-rprx-vision"
-            ep["flow"] = flow
+            # TLS-via-nginx (security=none → client tls) must not keep stale Vision
+            if sec != "reality" and flow == "xtls-rprx-vision":
+                flow = ""
+            if flow:
+                ep["flow"] = flow
         enc = s.get("encryption") or "none"
         if enc and enc != "none":
             ep["encryption"] = enc
