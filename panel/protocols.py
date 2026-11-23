@@ -338,6 +338,32 @@ def ensure_inbound_shape(ib: dict) -> dict:
     return ib
 
 
+def _ws_path_query_keep(q: str) -> str:
+    """Keep only Mihomo/Xray-safe WS query (early-data ``ed=N``). Drop junk like ``?=foo``."""
+    q = (q or "").lstrip("?").strip()
+    if not q:
+        return ""
+    kept: list[str] = []
+    for part in q.split("&"):
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        if k == "ed" and v.isdigit():
+            kept.append(f"ed={v}")
+    return "&".join(kept)
+
+
+def sanitize_ws_path(path: str) -> str:
+    """Normalize WS/httpupgrade/xhttp path for nginx + Mihomo (no broken ``?=`` queries)."""
+    raw = str(path or "/").strip() or "/"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    base, _, q = raw.partition("?")
+    base = base.split("#", 1)[0] or "/"
+    keep = _ws_path_query_keep(q)
+    return f"{base}?{keep}" if keep else base
+
+
 def fix_http_front_path(ib: dict) -> str:
     """Ensure WS/xhttp/httpupgrade path is publishable on nginx :443. Returns new path or ''."""
     if not isinstance(ib, dict):
@@ -354,7 +380,8 @@ def fix_http_front_path(ib: dict) -> str:
         cur = str(cfg.get("service_name") or "").strip()
         path_now = front_http_path(ib)
     else:
-        cur = str(cfg.get("path") or "/").strip() or "/"
+        cur = sanitize_ws_path(str(cfg.get("path") or "/").strip() or "/")
+        cfg["path"] = cur  # drop junk queries in-place
         path_now = front_http_path(ib)
     # Collapse query-only paths like "/?=x" → "/" which is reserved
     if path_now in ("/", "") or path_now.startswith("/sub") or path_now.startswith("/api"):
@@ -363,12 +390,9 @@ def fix_http_front_path(ib: dict) -> str:
         if net == "grpc":
             cfg["service_name"] = tag[:32]
         else:
-            # Preserve user query suffix if they set one for cosmetics
-            q = ""
-            if "?" in cur:
-                q = cur.split("?", 1)[1]
+            q = _ws_path_query_keep(cur.split("?", 1)[1] if "?" in cur else "")
             cfg["path"] = f"{new_path}?{q}" if q else new_path
-        return cfg.get("path") or cfg.get("service_name") or new_path
+        return str(cfg.get("path") or cfg.get("service_name") or new_path)
     return ""
 
 
@@ -1127,7 +1151,7 @@ def endpoint_for(ib: dict, ident: dict, host: str, remark: str) -> dict | None:
             ep["path"] = raw.get("http_path") or "/"
     elif net in ("ws", "httpupgrade", "xhttp"):
         cfg = st.get(net) or {}
-        ep["path"] = cfg.get("path") or "/"
+        ep["path"] = sanitize_ws_path(cfg.get("path") or "/")
         ep["host"] = cfg.get("host") or ""
         if net == "ws":
             try:
@@ -1967,7 +1991,7 @@ def endpoint_to_clash(ep: dict) -> dict | None:
         return None  # not supported by Mihomo (xhttp needs recent Meta; keep conservative)
     p["network"] = {"raw": "tcp", "httpupgrade": "ws"}.get(net, net)
     if net == "ws" or net == "httpupgrade":
-        opts: dict[str, Any] = {"path": ep.get("path") or "/"}
+        opts: dict[str, Any] = {"path": sanitize_ws_path(ep.get("path") or "/")}
         if ep.get("host"):
             opts["headers"] = {"Host": ep["host"]}
         if net == "httpupgrade":
