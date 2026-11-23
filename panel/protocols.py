@@ -853,6 +853,19 @@ def supports_flow(ib: dict) -> bool:
 
 def build_inbound(ib: dict, identities: list[dict]) -> dict:
     """identities: [{uuid, email, password, wg_public, wg_ip, main}]"""
+    # Xray rejects duplicate emails inside one inbound
+    deduped: list[dict] = []
+    seen_em: set[str] = set()
+    for i in identities or []:
+        if not isinstance(i, dict):
+            continue
+        em = str(i.get("email") or "").strip()
+        if em and em in seen_em:
+            continue
+        if em:
+            seen_em.add(em)
+        deduped.append(i)
+    identities = deduped
     proto = ib["protocol"]
     s = ib.get("settings") or {}
     settings: dict[str, Any] = {}

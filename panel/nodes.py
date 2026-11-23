@@ -2006,7 +2006,10 @@ def _agent_safe_clients(
             c["outbound"] = self_tag
         elif ob.startswith("node_") and not keep_node and ob not in keep:
             c["outbound"] = "direct"
-        # Keep allowed_tags that still resolve; drop foreign node_* not in keep
+        # Keep allowed_tags that still resolve; drop foreign node_* not in keep.
+        # Do NOT auto-append self_tag — client_identities already registers
+        # email~node_* via settings.nodes.direct_connect_tag; appending here
+        # duplicated that identity through subscription_entries.
         if self_tag or keep:
             allowed = []
             for t in c.get("allowed_tags") or []:
@@ -2016,10 +2019,92 @@ def _agent_safe_clients(
                 if ts.startswith("node_") and not keep_node and ts not in keep:
                     continue
                 allowed.append(ts)
-            if self_tag and self_tag not in allowed:
-                allowed.append(self_tag)
             c["allowed_tags"] = allowed
         out.append(c)
+    return out
+
+
+def _email_tag_suffix(tag: str, *, index: int = 0) -> str:
+    """Safe email suffix from an inbound tag (Xray email charset)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tag or "").strip()).strip("-._")
+    if not safe:
+        safe = f"ib{index or 1}"
+    return safe[:48]
+
+
+def split_dc_clients_per_inbound(
+    store: dict,
+    clients: list[dict],
+    inbound_tags: list[str],
+) -> list[dict]:
+    """One client row per inbound on multi-inbound Direct cores.
+
+    Xray requires globally unique emails. ``client_identities`` emits the same
+    ``email~node_*`` for every inbound the client can access, so old agents
+    (without ``build_config`` uniquify) fail with
+    ``User email~node_* already exists``.
+
+    Master-side fix that works without updating agents: pin each copy to a
+    single inbound, clear ``group_id`` (groups would re-expand to all core
+    inbounds), and suffix emails for 2nd+ inbounds. Same UUID on every copy so
+    subscription auth still works on all inbounds.
+    """
+    tags = [str(t or "").strip() for t in (inbound_tags or []) if str(t or "").strip()]
+    # Preserve order, drop dups
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for t in tags:
+        tl = t.lower()
+        if tl in seen:
+            continue
+        seen.add(tl)
+        ordered.append(t)
+    if not ordered:
+        return list(clients or [])
+
+    tag_by_l = {t.lower(): t for t in ordered}
+    out: list[dict] = []
+    try:
+        import xray_runtime as xr
+    except Exception:
+        xr = None  # type: ignore
+
+    for c in clients or []:
+        if not isinstance(c, dict):
+            continue
+        c_tags: list[str]
+        if xr is not None:
+            try:
+                wanted = xr.client_effective_inbounds(store, c)
+            except Exception:
+                wanted = list(c.get("inbounds") or [])
+            if not wanted:
+                # empty = all capable — on this node that means all shipped tags
+                c_tags = list(ordered)
+            else:
+                want_l = {str(t).strip().lower() for t in wanted if str(t).strip()}
+                c_tags = [tag_by_l[tl] for tl in tag_by_l if tl in want_l]
+        else:
+            personal = [str(t).strip() for t in (c.get("inbounds") or []) if str(t).strip()]
+            if not personal:
+                c_tags = list(ordered)
+            else:
+                want_l = {t.lower() for t in personal}
+                c_tags = [tag_by_l[tl] for tl in tag_by_l if tl in want_l]
+        if not c_tags:
+            continue
+        base_email = str(c.get("email") or "").strip() or "user"
+        for i, tag in enumerate(c_tags):
+            cc = dict(c)
+            if i == 0:
+                cc["email"] = base_email
+            else:
+                cc["email"] = f"{base_email}~{_email_tag_suffix(tag, index=i)}"
+            cc["inbounds"] = [tag]
+            cc["ib_mode"] = "select"
+            # Groups grant whole cores → all inbounds; clear so personal list sticks.
+            cc["group_id"] = ""
+            out.append(cc)
     return out
 
 
@@ -2214,14 +2299,21 @@ def probe_role(node: dict, timeout: int = 10) -> dict:
 
 
 def _local_direct_outbound(node: dict) -> dict:
-    """Freedom stub on the agent so email~node_tag identities egress locally."""
+    """Freedom stub on the agent so email~node_tag identities egress locally.
+
+    ``in_sub`` must stay False: on agents ≤2.2.8, ``_agent_safe_clients`` appends
+    ``self_tag`` to ``allowed_tags``, and ``client_identities`` already registers
+    ``email~node_*`` as the Direct primary. With ``in_sub=True``,
+    ``subscription_entries`` would emit the same email again → Xray
+    ``User … already exists`` (even on a single-inbound core).
+    """
     tag = node_outbound_tag(node)
     return {
         "tag": tag,
         "remark": node_user_title(node),
         "kind": "local_direct",
         "enabled": True,
-        "in_sub": True,
+        "in_sub": False,
         "info": "direct connect",
         "country": (node.get("country") or "")[:2].upper(),
         "config": {
@@ -2336,6 +2428,16 @@ def build_payload(store: dict, node: dict, build_config) -> dict:
                     cc["inbounds"] = [t for t in ibs if str(t) not in excl]
                 cleaned.append(cc)
             clients = cleaned
+    # Direct multi-inbound: split clients so old agents don't emit duplicate emails
+    if dc and not mirror and not nat:
+        ship_tags = [
+            str(i.get("tag") or "").strip()
+            for i in inbounds
+            if isinstance(i, dict) and str(i.get("tag") or "").strip()
+            and str(i.get("tag") or "") not in _SYSTEM_INBOUND_TAGS
+        ]
+        if len(ship_tags) > 1:
+            clients = split_dc_clients_per_inbound(store, clients, ship_tags)
     if dc:
         customs = [o for o in customs if o.get("tag") not in (self_tag, MASTER_EGRESS_TAG)]
         customs.append(_local_direct_outbound(node))
@@ -2478,6 +2580,23 @@ def build_clients_sync_payload(store: dict, node: dict, build_config=None) -> di
             keep_tags=keep_tags,
             direct_self_tag=self_tag if dc else "",
         )
+    # Same split as full apply — clients-only must not reintroduce duplicate emails
+    if dc and not mirror and not nat:
+        ship_tags: list[str] = []
+        try:
+            import cores as cores_mod
+            cores_mod.ensure_cores(store)
+            view = cores_mod.store_view_for_node(store, node)
+            ship_tags = [
+                str(i.get("tag") or "").strip()
+                for i in (view.get("inbounds") or [])
+                if isinstance(i, dict) and str(i.get("tag") or "").strip()
+                and str(i.get("tag") or "") not in _SYSTEM_INBOUND_TAGS
+            ]
+        except Exception:
+            ship_tags = []
+        if len(ship_tags) > 1:
+            clients = split_dc_clients_per_inbound(store, clients, ship_tags)
     bridge_clients: list[dict] = []
     bridge_on = bool(node.get("as_outbound")) and not uses_reverse(node) and not uses_l2x_tunnel(node) and not nat
     if bridge_on:

@@ -2578,22 +2578,35 @@ def client_identities(store: dict, client: dict, ib: dict) -> list[dict]:
     elif self_tag and _is_direct_connect_tag(store, self_tag):
         primary_tag = self_tag
     out: list[dict] = []
+    seen_emails: set[str] = set()
     if primary_tag:
         ident_uuid = P.identity_uuid(client["uuid"], primary_tag)
+        node_email = f"{client['email']}~{primary_tag}"
         out.append({
             "uuid": ident_uuid,
-            "email": f"{client['email']}~{primary_tag}",
+            "email": node_email,
             "password": P.derived_password(ident_uuid),
             "main": True,
             "tag": primary_tag,
             "label": outbound_label(store, primary_tag),
         })
+        seen_emails.add(node_email)
         # Always keep the base UUID too (legacy clients / Russia-style profiles).
         out.append(dict(main))
+        seen_emails.add(str(main.get("email") or ""))
     else:
         out.append(main)
+        seen_emails.add(str(main.get("email") or ""))
     for e in subscription_entries(store, client):
+        em = str(e.get("email") or "")
+        # Skip duplicate of Direct primary identity (allowed_tags often re-lists self_tag)
+        if em and em in seen_emails:
+            continue
+        if primary_tag and str(e.get("tag") or "") == primary_tag:
+            continue
         out.append({"uuid": e["uuid"], "email": e["email"], "password": e["password"], "main": False, "tag": e["tag"], "label": e["label"]})
+        if em:
+            seen_emails.add(em)
     return out
 
 
@@ -3780,14 +3793,46 @@ def build_config(store: dict) -> dict:
     # Match by tag (case-insensitive), not object identity — core views / agent
     # copies are different dicts with the same tag.
     client_ib_tags = {id(c): client_inbound_tags(store, c) for c in active_clients}
+    # Xray requires unique emails across ALL inbounds. Multi-inbound cores
+    # (e.g. Buharest+yandex+vk) would otherwise repeat email~node_* and fail to start.
+    used_emails: set[str] = set()
+
+    def _unique_identity(ident: dict, ib_tag: str) -> dict:
+        em = str(ident.get("email") or "").strip()
+        if not em:
+            return ident
+        if em not in used_emails:
+            used_emails.add(em)
+            return ident
+        out = dict(ident)
+        tag = str(ib_tag or "ib").strip() or "ib"
+        base = em
+        candidate = f"{base}~{tag}" if not base.endswith(f"~{tag}") else f"{base}~dup"
+        n = 2
+        while candidate in used_emails:
+            candidate = f"{base}~{tag}~{n}"
+            n += 1
+        out["email"] = candidate
+        used_emails.add(candidate)
+        return out
+
     for ib in inbounds_model:
         if not inbound_access_ok(ib):
             continue
-        ib_tag_l = str(ib.get("tag") or "").strip().lower()
+        ib_tag = str(ib.get("tag") or "").strip()
+        ib_tag_l = ib_tag.lower()
         identities: list[dict] = []
+        seen_local: set[str] = set()
         for c in active_clients:
             if ib_tag_l and ib_tag_l in client_ib_tags.get(id(c), set()):
-                identities.extend(client_identities(store, c, ib))
+                for raw in client_identities(store, c, ib):
+                    ident = _unique_identity(raw, ib_tag)
+                    em = str(ident.get("email") or "")
+                    if em and em in seen_local:
+                        continue
+                    if em:
+                        seen_local.add(em)
+                    identities.append(ident)
         built = P.build_inbound(ib, identities)
         # Panel routes (domain / protocol / ads / geo) need sniffing every time —
         # without it matches flap depending on whether the client dialed by IP or name.
