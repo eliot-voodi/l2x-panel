@@ -1,10 +1,5 @@
-## v2.2.13 — PasarGuard: HWID devices, limits, dates, traffic
+## v2.3.6 — Fix Mihomo Reality (Vision) + WS cosmetic paths
 
-Import from backup now also transfers:
-- ``hwid_limit`` → ``limit_hwid``
-- ``user_hwids`` (bound devices: hash, OS, model, first/last seen)
-- traffic usage (``used_traffic`` / lifetime)
-- ``created_at`` / ``updated_at`` / ``online_at``
-- ``data_limit_reset_strategy`` → ``reset_period``
-
-Re-import the PasarGuard backup to fill devices on already-migrated clients.
+- Clash/Mihomo: do **not** set `packet-encoding: xudp` with XTLS Vision — it broke all Reality nodes (delay ---)
+- Count path-inbounds across core snapshots for `/u-…` cosmetic paths (Direct cores)
+- Sanitize WS paths (from 2.3.5) kept

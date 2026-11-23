@@ -1958,14 +1958,17 @@ def endpoint_to_clash(ep: dict) -> dict | None:
     p: dict[str, Any] = {"name": ep.get("remark") or proto, "server": ep["address"], "port": ep["port"], "udp": True}
     if proto == "vless":
         p.update({"type": "vless", "uuid": ep["uuid"]})
-        if ep.get("flow"):
-            p["flow"] = ep["flow"]
+        flow = str(ep.get("flow") or "").strip()
+        if flow:
+            p["flow"] = flow
         # Mihomo: VLESS ML-KEM / X25519 encryption (NOT packet-encoding)
         enc = str(ep.get("encryption") or "").strip()
         if enc and enc.lower() != "none":
             p["encryption"] = enc
-        # Prefer XUDP for VLESS UDP (Xray-compatible); independent of encryption
-        p["packet-encoding"] = "xudp"
+        # XUDP breaks XTLS Vision in Mihomo (Reality+Vision delay/connect fail).
+        # Only enable for non-Vision VLESS.
+        if "vision" not in flow.lower():
+            p["packet-encoding"] = "xudp"
     elif proto == "vmess":
         p.update({"type": "vmess", "uuid": ep["uuid"], "alterId": 0, "cipher": "auto"})
         p["packet-encoding"] = "xudp"

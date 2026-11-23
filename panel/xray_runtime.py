@@ -2086,6 +2086,30 @@ def ensure_client_link_token(client: dict) -> str:
     return client["link_token"]
 
 
+def _iter_all_inbounds(store: dict):
+    """Master live inbounds + every core snapshot (Direct cores own their own lists)."""
+    seen: set[int] = set()
+    for ib in store.get("inbounds") or []:
+        if isinstance(ib, dict):
+            i = id(ib)
+            if i not in seen:
+                seen.add(i)
+                yield ib
+    try:
+        import cores as cores_mod
+        for core in cores_mod.ensure_cores(store) or []:
+            if not isinstance(core, dict) or core.get("inherit_master"):
+                continue
+            for ib in core.get("inbounds") or []:
+                if isinstance(ib, dict):
+                    i = id(ib)
+                    if i not in seen:
+                        seen.add(i)
+                        yield ib
+    except Exception:
+        return
+
+
 def client_cosmetic_path(store: dict, client: dict, ib: dict) -> str:
     """Unique path for the client link; nginx rewrites it to the inbound's real path.
 
@@ -2104,7 +2128,7 @@ def client_cosmetic_path(store: dict, client: dict, ib: dict) -> str:
         domain = str(ib.get("share_host") or "").strip().lower()
     # Multiple path inbounds on one host need distinct prefixes so regex locations do not clash.
     peers = 0
-    for other in store.get("inbounds") or []:
+    for other in _iter_all_inbounds(store):
         if not other.get("enabled", True) or P.front_mode(other) != "http":
             continue
         onet = ((other.get("stream") or {}).get("network") or "")
