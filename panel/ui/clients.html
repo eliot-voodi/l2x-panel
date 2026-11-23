@@ -51,17 +51,38 @@
     .clients-toolbar form { flex: 1; min-width: 0 }
     .clients-toolbar input[name=q] { width: 100% !important }
   }
+  th.sortable { white-space: nowrap }
+  th.sortable a {
+    color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: .25rem;
+  }
+  th.sortable a:hover { color: var(--accent) }
+  th.sortable .sort-ind { font-size: .7em; opacity: .45; line-height: 1 }
+  th.sortable.active .sort-ind { opacity: 1; color: var(--accent) }
 </style>
 {% endblock %}
 {% block content %}
+{% set sort = sort or 'email' %}
+{% set dir = dir or 'asc' %}
+{% macro sort_url(col) -%}
+?status={{ status }}&q={{ q|urlencode }}&sort={{ col }}&dir={% if sort == col and dir == 'asc' %}desc{% else %}asc{% endif %}
+{%- endmacro %}
+{% macro sort_th(col, label, extra_class='') -%}
+<th class="sortable {% if sort == col %}active{% endif %} {{ extra_class }}">
+  <a href="{{ sort_url(col) }}" title="Сортировка">{{ label }}
+    <span class="sort-ind">{% if sort == col %}{% if dir == 'asc' %}▲{% else %}▼{% endif %}{% else %}↕{% endif %}</span>
+  </a>
+</th>
+{%- endmacro %}
 <div class="flex between mb0 clients-toolbar" style="flex-wrap:wrap;margin-bottom:1rem">
   <div class="seg">
     {% for key, label in [('', t('Все')), ('online', t('Онлайн')), ('active', t('Активные')), ('expired', t('Истёкшие')), ('limited', t('Исчерпан')), ('daily_limited', 'День'), ('disabled', t('Отключённые'))] %}
-    <a href="?status={{ key }}&q={{ q }}" class="{% if status == key %}active{% endif %}">{{ label }}</a>
+    <a href="?status={{ key }}&q={{ q|urlencode }}&sort={{ sort }}&dir={{ dir }}" class="{% if status == key %}active{% endif %}">{{ label }}</a>
     {% endfor %}
   </div>
   <form method="get" class="flex">
     <input type="hidden" name="status" value="{{ status }}">
+    <input type="hidden" name="sort" value="{{ sort }}">
+    <input type="hidden" name="dir" value="{{ dir }}">
     <input name="q" value="{{ q }}" placeholder="{{ t('Поиск') }}: email, комментарий, uuid" style="width:min(280px,100%)">
   </form>
 </div>
@@ -88,7 +109,13 @@
   <table>
     <thead><tr>
       <th style="width:32px"><input type="checkbox" id="selall"></th>
-      <th>Клиент</th><th>{{ t('Статус') }}</th><th>Устройства</th><th>{{ t('Трафик') }}</th><th>{{ t('Срок') }}</th><th>Inbounds / outbound</th><th class="right">{{ t('Действия') }}</th>
+      {{ sort_th('email', 'Клиент') }}
+      {{ sort_th('status', t('Статус')) }}
+      {{ sort_th('devices', 'Устройства') }}
+      {{ sort_th('traffic', t('Трафик')) }}
+      {{ sort_th('expire', t('Срок')) }}
+      {{ sort_th('inbounds', 'Inbounds / outbound') }}
+      <th class="right">{{ t('Действия') }}</th>
     </tr></thead>
     <tbody>
     {% for c in items %}

@@ -3781,6 +3781,40 @@ def _client_row(store: dict, c: dict) -> dict:
     }
 
 
+_CLIENT_SORT_KEYS = ("email", "status", "devices", "traffic", "expire", "inbounds")
+_CLIENT_STATUS_RANK = {
+    "active": 0,
+    "limited": 1,
+    "daily_limited": 2,
+    "expired": 3,
+    "disabled": 4,
+}
+
+
+def _client_sort_key(row: dict, sort: str):
+    """Sortable key for clients table columns."""
+    if sort == "status":
+        online = 0 if row.get("online_ips") else 1
+        return (online, _CLIENT_STATUS_RANK.get(str(row.get("status") or ""), 9), str(row.get("status") or ""))
+    if sort == "devices":
+        return (len(row.get("hwids") or []), str(row.get("email") or "").lower())
+    if sort == "traffic":
+        return (int(row.get("used") or 0), str(row.get("email") or "").lower())
+    if sort == "expire":
+        exp = str(row.get("expire_at") or "").strip()
+        # Empty (∞) last when ascending
+        return (1 if not exp else 0, exp, str(row.get("email") or "").lower())
+    if sort == "inbounds":
+        tags = ",".join(str(t) for t in (row.get("inbound_tags") or []))
+        return (
+            str(row.get("group_name") or "").lower(),
+            tags.lower(),
+            str(row.get("email") or "").lower(),
+        )
+    # email (default) — comment as tie-breaker noise avoided
+    return (str(row.get("email") or "").lower(),)
+
+
 @app.get("/clients", response_class=HTMLResponse)
 def clients_page(request: Request):
     if redir := _require(request):
@@ -3788,6 +3822,12 @@ def clients_page(request: Request):
     store = _load_store()
     q = (request.query_params.get("q") or "").strip().lower()
     status = request.query_params.get("status") or ""
+    sort = str(request.query_params.get("sort") or "email").strip().lower()
+    if sort not in _CLIENT_SORT_KEYS:
+        sort = "email"
+    direction = str(request.query_params.get("dir") or "asc").strip().lower()
+    if direction not in ("asc", "desc"):
+        direction = "asc"
     rows = []
     for c in store["clients"]:
         row = _client_row(store, c)
@@ -3798,8 +3838,12 @@ def clients_page(request: Request):
         if status and status != "online" and row["status"] != status:
             continue
         rows.append(row)
-    return page(request, "clients.html", active="clients", items=rows, q=q, status=status, store=store,
-                total=len(store["clients"]), groups=xray.ensure_groups(store))
+    rows.sort(key=lambda r: _client_sort_key(r, sort), reverse=(direction == "desc"))
+    return page(
+        request, "clients.html", active="clients", items=rows, q=q, status=status, store=store,
+        total=len(store["clients"]), groups=xray.ensure_groups(store),
+        sort=sort, dir=direction,
+    )
 
 
 def _client_form(form, store: dict, client: dict) -> str | None:
