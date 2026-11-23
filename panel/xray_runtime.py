@@ -3779,6 +3779,42 @@ def deep_merge(base: Any, patch: Any) -> Any:
 
 # ---------------------------------------------------------------- build
 
+def _scrub_duplicate_emails(inbounds: list[dict]) -> int:
+    """Ensure every client email is unique across the whole Xray config.
+
+    Returns how many emails were rewritten. Protects against
+    ``User email~node_* already exists`` after migrations / old agents.
+    """
+    used: set[str] = set()
+    fixed = 0
+    for ib in inbounds or []:
+        if not isinstance(ib, dict):
+            continue
+        clients = (ib.get("settings") or {}).get("clients")
+        if not isinstance(clients, list):
+            continue
+        ib_tag = str(ib.get("tag") or "ib").strip() or "ib"
+        for u in clients:
+            if not isinstance(u, dict):
+                continue
+            em = str(u.get("email") or "").strip()
+            if not em:
+                continue
+            if em not in used:
+                used.add(em)
+                continue
+            base = em
+            candidate = f"{base}~{ib_tag}" if not base.endswith(f"~{ib_tag}") else f"{base}~dup"
+            n = 2
+            while candidate in used:
+                candidate = f"{base}~{ib_tag}~{n}"
+                n += 1
+            u["email"] = candidate
+            used.add(candidate)
+            fixed += 1
+    return fixed
+
+
 def build_config(store: dict) -> dict:
     ensure_balancers(store)
     inbounds_model = ensure_inbounds(store)
@@ -3993,6 +4029,12 @@ def build_config(store: dict) -> dict:
         log["access"] = str(XRAY_LOG_DIR / "access.log")
     if xs.get("dns_log"):
         log["dnsLog"] = True
+
+    # Last-resort guard: Xray rejects duplicate emails across ALL inbounds
+    # (seen after PasarGuard migrate when clients had no group → «all inbounds»
+    # and email~node_* repeated). ``_unique_identity`` above should already prevent
+    # this; scrub anything that slipped through before ``xray run -test``.
+    _scrub_duplicate_emails(inbounds)
 
     cfg: dict[str, Any] = {
         "log": log,

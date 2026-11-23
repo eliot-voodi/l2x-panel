@@ -65,6 +65,10 @@ class NormalizedUser:
         gnames = extra.get("group_names") or extra.get("groups")
         if gnames:
             d["groups"] = list(gnames)
+            d["group_names"] = list(gnames)
+        gids = extra.get("group_ids")
+        if gids:
+            d["group_ids"] = list(gids)
         return d
 
 
@@ -445,6 +449,12 @@ def apply(
 ) -> dict[str, Any]:
     """Mutate store clients in-place. Caller holds mutate() lock.
 
+    PasarGuard order (mandatory):
+      1) restore / create groups
+      2) create / update users
+      3) assign groups to users
+      4) caller applies Xray / node sync
+
     Prefer assigning an L2X ``group_id`` (from PasarGuard groups or UI fallback).
     ``inbound_tags`` kept for legacy X-UI imports without groups.
     """
@@ -456,16 +466,21 @@ def apply(
     errors: list[str] = []
     groups_created = 0
     groups_mapped = 0
-
-    # PasarGuard: recreate empty groups and map name → id
     name_to_gid: dict[str, str] = {}
     meta = LAST_SOURCE_META or {}
-    if create_source_groups and str(meta.get("source") or "").lower() == "pasarguard":
+    is_pg = create_source_groups and str(meta.get("source") or "").lower() == "pasarguard"
+
+    # ── 1) Groups first ──────────────────────────────────────────────
+    if is_pg:
+        # Re-hydrate group_names from users_groups (preview cache may have dropped them)
+        _attach_pasarguard_groups_to_users(
+            users,
+            groups=list(meta.get("groups") or []),
+            user_groups=dict(meta.get("user_groups") or {}),
+        )
         before = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
         name_to_gid = ensure_pasarguard_groups(store, meta.get("groups") or [])
-        after = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
-        groups_created = len(after - before)
-        # Also map names discovered only on users
+        # Names discovered only on users
         extra_names = []
         for u in users:
             for n in (u.extra or {}).get("group_names") or []:
@@ -473,10 +488,9 @@ def apply(
                 if name and name not in name_to_gid:
                     extra_names.append({"id": f"name:{name}", "name": name})
         if extra_names:
-            more = ensure_pasarguard_groups(store, extra_names)
-            name_to_gid.update(more)
-            after2 = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
-            groups_created = len(after2 - before)
+            name_to_gid.update(ensure_pasarguard_groups(store, extra_names))
+        after = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
+        groups_created = len(after - before)
 
     fallback_gid = str(group_id or "").strip()
     if fallback_gid and not xray.get_group(store, fallback_gid):
@@ -485,9 +499,10 @@ def apply(
     def _resolve_group_id(u: NormalizedUser) -> str:
         for n in (u.extra or {}).get("group_names") or []:
             name = str(n).strip()
+            if not name:
+                continue
             gid = name_to_gid.get(name) or ""
             if not gid:
-                # case-insensitive
                 for kn, kv in name_to_gid.items():
                     if kn.lower() == name.lower():
                         gid = kv
@@ -496,6 +511,31 @@ def apply(
                 return gid
         return fallback_gid
 
+    def _assign_group(c: dict, gid: str, *, force: bool = False) -> bool:
+        """Pin client to group; clear personal inbounds (avoids all-inbound email~node_* dups)."""
+        if not gid:
+            return False
+        if not force and str(c.get("group_id") or "").strip() == gid:
+            # Still ensure personal list is empty so group owns inbounds
+            if c.get("inbounds"):
+                c["inbounds"] = []
+                c["ib_mode"] = "all"
+                return True
+            return False
+        c["group_id"] = gid
+        c["inbounds"] = []
+        c["ib_mode"] = "all"
+        return True
+
+    # Planned group per email (phase 3 applies even if user upsert skipped)
+    planned_gid: dict[str, str] = {}
+    for u in users:
+        email = _norm_email(u.email)
+        if not email:
+            continue
+        planned_gid[email] = _resolve_group_id(u)
+
+    # ── 2) Users ─────────────────────────────────────────────────────
     for u in users:
         email = _norm_email(u.email)
         if not email:
@@ -504,7 +544,7 @@ def apply(
         # Prefer inbound tags recorded from x-ui inbound.settings.clients (legacy)
         user_tags = [t for t in ((u.extra or {}).get("inbounds") or []) if t in capable]
         use_tags = user_tags or tags
-        gid = _resolve_group_id(u)
+        gid = planned_gid.get(email) or ""
         existing = by_email.get(email)
         up_i, down_i = int(u.up or 0), int(u.down or 0)
         if existing and not update_existing:
@@ -524,13 +564,6 @@ def apply(
                 existing["source_id"] = str(u.source_id)
                 if u.source:
                     existing["source"] = str(u.source)
-                repaired = True
-            # Assign missing group from PasarGuard mapping
-            if gid and not existing.get("group_id"):
-                existing["group_id"] = gid
-                existing["inbounds"] = []
-                existing["ib_mode"] = "all"
-                groups_mapped += 1
                 repaired = True
             # Replace username-fallback tokens with minted PasarGuard tokens when available
             if (
@@ -569,12 +602,7 @@ def apply(
                     c["source_id"] = str(u.source_id)
                 if u.source:
                     c["source"] = str(u.source)
-                if gid:
-                    c["group_id"] = gid
-                    c["inbounds"] = []
-                    c["ib_mode"] = "all"
-                    groups_mapped += 1
-                elif use_tags:
+                if not gid and use_tags:
                     c["inbounds"] = list(use_tags)
                 xray.ensure_client(c)
                 _set_imported_traffic(c, up_i, down_i)
@@ -585,6 +613,8 @@ def apply(
                 payload: dict[str, Any] = {
                     "email": email,
                     "enabled": bool(u.enabled),
+                    # Group assignment in phase 3; until then avoid «all inbounds»
+                    # (that caused email~node_* dups on Direct multi-inbound cores).
                     "inbounds": [] if gid else list(use_tags),
                     "ib_mode": "all",
                     "limit_gb": float(u.limit_gb or 0),
@@ -592,7 +622,7 @@ def apply(
                     "comment": u.comment or "",
                     "tg_id": str(u.tg_id or ""),
                     "sub_enabled": True,
-                    "group_id": gid,
+                    "group_id": "",
                 }
                 if u.sub_token:
                     payload["sub_token"] = u.sub_token
@@ -614,10 +644,19 @@ def apply(
                 by_email[email] = c
                 xray.ensure_wg_peer(store, c)
                 created += 1
-                if gid:
-                    groups_mapped += 1
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{email}: {exc}")
+
+    # ── 3) Assign groups to users ────────────────────────────────────
+    for email, gid in planned_gid.items():
+        if not gid:
+            continue
+        c = by_email.get(email)
+        if not c:
+            continue
+        force = bool(update_existing)
+        if _assign_group(c, gid, force=force or not str(c.get("group_id") or "").strip()):
+            groups_mapped += 1
 
     return {
         "ok": not errors,
@@ -2090,6 +2129,29 @@ def extract_pasarguard_groups_from_sqlite(path: Path) -> dict[str, Any]:
     }
 
 
+def _ug_lookup(user_groups: dict[str, list[str]], uid: str) -> list[str]:
+    """Resolve users_groups row for a user id (str/int key variants)."""
+    if not uid:
+        return []
+    ug = user_groups or {}
+    hit = ug.get(uid)
+    if hit:
+        return list(hit)
+    # int-ish keys: "12" vs 12 serialized differently in JSON meta
+    try:
+        alt = str(int(float(uid)))
+        if alt != uid:
+            hit = ug.get(alt)
+            if hit:
+                return list(hit)
+    except (TypeError, ValueError):
+        pass
+    for k, v in ug.items():
+        if str(k).strip() == uid:
+            return list(v or [])
+    return []
+
+
 def _attach_pasarguard_groups_to_users(
     users: list[NormalizedUser],
     *,
@@ -2097,17 +2159,31 @@ def _attach_pasarguard_groups_to_users(
     user_groups: dict[str, list[str]] | None = None,
 ) -> None:
     """Fill ``extra['group_names']`` from association map / API fields."""
-    by_id = {str(g.get("id")): str(g.get("name") or "").strip() for g in (groups or []) if g.get("id") is not None}
-    ug = user_groups or {}
+    by_id: dict[str, str] = {}
+    for g in groups or []:
+        if not isinstance(g, dict) or g.get("id") is None:
+            continue
+        name = str(g.get("name") or "").strip()
+        if not name:
+            continue
+        gid = str(g.get("id"))
+        by_id[gid] = name
+        try:
+            by_id[str(int(float(gid)))] = name
+        except (TypeError, ValueError):
+            pass
+    ug = {str(k): list(v or []) for k, v in (user_groups or {}).items()}
     for u in users:
+        if not isinstance(u.extra, dict):
+            u.extra = {}
         names: list[str] = []
-        # Already set from API/JSON
+        # Already set from API/JSON / cache
         existing = u.extra.get("group_names") if isinstance(u.extra, dict) else None
         if isinstance(existing, list) and existing:
             names = [str(n).strip() for n in existing if str(n).strip()]
         else:
             uid = str(u.source_id or (u.extra or {}).get("id") or "").strip()
-            for gid in ug.get(uid) or []:
+            for gid in _ug_lookup(ug, uid):
                 name = by_id.get(str(gid)) or ""
                 if name and name not in names:
                     names.append(name)

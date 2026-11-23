@@ -4002,10 +4002,19 @@ def _migrate_cache_load() -> list:
     for item in items:
         if not isinstance(item, dict):
             continue
-        extra = {}
+        extra: dict = {}
         ibs = item.get("inbounds")
         if isinstance(ibs, list) and ibs:
             extra["inbounds"] = [str(t) for t in ibs if t]
+        # PasarGuard groups — must survive preview→import (to_dict stores as ``groups``)
+        gnames = item.get("groups") or item.get("group_names")
+        if isinstance(gnames, list) and gnames:
+            extra["group_names"] = [str(n).strip() for n in gnames if str(n).strip()]
+        gids = item.get("group_ids")
+        if isinstance(gids, list) and gids:
+            extra["group_ids"] = [str(x).strip() for x in gids if str(x).strip()]
+        elif isinstance(gids, (str, int)) and str(gids).strip():
+            extra["group_ids"] = [str(gids).strip()]
         out.append(migrate_mod.NormalizedUser(
             email=str(item.get("email") or ""),
             uuid=str(item.get("uuid") or ""),
@@ -4266,6 +4275,10 @@ async def clients_migrate_run(request: Request):
         traffic_hint = f" · трафик {xray.format_traffic(tb)}"
     if tf:
         traffic_hint += f" (восстановлен у {tf})"
+    gc = int(report.get("groups_created") or 0)
+    gm = int(report.get("groups_mapped") or 0)
+    if source == "pasarguard" or gc or gm:
+        extra += f" · групп +{gc} / назначено {gm}"
     flash(request, *_ok_msg(
         f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}"
         f"{traffic_hint}{extra}",
