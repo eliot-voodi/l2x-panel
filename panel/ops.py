@@ -1219,9 +1219,26 @@ def make_backup(data_dir: Path) -> bytes:
             counts["data"] += 1
         counts["certs"] = _add_tree_to_zip(z, CERT_DIR, "certs")
         counts["doh"] = _add_tree_to_zip(z, doh_dir(), "doh")
+        # PostgreSQL dump when L2XPANEL_DATABASE_URL is set
+        pg_ok = False
+        try:
+            dsn = (os.environ.get("L2XPANEL_DATABASE_URL") or "").strip()
+            if dsn:
+                import subprocess
+                r = subprocess.run(
+                    ["pg_dump", "--no-owner", "--no-acl", dsn],
+                    capture_output=True, timeout=120,
+                )
+                if r.returncode == 0 and r.stdout:
+                    z.writestr("postgres/l2xpanel.sql", r.stdout)
+                    pg_ok = True
+                    counts["postgres"] = 1
+        except Exception:
+            pg_ok = False
+        includes = ["data", "certs", "doh"] + (["postgres"] if pg_ok else [])
         z.writestr("_meta.json", json.dumps({
             "created": int(time.time()), "app": "l2xpanel",
-            "includes": ["data", "certs", "doh"], "counts": counts,
+            "includes": includes, "counts": counts,
         }))
     return buf.getvalue()
 

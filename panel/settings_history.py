@@ -13,9 +13,10 @@ from typing import Any
 
 HISTORY_DIR = Path(os.environ.get("L2XPANEL_DATA", "/var/lib/l2xpanel")) / "settings_versions"
 INDEX_FILE = HISTORY_DIR / "index.json"
-MAX_VERSIONS = 80
+MAX_VERSIONS = 30  # was 80 — each snapshot ~full store; keep disk small
 _LOCK = threading.RLock()
 FORMAT_V2 = 2
+_ORPHANS_PRUNED = False
 
 TRACKED_KEYS = (
     "clients",
@@ -118,7 +119,7 @@ def _load_index() -> list[dict]:
 def _save_index(items: list[dict]) -> None:
     _ensure_dir()
     tmp = INDEX_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, INDEX_FILE)
 
 
@@ -532,6 +533,42 @@ def _normalize_input(data: dict | None) -> dict:
     return {"settings": deepcopy(data)}
 
 
+def prune_orphan_snapshots() -> int:
+    """Delete snapshot files not listed in index.json. Returns removed count."""
+    global _ORPHANS_PRUNED
+    with _LOCK:
+        _ensure_dir()
+        items = _load_index()
+        keep = {str(it.get("id") or "") for it in items if it.get("id")}
+        # Also drop index entries beyond MAX_VERSIONS
+        while len(items) > MAX_VERSIONS:
+            old = items.pop()
+            oid = str(old.get("id") or "")
+            if oid:
+                keep.discard(oid)
+                _snapshot_path(oid).unlink(missing_ok=True)
+        _save_index(items)
+        removed = 0
+        try:
+            for path in HISTORY_DIR.glob("*.json"):
+                if path.name == "index.json":
+                    continue
+                # snapshot files named by id
+                stem = path.stem
+                # allow both id.json and id variants
+                vid = stem
+                if vid not in keep:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        _ORPHANS_PRUNED = True
+        return removed
+
+
 def record(
     before: dict,
     after: dict,
@@ -542,28 +579,63 @@ def record(
     note: str = "",
 ) -> dict | None:
     """Save after-state. `before`/`after` may be full store or canonical state."""
+    global _ORPHANS_PRUNED
     before_c = _normalize_input(before)
     after_c = _normalize_input(after)
     events = describe_changes(before_c, after_c)
     if not events:
         return None
     vid = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    sec = str(section or infer_section(events))
     entry = {
         "id": vid,
         "at": _now(),
         "user": str(user or ""),
         "ip": str(ip or ""),
-        "section": str(section or infer_section(events)),
+        "section": sec,
         "note": str(note or ""),
         "changes": len(events),
         "summary": summarize_events(events),
         "format": FORMAT_V2,
     }
-    payload = {"_format": FORMAT_V2, "state": after_c}
+    # For client-only edits store events summary + slim state (no full 820-client dump)
+    if sec == "clients" and len(events) <= 20:
+        slim_state = {
+            "events": events[:50],
+            "section": "clients",
+        }
+        # Keep touched client emails only
+        emails = []
+        for ev in events:
+            t = str(ev.get("target") or ev.get("id") or "")
+            if t and t not in emails:
+                emails.append(t)
+        clients_src = after_c.get("clients") if isinstance(after_c.get("clients"), list) else []
+        if emails and clients_src:
+            want = set(emails)
+            slim_clients = [
+                c for c in clients_src
+                if isinstance(c, dict) and str(c.get("email") or "") in want
+            ]
+            if slim_clients:
+                slim_state["clients"] = slim_clients
+        payload = {"_format": FORMAT_V2, "state": slim_state, "_slim": True}
+        pg_state = slim_state
+    else:
+        payload = {"_format": FORMAT_V2, "state": after_c}
+        pg_state = after_c
     with _LOCK:
+        if not _ORPHANS_PRUNED:
+            try:
+                prune_orphan_snapshots()
+            except Exception:
+                _ORPHANS_PRUNED = True
         _ensure_dir()
         path = _snapshot_path(vid)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -574,6 +646,21 @@ def record(
             old = items.pop()
             _snapshot_path(str(old.get("id") or "")).unlink(missing_ok=True)
         _save_index(items)
+    try:
+        import db as db_mod
+        if db_mod.enabled():
+            db_mod.save_history_version(
+                vid,
+                user=str(user or ""),
+                ip=str(ip or ""),
+                section=sec,
+                note=str(note or ""),
+                changes=len(events),
+                summary=str(entry.get("summary") or ""),
+                state=pg_state if isinstance(pg_state, dict) else {},
+            )
+    except Exception:
+        pass
     return entry
 
 

@@ -4587,10 +4587,25 @@ def ban_inbound_ports(store: dict) -> None:
                 _run([tool, "-I", "INPUT", "1", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"])
 
 
+_XRAY_STATUS_CACHE: dict = {"at": 0.0, "val": {}}
+
+
 def xray_status() -> dict:
+    """Cached ~2s — dashboard/pages call this often; systemctl+version is slow."""
+    import time as _time
+    now = _time.time()
+    if now - float(_XRAY_STATUS_CACHE.get("at") or 0) < 2.0 and _XRAY_STATUS_CACHE.get("val"):
+        return dict(_XRAY_STATUS_CACHE["val"])
     active = (_run(["systemctl", "is-active", "xray"])["stdout"] or "").strip()
     ver = (_run([XRAY_BIN, "version"])["stdout"] or "").splitlines()
-    return {"active": active == "active", "state": active, "version": ver[0].split()[1] if ver and len(ver[0].split()) > 1 else ""}
+    val = {
+        "active": active == "active",
+        "state": active,
+        "version": ver[0].split()[1] if ver and len(ver[0].split()) > 1 else "",
+    }
+    _XRAY_STATUS_CACHE["at"] = now
+    _XRAY_STATUS_CACHE["val"] = val
+    return dict(val)
 
 
 # ---------------------------------------------------------------- stats

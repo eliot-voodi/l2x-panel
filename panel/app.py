@@ -79,6 +79,9 @@ STARTED_AT = time.time()
 # Fail-closed when store.json is corrupt and .bak cannot be recovered.
 STORE_OK = True
 STORE_ERR = ""
+# In-memory store cache: avoid re-parsing store.json (~4MB) on every request.
+_STORE_MEM: dict | None = None
+_STORE_MEM_GEN = 0
 # PasarGuard-style: when set, mutate() edits that core's slices instead of master.
 _EDIT_CORE_CV: contextvars.ContextVar[str] = contextvars.ContextVar("edit_core_id", default="")
 
@@ -322,10 +325,61 @@ def _read_store_json(path: Path) -> dict:
     return data
 
 
-def _load_store() -> dict:
+def _invalidate_store_cache() -> None:
+    global _STORE_MEM, _STORE_MEM_GEN
+    _STORE_MEM = None
+    _STORE_MEM_GEN += 1
+
+
+def _normalize_store(data: dict) -> bool:
+    """Ensure required keys / defaults. Returns True if mutated."""
+    dirty = False
+    for key, default in (("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
+                         ("ip_ban_stats", {}), ("xray_update_state", {}),
+                         ("panel_update_state", {}), ("nodes", []), ("groups", [])):
+        if key not in data:
+            data[key] = default if not isinstance(default, (dict, list)) else (
+                list(default) if isinstance(default, list) else dict(default)
+            )
+            dirty = True
+    data.setdefault("reverse", {"bridges": [], "portals": []})
+    data.setdefault("meta", {})
+    xray.ensure_balancers(data)
+    xray.ensure_inbounds(data)
+    xray.ensure_groups(data)
+    xray._ensure_section(data, "xray_settings", xray.default_xray_settings())
+    xray._ensure_section(data, "dns", xray.default_dns())
+    _ensure_settings(data)
+    dirty = _purge_legacy_l2tp(data) or dirty
+    for c in data["clients"]:
+        xray.ensure_client(c)
+        if not c.get("sub_token"):
+            c["sub_token"] = secrets.token_urlsafe(18)
+            dirty = True
+    if "inbound" in data:
+        data.pop("inbound", None)
+        dirty = True
+    return dirty
+
+
+def _load_store_from_disk() -> tuple[dict, bool]:
+    """Load store dict from PostgreSQL (preferred) or store.json. Returns (data, loaded_ok)."""
     global STORE_OK, STORE_ERR
     data: dict = {}
     loaded_ok = False
+    # Prefer PostgreSQL when configured and populated
+    try:
+        import db as db_mod
+        if db_mod.enabled():
+            blob = db_mod.load_store_blob()
+            if isinstance(blob, dict) and blob:
+                STORE_OK = True
+                STORE_ERR = ""
+                return blob, True
+    except Exception as exc:  # noqa: BLE001
+        # Fall through to file; keep error visible if file also missing
+        STORE_ERR = f"postgres: {exc}"
+
     if STORE.exists():
         try:
             data = _read_store_json(STORE)
@@ -347,60 +401,75 @@ def _load_store() -> dict:
             if not recovered:
                 STORE_OK = False
                 STORE_ERR = f"store.json повреждён и store.bak недоступен: {exc}"
-                # Fail-closed: empty in-memory view, never persist until fixed.
                 data = {}
     else:
         STORE_OK = True
         STORE_ERR = ""
         loaded_ok = True
-
-    for key, default in (("clients", []), ("routes", []), ("outbounds_custom", []), ("ip_bans", []),
-                         ("ip_ban_stats", {}), ("xray_update_state", {}),
-                         ("panel_update_state", {}), ("nodes", []), ("groups", [])):
-        data.setdefault(key, default)
-    data.setdefault("reverse", {"bridges": [], "portals": []})
-    data.setdefault("meta", {})
-    xray.ensure_balancers(data)
-    xray.ensure_inbounds(data)
-    xray.ensure_groups(data)
-    xray._ensure_section(data, "xray_settings", xray.default_xray_settings())
-    xray._ensure_section(data, "dns", xray.default_dns())
-    _ensure_settings(data)
-    dirty = _purge_legacy_l2tp(data)
-    for c in data["clients"]:
-        xray.ensure_client(c)
-        if not c.get("sub_token"):
-            c["sub_token"] = secrets.token_urlsafe(18)
-            dirty = True
-    if "inbound" in data:
-        data.pop("inbound", None)
-        dirty = True
-    # Never write an empty/default store over a corrupt file.
-    if dirty and STORE_OK and loaded_ok:
-        _save_store(data)
-    return data
+    return data, loaded_ok
 
 
-def _save_store(data: dict) -> None:
+def _load_store() -> dict:
+    global STORE_OK, STORE_ERR, _STORE_MEM
+    with STORE_LOCK:
+        if _STORE_MEM is not None and STORE_OK:
+            return _STORE_MEM
+        data, loaded_ok = _load_store_from_disk()
+        dirty = _normalize_store(data)
+        # Never write an empty/default store over a corrupt file.
+        if dirty and STORE_OK and loaded_ok:
+            _save_store(data, _already_locked=True)
+        else:
+            _STORE_MEM = data
+        return data
+
+
+def _save_store(data: dict, *, _already_locked: bool = False) -> None:
+    global _STORE_MEM, _STORE_MEM_GEN
     if not STORE_OK:
         raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    if STORE.exists():
+    # Compact JSON — ~30% smaller / faster than indent=2
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    def _do_save() -> None:
+        global _STORE_MEM, _STORE_MEM_GEN
+        # PostgreSQL primary persistence
+        pg_ok = False
         try:
-            shutil.copy2(STORE, STORE_BAK)
+            import db as db_mod
+            if db_mod.enabled():
+                db_mod.save_store_blob(data)
+                db_mod.sync_clients_groups(data)
+                pg_ok = True
+        except Exception:
+            pg_ok = False
+        # File backup (always keep a compact copy for disaster recovery)
+        if STORE.exists():
             try:
-                os.chmod(STORE_BAK, 0o600)
+                shutil.copy2(STORE, STORE_BAK)
+                try:
+                    os.chmod(STORE_BAK, 0o600)
+                except OSError:
+                    pass
             except OSError:
                 pass
+        tmp = STORE.with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
         except OSError:
             pass
-    tmp = STORE.with_suffix(".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, STORE)
+        os.replace(tmp, STORE)
+        _STORE_MEM = data
+        _STORE_MEM_GEN += 1
+        if not pg_ok:
+            pass  # file is source of truth until PG is up
+
+    if _already_locked:
+        _do_save()
+    else:
+        with STORE_LOCK:
+            _do_save()
 
 
 @contextmanager
@@ -1213,8 +1282,47 @@ def _ok_msg(prefix: str, result: dict) -> tuple[str, str]:
     if result.get("ok"):
         if result.get("hot_clients") and not result.get("restarted"):
             return f"{prefix} (без перезапуска Xray)", "info"
+        if result.get("queued"):
+            return f"{prefix} (в фоне)", "info"
         return prefix, "info"
     return f"{prefix} / Xray: {result.get('error')}", "error"
+
+
+def _apply_xray_bg(
+    *,
+    clients_only: bool = False,
+    xray_only: bool = False,
+    push_clients: bool = False,
+    push_reason: str = "client-save",
+    name: str = "xray-apply",
+) -> dict:
+    """Queue Xray apply (+ optional node client push) so HTTP returns immediately."""
+
+    def _job() -> dict:
+        try:
+            res = _apply_xray(
+                _load_store(),
+                clients_only=clients_only,
+                xray_only=xray_only or clients_only,
+            )
+            if push_clients:
+                try:
+                    _push_clients_after_save(push_reason)
+                except Exception:
+                    pass
+            return {
+                "ok": bool(res.get("ok")),
+                "error": res.get("error") or "",
+                "log": (
+                    "hot-clients" if res.get("hot_clients") else
+                    ("restarted" if res.get("restarted") else "applied")
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "log": str(exc)}
+
+    job_id = ops.start_job(name, _job)
+    return {"ok": True, "queued": True, "job_id": job_id, "hot_clients": clients_only}
 
 
 def _split_lines(value: str) -> list[str]:
@@ -2561,6 +2669,38 @@ def _startup():
         ops.ensure_network_perf()
     except Exception:
         pass
+
+    def _bg_store_boot():
+        # Prune 1GB+ history orphans; import store.json → PostgreSQL if empty
+        try:
+            n = shist.prune_orphan_snapshots()
+            if n:
+                print(f"[l2x] pruned {n} orphan settings_versions snapshots", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[l2x] history prune: {exc}", flush=True)
+        try:
+            import db as db_mod
+            if db_mod.enabled():
+                with STORE_LOCK:
+                    data, ok = _load_store_from_disk()
+                    if ok and data:
+                        _normalize_store(data)
+                        if db_mod.import_store_if_empty(data):
+                            print("[l2x] imported store.json → PostgreSQL", flush=True)
+                        else:
+                            # Ensure relational tables stay in sync on upgrade
+                            try:
+                                db_mod.sync_clients_groups(data)
+                            except Exception:
+                                pass
+                    # Warm RAM cache from PG
+                    _invalidate_store_cache()
+                _load_store()
+                print(f"[l2x] postgres: {db_mod.status()}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[l2x] postgres boot: {exc}", flush=True)
+
+    threading.Thread(target=_bg_store_boot, name="store-boot", daemon=True).start()
     # Free host :53 for MasterDNS: move local Pi-hole bind 53 → 5353
     def _bg_pihole_dns_port():
         try:
@@ -4393,9 +4533,10 @@ async def client_save(request: Request):
         if not original:
             store["clients"].append(c)
         xray.ensure_wg_peer(store, c)
-    result = _apply_xray(_load_store(), clients_only=True)
-    # Always push users via /agent/clients right after save (do not rely only on coalesce)
-    _push_clients_after_save("client-save")
+    # Apply + node push in background — don't block the browser on xray/API
+    result = _apply_xray_bg(
+        clients_only=True, push_clients=True, push_reason="client-save", name="client-save",
+    )
     act = "создан" if not original else "обновлён"
     bits = []
     if c.get("limit_gb"):
@@ -4407,8 +4548,7 @@ async def client_save(request: Request):
     ibs = c.get("inbounds") or []
     if ibs:
         bits.append("inbounds: " + ", ".join(f"<code>{tgbot.escape(str(x))}</code>" for x in ibs[:8]))
-    if result.get("hot_clients") and not result.get("restarted"):
-        bits.append("xray hot-apply")
+    bits.append("sync в фоне")
     _tg_change(
         f"👤 Клиент <b>{tgbot.escape(c['email'])}</b> {act}",
         " · ".join(bits),
@@ -4490,8 +4630,9 @@ async def clients_bulk(request: Request):
         else:
             flash(request, "Ничего не выбрано", "error")
             return go("/clients")
-    result = _apply_xray(_load_store(), clients_only=True)
-    _push_clients_after_save("clients-bulk")
+    result = _apply_xray_bg(
+        clients_only=True, push_clients=True, push_reason="clients-bulk", name="clients-bulk",
+    )
     _tg_change(f"👤 Клиенты (bulk): {tgbot.escape(msg)}")
     flash(request, *_ok_msg(msg, result))
     return go("/clients")
@@ -4631,8 +4772,9 @@ async def groups_save(request: Request):
         if err:
             flash(request, err, "error")
             return go(f"/groups/{g['id']}/edit" if gid else "/groups/new")
-    result = _apply_xray(_load_store(), clients_only=True)
-    _push_clients_after_save("group")
+    result = _apply_xray_bg(
+        clients_only=True, push_clients=True, push_reason="group", name="group-save",
+    )
     _tg_change(f"👥 Группа <b>{tgbot.escape(g['name'])}</b> сохранена")
     flash(request, *_ok_msg(f"Группа «{g['name']}» сохранена", result))
     return go(f"/groups/{g['id']}/edit")
@@ -4652,8 +4794,9 @@ def groups_delete(gid: str, request: Request):
         for c in store.get("clients") or []:
             if str(c.get("group_id") or "") == gid:
                 c["group_id"] = ""
-    result = _apply_xray(_load_store(), xray_only=True)
-    _push_clients_after_save("group-delete")
+    result = _apply_xray_bg(
+        clients_only=True, push_clients=True, push_reason="group-delete", name="group-delete",
+    )
     _tg_change(f"👥 Группа <b>{tgbot.escape(str(name))}</b> удалена")
     flash(request, *_ok_msg(f"Группа «{name}» удалена", result))
     return go("/groups")
@@ -8942,28 +9085,37 @@ async def cores_apply(core_id: str, request: Request):
         except Exception:
             pass
 
-    # Sync nodes that use this core (config already validated)
+    # Sync nodes + master Xray in background (config already validated under mutate)
+    def _core_apply_job(cid: str = core_id, inherit: bool = False) -> dict:
+        try:
+            st = _load_store()
+            c0 = cores_mod.core_by_id(st, cid) or {}
+            inherit = bool(c0.get("inherit_master"))
+            host = public_host()
+            ok_n = 0
+            for n in cores_mod.nodes_for_core(st, cid):
+                if not n.get("enabled", True):
+                    continue
+                try:
+                    payload = nodes_mod.build_payload(st, n, xray.build_config)
+                    push = nodes_mod.push(n, payload, master_host=host)
+                    if push.get("ok") or push.get("queued"):
+                        ok_n += 1
+                except Exception:
+                    pass
+            if inherit:
+                xr = _apply_xray(_load_store(), xray_only=True)
+                if not xr.get("ok"):
+                    return {"ok": False, "error": xr.get("error") or "xray", "log": f"nodes={ok_n}"}
+            return {"ok": True, "log": f"nodes_synced={ok_n}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "log": str(exc)}
+
+    ops.start_job(f"core-apply-{core_id[:8]}", _core_apply_job)
     store = _load_store()
     core = cores_mod.core_by_id(store, core_id) or {}
-    nodes = cores_mod.nodes_for_core(store, core_id)
-    host = public_host()
-    ok_n = 0
-    for n in nodes:
-        if not n.get("enabled", True):
-            continue
-        try:
-            payload = nodes_mod.build_payload(store, n, xray.build_config)
-            push = nodes_mod.push(n, payload, master_host=host)
-            if push.get("ok") or push.get("queued"):
-                ok_n += 1
-        except Exception:
-            pass
-    # Inherit cores also touch master live Xray
-    if core.get("inherit_master"):
-        xr = _apply_xray(_load_store(), xray_only=True)
-        if not xr.get("ok"):
-            flash(request, f"Конфиг ядра OK, но Xray мастера: {xr.get('error')}", "error")
-            return go(back)
+    nodes = [n for n in cores_mod.nodes_for_core(store, core_id) if n.get("enabled", True)]
+    ok_n = len(nodes)  # queued
     extra = ""
     if sni_notes:
         extra = " · SNI: " + "; ".join(sni_notes[:3])
@@ -8971,8 +9123,7 @@ async def cores_apply(core_id: str, request: Request):
             extra += "…"
     flash(
         request,
-        f"Ядро «{core.get('name')}» применено (xray -test OK)"
-        + (f", sync {ok_n}/{len(nodes)} нод" if nodes else "")
+        f"Ядро «{core.get('name')}» OK (xray -test) · sync {ok_n} нод в фоне"
         + (", Custom JSON обновлён" if core.get("sub_custom_json") else "")
         + extra,
         "info",
