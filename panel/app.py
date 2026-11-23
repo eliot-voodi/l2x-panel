@@ -4015,6 +4015,18 @@ def _migrate_cache_load() -> list:
             extra["group_ids"] = [str(x).strip() for x in gids if str(x).strip()]
         elif isinstance(gids, (str, int)) and str(gids).strip():
             extra["group_ids"] = [str(gids).strip()]
+        if item.get("limit_hwid") is not None:
+            try:
+                extra["limit_hwid"] = max(0, int(item.get("limit_hwid") or 0))
+            except (TypeError, ValueError):
+                extra["limit_hwid"] = 0
+        hw = item.get("hwids")
+        if isinstance(hw, list) and hw:
+            extra["hwids"] = [d for d in hw if isinstance(d, dict)]
+        for key in ("created_at", "updated_at", "online_at", "reset_period"):
+            val = str(item.get(key) or "").strip()
+            if val:
+                extra[key] = val
         out.append(migrate_mod.NormalizedUser(
             email=str(item.get("email") or ""),
             uuid=str(item.get("uuid") or ""),
@@ -4197,6 +4209,10 @@ async def clients_migrate_run(request: Request):
                 hint += f" · связей user↔group: {ugn}"
             elif gn:
                 hint += " · ⚠ связей user↔group: 0 — в бэкапе нет users_groups_association?"
+            hd = int(meta.get("hwid_devices") or 0)
+            hl = int(meta.get("hwid_limited") or 0)
+            if hd or hl:
+                hint += f" · HWID устройств: {hd}, лимит у {hl} клиентов"
         if want_clients:
             flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         else:
@@ -4284,6 +4300,12 @@ async def clients_migrate_run(request: Request):
     gm = int(report.get("groups_mapped") or 0)
     if source == "pasarguard" or gc or gm:
         extra += f" · групп +{gc} / назначено {gm}"
+    hd = int(report.get("hwid_devices") or 0)
+    hl = int(report.get("hwid_limits") or 0)
+    if hd or hl:
+        extra += f" · HWID +{hd} / лимитов {hl}"
+    if int(report.get("dates_set") or 0):
+        extra += f" · дат {report.get('dates_set')}"
     flash(request, *_ok_msg(
         f"Импорт: +{report.get('created', 0)} / ~{report.get('updated', 0)} / skip {report.get('skipped', 0)}"
         f"{traffic_hint}{extra}",

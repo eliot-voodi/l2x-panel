@@ -69,6 +69,18 @@ class NormalizedUser:
         gids = extra.get("group_ids")
         if gids:
             d["group_ids"] = list(gids)
+        if extra.get("limit_hwid") is not None:
+            d["limit_hwid"] = int(extra.get("limit_hwid") or 0)
+        if extra.get("hwids"):
+            d["hwids"] = list(extra["hwids"])
+        if extra.get("created_at"):
+            d["created_at"] = extra["created_at"]
+        if extra.get("updated_at"):
+            d["updated_at"] = extra["updated_at"]
+        if extra.get("reset_period"):
+            d["reset_period"] = extra["reset_period"]
+        if extra.get("online_at"):
+            d["online_at"] = extra["online_at"]
         return d
 
 
@@ -472,12 +484,13 @@ def apply(
 
     # ── 1) Groups first ──────────────────────────────────────────────
     if is_pg:
-        # Re-hydrate group_names from users_groups (preview cache may have dropped them)
+        # Re-hydrate group_names / hwids (preview cache may have dropped them)
         _attach_pasarguard_groups_to_users(
             users,
             groups=list(meta.get("groups") or []),
             user_groups=dict(meta.get("user_groups") or {}),
         )
+        _attach_pasarguard_hwids_to_users(users, dict(meta.get("user_hwids") or {}))
         before = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
         name_to_gid = ensure_pasarguard_groups(store, meta.get("groups") or [])
         # Names discovered only on users
@@ -527,6 +540,55 @@ def apply(
         c["ib_mode"] = "all"
         return True
 
+    def _apply_pg_extras(c: dict, u: NormalizedUser, *, force: bool = False) -> dict[str, int]:
+        """HWID limit/devices, created/updated, reset period, last online."""
+        import hwid as hwid_mod
+        stats = {"hwid_limits": 0, "hwid_devices": 0, "dates": 0}
+        extra = u.extra or {}
+        if "limit_hwid" in extra:
+            lim = max(0, int(extra.get("limit_hwid") or 0))
+            if force or not int(c.get("limit_hwid") or 0):
+                if int(c.get("limit_hwid") or 0) != lim:
+                    c["limit_hwid"] = lim
+                    stats["hwid_limits"] = 1
+        devices = [d for d in (extra.get("hwids") or []) if isinstance(d, dict) and d.get("hash")]
+        if devices:
+            hwid_mod.ensure(c)
+            existing = list(c.get("hwids") or [])
+            seen = {str(d.get("hash") or "") for d in existing if isinstance(d, dict)}
+            added = 0
+            for d in devices:
+                h = str(d.get("hash") or "")
+                if h in seen:
+                    if force:
+                        for old in existing:
+                            if str(old.get("hash") or "") == h:
+                                for k in ("first_seen", "last_seen", "os", "os_ver", "model", "raw", "kind", "fp"):
+                                    if d.get(k):
+                                        old[k] = d[k]
+                                break
+                    continue
+                existing.append(d)
+                seen.add(h)
+                added += 1
+            c["hwids"] = existing
+            stats["hwid_devices"] = added
+        created = str(extra.get("created_at") or "").strip()
+        if created and (force or not c.get("created_at")):
+            c["created_at"] = created
+            stats["dates"] = 1
+        updated = str(extra.get("updated_at") or "").strip()
+        if updated and (force or not c.get("updated_at")):
+            c["updated_at"] = updated
+            stats["dates"] = 1
+        online = str(extra.get("online_at") or "").strip()
+        if online and (force or not c.get("last_online")):
+            c["last_online"] = online
+        reset = str(extra.get("reset_period") or "").strip()
+        if reset in ("daily", "weekly", "monthly") and (force or not c.get("reset_period")):
+            c["reset_period"] = reset
+        return stats
+
     # Planned group per email (phase 3 applies even if user upsert skipped)
     planned_gid: dict[str, str] = {}
     for u in users:
@@ -534,6 +596,8 @@ def apply(
         if not email:
             continue
         planned_gid[email] = _resolve_group_id(u)
+
+    hwid_limits_n = hwid_devices_n = dates_n = 0
 
     # ── 2) Users ─────────────────────────────────────────────────────
     for u in users:
@@ -577,6 +641,13 @@ def apply(
             ):
                 existing["sub_token"] = u.sub_token
                 repaired = True
+            # Fill missing HWID / dates without full update_existing
+            st_ex = _apply_pg_extras(existing, u, force=False)
+            hwid_limits_n += st_ex["hwid_limits"]
+            hwid_devices_n += st_ex["hwid_devices"]
+            dates_n += st_ex["dates"]
+            if st_ex["hwid_limits"] or st_ex["hwid_devices"] or st_ex["dates"]:
+                repaired = True
             if not repaired:
                 skipped += 1
             continue
@@ -607,6 +678,10 @@ def apply(
                 xray.ensure_client(c)
                 _set_imported_traffic(c, up_i, down_i)
                 traffic_bytes += up_i + down_i
+                st_ex = _apply_pg_extras(c, u, force=True)
+                hwid_limits_n += st_ex["hwid_limits"]
+                hwid_devices_n += st_ex["hwid_devices"]
+                dates_n += st_ex["dates"]
                 xray.ensure_wg_peer(store, c)
                 updated += 1
             else:
@@ -637,6 +712,10 @@ def apply(
                 c = xray.ensure_client(payload)
                 _set_imported_traffic(c, up_i, down_i)
                 traffic_bytes += up_i + down_i
+                st_ex = _apply_pg_extras(c, u, force=True)
+                hwid_limits_n += st_ex["hwid_limits"]
+                hwid_devices_n += st_ex["hwid_devices"]
+                dates_n += st_ex["dates"]
                 if not c.get("sub_token"):
                     import secrets
                     c["sub_token"] = secrets.token_urlsafe(18)
@@ -669,6 +748,9 @@ def apply(
         "inbounds": tags,
         "groups_created": groups_created,
         "groups_mapped": groups_mapped,
+        "hwid_limits": hwid_limits_n,
+        "hwid_devices": hwid_devices_n,
+        "dates_set": dates_n,
         "client_inbound_map": sum(
             1 for u in users if (u.extra or {}).get("inbounds")
         ),
@@ -1743,6 +1825,76 @@ def _pg_expire_at(u: dict) -> str:
     return ""
 
 
+def _pg_iso_dt(raw: Any) -> str:
+    """Normalize PasarGuard datetime / unix → ISO-8601 UTC string (or "")."""
+    if raw in (None, "", 0, "0"):
+        return ""
+    if isinstance(raw, datetime):
+        dt = raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    s = str(raw).strip()
+    if not s or s.upper() == "NULL":
+        return ""
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        try:
+            n = float(s)
+            if n > 1e12:  # ms
+                n /= 1000.0
+            return datetime.fromtimestamp(n, tz=timezone.utc).isoformat(timespec="seconds")
+        except (OSError, OverflowError, ValueError):
+            return ""
+    try:
+        # strip Z / space
+        s2 = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except ValueError:
+        exp = expire_from_iso(s)
+        return exp or ""
+
+
+def _pg_reset_period(raw: Any) -> str:
+    """Map PasarGuard data_limit_reset_strategy → L2X reset_period."""
+    s = str(raw or "").strip().lower()
+    return {
+        "day": "daily",
+        "daily": "daily",
+        "week": "weekly",
+        "weekly": "weekly",
+        "month": "monthly",
+        "monthly": "monthly",
+    }.get(s, "")
+
+
+def _pg_hwid_device(rec: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a PasarGuard ``user_hwids`` row → L2X ``client.hwids[]`` entry."""
+    import hwid as hwid_mod
+    raw = str(rec.get("hwid") or "").strip()
+    if not raw:
+        return None
+    digest = hwid_mod.hash_hwid(raw)
+    first = _pg_iso_dt(rec.get("created_at")) or hwid_mod.now_iso()
+    last = _pg_iso_dt(rec.get("last_used_at") or rec.get("updated_at")) or first
+    os_name = str(rec.get("device_os") or "").strip()[:64]
+    os_ver = str(rec.get("os_version") or "").strip()[:64]
+    model = str(rec.get("device_model") or "").strip()[:128]
+    return {
+        "hash": digest,
+        "fp": digest[:12],
+        "kind": "hwid",
+        "first_seen": first,
+        "last_seen": last,
+        "ua": "",
+        "os": os_name,
+        "os_ver": os_ver,
+        "model": model,
+        # Keep raw for re-hash / debug; gate() matches via hash(X-HWID)
+        "raw": raw[:256],
+    }
+
+
 def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser | None:
     email = _norm_email(u.get("username") or u.get("email") or u.get("name") or "")
     if not email:
@@ -1765,7 +1917,11 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
         enabled = bool(u["enabled"])
     uuid, password = _pg_uuid_password(u)
     source_id = str(u.get("id") if u.get("id") is not None else "").strip()
-    created_raw = u.get("created_at") or u.get("createdAt")
+    created_iso = _pg_iso_dt(u.get("created_at") or u.get("createdAt"))
+    updated_iso = _pg_iso_dt(
+        u.get("updated_at") or u.get("updatedAt") or u.get("edit_at") or u.get("modified_at")
+    )
+    online_iso = _pg_iso_dt(u.get("online_at") or u.get("onlineAt") or u.get("last_online"))
     # File dumps have no subscription_url (signed URL is computed by PasarGuard).
     # Leave sub_token empty here — parse_pasarguard_backup mints a v3 token from jwt secret.
     # Username fallback only if minting is impossible (no secret / no id).
@@ -1786,12 +1942,48 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
         n = str(u.get(key) or "").strip()
         if n and n not in group_names and not n.startswith("{"):
             group_names.append(n)
+    # Device limit (0 = unlimited / opt-out in both PG and L2X)
+    hwid_limit_raw = u.get("hwid_limit")
+    if hwid_limit_raw is None:
+        hwid_limit_raw = u.get("hwidLimit")
+    limit_hwid = _safe_int(hwid_limit_raw, 0) if hwid_limit_raw is not None else 0
+    if limit_hwid < 0:
+        limit_hwid = 0
+    reset_period = _pg_reset_period(
+        u.get("data_limit_reset_strategy")
+        or u.get("dataLimitResetStrategy")
+        or u.get("reset_strategy")
+    )
+    # API may embed hwids list
+    hwids_in: list[dict] = []
+    for key in ("hwids", "user_hwids", "devices"):
+        raw_h = u.get(key)
+        if not isinstance(raw_h, list):
+            continue
+        for item in raw_h:
+            if not isinstance(item, dict):
+                continue
+            dev = _pg_hwid_device(item)
+            if dev:
+                hwids_in.append(dev)
+        if hwids_in:
+            break
     extra: dict[str, Any] = {
         "status": status,
         "id": u.get("id"),
-        "created_at": created_raw,
         "group_ids": _pg_parse_group_ids_field(u.get("group_ids") or u.get("groupIds")),
+        "limit_hwid": limit_hwid,
     }
+    if created_iso:
+        extra["created_at"] = created_iso
+    if updated_iso:
+        extra["updated_at"] = updated_iso
+    if online_iso:
+        extra["online_at"] = online_iso
+    if reset_period:
+        extra["reset_period"] = reset_period
+    if hwids_in:
+        extra["hwids"] = hwids_in
     if group_names:
         extra["group_names"] = group_names
     return NormalizedUser(
@@ -1912,12 +2104,18 @@ def _pg_rec_from_sql_cols(cols: list[str], fields: list[Any]) -> dict:
         "used_traffic": _sql_unquote(rec_raw.get("used_traffic")),
         "lifetime_used_traffic": _sql_unquote(rec_raw.get("lifetime_used_traffic")),
         "data_limit": _sql_unquote(rec_raw.get("data_limit")),
+        "data_limit_reset_strategy": _sql_unquote(
+            rec_raw.get("data_limit_reset_strategy") or rec_raw.get("dataLimitResetStrategy")
+        ),
         "expire": _sql_unquote(rec_raw.get("expire") or rec_raw.get("expire_at")),
         "expire_at": _sql_unquote(rec_raw.get("expire_at") or rec_raw.get("expire")),
         "created_at": _sql_unquote(rec_raw.get("created_at")),
+        "updated_at": _sql_unquote(rec_raw.get("updated_at") or rec_raw.get("edit_at")),
+        "online_at": _sql_unquote(rec_raw.get("online_at")),
         "status": _sql_unquote(rec_raw.get("status")),
         "note": _sql_unquote(rec_raw.get("note")),
         "telegram_id": _sql_unquote(rec_raw.get("telegram_id")),
+        "hwid_limit": _sql_unquote(rec_raw.get("hwid_limit")),
         "proxy_settings": _sql_unquote(rec_raw.get("proxy_settings")),
         "proxies": _sql_unquote(rec_raw.get("proxies")),
         "subscription_url": _sql_unquote(rec_raw.get("subscription_url") or ""),
@@ -1938,6 +2136,114 @@ def _iter_sql_copy_tables(text: str):
         cols = [c.strip().strip('"') for c in block.group("cols").split(",")]
         body = block.group("body") or ""
         yield table, cols, body
+
+
+def extract_pasarguard_hwids_from_sql(text: str) -> dict[str, list[dict[str, Any]]]:
+    """Parse ``user_hwids`` → ``{user_id: [device, …]}`` from COPY / INSERT dumps."""
+    by_uid: dict[str, list[dict[str, Any]]] = {}
+
+    def _add(rec: dict[str, Any]) -> None:
+        uid = str(rec.get("user_id") or rec.get("users_id") or "").strip()
+        dev = _pg_hwid_device(rec)
+        if not uid or not dev:
+            return
+        bucket = by_uid.setdefault(uid, [])
+        if any(d.get("hash") == dev["hash"] for d in bucket):
+            return
+        bucket.append(dev)
+
+    for table, cols, body in _iter_sql_copy_tables(text):
+        low = table.lower().split(".")[-1]
+        if low not in ("user_hwids", "user_hwid", "hwids", "devices"):
+            continue
+        for line in body.splitlines():
+            if not line or line == r"\.":
+                continue
+            raw_fields = line.split("\t")
+            if len(raw_fields) < len(cols):
+                continue
+            fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+            rec = {cols[i]: fields[i] for i in range(len(cols))}
+            _add(rec)
+
+    if not by_uid:
+        for block in re.finditer(
+            r"INSERT\s+INTO\s+(?:[\"`]?[\w]+[\"`]?\.)?[\"`]?(user_hwids|user_hwid|hwids)[\"`]?\s*"
+            r"\(([^)]+)\)\s*VALUES\s*(.+?);",
+            text,
+            re.I | re.S,
+        ):
+            cols = [c.strip().strip('`"') for c in block.group(2).split(",")]
+            for row in re.findall(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", block.group(3)):
+                fields = _split_sql_values(row)
+                if len(fields) < len(cols):
+                    continue
+                rec = {cols[i]: _sql_unquote(fields[i]) for i in range(len(cols))}
+                _add(rec)
+    return by_uid
+
+
+def extract_pasarguard_hwids_from_sqlite(path: Path) -> dict[str, list[dict[str, Any]]]:
+    by_uid: dict[str, list[dict[str, Any]]] = {}
+    conn = sqlite3.connect(str(path))
+    try:
+        tables = {
+            r[0].lower()
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        jtable = next((t for t in ("user_hwids", "user_hwid", "hwids") if t in tables), "")
+        if not jtable:
+            return by_uid
+        cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{jtable}")').fetchall()]
+        for row in conn.execute(f'SELECT * FROM "{jtable}"'):
+            rec = {cols[i]: row[i] for i in range(len(cols))}
+            uid = str(rec.get("user_id") or rec.get("users_id") or "").strip()
+            dev = _pg_hwid_device(rec)
+            if not uid or not dev:
+                continue
+            bucket = by_uid.setdefault(uid, [])
+            if any(d.get("hash") == dev["hash"] for d in bucket):
+                continue
+            bucket.append(dev)
+    finally:
+        conn.close()
+    return by_uid
+
+
+def _attach_pasarguard_hwids_to_users(
+    users: list[NormalizedUser],
+    user_hwids: dict[str, list[dict[str, Any]]] | None,
+) -> None:
+    """Merge devices from ``user_hwids`` table into ``extra['hwids']``."""
+    uh = {str(k): list(v or []) for k, v in (user_hwids or {}).items()}
+    if not uh:
+        return
+    for u in users:
+        if not isinstance(u.extra, dict):
+            u.extra = {}
+        uid = str(u.source_id or (u.extra or {}).get("id") or "").strip()
+        devices = list(uh.get(uid) or [])
+        if not devices:
+            try:
+                alt = str(int(float(uid)))
+                if alt != uid:
+                    devices = list(uh.get(alt) or [])
+            except (TypeError, ValueError):
+                pass
+        if not devices:
+            continue
+        existing = list(u.extra.get("hwids") or [])
+        seen = {str(d.get("hash") or "") for d in existing if isinstance(d, dict)}
+        for d in devices:
+            if not isinstance(d, dict):
+                continue
+            h = str(d.get("hash") or "")
+            if h and h in seen:
+                continue
+            existing.append(d)
+            if h:
+                seen.add(h)
+        u.extra["hwids"] = existing
 
 
 def extract_pasarguard_meta_from_sql(text: str) -> dict[str, Any]:
@@ -1984,7 +2290,8 @@ def extract_pasarguard_meta_from_sql(text: str) -> dict[str, Any]:
                     path = re.sub(r"[^A-Za-z0-9_-]", "", prefix.strip("/").split("/")[0] or "")
                 break
     groups_meta = extract_pasarguard_groups_from_sql(text)
-    return {"jwt_secrets": secrets, "path": path, **groups_meta}
+    hwids = extract_pasarguard_hwids_from_sql(text)
+    return {"jwt_secrets": secrets, "path": path, "user_hwids": hwids, **groups_meta}
 
 
 def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
@@ -2005,7 +2312,8 @@ def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
     finally:
         conn.close()
     groups_meta = extract_pasarguard_groups_from_sqlite(path)
-    return {"jwt_secrets": secrets, **groups_meta}
+    hwids = extract_pasarguard_hwids_from_sqlite(path)
+    return {"jwt_secrets": secrets, "user_hwids": hwids, **groups_meta}
 
 
 def _pg_parse_group_ids_field(raw: Any) -> list[str]:
@@ -2411,6 +2719,7 @@ def _finalize_pasarguard_users(
     tls: bool = False,
     groups: list[dict[str, Any]] | None = None,
     user_groups: dict[str, list[str]] | None = None,
+    user_hwids: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[NormalizedUser]:
     global LAST_SOURCE_META
     secrets = [s for s in (jwt_secrets or []) if s]
@@ -2421,7 +2730,9 @@ def _finalize_pasarguard_users(
             u.sub_token = re.sub(r"[^A-Za-z0-9_-]", "", u.email)[:64] or u.email
     g_list = list(groups or [])
     ug = dict(user_groups or {})
+    uh = dict(user_hwids or {})
     _attach_pasarguard_groups_to_users(users, groups=g_list, user_groups=ug)
+    _attach_pasarguard_hwids_to_users(users, uh)
     # Ensure group catalog includes names only present on users
     known = {str(g.get("name") or "").strip().lower() for g in g_list}
     for u in users:
@@ -2430,6 +2741,8 @@ def _finalize_pasarguard_users(
             if name and name.lower() not in known:
                 g_list.append({"id": f"name:{name}", "name": name})
                 known.add(name.lower())
+    hwid_devices = sum(len((u.extra or {}).get("hwids") or []) for u in users)
+    hwid_limited = sum(1 for u in users if int((u.extra or {}).get("limit_hwid") or 0) > 0)
     LAST_SOURCE_META = {
         **(LAST_SOURCE_META or {}),
         "source": "pasarguard",
@@ -2440,6 +2753,9 @@ def _finalize_pasarguard_users(
         "tls": bool(tls),
         "groups": g_list,
         "user_groups": ug,
+        "user_hwids": uh,
+        "hwid_devices": hwid_devices,
+        "hwid_limited": hwid_limited,
         "sub_tokens_minted": sum(1 for u in users if u.sub_token and "." in u.sub_token),
         "note": note or (
             "JWT secret imported — старые PasarGuard-ссылки принимаются панелью"
@@ -2457,6 +2773,7 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
     all_secrets: list[str] = []
     all_groups: list[dict[str, Any]] = []
     all_user_groups: dict[str, list[str]] = {}
+    all_user_hwids: dict[str, list[dict[str, Any]]] = {}
     path_hint = ""
     port_hint = 0
     tls_hint = False
@@ -2480,6 +2797,18 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                 sg = str(gid)
                 if sg and sg not in bucket:
                     bucket.append(sg)
+        for uid, devices in (meta.get("user_hwids") or {}).items():
+            bucket = all_user_hwids.setdefault(str(uid), [])
+            seen = {str(d.get("hash") or "") for d in bucket if isinstance(d, dict)}
+            for d in devices or []:
+                if not isinstance(d, dict):
+                    continue
+                h = str(d.get("hash") or "")
+                if h and h in seen:
+                    continue
+                bucket.append(d)
+                if h:
+                    seen.add(h)
 
     for name, content in ordered:
         low = name.lower()
@@ -2527,6 +2856,7 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
         tls=tls_hint,
         groups=all_groups,
         user_groups=all_user_groups,
+        user_hwids=all_user_hwids,
     )
     for name, content in ordered:
         if _pg_member_priority(name, content) >= 100:
@@ -2545,6 +2875,7 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                         fin_kw["jwt_secrets"] = all_secrets
                         fin_kw["groups"] = all_groups
                         fin_kw["user_groups"] = all_user_groups
+                        fin_kw["user_hwids"] = all_user_hwids
                     users = _parse_pg_sqlite(path)
                 finally:
                     path.unlink(missing_ok=True)
@@ -2563,6 +2894,7 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                     fin_kw["jwt_secrets"] = all_secrets
                     fin_kw["groups"] = all_groups
                     fin_kw["user_groups"] = all_user_groups
+                    fin_kw["user_hwids"] = all_user_hwids
                 users = _parse_users_sql_dump(text)
                 if users:
                     return _finalize_pasarguard_users(users, **fin_kw)

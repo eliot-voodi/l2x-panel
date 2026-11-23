@@ -12,7 +12,8 @@
 {% block content %}
 <div class="card" style="margin-bottom:1rem">
   <h3>Что переносится</h3>
-  <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит, срок, уже потраченный трафик.
+  <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит трафика, срок,
+  уже потраченный трафик, <b>HWID-лимит и привязанные устройства</b>, даты создания/изменения, Telegram id, заметка, группы.
   Для <b>x-ui.db</b> ниже выберите: только клиенты / только outbound / только маршруты / всё (включая inbounds).</div>
   <div class="hint" style="margin-top:.5rem">
     Токен клиента (последний сегмент URL) сохраняется. Если в старой панели ссылка была вида
@@ -181,6 +182,17 @@
     <div><span class="dim">Групп создано</span><div><b class="ok">{{ report.groups_created or 0 }}</b></div></div>
     <div><span class="dim">Клиентов с группой</span><div><b>{{ report.groups_mapped or 0 }}</b></div></div>
   </div>
+  {% endif %}
+  {% if report.hwid_devices or report.hwid_limits or report.dates_set %}
+  <div class="row" style="margin-top:.6rem">
+    <div><span class="dim">HWID устройств</span><div><b class="ok">+{{ report.hwid_devices or 0 }}</b></div></div>
+    <div><span class="dim">HWID лимитов</span><div><b>{{ report.hwid_limits or 0 }}</b></div></div>
+    <div><span class="dim">Дат проставлено</span><div><b>{{ report.dates_set or 0 }}</b></div></div>
+  </div>
+  {% endif %}
+  {% if report.traffic_bytes %}
+  <div class="hint" style="margin-top:.5rem">Трафик из бэкапа: {{ report.traffic_bytes }} байт
+    {% if report.traffic_fixed %} (восстановлен у {{ report.traffic_fixed }}){% endif %}</div>
   {% endif %}
   {% if report.structure %}
   <div class="row" style="margin-top:.6rem">
