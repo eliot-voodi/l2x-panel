@@ -2009,7 +2009,7 @@ def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
 
 
 def _pg_parse_group_ids_field(raw: Any) -> list[str]:
-    """Normalize group id list from JSON column / API field."""
+    """Normalize group id list from JSON column / API / Postgres ARRAY field."""
     if raw is None or raw == "":
         return []
     if isinstance(raw, list):
@@ -2017,7 +2017,7 @@ def _pg_parse_group_ids_field(raw: Any) -> list[str]:
     if isinstance(raw, (int, float)):
         return [str(int(raw))]
     s = str(raw).strip()
-    if not s:
+    if not s or s.upper() == "NULL":
         return []
     if s.startswith("["):
         try:
@@ -2026,11 +2026,56 @@ def _pg_parse_group_ids_field(raw: Any) -> list[str]:
                 return [str(x).strip() for x in data if str(x).strip()]
         except Exception:
             pass
+    # Postgres text[] / int[] : {1,2,3} or {"1","2"}
+    if s.startswith("{") and s.endswith("}"):
+        inner = s[1:-1].strip()
+        if not inner:
+            return []
+        out: list[str] = []
+        for part in inner.split(","):
+            p = part.strip().strip('"').strip("'")
+            if p and p.upper() != "NULL":
+                out.append(p)
+        return out
     return [s]
 
 
+# PasarGuard (SQLAlchemy) uses ``users_groups_association`` (user_id, groups_id).
+# Older Marzban-style dumps may use ``users_groups``.
+_PG_USER_GROUP_TABLES = frozenset({
+    "users_groups",
+    "user_groups",
+    "group_users",
+    "users_group",
+    "users_groups_association",
+    "user_groups_association",
+    "users_group_association",
+})
+
+
+def _pg_is_user_group_table(name: str) -> bool:
+    low = str(name or "").lower().split(".")[-1]
+    if low in _PG_USER_GROUP_TABLES:
+        return True
+    # e.g. public.users_groups_association
+    return "users_groups" in low and "assoc" in low
+
+
+def _pg_add_user_group(user_groups: dict[str, list[str]], uid: Any, gid: Any) -> None:
+    u = str(uid if uid is not None else "").strip()
+    g = str(gid if gid is not None else "").strip()
+    if not u or not g or u.upper() == "NULL" or g.upper() == "NULL":
+        return
+    bucket = user_groups.setdefault(u, [])
+    if g not in bucket:
+        bucket.append(g)
+
+
 def extract_pasarguard_groups_from_sql(text: str) -> dict[str, Any]:
-    """Parse ``groups`` + ``users_groups`` (Marzban/PasarGuard) from pg_dump COPY blocks."""
+    """Parse ``groups`` + user↔group links from pg_dump COPY / INSERT blocks.
+
+    PasarGuard stores membership in ``users_groups_association(user_id, groups_id)``.
+    """
     groups_by_id: dict[str, dict[str, Any]] = {}
     user_groups: dict[str, list[str]] = {}  # user_id → [group_id, ...]
     for table, cols, body in _iter_sql_copy_tables(text):
@@ -2049,7 +2094,12 @@ def extract_pasarguard_groups_from_sql(text: str) -> dict[str, Any]:
                 if not gid or not name:
                     continue
                 groups_by_id[gid] = {"id": gid, "name": name}
-        elif low in ("users_groups", "user_groups", "group_users", "users_group"):
+        elif _pg_is_user_group_table(table):
+            col_l = {c.lower(): c for c in cols}
+            uid_key = col_l.get("user_id") or col_l.get("users_id")
+            gid_key = col_l.get("groups_id") or col_l.get("group_id")
+            if not uid_key or not gid_key:
+                continue
             for line in body.splitlines():
                 if not line or line == r"\.":
                     continue
@@ -2058,13 +2108,46 @@ def extract_pasarguard_groups_from_sql(text: str) -> dict[str, Any]:
                     continue
                 fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
                 rec = {cols[i]: fields[i] for i in range(len(cols))}
-                uid = str(rec.get("user_id") or rec.get("users_id") or "").strip()
-                gid = str(rec.get("group_id") or rec.get("groups_id") or "").strip()
-                if not uid or not gid:
+                _pg_add_user_group(user_groups, rec.get(uid_key), rec.get(gid_key))
+        elif low == "users" and not user_groups:
+            # Fallback: group_ids array/json on users row
+            col_l = {c.lower(): c for c in cols}
+            if "id" in col_l and "group_ids" in col_l:
+                id_key, gids_key = col_l["id"], col_l["group_ids"]
+                for line in body.splitlines():
+                    if not line or line == r"\.":
+                        continue
+                    raw_fields = line.split("\t")
+                    if len(raw_fields) < len(cols):
+                        continue
+                    fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                    rec = {cols[i]: fields[i] for i in range(len(cols))}
+                    uid = str(rec.get(id_key) if rec.get(id_key) is not None else "").strip()
+                    for gid in _pg_parse_group_ids_field(rec.get(gids_key)):
+                        _pg_add_user_group(user_groups, uid, gid)
+
+    # INSERT INTO … users_groups_association (…) VALUES (…)
+    if not user_groups:
+        for block in re.finditer(
+            r"INSERT\s+INTO\s+(?:[\"`]?[\w]+[\"`]?\.)?[\"`]?("
+            + "|".join(re.escape(t) for t in sorted(_PG_USER_GROUP_TABLES, key=len, reverse=True))
+            + r")[\"`]?\s*\(([^)]+)\)\s*VALUES\s*(.+?);",
+            text,
+            re.I | re.S,
+        ):
+            cols = [c.strip().strip('`"') for c in block.group(2).split(",")]
+            col_l = {c.lower(): c for c in cols}
+            uid_key = col_l.get("user_id") or col_l.get("users_id")
+            gid_key = col_l.get("groups_id") or col_l.get("group_id")
+            if not uid_key or not gid_key:
+                continue
+            for row in re.findall(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", block.group(3)):
+                fields = _split_sql_values(row)
+                if len(fields) < len(cols):
                     continue
-                user_groups.setdefault(uid, [])
-                if gid not in user_groups[uid]:
-                    user_groups[uid].append(gid)
+                rec = {cols[i]: _sql_unquote(fields[i]) for i in range(len(cols))}
+                _pg_add_user_group(user_groups, rec.get(uid_key), rec.get(gid_key))
+
     return {
         "groups": list(groups_by_id.values()),
         "user_groups": user_groups,
@@ -2091,26 +2174,21 @@ def extract_pasarguard_groups_from_sqlite(path: Path) -> dict[str, Any]:
                     name = str(rec.get(col_l["name"]) or "").strip()
                     if gid and name:
                         groups_by_id[gid] = {"id": gid, "name": name}
-        for jtable in ("users_groups", "user_groups", "group_users", "users_group"):
-            if jtable not in tables:
-                continue
+        # Prefer exact known names, then any table matching users_groups*assoc*
+        jtables = [t for t in sorted(tables) if _pg_is_user_group_table(t)]
+        for jtable in jtables:
             cols = [r[1] for r in conn.execute(f"PRAGMA table_info({jtable})").fetchall()]
             col_l = {c.lower(): c for c in cols}
             uid_c = col_l.get("user_id") or col_l.get("users_id")
-            gid_c = col_l.get("group_id") or col_l.get("groups_id")
+            gid_c = col_l.get("groups_id") or col_l.get("group_id")
             if not uid_c or not gid_c:
                 continue
-            for row in conn.execute(f"SELECT * FROM {jtable}"):
+            for row in conn.execute(f'SELECT * FROM "{jtable}"'):
                 rec = {cols[i]: row[i] for i in range(len(cols))}
-                uid = str(rec.get(uid_c) or "").strip()
-                gid = str(rec.get(gid_c) or "").strip()
-                if not uid or not gid:
-                    continue
-                user_groups.setdefault(uid, [])
-                if gid not in user_groups[uid]:
-                    user_groups[uid].append(gid)
-            break
-        # Fallback: group_ids JSON on users
+                _pg_add_user_group(user_groups, rec.get(uid_c), rec.get(gid_c))
+            if user_groups:
+                break
+        # Fallback: group_ids JSON / array on users
         if "users" in tables and not user_groups:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
             col_l = {c.lower(): c for c in cols}
@@ -2118,9 +2196,8 @@ def extract_pasarguard_groups_from_sqlite(path: Path) -> dict[str, Any]:
                 for row in conn.execute("SELECT * FROM users"):
                     rec = {cols[i]: row[i] for i in range(len(cols))}
                     uid = str(rec.get(col_l["id"]) or "").strip()
-                    gids = _pg_parse_group_ids_field(rec.get(col_l["group_ids"]))
-                    if uid and gids:
-                        user_groups[uid] = gids
+                    for gid in _pg_parse_group_ids_field(rec.get(col_l["group_ids"])):
+                        _pg_add_user_group(user_groups, uid, gid)
     finally:
         conn.close()
     return {

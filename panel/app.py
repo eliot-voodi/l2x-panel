@@ -4190,8 +4190,13 @@ async def clients_migrate_run(request: Request):
             if meta.get("port"):
                 hint += f" · порт PasarGuard {meta['port']} ({'HTTPS' if meta.get('tls') else 'HTTP'})"
             gn = len(meta.get("groups") or [])
+            ugn = len(meta.get("user_groups") or {})
             if gn:
                 hint += f" · групп PasarGuard: {gn} (создадутся пустыми, без ядер)"
+            if ugn:
+                hint += f" · связей user↔group: {ugn}"
+            elif gn:
+                hint += " · ⚠ связей user↔group: 0 — в бэкапе нет users_groups_association?"
         if want_clients:
             flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         else:

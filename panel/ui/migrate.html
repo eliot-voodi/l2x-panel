@@ -93,9 +93,10 @@
   <div class="hint">
     Клиенты назначаются в <b>группы</b> (ядра внутри группы настраиваются отдельно).
     <b>PasarGuard:</b> порядок импорта — сначала группы, затем пользователи, затем назначение групп
-    (из <code>groups</code> + <code>users_groups</code>). Группы создаются пустыми (без ядер) —
+    (из <code>groups</code> + <code>users_groups_association</code>). Группы создаются пустыми (без ядер) —
     ядра назначаете в UI. Пока группа без ядер, клиент не попадает во все inbound ноды
     (защита от <code>User email~node_* already exists</code>).
+    В preview должно быть «связей user↔group» &gt; 0 — иначе перезалийте полный SQL/zip бэкап.
     Ниже — fallback-группа, если у клиента в источнике группы нет.
   </div>
   <label class="f" style="margin-top:.5rem">Fallback-группа L2X</label>
