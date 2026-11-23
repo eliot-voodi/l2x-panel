@@ -13,7 +13,7 @@ from typing import Any
 
 HISTORY_DIR = Path(os.environ.get("L2XPANEL_DATA", "/var/lib/l2xpanel")) / "settings_versions"
 INDEX_FILE = HISTORY_DIR / "index.json"
-MAX_VERSIONS = 30  # was 80 — each snapshot ~full store; keep disk small
+MAX_VERSIONS = 15  # light VPS: each snapshot can be multi‑MB
 _LOCK = threading.RLock()
 FORMAT_V2 = 2
 _ORPHANS_PRUNED = False

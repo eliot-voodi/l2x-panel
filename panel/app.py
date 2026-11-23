@@ -82,6 +82,10 @@ STORE_ERR = ""
 # In-memory store cache: avoid re-parsing store.json (~4MB) on every request.
 _STORE_MEM: dict | None = None
 _STORE_MEM_GEN = 0
+_SAVE_SEQ = 0
+_LAST_TRAFFIC_FLUSH = 0.0
+# Traffic/watchdog flushes to disk at most this often (seconds). RAM is always updated.
+TRAFFIC_FLUSH_SEC = int(os.environ.get("L2XPANEL_TRAFFIC_FLUSH_SEC", "60"))
 # PasarGuard-style: when set, mutate() edits that core's slices instead of master.
 _EDIT_CORE_CV: contextvars.ContextVar[str] = contextvars.ContextVar("edit_core_id", default="")
 
@@ -424,27 +428,41 @@ def _load_store() -> dict:
         return data
 
 
-def _save_store(data: dict, *, _already_locked: bool = False) -> None:
-    global _STORE_MEM, _STORE_MEM_GEN
+def _save_store(
+    data: dict,
+    *,
+    _already_locked: bool = False,
+    kind: str = "mutate",
+) -> None:
+    """Persist store.
+
+    kind:
+      - ``mutate`` — user/config edit: write file (+ optional PG blob). No relational rewrite.
+      - ``traffic`` — watchdog/stats: keep RAM; flush file at most every TRAFFIC_FLUSH_SEC.
+      - ``full`` — rare: file + bak + PG blob + relational sync (import/migrate).
+    """
+    global _STORE_MEM, _STORE_MEM_GEN, _SAVE_SEQ, _LAST_TRAFFIC_FLUSH
     if not STORE_OK:
         raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
-    # Compact JSON — ~30% smaller / faster than indent=2
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     def _do_save() -> None:
-        global _STORE_MEM, _STORE_MEM_GEN
-        # PostgreSQL primary persistence
-        pg_ok = False
-        try:
-            import db as db_mod
-            if db_mod.enabled():
-                db_mod.save_store_blob(data)
-                db_mod.sync_clients_groups(data)
-                pg_ok = True
-        except Exception:
-            pg_ok = False
-        # File backup (always keep a compact copy for disaster recovery)
-        if STORE.exists():
+        global _STORE_MEM, _STORE_MEM_GEN, _SAVE_SEQ, _LAST_TRAFFIC_FLUSH
+        _STORE_MEM = data
+        _STORE_MEM_GEN += 1
+        now = time.time()
+        kind_l = (kind or "mutate").lower()
+
+        # Watchdog/traffic: don't hammer disk/PG every 20s
+        if kind_l == "traffic":
+            if now - float(_LAST_TRAFFIC_FLUSH or 0) < max(15, TRAFFIC_FLUSH_SEC):
+                return
+            _LAST_TRAFFIC_FLUSH = now
+
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        _SAVE_SEQ += 1
+        # .bak only every 20th full/mutate write (or first) — copy2 of 3MB is costly
+        want_bak = kind_l == "full" or (_SAVE_SEQ % 20 == 1)
+        if want_bak and STORE.exists():
             try:
                 shutil.copy2(STORE, STORE_BAK)
                 try:
@@ -460,10 +478,17 @@ def _save_store(data: dict, *, _already_locked: bool = False) -> None:
         except OSError:
             pass
         os.replace(tmp, STORE)
-        _STORE_MEM = data
-        _STORE_MEM_GEN += 1
-        if not pg_ok:
-            pass  # file is source of truth until PG is up
+
+        # PostgreSQL: blob only on mutate/full; relational sync ONLY on kind=full
+        if kind_l in ("mutate", "full"):
+            try:
+                import db as db_mod
+                if db_mod.enabled():
+                    db_mod.save_store_blob(data)
+                    if kind_l == "full" and db_mod.relational_sync_enabled():
+                        db_mod.sync_clients_groups(data)
+            except Exception:
+                pass
 
     if _already_locked:
         _do_save()
@@ -529,7 +554,7 @@ def mutate(*, history_section: str = "", history_note: str = "", edit_core_id: s
                 section=history_section or ("cores" if core is not None else ""),
                 note=note,
             )
-        _save_store(store)
+        _save_store(store, kind="mutate")
 
 
 def _config_store(request: Request) -> dict:
@@ -698,7 +723,7 @@ def _apply_xray(
             if not xray_only:
                 front.rollback(staged)
             if persist:
-                _save_store(store)
+                _save_store(store, kind="mutate")
             return result
         if xray_only:
             pass
@@ -713,7 +738,7 @@ def _apply_xray(
             elif staged.get("problems"):
                 result = {**result, "warning": "; ".join(staged["problems"])}
         if persist:
-            _save_store(store)
+            _save_store(store, kind="mutate")
     if result.get("ok") and not xray_only:
         direct_ports = [
             int(ib.get("port") or 0) for ib in runtime.get("inbounds") or []
@@ -1956,7 +1981,8 @@ def _watchdog_cycle() -> None:
             for c in (store.get("clients") or [])
         )
         if STORE_OK:
-            _save_store(store)
+            # Throttled disk flush — was rewriting full store (+PG) every 20s → high CPU/RAM
+            _save_store(store, kind="traffic")
         if need_apply and STORE_OK:
             # Hot-remove users from local Xray (no full restart when possible)
             _apply_xray(store, clients_only=True)
@@ -2027,7 +2053,7 @@ def _direct_agent_quota_cycle() -> None:
         except Exception:
             pass
         if STORE_OK:
-            _save_store(store)
+            _save_store(store, kind="traffic")
         if need_kick and STORE_OK:
             # Node itself drops the session before waiting for master push
             _apply_xray(store, clients_only=True)
@@ -2065,7 +2091,7 @@ def _direct_agent_quota_cycle() -> None:
         store = _load_store()
         if nodes_mod.apply_master_access_snapshot(store, access):
             if STORE_OK:
-                _save_store(store)
+                _save_store(store, kind="traffic")
             # Master may block due to traffic counted on other nodes
             if any(not xray.client_access_ok(c) for c in (store.get("clients") or []) if isinstance(c, dict)):
                 _apply_xray(store, clients_only=True)

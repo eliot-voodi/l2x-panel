@@ -18,6 +18,9 @@ from typing import Any
 from urllib.parse import urlparse, unquote
 
 DATABASE_URL = (os.environ.get("L2XPANEL_DATABASE_URL") or "").strip()
+# blob = only panel_store jsonb (cheap); full = also rewrite clients/groups tables (heavy);
+# off = ignore DATABASE_URL entirely.
+PG_MODE = (os.environ.get("L2XPANEL_PG_MODE") or "blob").strip().lower()
 _LOCK = threading.RLock()
 _INIT_DONE = False
 _ENABLED: bool | None = None
@@ -29,9 +32,9 @@ def _now() -> str:
 
 
 def enabled() -> bool:
-    """True when DATABASE_URL is set and connection/schema are ready."""
+    """True when DATABASE_URL is set, mode != off, and connection/schema are ready."""
     global _ENABLED, _LAST_ERR
-    if not DATABASE_URL:
+    if not DATABASE_URL or PG_MODE in ("off", "0", "false", "no"):
         _ENABLED = False
         return False
     if _ENABLED is True:
@@ -45,6 +48,11 @@ def enabled() -> bool:
         _ENABLED = False
         _LAST_ERR = str(exc)
         return False
+
+
+def relational_sync_enabled() -> bool:
+    """Full clients/groups table rewrite — expensive; only for large dedicated DB hosts."""
+    return enabled() and PG_MODE in ("full", "relational", "all")
 
 
 def last_error() -> str:
@@ -209,16 +217,17 @@ def load_store_blob() -> dict | None:
             data = json.loads(data)
         if not isinstance(data, dict) or not data:
             return None
-        # Prefer relational clients/groups when present (source of truth for hot rows)
-        try:
-            rel_clients = _fetch_clients(conn)
-            rel_groups = _fetch_groups(conn)
-            if rel_clients is not None and len(rel_clients) > 0:
-                data["clients"] = rel_clients
-            if rel_groups is not None and len(rel_groups) > 0:
-                data["groups"] = rel_groups
-        except Exception:
-            pass
+        # Relational overlay only in full mode (blob is enough for light VPS)
+        if relational_sync_enabled():
+            try:
+                rel_clients = _fetch_clients(conn)
+                rel_groups = _fetch_groups(conn)
+                if rel_clients:
+                    data["clients"] = rel_clients
+                if rel_groups:
+                    data["groups"] = rel_groups
+            except Exception:
+                pass
         return data
     finally:
         conn.close()
