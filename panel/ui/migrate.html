@@ -89,19 +89,26 @@
     routes {{ source_meta.routes or 0 }}</div>
   {% endif %}
 
-  <h3 style="margin-top:1.4rem">Куда повесить</h3>
-  <div class="hint">Fallback L2X inbounds, если у клиента нет tag из бэкапа (по умолчанию — все). После восстановления структуры обычно не нужны.</div>
-  <div class="row" style="flex-wrap:wrap;gap:.4rem 1rem;margin-top:.5rem">
-    {% for ib in inbounds %}
-    <label class="check"><input type="checkbox" name="inbounds" value="{{ ib.tag }}"
-      {% if not selected_inbounds or ib.tag in selected_inbounds %}checked{% endif %}> {{ ib.tag }}
-      <span class="dim">({{ ib.protocol }})</span></label>
-    {% else %}
-    <div class="hint">Нет подходящих inbounds — при восстановлении структуры они создадутся из бэкапа.</div>
-    {% endfor %}
+  <h3 style="margin-top:1.4rem">Группа</h3>
+  <div class="hint">
+    Клиенты назначаются в <b>группы</b> (ядра внутри группы настраиваются отдельно).
+    <b>PasarGuard:</b> группы из бэкапа/API создаются автоматически (пока без ядер) и назначаются тем же пользователям.
+    Ниже — fallback-группа, если у клиента в источнике группы нет.
   </div>
+  <label class="f" style="margin-top:.5rem">Fallback-группа L2X</label>
+  <select name="group_id" style="max-width:360px">
+    <option value="">— без группы —</option>
+    {% for g in groups or [] %}
+    <option value="{{ g.id }}" {% if selected_group_id == g.id %}selected{% endif %}>{{ g.name }}</option>
+    {% endfor %}
+  </select>
+  {% if source_meta and source_meta.groups %}
+  <div class="hint" style="margin-top:.5rem">В источнике групп: <b>{{ source_meta.groups|length }}</b>
+    — {% for g in source_meta.groups[:12] %}{{ g.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if source_meta.groups|length > 12 %}…{% endif %}
+  </div>
+  {% endif %}
   <div style="margin-top:.8rem">
-    {{ m.check('update_existing', update_existing, 'Обновить существующих (трафик / sub_token / лимиты) — иначе пропуск') }}
+    {{ m.check('update_existing', update_existing, 'Обновить существующих (трафик / sub_token / лимиты / группа) — иначе пропуск') }}
   </div>
 
   <h3 style="margin-top:1.4rem">Старые ссылки (путь / порт)</h3>
@@ -137,11 +144,12 @@
   {% if preview.sample %}
   <div style="overflow:auto;margin-top:.8rem">
     <table class="table">
-      <thead><tr><th>email</th><th>sub</th><th>лимит GB</th><th>трафик</th><th>срок</th></tr></thead>
+      <thead><tr><th>email</th><th>группа</th><th>sub</th><th>лимит GB</th><th>трафик</th><th>срок</th></tr></thead>
       <tbody>
       {% for u in preview.sample %}
         <tr>
           <td>{{ u.email }}</td>
+          <td class="small">{% if u.groups %}{{ u.groups|join(', ') }}{% else %}<span class="dim">—</span>{% endif %}</td>
           <td class="mono">{{ u.sub_token[:16] }}{% if u.sub_token|length > 16 %}…{% endif %}</td>
           <td>{{ u.limit_gb or '∞' }}</td>
           <td>{{ format_traffic((u.up or 0) + (u.down or 0)) }}</td>
@@ -164,6 +172,12 @@
     <div><span class="dim">Обновлено</span><div><b>{{ report.updated }}</b></div></div>
     <div><span class="dim">Пропущено</span><div><b>{{ report.skipped }}</b></div></div>
   </div>
+  {% if report.groups_created is defined or report.groups_mapped is defined %}
+  <div class="row" style="margin-top:.6rem">
+    <div><span class="dim">Групп создано</span><div><b class="ok">{{ report.groups_created or 0 }}</b></div></div>
+    <div><span class="dim">Клиентов с группой</span><div><b>{{ report.groups_mapped or 0 }}</b></div></div>
+  </div>
+  {% endif %}
   {% if report.structure %}
   <div class="row" style="margin-top:.6rem">
     <div><span class="dim">Inbounds</span><div><b>+{{ report.structure.inbounds_created }} / ~{{ report.structure.inbounds_updated }}</b></div></div>

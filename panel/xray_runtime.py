@@ -1703,16 +1703,6 @@ def client_capable_inbounds(store: dict) -> list[dict]:
     return out
 
 
-def client_inbounds(store: dict, client: dict) -> list[dict]:
-    wanted = client_effective_inbounds(store, client)
-    capable = client_capable_inbounds(store)
-    if not wanted:
-        return capable
-    # Case-insensitive: UI / legacy data may store BUHAREST vs Buharest
-    want = {str(t).strip().lower() for t in wanted if str(t).strip()}
-    return [i for i in capable if str(i.get("tag") or "").strip().lower() in want]
-
-
 def client_inbound_tags(store: dict, client: dict) -> set[str]:
     """Lowercased inbound tags assigned to the client (for build_config matching)."""
     return {str(i.get("tag") or "").strip().lower() for i in client_inbounds(store, client) if i.get("tag")}
@@ -1933,15 +1923,43 @@ def client_effective_allowed_tags(store: dict, client: dict) -> list[str]:
 
 
 def client_effective_inbounds(store: dict, client: dict) -> list[str]:
-    """Inbound tags for the client. Empty list = all capable.
+    """Inbound tags for the client. Empty list = all capable — except empty select-group.
 
     With a group: cores (→ inbound tags) are the base; personal inbounds may add extras.
+    Group with ``core_mode=select`` and no cores yet → no inbounds (admin assigns cores later).
     """
     personal = list(client.get("inbounds") or [])
     g = client_group(store, client)
     if g is not None:
-        return _merge_tag_lists(group_inbound_tags(store, g), personal)
+        base = group_inbound_tags(store, g)
+        if (
+            not base
+            and list_mode(g, list_key="cores", mode_key="core_mode") == "select"
+            and not (g.get("cores") or [])
+        ):
+            # Empty select-group: only personal extras (usually none)
+            return list(personal)
+        return _merge_tag_lists(base, personal)
     return personal
+
+
+def client_inbounds(store: dict, client: dict) -> list[dict]:
+    wanted = client_effective_inbounds(store, client)
+    capable = client_capable_inbounds(store)
+    if not wanted:
+        g = client_group(store, client)
+        # select-group with no cores → explicitly none (not «all»)
+        if (
+            g is not None
+            and list_mode(g, list_key="cores", mode_key="core_mode") == "select"
+            and not (g.get("cores") or [])
+            and not (client.get("inbounds") or [])
+        ):
+            return []
+        return capable
+    # Case-insensitive: UI / legacy data may store BUHAREST vs Buharest
+    want = {str(t).strip().lower() for t in wanted if str(t).strip()}
+    return [i for i in capable if str(i.get("tag") or "").strip().lower() in want]
 
 
 def client_default_outbound(store: dict, client: dict) -> str:

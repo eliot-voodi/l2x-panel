@@ -1,4 +1,4 @@
-﻿"""Import users from X-UI, PasarGuard, or Remnawave (API or backup file).
+"""Import users from X-UI, PasarGuard, or Remnawave (API or backup file).
 
 Preserves subscription tokens, traffic counters, limits, and expiry so clients
 can keep their existing subscription URLs after DNS points at L2X.
@@ -62,6 +62,9 @@ class NormalizedUser:
         ibs = extra.get("inbounds")
         if ibs:
             d["inbounds"] = list(ibs)
+        gnames = extra.get("group_names") or extra.get("groups")
+        if gnames:
+            d["groups"] = list(gnames)
         return d
 
 
@@ -434,26 +437,74 @@ def _set_imported_traffic(client: dict, up: int, down: int) -> None:
 def apply(
     store: dict,
     users: list[NormalizedUser],
-    inbound_tags: list[str],
+    inbound_tags: list[str] | None = None,
     *,
+    group_id: str = "",
     update_existing: bool = False,
+    create_source_groups: bool = True,
 ) -> dict[str, Any]:
-    """Mutate store clients in-place. Caller holds mutate() lock."""
+    """Mutate store clients in-place. Caller holds mutate() lock.
+
+    Prefer assigning an L2X ``group_id`` (from PasarGuard groups or UI fallback).
+    ``inbound_tags`` kept for legacy X-UI imports without groups.
+    """
     capable = {i["tag"] for i in xray.client_capable_inbounds(store)}
-    tags = [t for t in inbound_tags if t in capable] if inbound_tags else list(capable)
+    tags = [t for t in (inbound_tags or []) if t in capable]
     by_email = {str(c.get("email") or ""): c for c in store.get("clients") or []}
     created = updated = skipped = traffic_fixed = 0
     traffic_bytes = 0
     errors: list[str] = []
+    groups_created = 0
+    groups_mapped = 0
+
+    # PasarGuard: recreate empty groups and map name → id
+    name_to_gid: dict[str, str] = {}
+    meta = LAST_SOURCE_META or {}
+    if create_source_groups and str(meta.get("source") or "").lower() == "pasarguard":
+        before = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
+        name_to_gid = ensure_pasarguard_groups(store, meta.get("groups") or [])
+        after = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
+        groups_created = len(after - before)
+        # Also map names discovered only on users
+        extra_names = []
+        for u in users:
+            for n in (u.extra or {}).get("group_names") or []:
+                name = str(n).strip()
+                if name and name not in name_to_gid:
+                    extra_names.append({"id": f"name:{name}", "name": name})
+        if extra_names:
+            more = ensure_pasarguard_groups(store, extra_names)
+            name_to_gid.update(more)
+            after2 = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
+            groups_created = len(after2 - before)
+
+    fallback_gid = str(group_id or "").strip()
+    if fallback_gid and not xray.get_group(store, fallback_gid):
+        fallback_gid = ""
+
+    def _resolve_group_id(u: NormalizedUser) -> str:
+        for n in (u.extra or {}).get("group_names") or []:
+            name = str(n).strip()
+            gid = name_to_gid.get(name) or ""
+            if not gid:
+                # case-insensitive
+                for kn, kv in name_to_gid.items():
+                    if kn.lower() == name.lower():
+                        gid = kv
+                        break
+            if gid:
+                return gid
+        return fallback_gid
 
     for u in users:
         email = _norm_email(u.email)
         if not email:
             skipped += 1
             continue
-        # Prefer inbound tags recorded from x-ui inbound.settings.clients
+        # Prefer inbound tags recorded from x-ui inbound.settings.clients (legacy)
         user_tags = [t for t in ((u.extra or {}).get("inbounds") or []) if t in capable]
         use_tags = user_tags or tags
+        gid = _resolve_group_id(u)
         existing = by_email.get(email)
         up_i, down_i = int(u.up or 0), int(u.down or 0)
         if existing and not update_existing:
@@ -473,6 +524,13 @@ def apply(
                 existing["source_id"] = str(u.source_id)
                 if u.source:
                     existing["source"] = str(u.source)
+                repaired = True
+            # Assign missing group from PasarGuard mapping
+            if gid and not existing.get("group_id"):
+                existing["group_id"] = gid
+                existing["inbounds"] = []
+                existing["ib_mode"] = "all"
+                groups_mapped += 1
                 repaired = True
             # Replace username-fallback tokens with minted PasarGuard tokens when available
             if (
@@ -511,7 +569,12 @@ def apply(
                     c["source_id"] = str(u.source_id)
                 if u.source:
                     c["source"] = str(u.source)
-                if use_tags:
+                if gid:
+                    c["group_id"] = gid
+                    c["inbounds"] = []
+                    c["ib_mode"] = "all"
+                    groups_mapped += 1
+                elif use_tags:
                     c["inbounds"] = list(use_tags)
                 xray.ensure_client(c)
                 _set_imported_traffic(c, up_i, down_i)
@@ -522,12 +585,14 @@ def apply(
                 payload: dict[str, Any] = {
                     "email": email,
                     "enabled": bool(u.enabled),
-                    "inbounds": list(use_tags),
+                    "inbounds": [] if gid else list(use_tags),
+                    "ib_mode": "all",
                     "limit_gb": float(u.limit_gb or 0),
                     "expire_at": u.expire_at or "",
                     "comment": u.comment or "",
                     "tg_id": str(u.tg_id or ""),
                     "sub_enabled": True,
+                    "group_id": gid,
                 }
                 if u.sub_token:
                     payload["sub_token"] = u.sub_token
@@ -549,6 +614,8 @@ def apply(
                 by_email[email] = c
                 xray.ensure_wg_peer(store, c)
                 created += 1
+                if gid:
+                    groups_mapped += 1
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{email}: {exc}")
 
@@ -561,6 +628,8 @@ def apply(
         "traffic_bytes": traffic_bytes,
         "errors": errors[:30],
         "inbounds": tags,
+        "groups_created": groups_created,
+        "groups_mapped": groups_mapped,
         "client_inbound_map": sum(
             1 for u in users if (u.extra or {}).get("inbounds")
         ),
@@ -1661,6 +1730,31 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
     # File dumps have no subscription_url (signed URL is computed by PasarGuard).
     # Leave sub_token empty here — parse_pasarguard_backup mints a v3 token from jwt secret.
     # Username fallback only if minting is impossible (no secret / no id).
+    group_names: list[str] = []
+    # API / JSON may embed group objects or names
+    for key in ("group_names", "groups"):
+        raw_g = u.get(key)
+        if isinstance(raw_g, list):
+            for item in raw_g:
+                if isinstance(item, dict):
+                    n = str(item.get("name") or "").strip()
+                else:
+                    n = str(item or "").strip()
+                if n and n not in group_names:
+                    group_names.append(n)
+    # Single group name field
+    for key in ("group_name", "group"):
+        n = str(u.get(key) or "").strip()
+        if n and n not in group_names and not n.startswith("{"):
+            group_names.append(n)
+    extra: dict[str, Any] = {
+        "status": status,
+        "id": u.get("id"),
+        "created_at": created_raw,
+        "group_ids": _pg_parse_group_ids_field(u.get("group_ids") or u.get("groupIds")),
+    }
+    if group_names:
+        extra["group_names"] = group_names
     return NormalizedUser(
         email=email,
         uuid=uuid,
@@ -1675,7 +1769,7 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
         down=used,
         source=source,
         source_id=source_id,
-        extra={"status": status, "id": u.get("id"), "created_at": created_raw},
+        extra=extra,
     )
 
 
@@ -1850,7 +1944,8 @@ def extract_pasarguard_meta_from_sql(text: str) -> dict[str, Any]:
                 if prefix and "://" not in prefix:
                     path = re.sub(r"[^A-Za-z0-9_-]", "", prefix.strip("/").split("/")[0] or "")
                 break
-    return {"jwt_secrets": secrets, "path": path}
+    groups_meta = extract_pasarguard_groups_from_sql(text)
+    return {"jwt_secrets": secrets, "path": path, **groups_meta}
 
 
 def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
@@ -1870,7 +1965,192 @@ def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
                         secrets.append(key)
     finally:
         conn.close()
-    return {"jwt_secrets": secrets}
+    groups_meta = extract_pasarguard_groups_from_sqlite(path)
+    return {"jwt_secrets": secrets, **groups_meta}
+
+
+def _pg_parse_group_ids_field(raw: Any) -> list[str]:
+    """Normalize group id list from JSON column / API field."""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, (int, float)):
+        return [str(int(raw))]
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x).strip()]
+        except Exception:
+            pass
+    return [s]
+
+
+def extract_pasarguard_groups_from_sql(text: str) -> dict[str, Any]:
+    """Parse ``groups`` + ``users_groups`` (Marzban/PasarGuard) from pg_dump COPY blocks."""
+    groups_by_id: dict[str, dict[str, Any]] = {}
+    user_groups: dict[str, list[str]] = {}  # user_id → [group_id, ...]
+    for table, cols, body in _iter_sql_copy_tables(text):
+        low = table.lower().split(".")[-1]
+        if low in ("groups", "group"):
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                gid = str(rec.get("id") if rec.get("id") is not None else "").strip()
+                name = str(rec.get("name") or "").strip()
+                if not gid or not name:
+                    continue
+                groups_by_id[gid] = {"id": gid, "name": name}
+        elif low in ("users_groups", "user_groups", "group_users", "users_group"):
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                uid = str(rec.get("user_id") or rec.get("users_id") or "").strip()
+                gid = str(rec.get("group_id") or rec.get("groups_id") or "").strip()
+                if not uid or not gid:
+                    continue
+                user_groups.setdefault(uid, [])
+                if gid not in user_groups[uid]:
+                    user_groups[uid].append(gid)
+    return {
+        "groups": list(groups_by_id.values()),
+        "user_groups": user_groups,
+    }
+
+
+def extract_pasarguard_groups_from_sqlite(path: Path) -> dict[str, Any]:
+    groups_by_id: dict[str, dict[str, Any]] = {}
+    user_groups: dict[str, list[str]] = {}
+    conn = sqlite3.connect(str(path))
+    try:
+        tables = {
+            r[0].lower()
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        gtable = "groups" if "groups" in tables else ("group" if "group" in tables else "")
+        if gtable:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({gtable})").fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            if "id" in col_l and "name" in col_l:
+                for row in conn.execute(f"SELECT * FROM {gtable}"):
+                    rec = {cols[i]: row[i] for i in range(len(cols))}
+                    gid = str(rec.get(col_l["id"]) if rec.get(col_l["id"]) is not None else "").strip()
+                    name = str(rec.get(col_l["name"]) or "").strip()
+                    if gid and name:
+                        groups_by_id[gid] = {"id": gid, "name": name}
+        for jtable in ("users_groups", "user_groups", "group_users", "users_group"):
+            if jtable not in tables:
+                continue
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({jtable})").fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            uid_c = col_l.get("user_id") or col_l.get("users_id")
+            gid_c = col_l.get("group_id") or col_l.get("groups_id")
+            if not uid_c or not gid_c:
+                continue
+            for row in conn.execute(f"SELECT * FROM {jtable}"):
+                rec = {cols[i]: row[i] for i in range(len(cols))}
+                uid = str(rec.get(uid_c) or "").strip()
+                gid = str(rec.get(gid_c) or "").strip()
+                if not uid or not gid:
+                    continue
+                user_groups.setdefault(uid, [])
+                if gid not in user_groups[uid]:
+                    user_groups[uid].append(gid)
+            break
+        # Fallback: group_ids JSON on users
+        if "users" in tables and not user_groups:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            if "id" in col_l and "group_ids" in col_l:
+                for row in conn.execute("SELECT * FROM users"):
+                    rec = {cols[i]: row[i] for i in range(len(cols))}
+                    uid = str(rec.get(col_l["id"]) or "").strip()
+                    gids = _pg_parse_group_ids_field(rec.get(col_l["group_ids"]))
+                    if uid and gids:
+                        user_groups[uid] = gids
+    finally:
+        conn.close()
+    return {
+        "groups": list(groups_by_id.values()),
+        "user_groups": user_groups,
+    }
+
+
+def _attach_pasarguard_groups_to_users(
+    users: list[NormalizedUser],
+    *,
+    groups: list[dict[str, Any]] | None = None,
+    user_groups: dict[str, list[str]] | None = None,
+) -> None:
+    """Fill ``extra['group_names']`` from association map / API fields."""
+    by_id = {str(g.get("id")): str(g.get("name") or "").strip() for g in (groups or []) if g.get("id") is not None}
+    ug = user_groups or {}
+    for u in users:
+        names: list[str] = []
+        # Already set from API/JSON
+        existing = u.extra.get("group_names") if isinstance(u.extra, dict) else None
+        if isinstance(existing, list) and existing:
+            names = [str(n).strip() for n in existing if str(n).strip()]
+        else:
+            uid = str(u.source_id or (u.extra or {}).get("id") or "").strip()
+            for gid in ug.get(uid) or []:
+                name = by_id.get(str(gid)) or ""
+                if name and name not in names:
+                    names.append(name)
+            # group_ids on user dict leftovers
+            for gid in _pg_parse_group_ids_field((u.extra or {}).get("group_ids")):
+                name = by_id.get(str(gid)) or ""
+                if name and name not in names:
+                    names.append(name)
+        if names:
+            u.extra["group_names"] = names
+
+
+def ensure_pasarguard_groups(store: dict, groups: list[dict[str, Any]] | None) -> dict[str, str]:
+    """Create empty L2X groups for PasarGuard group names. Returns name → group_id.
+
+    Groups are created with ``core_mode=select`` and no cores — admin assigns cores later.
+    """
+    xray.ensure_groups(store)
+    by_name = {
+        str(g.get("name") or "").strip().lower(): g
+        for g in (store.get("groups") or [])
+        if isinstance(g, dict) and str(g.get("name") or "").strip()
+    }
+    mapping: dict[str, str] = {}
+    for g in groups or []:
+        name = str(g.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        existing = by_name.get(key)
+        if existing:
+            mapping[name] = str(existing.get("id") or "")
+            continue
+        ng = xray.new_group(name=name, comment="импорт PasarGuard")
+        # Empty cores — admin picks later; not «all cores»
+        ng["core_mode"] = "select"
+        ng["cores"] = []
+        ng["ib_mode"] = "select"
+        ng["inbounds"] = []
+        store.setdefault("groups", []).append(ng)
+        by_name[key] = ng
+        mapping[name] = str(ng.get("id") or "")
+    return mapping
 
 
 def _parse_users_sql_insert(text: str) -> list[NormalizedUser]:
@@ -1976,6 +2256,8 @@ def _finalize_pasarguard_users(
     note: str = "",
     port: int = 0,
     tls: bool = False,
+    groups: list[dict[str, Any]] | None = None,
+    user_groups: dict[str, list[str]] | None = None,
 ) -> list[NormalizedUser]:
     global LAST_SOURCE_META
     secrets = [s for s in (jwt_secrets or []) if s]
@@ -1984,6 +2266,17 @@ def _finalize_pasarguard_users(
     for u in users:
         if not u.sub_token:
             u.sub_token = re.sub(r"[^A-Za-z0-9_-]", "", u.email)[:64] or u.email
+    g_list = list(groups or [])
+    ug = dict(user_groups or {})
+    _attach_pasarguard_groups_to_users(users, groups=g_list, user_groups=ug)
+    # Ensure group catalog includes names only present on users
+    known = {str(g.get("name") or "").strip().lower() for g in g_list}
+    for u in users:
+        for n in (u.extra or {}).get("group_names") or []:
+            name = str(n).strip()
+            if name and name.lower() not in known:
+                g_list.append({"id": f"name:{name}", "name": name})
+                known.add(name.lower())
     LAST_SOURCE_META = {
         **(LAST_SOURCE_META or {}),
         "source": "pasarguard",
@@ -1992,6 +2285,8 @@ def _finalize_pasarguard_users(
         "path": path or "",
         "port": int(port or 0) or None,
         "tls": bool(tls),
+        "groups": g_list,
+        "user_groups": ug,
         "sub_tokens_minted": sum(1 for u in users if u.sub_token and "." in u.sub_token),
         "note": note or (
             "JWT secret imported — старые PasarGuard-ссылки принимаются панелью"
@@ -2005,11 +2300,34 @@ def _finalize_pasarguard_users(
 def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
     members = _extract_archive_members(raw)
     ordered = sorted(members, key=lambda it: (_pg_member_priority(it[0], it[1]), it[0].lower()))
-    # Collect jwt secrets from any dump member (may live in a different file than users)
+    # Collect jwt secrets / groups from any dump member (may live in a different file than users)
     all_secrets: list[str] = []
+    all_groups: list[dict[str, Any]] = []
+    all_user_groups: dict[str, list[str]] = {}
     path_hint = ""
     port_hint = 0
     tls_hint = False
+
+    def _merge_groups_meta(meta: dict[str, Any]) -> None:
+        for g in meta.get("groups") or []:
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get("id") or "")
+            name = str(g.get("name") or "").strip()
+            if not name:
+                continue
+            if not any(
+                str(x.get("id")) == gid or str(x.get("name") or "").lower() == name.lower()
+                for x in all_groups
+            ):
+                all_groups.append({"id": gid or f"name:{name}", "name": name})
+        for uid, gids in (meta.get("user_groups") or {}).items():
+            bucket = all_user_groups.setdefault(str(uid), [])
+            for gid in gids or []:
+                sg = str(gid)
+                if sg and sg not in bucket:
+                    bucket.append(sg)
+
     for name, content in ordered:
         low = name.lower()
         try:
@@ -2024,11 +2342,13 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                 for s in meta.get("jwt_secrets") or []:
                     if s not in all_secrets:
                         all_secrets.append(s)
+                _merge_groups_meta(meta)
             elif low.endswith(".sql") or _pg_looks_like_sql(content):
                 meta = extract_pasarguard_meta_from_sql(content.decode("utf-8", "replace"))
                 for s in meta.get("jwt_secrets") or []:
                     if s not in all_secrets:
                         all_secrets.append(s)
+                _merge_groups_meta(meta)
                 if not path_hint and meta.get("path"):
                     path_hint = str(meta["path"])
             elif low.endswith(".env") or low.rsplit("/", 1)[-1] == ".env":
@@ -2047,6 +2367,14 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
             continue
 
     errors: list[str] = []
+    fin_kw = dict(
+        jwt_secrets=all_secrets,
+        path=path_hint,
+        port=port_hint,
+        tls=tls_hint,
+        groups=all_groups,
+        user_groups=all_user_groups,
+    )
     for name, content in ordered:
         if _pg_member_priority(name, content) >= 100:
             continue
@@ -2057,36 +2385,39 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                     tmp.write(content)
                     path = Path(tmp.name)
                 try:
-                    if not all_secrets:
+                    if not all_secrets or not all_groups:
                         meta = extract_pasarguard_meta_from_sqlite(path)
-                        all_secrets.extend(meta.get("jwt_secrets") or [])
+                        all_secrets.extend(s for s in (meta.get("jwt_secrets") or []) if s not in all_secrets)
+                        _merge_groups_meta(meta)
+                        fin_kw["jwt_secrets"] = all_secrets
+                        fin_kw["groups"] = all_groups
+                        fin_kw["user_groups"] = all_user_groups
                     users = _parse_pg_sqlite(path)
                 finally:
                     path.unlink(missing_ok=True)
                 if users:
-                    return _finalize_pasarguard_users(
-                        users, jwt_secrets=all_secrets, path=path_hint, port=port_hint, tls=tls_hint
-                    )
+                    return _finalize_pasarguard_users(users, **fin_kw)
                 continue
             if low.endswith(".sql") or _pg_looks_like_sql(content):
                 text = content.decode("utf-8", "replace")
-                if not all_secrets:
+                if not all_secrets or not all_groups:
                     meta = extract_pasarguard_meta_from_sql(text)
-                    all_secrets.extend(meta.get("jwt_secrets") or [])
+                    all_secrets.extend(s for s in (meta.get("jwt_secrets") or []) if s not in all_secrets)
+                    _merge_groups_meta(meta)
                     if not path_hint and meta.get("path"):
                         path_hint = str(meta["path"])
+                        fin_kw["path"] = path_hint
+                    fin_kw["jwt_secrets"] = all_secrets
+                    fin_kw["groups"] = all_groups
+                    fin_kw["user_groups"] = all_user_groups
                 users = _parse_users_sql_dump(text)
                 if users:
-                    return _finalize_pasarguard_users(
-                        users, jwt_secrets=all_secrets, path=path_hint, port=port_hint, tls=tls_hint
-                    )
+                    return _finalize_pasarguard_users(users, **fin_kw)
                 continue
             if low.endswith(".json") or b'"username"' in content[:4000]:
                 users = parse_pasarguard_json(content)
                 if users:
-                    return _finalize_pasarguard_users(
-                        users, jwt_secrets=all_secrets, path=path_hint, port=port_hint, tls=tls_hint
-                    )
+                    return _finalize_pasarguard_users(users, **fin_kw)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")
             continue
@@ -2157,6 +2488,27 @@ def fetch_pasarguard_api(
     else:
         raise RuntimeError("Укажите логин/пароль или API key")
 
+    # Groups catalog (optional)
+    api_groups: list[dict[str, Any]] = []
+    for gpath in ("/api/groups", "/api/user/groups", "/api/admin/groups"):
+        try:
+            gdata = http.json("GET", gpath)
+        except Exception:
+            continue
+        batch_g: list = []
+        if isinstance(gdata, list):
+            batch_g = gdata
+        elif isinstance(gdata, dict):
+            batch_g = gdata.get("groups") or gdata.get("items") or gdata.get("data") or []
+        for g in batch_g:
+            if isinstance(g, dict) and (g.get("name") or g.get("id") is not None):
+                api_groups.append({
+                    "id": str(g.get("id") if g.get("id") is not None else g.get("name")),
+                    "name": str(g.get("name") or g.get("id") or "").strip(),
+                })
+        if api_groups:
+            break
+
     out: list[NormalizedUser] = []
     offset = 0
     limit = 100
@@ -2196,7 +2548,21 @@ def fetch_pasarguard_api(
         offset += limit
         if offset > 100_000:
             break
-    return out
+    # Resolve group_ids → names when API returned groups catalog
+    user_groups: dict[str, list[str]] = {}
+    by_id = {str(g.get("id")): str(g.get("name") or "") for g in api_groups}
+    for u in out:
+        gids = _pg_parse_group_ids_field((u.extra or {}).get("group_ids"))
+        if gids and u.source_id:
+            user_groups[str(u.source_id)] = gids
+        # Resolve names from ids if only ids present
+        if gids and not (u.extra or {}).get("group_names"):
+            names = [by_id[g] for g in gids if by_id.get(g)]
+            if names:
+                u.extra["group_names"] = names
+    return _finalize_pasarguard_users(
+        out, groups=api_groups, user_groups=user_groups, note="PasarGuard API"
+    )
 
 
 # ---------------------------------------------------------------- Remnawave

@@ -4027,12 +4027,11 @@ def _migrate_cache_load() -> list:
 
 def _migrate_page(request: Request, *, preview=None, report=None, **form_kw):
     store = _load_store()
-    inbounds = xray.client_capable_inbounds(store)
     meta = migrate_mod.LAST_SOURCE_META or {}
     return page(
         request, "migrate.html", active="migrate",
         sources=list(migrate_mod.SOURCE_LABELS.items()),
-        inbounds=inbounds,
+        groups=xray.ensure_groups(store),
         preview=preview, report=report,
         source=form_kw.get("source") or "3xui",
         mode=form_kw.get("mode") or "api",
@@ -4041,7 +4040,7 @@ def _migrate_page(request: Request, *, preview=None, report=None, **form_kw):
         web_base=form_kw.get("web_base") or "",
         insecure=bool(form_kw.get("insecure")),
         update_existing=bool(form_kw.get("update_existing")),
-        selected_inbounds=form_kw.get("selected_inbounds"),
+        selected_group_id=str(form_kw.get("selected_group_id") or ""),
         legacy_path=form_kw.get("legacy_path") or "",
         legacy_port=form_kw.get("legacy_port") or "",
         apply_legacy=bool(form_kw.get("apply_legacy")),
@@ -4079,14 +4078,14 @@ async def clients_migrate_run(request: Request):
     want_inbounds = migrate_what == "all"
     want_outbounds = migrate_what in ("outbounds", "all")
     want_routes = migrate_what in ("routes", "all")
-    selected = [str(x) for x in form.getlist("inbounds")]
+    selected_group_id = str(form.get("group_id") or "").strip()
     legacy_path = re.sub(r"[^A-Za-z0-9_-]", "", str(form.get("legacy_path") or ""))
     legacy_port = _int(form.get("legacy_port"), 0)
     apply_legacy = form.get("apply_legacy") == "1"
     form_kw = {
         "source": source, "mode": mode, "url": url, "username": username,
         "web_base": web_base, "insecure": insecure, "update_existing": update_existing,
-        "selected_inbounds": selected,
+        "selected_group_id": selected_group_id,
         "legacy_path": legacy_path, "legacy_port": legacy_port or "",
         "apply_legacy": apply_legacy,
         "migrate_what": migrate_what,
@@ -4181,6 +4180,9 @@ async def clients_migrate_run(request: Request):
                 hint += " · JWT secret не найден в файле — для тех же ссылок нужен API или бэкап с таблицей jwt"
             if meta.get("port"):
                 hint += f" · порт PasarGuard {meta['port']} ({'HTTPS' if meta.get('tls') else 'HTTP'})"
+            gn = len(meta.get("groups") or [])
+            if gn:
+                hint += f" · групп PasarGuard: {gn} (создадутся пустыми, без ядер)"
         if want_clients:
             flash(request, f"Найдено {prev['total']}: новых {prev['create']}, пропуск {prev['skip']}{hint}", "info")
         else:
@@ -4197,10 +4199,13 @@ async def clients_migrate_run(request: Request):
                 restore_outbounds=want_outbounds,
                 restore_routes=want_routes,
             )
-            if want_clients and not selected and struct_rep.get("inbound_tags"):
-                selected = list(struct_rep["inbound_tags"])
         if want_clients:
-            report = migrate_mod.apply(st, users, selected, update_existing=update_existing)
+            report = migrate_mod.apply(
+                st, users,
+                group_id=selected_group_id,
+                update_existing=update_existing,
+                create_source_groups=(source == "pasarguard"),
+            )
         else:
             report = {"created": 0, "updated": 0, "skipped": 0, "errors": [], "traffic_bytes": 0, "traffic_fixed": 0}
         if struct_rep:
