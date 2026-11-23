@@ -16,13 +16,13 @@
   <form class="card auth-card" method="post" action="{{ bp }}/login" autocomplete="on">
     <div class="brand"><div class="logo">L2X</div>{{ app_name }}</div>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
-    <label class="f">{{ t('Логин') }}</label>
-    <input name="username" autocomplete="username" required autofocus>
-    <label class="f">{{ t('Пароль') }}</label>
-    <input name="password" type="password" autocomplete="current-password" required>
+    <label class="f">{{ t('Логин') }} <span class="req">*</span></label>
+    <input name="username" autocomplete="username" required aria-required="true" autofocus>
+    <label class="f">{{ t('Пароль') }} <span class="req">*</span></label>
+    <input name="password" type="password" autocomplete="current-password" required aria-required="true">
     {% if totp_enabled %}
-    <label class="f">{{ t('Код 2FA') }}</label>
-    <input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+    <label class="f">{{ t('Код 2FA') }} <span class="req">*</span></label>
+    <input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required aria-required="true">
     {% endif %}
     <button class="btn mt" style="width:100%">{{ t('Вход') }}</button>
   </form>

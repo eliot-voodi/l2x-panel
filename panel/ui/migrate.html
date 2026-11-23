@@ -13,7 +13,10 @@
 <div class="card" style="margin-bottom:1rem">
   <h3>Что переносится</h3>
   <div class="hint">Логин клиента, UUID/пароль, <b>токен подписки</b> (ссылка не меняется), лимит трафика, срок,
-  уже потраченный трафик, <b>HWID-лимит и привязанные устройства</b>, даты создания/изменения, Telegram id, заметка, группы.
+  уже потраченный трафик, <b>HWID-лимит и привязанные устройства</b>, даты создания/изменения, Telegram id, заметка,
+  группы (+ inbounds групп → ядра L2X), <b>несколько групп</b> (объединение), шаблоны → группы-пресеты,
+  <b>on_hold → отложенный старт</b>, next-plan → renew, владелец-админ в поле клиента.
+  Не переносятся: usage-логи, трафик по нодам PG, hosts/ноды/inbounds инфраструктуры PG (своя модель L2X).
   Для <b>x-ui.db</b> ниже выберите: только клиенты / только outbound / только маршруты / всё (включая inbounds).</div>
   <div class="hint" style="margin-top:.5rem">
     Токен клиента (последний сегмент URL) сохраняется. Если в старой панели ссылка была вида
@@ -45,8 +48,8 @@
 
   <div id="box-api" style="margin-top:1rem">
     <div class="row">
-      <div style="flex:1.4"><label class="f">URL панели</label>
-        <input name="url" value="{{ url or '' }}" placeholder="https://panel.example.com" autocomplete="off">
+      <div style="flex:1.4"><label class="f">URL панели <span class="req">*</span></label>
+        <input name="url" id="mig_url" value="{{ url or '' }}" placeholder="https://panel.example.com" autocomplete="off">
       </div>
       <div><label class="f">Логин</label><input name="username" value="{{ username or '' }}" autocomplete="username"></div>
       <div><label class="f">Пароль</label><input name="password" type="password" value="" autocomplete="current-password" placeholder="••••••••"></div>
@@ -65,8 +68,8 @@
   </div>
 
   <div id="box-file" style="margin-top:1rem;display:none">
-    <label class="f">Файл</label>
-    <input type="file" name="file" accept=".db,.json,.sql,.zip,.tar,.gz,.tgz,application/octet-stream">
+    <label class="f">Файл <span class="req">*</span></label>
+    <input type="file" name="file" id="mig_file" accept=".db,.json,.sql,.zip,.tar,.gz,.tgz,application/octet-stream">
     <div class="hint">
       <b>X-UI:</b> SQLite <code>.db</code> (getDb) — клиенты + inbounds/outbounds/routes; или JSON export только клиентов.<br>
       <b>PasarGuard:</b> backup <code>.zip</code>/<code>.tar.gz</code> (<code>db.sqlite3</code>, <code>db_dump/</code>, <code>pg_dump/db-*.sql</code>), SQL dump или JSON users.
@@ -93,10 +96,9 @@
   <h3 style="margin-top:1.4rem">Группа</h3>
   <div class="hint">
     Клиенты назначаются в <b>группы</b> (ядра внутри группы настраиваются отдельно).
-    <b>PasarGuard:</b> порядок импорта — сначала группы, затем пользователи, затем назначение групп
-    (из <code>groups</code> + <code>users_groups_association</code>). Группы создаются пустыми (без ядер) —
-    ядра назначаете в UI. Пока группа без ядер, клиент не попадает во все inbound ноды
-    (защита от <code>User email~node_* already exists</code>).
+    <b>PasarGuard:</b> порядок — группы (+ inbounds→ядра) → шаблоны → пользователи → назначение групп.
+    Если у группы в PG есть <code>inbounds_groups_association</code>, L2X подставит ядра, покрывающие эти tag’и
+    (если такие inbound’ы уже есть на панели). Несколько групп на пользователя → объединённая группа.
     В preview должно быть «связей user↔group» &gt; 0 — иначе перезалийте полный SQL/zip бэкап.
     Ниже — fallback-группа, если у клиента в источнике группы нет.
   </div>
@@ -110,6 +112,10 @@
   {% if source_meta and source_meta.groups %}
   <div class="hint" style="margin-top:.5rem">В источнике групп: <b>{{ source_meta.groups|length }}</b>
     — {% for g in source_meta.groups[:12] %}{{ g.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if source_meta.groups|length > 12 %}…{% endif %}
+    {% if source_meta.group_inbound_links %} · inbound↔group: <b>{{ source_meta.group_inbound_links }}</b>{% endif %}
+    {% if source_meta.templates_count %} · шаблонов: <b>{{ source_meta.templates_count }}</b>{% endif %}
+    {% if source_meta.on_hold_users %} · on_hold: <b>{{ source_meta.on_hold_users }}</b>{% endif %}
+    {% if source_meta.next_plan_users %} · next-plan: <b>{{ source_meta.next_plan_users }}</b>{% endif %}
   </div>
   {% endif %}
   <div style="margin-top:.8rem">
@@ -183,11 +189,19 @@
     <div><span class="dim">Клиентов с группой</span><div><b>{{ report.groups_mapped or 0 }}</b></div></div>
   </div>
   {% endif %}
-  {% if report.hwid_devices or report.hwid_limits or report.dates_set %}
+  {% if report.groups_cores_mapped or report.templates_created %}
+  <div class="row" style="margin-top:.6rem">
+    <div><span class="dim">Групп с ядрами (inbounds PG)</span><div><b>{{ report.groups_cores_mapped or 0 }}</b></div></div>
+    <div><span class="dim">Шаблонов → групп</span><div><b class="ok">{{ report.templates_created or 0 }}</b></div></div>
+  </div>
+  {% endif %}
+  {% if report.hwid_devices or report.hwid_limits or report.dates_set or report.on_hold_set or report.admins_set %}
   <div class="row" style="margin-top:.6rem">
     <div><span class="dim">HWID устройств</span><div><b class="ok">+{{ report.hwid_devices or 0 }}</b></div></div>
     <div><span class="dim">HWID лимитов</span><div><b>{{ report.hwid_limits or 0 }}</b></div></div>
     <div><span class="dim">Дат проставлено</span><div><b>{{ report.dates_set or 0 }}</b></div></div>
+    <div><span class="dim">on_hold / next-plan</span><div><b>{{ report.on_hold_set or 0 }}</b></div></div>
+    <div><span class="dim">Админов PG</span><div><b>{{ report.admins_set or 0 }}</b></div></div>
   </div>
   {% endif %}
   {% if report.traffic_bytes %}
@@ -217,10 +231,14 @@
   var mode = document.getElementById('mode');
   var api = document.getElementById('box-api');
   var file = document.getElementById('box-file');
+  var url = document.getElementById('mig_url');
+  var fileInp = document.getElementById('mig_file');
   function sync() {
     var f = mode.value === 'file';
     api.style.display = f ? 'none' : 'block';
     file.style.display = f ? 'block' : 'none';
+    if (url) { url.required = !f; url.setAttribute('aria-required', f ? 'false' : 'true'); }
+    if (fileInp) { fileInp.required = f; fileInp.setAttribute('aria-required', f ? 'true' : 'false'); }
   }
   mode.addEventListener('change', sync);
   sync();

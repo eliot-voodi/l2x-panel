@@ -47,7 +47,7 @@
         </select>
         {% if not is_new %}<div class="hint">Смена протокола сбросит его параметры</div>{% endif %}
       </div>
-      <div><label class="f">Tag</label><input name="tag" value="{{ ib.tag }}" required pattern="[A-Za-z0-9._-]+"></div>
+      <div><label class="f">Tag <span class="req">*</span></label><input name="tag" value="{{ ib.tag }}" required aria-required="true" pattern="[A-Za-z0-9._-]+"></div>
     </div>
     <div class="row">
       <div style="flex:1">
@@ -78,7 +78,7 @@
     </div>
     <div class="row">
       <div><label class="f">Listen</label><input id="ib_listen" value="{{ P.inbound_listen(ib) }}" readonly class="mono"></div>
-      <div><label class="f" id="port_lbl">Порт</label><input name="port" id="ib_port" type="number" min="1" max="65535" value="{{ ib.port }}" required>
+      <div><label class="f" id="port_lbl">Порт <span class="req">*</span></label><input name="port" id="ib_port" type="number" min="1" max="65535" value="{{ ib.port }}" required aria-required="true">
         <div class="hint" id="port_err" style="display:none;color:var(--bad,#e5484d)">Порты 22, 80, 443 запрещены для inbound</div>
       </div>
     </div>

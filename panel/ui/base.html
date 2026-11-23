@@ -99,6 +99,8 @@
     .dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft) }
 
     label.f { display: block; font-size: .78rem; color: var(--muted); margin: .7rem 0 .3rem; font-weight: 500 }
+    label.f .req, .req { color: var(--danger); font-weight: 700; margin-left: .15rem }
+    input.invalid, select.invalid, textarea.invalid { border-color: var(--danger) !important; box-shadow: 0 0 0 3px var(--danger-soft) }
     input, select, textarea { font: inherit; color: var(--text); background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 9px;
       padding: .5rem .7rem; width: 100%; outline: none; transition: border-color .15s, box-shadow .15s; max-width: 100% }
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft) }
@@ -357,6 +359,44 @@
   function closeNav() { setNav(false); }
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeNav(); });
   window.addEventListener('resize', function () { if (window.innerWidth > 860) closeNav(); });
+  /* Required fields: highlight + alert if HTML5 validation skipped / empty */
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (!form || form.tagName !== 'FORM' || form.hasAttribute('novalidate')) return;
+    var bad = [];
+    form.querySelectorAll('[required]').forEach(function (el) {
+      if (el.disabled || el.type === 'hidden') return;
+      el.classList.remove('invalid');
+      var ok = true;
+      if (el.type === 'checkbox' || el.type === 'radio') {
+        var name = el.name;
+        if (!name) return;
+        var group = form.querySelectorAll('[name="' + name.replace(/"/g, '\\"') + '"]');
+        ok = Array.prototype.some.call(group, function (x) { return x.checked; });
+      } else if (el.type === 'file') {
+        ok = !!(el.files && el.files.length);
+      } else {
+        ok = String(el.value || '').trim().length > 0;
+        if (ok && typeof el.checkValidity === 'function' && !el.checkValidity()) ok = false;
+      }
+      if (!ok) {
+        el.classList.add('invalid');
+        var lab = '';
+        var wrap = el.closest('div, label, td, .row > *') || el.parentElement;
+        var lbl = wrap && wrap.querySelector ? wrap.querySelector('label.f, .f') : null;
+        if (lbl) lab = (lbl.textContent || '').replace(/\*/g, '').trim();
+        if (!lab) lab = el.getAttribute('name') || el.id || 'поле';
+        if (bad.indexOf(lab) < 0) bad.push(lab);
+      }
+    });
+    if (bad.length) {
+      e.preventDefault();
+      e.stopPropagation();
+      alert('Заполните обязательные поля (*):\n• ' + bad.join('\n• '));
+      var first = form.querySelector('.invalid');
+      if (first && first.focus) try { first.focus(); } catch (err) {}
+    }
+  }, true);
 </script>
 {% block scripts %}{% endblock %}
 </body>

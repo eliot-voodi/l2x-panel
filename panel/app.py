@@ -4023,10 +4023,24 @@ def _migrate_cache_load() -> list:
         hw = item.get("hwids")
         if isinstance(hw, list) and hw:
             extra["hwids"] = [d for d in hw if isinstance(d, dict)]
-        for key in ("created_at", "updated_at", "online_at", "reset_period"):
+        for key in ("created_at", "updated_at", "online_at", "reset_period", "admin", "admin_id"):
             val = str(item.get(key) or "").strip()
             if val:
                 extra[key] = val
+        if item.get("start_on_first_use"):
+            extra["start_on_first_use"] = True
+        if item.get("duration_days") is not None:
+            try:
+                extra["duration_days"] = max(0, int(item.get("duration_days") or 0))
+            except (TypeError, ValueError):
+                pass
+        if item.get("on_expire"):
+            extra["on_expire"] = str(item.get("on_expire"))
+        if item.get("renew_on_reset"):
+            extra["renew_on_reset"] = True
+        np = item.get("next_plan")
+        if isinstance(np, dict):
+            extra["next_plan"] = np
         out.append(migrate_mod.NormalizedUser(
             email=str(item.get("email") or ""),
             uuid=str(item.get("uuid") or ""),

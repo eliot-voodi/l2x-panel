@@ -20,9 +20,12 @@
   <div class="card">
     <h3>Профиль</h3>
     <div class="row">
-      <div><label class="f">Email / имя</label><input name="email" value="{{ c.email }}" required pattern="[^\s~]+" autofocus></div>
+      <div><label class="f">Email / имя <span class="req">*</span></label><input name="email" value="{{ c.email }}" required aria-required="true" pattern="[^\s~]+" autofocus></div>
       <div><label class="f">Комментарий</label><input name="comment" value="{{ c.comment }}"></div>
     </div>
+    {% if c.admin %}
+    <div class="hint mt">Владелец (PasarGuard admin): <b class="mono">{{ c.admin }}</b></div>
+    {% endif %}
     <label class="f">Группа</label>
     <select name="group_id" id="client-group">
       <option value="">— без группы (личные настройки) —</option>

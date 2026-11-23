@@ -110,7 +110,7 @@
   <h3>Панель на ноде</h3>
   <div class="row">
     <div><label class="f">Название</label><input name="title" value="{{ p.title or '' }}"></div>
-    <div><label class="f">Публичный домен</label><input name="public_host" value="{{ p.public_host or '' }}" required></div>
+    <div><label class="f">Публичный домен <span class="req">*</span></label><input name="public_host" value="{{ p.public_host or '' }}" required aria-required="true"></div>
   </div>
   <div class="row">
     <div><label class="f">Язык</label><select name="lang"><option value="ru">Русский</option><option value="en" {% if p.lang=='en' %}selected{% endif %}>English</option></select></div>

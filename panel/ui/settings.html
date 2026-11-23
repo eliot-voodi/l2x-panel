@@ -21,7 +21,7 @@
   <input type="hidden" name="section" value="panel">
   <div class="row">
     <div><label class="f">Название панели</label><input name="title" value="{{ p.title }}"></div>
-    <div><label class="f">Основной домен (HTTPS :443)</label><input name="public_host" value="{{ p.public_host }}" placeholder="test.gentle-den.cc" required></div>
+    <div><label class="f">Основной домен (HTTPS :443) <span class="req">*</span></label><input name="public_host" value="{{ p.public_host }}" placeholder="test.gentle-den.cc" required aria-required="true"></div>
   </div>
   <div class="hint">Основной адрес для клиентов: <code>https://домен/</code> — подписки и share-ссылки. A-запись → IP сервера; сертификат Let's Encrypt выпускается автоматически.</div>
   <label class="f">Дополнительные домены панели</label>
@@ -312,19 +312,19 @@
   <form class="mt" method="post" action="{{ bp }}/settings/admins/add">
     <h4 class="mb">Добавить администратора</h4>
     <div class="grid g2">
-      <label class="f">Логин<input name="username" required minlength="1" maxlength="64" autocomplete="username"></label>
-      <label class="f">Пароль (мин. 8)<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>
+      <label class="f">Логин <span class="req">*</span><input name="username" required aria-required="true" minlength="1" maxlength="64" autocomplete="username"></label>
+      <label class="f">Пароль (мин. 8) <span class="req">*</span><input name="password" type="password" required aria-required="true" minlength="8" autocomplete="new-password"></label>
     </div>
-    <label class="f mt">Ваш текущий пароль (подтверждение)<input name="current" type="password" required autocomplete="current-password"></label>
+    <label class="f mt">Ваш текущий пароль (подтверждение) <span class="req">*</span><input name="current" type="password" required aria-required="true" autocomplete="current-password"></label>
     <div class="actions mt"><button class="btn">Добавить</button></div>
   </form>
 </div>
 <div class="grid g2">
   <form class="card" method="post" action="{{ bp }}/settings/account">
     <h3>Моя учётная запись</h3>
-    <label class="f">{{ t('Логин') }}</label><input name="username" value="{{ admin.username }}" required>
+    <label class="f">{{ t('Логин') }} <span class="req">*</span></label><input name="username" value="{{ admin.username }}" required aria-required="true">
     <label class="f">Новый пароль (пусто — не менять)</label><input name="new_password" type="password" minlength="8" autocomplete="new-password">
-    <label class="f">Текущий пароль</label><input name="current" type="password" required autocomplete="current-password">
+    <label class="f">Текущий пароль <span class="req">*</span></label><input name="current" type="password" required aria-required="true" autocomplete="current-password">
     <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
   </form>
   <div class="card">
@@ -392,9 +392,9 @@
 <div class="grid g2">
   <form class="card" method="post" action="{{ bp }}/settings/cert">
     <h3>Выпустить сертификат Let's Encrypt</h3>
-    <label class="f">Домен или IP сервера</label>
+    <label class="f">Домен или IP сервера <span class="req">*</span></label>
     <div class="row" style="align-items:center">
-      <div><input name="domain" id="acme_domain" required placeholder="vpn.example.com или {{ public_host }}"></div>
+      <div><input name="domain" id="acme_domain" required aria-required="true" placeholder="vpn.example.com или {{ public_host }}"></div>
       <div style="flex:0 0 auto"><button type="button" class="btn ghost" onclick="document.getElementById('acme_domain').value='{{ public_host }}'">IP сервера</button></div>
     </div>
     <label class="f">Email</label><input name="email" type="email">
@@ -426,7 +426,8 @@
   </div>
   <form class="card" method="post" action="{{ bp }}/backup/restore" enctype="multipart/form-data" onsubmit="return confirm('Восстановить из бэкапа? Текущие данные будут заменены (копия сохранится).')">
     <h3>Восстановить</h3>
-    <input type="file" name="file" accept=".zip" required>
+    <label class="f">Файл бэкапа <span class="req">*</span></label>
+    <input type="file" name="file" accept=".zip" required aria-required="true">
     <div class="hint">Перед восстановлением создаётся страховочная копия pre-restore-*.zip в каталоге данных (хранится только последняя).</div>
     <div class="actions mt"><button class="btn danger">Восстановить</button></div>
   </form>
@@ -488,8 +489,8 @@
   <form method="post" action="{{ bp }}/panel/update/rollback" class="mt"
         onsubmit="return confirm('Установить панель '+this.version.value+'?\nТекущая: v{{ panel_version }}\nДанные сохранятся, Xray не трогаем.')">
     <input type="hidden" name="confirm" value="yes">
-    <label class="f">Релиз</label>
-    <select name="version" required style="max-width:280px">
+    <label class="f">Релиз <span class="req">*</span></label>
+    <select name="version" required aria-required="true" style="max-width:280px">
       {% for r in prels %}
       <option value="{{ r.tag }}" {% if r.tag.lstrip('v') == panel_version %}disabled{% endif %}>{{ r.tag }}{% if r.prerelease %} (pre){% endif %}</option>
       {% else %}<option value="">нет списка релизов — проверьте GitHub</option>{% endfor %}
@@ -521,8 +522,8 @@
   <h3>MasterDNS · l2x-dnsd</h3>
   <div class="hint">Свой DNS-tunnel сервер (wire-совместим с клиентом MasterDnsVPN). Не зависит от их бинарников — панель ставит <code>l2x-dnsd</code> из релизов L2X.</div>
   <label class="check mt"><input type="checkbox" name="enabled" value="1" {% if md.enabled %}checked{% endif %}> Включить сервер</label>
-  <label class="f mt">Tunnel domain</label>
-  <input name="domain" value="{{ md.domain or '' }}" placeholder="v.example.com" required>
+  <label class="f mt">Tunnel domain <span class="req">*</span></label>
+  <input name="domain" value="{{ md.domain or '' }}" placeholder="v.example.com" required aria-required="true">
   <div class="grid g2 mt">
     <div><label class="f">NS hostname</label><input name="ns_hostname" value="{{ md.ns_hostname or '' }}" placeholder="ns.example.com"></div>
     <div><label class="f">NS A / IP сервера</label><input name="ns_ip" value="{{ md.ns_ip or '' }}" placeholder="203.0.113.10"></div>

@@ -85,7 +85,7 @@
     <input type="hidden" name="stay" value="1">
     <h3>Профиль</h3>
     <div class="row">
-      <div style="flex:2"><label class="f">Название</label><input name="name" value="{{ core.name }}" required></div>
+      <div style="flex:2"><label class="f">Название <span class="req">*</span></label><input name="name" value="{{ core.name }}" required aria-required="true"></div>
       <div style="flex:2"><label class="f">Комментарий</label><input name="remark" value="{{ core.remark or '' }}"></div>
     </div>
     <div class="mt">
@@ -490,7 +490,7 @@
         <select name="protocol" id="core-ib-proto">
           {% for p in protocols %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
         </select></div>
-      <div><label class="f">Tag</label><input name="tag" id="core-ib-tag" required pattern="[A-Za-z0-9._-]+"></div>
+      <div><label class="f">Tag <span class="req">*</span></label><input name="tag" id="core-ib-tag" required aria-required="true" pattern="[A-Za-z0-9._-]+"></div>
       <div style="max-width:110px"><label class="f">Port</label><input name="port" id="core-ib-port" type="number" min="1" max="65535" value="{{ free_ib_port }}"></div>
     </div>
     <div class="row">

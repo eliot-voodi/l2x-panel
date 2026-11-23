@@ -18,7 +18,7 @@
   <div class="card">
     <h3>Профиль</h3>
     <div class="row">
-      <div><label class="f">Название</label><input name="name" value="{{ g.name }}" required autofocus placeholder="Free / Premium / …"></div>
+      <div><label class="f">Название <span class="req">*</span></label><input name="name" value="{{ g.name }}" required aria-required="true" autofocus placeholder="Free / Premium / …"></div>
       <div><label class="f">Комментарий</label><input name="comment" value="{{ g.comment or '' }}" placeholder="для себя"></div>
     </div>
     <div class="hint">Группа назначает клиентам <b>ядра</b>. Все inbound’ы выбранных ядер попадают в подписку. Маршрутизация — внутри ядер.</div>

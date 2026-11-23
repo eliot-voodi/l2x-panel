@@ -1,6 +1,6 @@
 {% import "_macros.html" as m %}
 <div class="row">
-  <div><label class="f">Имя</label><input name="name" required></div>
+  <div><label class="f">Имя <span class="req">*</span></label><input name="name" required aria-required="true"></div>
   <div><label class="f">Outbound</label>
     <select name="outbound">{% for tag in outbounds %}<option value="{{ tag }}">{{ outbound_label(store, tag) }}</option>{% endfor %}</select></div>
 </div>

@@ -476,12 +476,12 @@
   <h3>Установить ноду по SSH</h3>
   <div class="row">
     <div><label class="f">Имя</label><input name="name" placeholder="eu-2"></div>
-    <div style="flex:2"><label class="f">Domain</label><input name="domain" placeholder="node.example.com" required></div>
+    <div style="flex:2"><label class="f">Domain <span class="req">*</span></label><input name="domain" placeholder="node.example.com" required aria-required="true"></div>
   </div>
   <div><label class="f">Название у пользователя</label><input name="user_title" placeholder="Финляндия / FI-1 (как в подписке)"></div>
   <div class="row">
-    <div><label class="f">SSH login</label><input name="login" value="root" required></div>
-    <div><label class="f">SSH password</label><input name="password" type="password" required autocomplete="new-password"></div>
+    <div><label class="f">SSH login <span class="req">*</span></label><input name="login" value="root" required aria-required="true"></div>
+    <div><label class="f">SSH password <span class="req">*</span></label><input name="password" type="password" required aria-required="true" autocomplete="new-password"></div>
     <div style="max-width:100px"><label class="f">Port</label><input name="ssh_port" type="number" value="22"></div>
   </div>
   <div class="row mt" style="max-width:420px">
@@ -516,11 +516,11 @@
   <summary style="cursor:pointer"><b>Добавить вручную</b> (уже установленный агент)</summary>
   <form method="post" action="{{ bp }}/nodes/add" style="max-width:720px;margin-top:1rem">
     <div class="row">
-      <div><label class="f">Имя</label><input name="name" placeholder="eu-2" required></div>
-      <div style="flex:2"><label class="f">URL панели</label><input name="url" placeholder="https://node.example.com/SecretPath" required></div>
+      <div><label class="f">Имя <span class="req">*</span></label><input name="name" placeholder="eu-2" required aria-required="true"></div>
+      <div style="flex:2"><label class="f">URL панели <span class="req">*</span></label><input name="url" placeholder="https://node.example.com/SecretPath" required aria-required="true"></div>
     </div>
     <div><label class="f">Название у пользователя</label><input name="user_title" placeholder="Финляндия / FI-1 (как в подписке)"></div>
-    <label class="f">Agent token</label><input name="token" class="mono" required>
+    <label class="f">Agent token <span class="req">*</span></label><input name="token" class="mono" required aria-required="true">
     <div class="row mt" style="max-width:420px">
       <div style="flex:2"><label class="f">Конфигурация ядра</label>
         <select name="core_id">

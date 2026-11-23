@@ -81,6 +81,13 @@ class NormalizedUser:
             d["reset_period"] = extra["reset_period"]
         if extra.get("online_at"):
             d["online_at"] = extra["online_at"]
+        for key in (
+            "start_on_first_use", "duration_days", "on_expire", "renew_on_reset",
+            "admin", "admin_id", "next_plan", "auto_delete_in_days", "template",
+            "group_inbound_tags",
+        ):
+            if extra.get(key) is not None and extra.get(key) != "":
+                d[key] = extra[key]
         return d
 
 
@@ -482,15 +489,23 @@ def apply(
     meta = LAST_SOURCE_META or {}
     is_pg = create_source_groups and str(meta.get("source") or "").lower() == "pasarguard"
 
+    groups_cores_mapped = 0
+    templates_created = 0
+
     # ── 1) Groups first ──────────────────────────────────────────────
     if is_pg:
-        # Re-hydrate group_names / hwids (preview cache may have dropped them)
+        # Re-hydrate group_names / hwids / extras (preview cache may have dropped them)
         _attach_pasarguard_groups_to_users(
             users,
             groups=list(meta.get("groups") or []),
             user_groups=dict(meta.get("user_groups") or {}),
         )
         _attach_pasarguard_hwids_to_users(users, dict(meta.get("user_hwids") or {}))
+        _attach_pasarguard_extras_to_users(
+            users,
+            admins=dict(meta.get("admins") or {}),
+            next_plans=dict(meta.get("next_plans") or {}),
+        )
         before = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
         name_to_gid = ensure_pasarguard_groups(store, meta.get("groups") or [])
         # Names discovered only on users
@@ -502,6 +517,21 @@ def apply(
                     extra_names.append({"id": f"name:{name}", "name": name})
         if extra_names:
             name_to_gid.update(ensure_pasarguard_groups(store, extra_names))
+        # Map PG inbound tags → L2X cores on groups
+        groups_cores_mapped = apply_pasarguard_group_cores(
+            store,
+            groups=list(meta.get("groups") or []),
+            group_inbound_tags=dict(meta.get("group_inbound_tags") or {}),
+            name_to_gid=name_to_gid,
+        )
+        # Templates → preset groups
+        templates_created = ensure_pasarguard_templates(
+            store,
+            list(meta.get("templates") or []),
+            groups=list(meta.get("groups") or []),
+            group_inbound_tags=dict(meta.get("group_inbound_tags") or {}),
+            name_to_gid=name_to_gid,
+        )
         after = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
         groups_created = len(after - before)
 
@@ -509,20 +539,78 @@ def apply(
     if fallback_gid and not xray.get_group(store, fallback_gid):
         fallback_gid = ""
 
+    # Cache of synthetic multi-group unions: frozenset(names) → l2x group_id
+    multi_cache: dict[frozenset, str] = {}
+    git_by_name: dict[str, list[str]] = {}
+    if is_pg:
+        by_id_name = {
+            str(g.get("id")): str(g.get("name") or "").strip()
+            for g in (meta.get("groups") or [])
+            if isinstance(g, dict) and g.get("id") is not None
+        }
+        for gid, tags in (meta.get("group_inbound_tags") or {}).items():
+            n = by_id_name.get(str(gid)) or by_id_name.get(str(_safe_int(gid, 0))) or ""
+            if n:
+                git_by_name.setdefault(n.lower(), [])
+                for t in tags or []:
+                    if t and t not in git_by_name[n.lower()]:
+                        git_by_name[n.lower()].append(t)
+
+    def _lookup_gid(name: str) -> str:
+        gid = name_to_gid.get(name) or ""
+        if gid:
+            return gid
+        for kn, kv in name_to_gid.items():
+            if kn.lower() == name.lower():
+                return kv
+        return ""
+
     def _resolve_group_id(u: NormalizedUser) -> str:
-        for n in (u.extra or {}).get("group_names") or []:
-            name = str(n).strip()
-            if not name:
-                continue
-            gid = name_to_gid.get(name) or ""
-            if not gid:
-                for kn, kv in name_to_gid.items():
-                    if kn.lower() == name.lower():
-                        gid = kv
-                        break
-            if gid:
-                return gid
-        return fallback_gid
+        names = [str(n).strip() for n in ((u.extra or {}).get("group_names") or []) if str(n).strip()]
+        if not names:
+            return fallback_gid
+        if len(names) == 1:
+            return _lookup_gid(names[0]) or fallback_gid
+        # Multiple PG groups → union group (cores = union of inbound tags)
+        key = frozenset(n.lower() for n in names)
+        if key in multi_cache:
+            return multi_cache[key]
+        synth = " + ".join(names[:3])
+        if len(names) > 3:
+            synth += " +…"
+        existing_gid = _lookup_gid(synth)
+        tags: list[str] = []
+        for n in names:
+            for t in git_by_name.get(n.lower()) or []:
+                if t not in tags:
+                    tags.append(t)
+        cores = xray._core_ids_covering_inbound_tags(store, tags) if tags else []
+        if existing_gid:
+            g = xray.get_group(store, existing_gid)
+            if g and cores:
+                have = list(g.get("cores") or [])
+                for c in cores:
+                    if c not in have:
+                        have.append(c)
+                g["core_mode"] = "select"
+                g["cores"] = have
+                g["inbounds"] = xray._inbound_tags_for_core_ids(store, have)
+                g["ib_mode"] = "select"
+            multi_cache[key] = existing_gid
+            return existing_gid
+        ng = xray.new_group(
+            name=synth,
+            comment=f"импорт PasarGuard (объединение: {', '.join(names)})",
+        )
+        ng["core_mode"] = "select"
+        ng["cores"] = cores
+        ng["inbounds"] = xray._inbound_tags_for_core_ids(store, cores) if cores else list(tags)
+        ng["ib_mode"] = "select"
+        store.setdefault("groups", []).append(ng)
+        gid = str(ng.get("id") or "")
+        name_to_gid[synth] = gid
+        multi_cache[key] = gid
+        return gid
 
     def _assign_group(c: dict, gid: str, *, force: bool = False) -> bool:
         """Pin client to group; clear personal inbounds (avoids all-inbound email~node_* dups)."""
@@ -541,9 +629,9 @@ def apply(
         return True
 
     def _apply_pg_extras(c: dict, u: NormalizedUser, *, force: bool = False) -> dict[str, int]:
-        """HWID limit/devices, created/updated, reset period, last online."""
+        """HWID, dates, on_hold/next_plan, admin owner."""
         import hwid as hwid_mod
-        stats = {"hwid_limits": 0, "hwid_devices": 0, "dates": 0}
+        stats = {"hwid_limits": 0, "hwid_devices": 0, "dates": 0, "hold": 0, "admin": 0}
         extra = u.extra or {}
         if "limit_hwid" in extra:
             lim = max(0, int(extra.get("limit_hwid") or 0))
@@ -587,6 +675,36 @@ def apply(
         reset = str(extra.get("reset_period") or "").strip()
         if reset in ("daily", "weekly", "monthly") and (force or not c.get("reset_period")):
             c["reset_period"] = reset
+        # on_hold / next_plan → start_on_first_use, duration, renew
+        if extra.get("start_on_first_use") and (force or not c.get("start_on_first_use")):
+            c["start_on_first_use"] = True
+            stats["hold"] = 1
+            if not c.get("expire_at") or force:
+                # Period starts on first use
+                if xray.client_used_bytes(c) == 0:
+                    c["expire_at"] = ""
+        if extra.get("duration_days") and (force or not int(c.get("duration_days") or 0)):
+            c["duration_days"] = max(0, int(extra.get("duration_days") or 0))
+            stats["hold"] = 1
+        if extra.get("on_expire") in xray.LIMIT_ACTIONS and (force or not c.get("on_expire") or c.get("on_expire") == "block"):
+            c["on_expire"] = str(extra["on_expire"])
+        if extra.get("renew_on_reset") and (force or not c.get("renew_on_reset")):
+            c["renew_on_reset"] = True
+        np = extra.get("next_plan")
+        if isinstance(np, dict):
+            c["next_plan"] = {
+                "data_limit": int(np.get("data_limit") or 0),
+                "expire": int(np.get("expire") or 0),
+                "add_remaining_traffic": bool(np.get("add_remaining_traffic")),
+            }
+            # Next period data limit → current limit when renewing (L2X uses same limit_gb)
+            np_lim = bytes_to_limit_gb(int(np.get("data_limit") or 0))
+            if np_lim and (force or not float(c.get("limit_gb") or 0)):
+                c["limit_gb"] = np_lim
+        admin_name = str(extra.get("admin") or "").strip()
+        if admin_name and (force or not c.get("admin")):
+            c["admin"] = admin_name
+            stats["admin"] = 1
         return stats
 
     # Planned group per email (phase 3 applies even if user upsert skipped)
@@ -597,7 +715,7 @@ def apply(
             continue
         planned_gid[email] = _resolve_group_id(u)
 
-    hwid_limits_n = hwid_devices_n = dates_n = 0
+    hwid_limits_n = hwid_devices_n = dates_n = hold_n = admin_n = 0
 
     # ── 2) Users ─────────────────────────────────────────────────────
     for u in users:
@@ -646,7 +764,9 @@ def apply(
             hwid_limits_n += st_ex["hwid_limits"]
             hwid_devices_n += st_ex["hwid_devices"]
             dates_n += st_ex["dates"]
-            if st_ex["hwid_limits"] or st_ex["hwid_devices"] or st_ex["dates"]:
+            hold_n += st_ex.get("hold", 0)
+            admin_n += st_ex.get("admin", 0)
+            if st_ex["hwid_limits"] or st_ex["hwid_devices"] or st_ex["dates"] or st_ex.get("hold") or st_ex.get("admin"):
                 repaired = True
             if not repaired:
                 skipped += 1
@@ -682,6 +802,8 @@ def apply(
                 hwid_limits_n += st_ex["hwid_limits"]
                 hwid_devices_n += st_ex["hwid_devices"]
                 dates_n += st_ex["dates"]
+                hold_n += st_ex.get("hold", 0)
+                admin_n += st_ex.get("admin", 0)
                 xray.ensure_wg_peer(store, c)
                 updated += 1
             else:
@@ -716,6 +838,8 @@ def apply(
                 hwid_limits_n += st_ex["hwid_limits"]
                 hwid_devices_n += st_ex["hwid_devices"]
                 dates_n += st_ex["dates"]
+                hold_n += st_ex.get("hold", 0)
+                admin_n += st_ex.get("admin", 0)
                 if not c.get("sub_token"):
                     import secrets
                     c["sub_token"] = secrets.token_urlsafe(18)
@@ -748,9 +872,13 @@ def apply(
         "inbounds": tags,
         "groups_created": groups_created,
         "groups_mapped": groups_mapped,
+        "groups_cores_mapped": groups_cores_mapped,
+        "templates_created": templates_created,
         "hwid_limits": hwid_limits_n,
         "hwid_devices": hwid_devices_n,
         "dates_set": dates_n,
+        "on_hold_set": hold_n,
+        "admins_set": admin_n,
         "client_inbound_map": sum(
             1 for u in users if (u.extra or {}).get("inbounds")
         ),
@@ -1912,7 +2040,9 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
     )
     limit = _safe_int(u.get("data_limit") or u.get("dataLimit") or 0, 0)
     status = str(u.get("status") or "active").lower()
-    enabled = status not in ("disabled", "on_hold", "expired") and status != "false"
+    is_on_hold = status == "on_hold"
+    # on_hold → enabled + start_on_first_use (срок с первого подключения)
+    enabled = status not in ("disabled", "expired") and status != "false"
     if "enabled" in u:
         enabled = bool(u["enabled"])
     uuid, password = _pg_uuid_password(u)
@@ -1986,13 +2116,63 @@ def _pg_user_from_dict(u: dict, *, source: str = "pasarguard") -> NormalizedUser
         extra["hwids"] = hwids_in
     if group_names:
         extra["group_names"] = group_names
+    # Admin owner (id; username resolved later from admins table)
+    admin_id = u.get("admin_id") if u.get("admin_id") is not None else u.get("adminId")
+    if admin_id is not None and str(admin_id).strip() and str(admin_id).upper() != "NULL":
+        extra["admin_id"] = str(admin_id).strip()
+    admin_name = str(u.get("admin") or u.get("admin_username") or "").strip()
+    if admin_name:
+        extra["admin"] = admin_name
+    # on_hold → deferred start
+    if is_on_hold:
+        extra["start_on_first_use"] = True
+        hold_dur = _safe_int(
+            u.get("on_hold_expire_duration")
+            or u.get("onHoldExpireDuration")
+            or u.get("expire_duration"),
+            0,
+        )
+        if hold_dur > 0:
+            extra["duration_days"] = max(1, int(round(hold_dur / 86400)))
+        # Clear absolute expire — period starts on first use
+        # (expire_at still parsed below; override after)
+    auto_del = u.get("auto_delete_in_days")
+    if auto_del is None:
+        auto_del = u.get("autoDeleteInDays")
+    if auto_del is not None and str(auto_del).strip() and str(auto_del).upper() != "NULL":
+        days_del = _safe_int(auto_del, 0)
+        if days_del > 0:
+            extra["auto_delete_in_days"] = days_del
+            extra["on_expire"] = "delete"
+    # next_plan may be embedded in API JSON
+    np = u.get("next_plan") or u.get("nextPlan")
+    if isinstance(np, dict):
+        extra["next_plan"] = {
+            "data_limit": _safe_int(np.get("data_limit") or np.get("dataLimit"), 0),
+            "expire": _safe_int(np.get("expire"), 0),
+            "add_remaining_traffic": bool(
+                np.get("add_remaining_traffic")
+                if np.get("add_remaining_traffic") is not None
+                else np.get("addRemainingTraffic")
+            ),
+            "user_template_id": (
+                str(np.get("user_template_id") or np.get("userTemplateId") or "").strip() or None
+            ),
+        }
+        if extra["next_plan"]["expire"] > 0 and not extra.get("duration_days"):
+            extra["duration_days"] = max(1, int(round(extra["next_plan"]["expire"] / 86400)))
+        extra["on_expire"] = extra.get("on_expire") or "renew"
+        extra["renew_on_reset"] = True
+    expire_at = _pg_expire_at(u)
+    if is_on_hold:
+        expire_at = ""
     return NormalizedUser(
         email=email,
         uuid=uuid,
         password=password,
         sub_token=sub,
         limit_gb=bytes_to_limit_gb(limit),
-        expire_at=_pg_expire_at(u),
+        expire_at=expire_at,
         enabled=enabled,
         comment=str(u.get("note") or u.get("comment") or ""),
         tg_id=str(u.get("telegram_id") or u.get("telegramId") or ""),
@@ -2120,6 +2300,11 @@ def _pg_rec_from_sql_cols(cols: list[str], fields: list[Any]) -> dict:
         "proxies": _sql_unquote(rec_raw.get("proxies")),
         "subscription_url": _sql_unquote(rec_raw.get("subscription_url") or ""),
         "subscription_token": _sql_unquote(rec_raw.get("subscription_token") or ""),
+        "admin_id": _sql_unquote(rec_raw.get("admin_id")),
+        "on_hold_expire_duration": _sql_unquote(rec_raw.get("on_hold_expire_duration")),
+        "on_hold_timeout": _sql_unquote(rec_raw.get("on_hold_timeout")),
+        "auto_delete_in_days": _sql_unquote(rec_raw.get("auto_delete_in_days")),
+        "group_ids": _sql_unquote(rec_raw.get("group_ids")),
     }
 
 
@@ -2291,7 +2476,14 @@ def extract_pasarguard_meta_from_sql(text: str) -> dict[str, Any]:
                 break
     groups_meta = extract_pasarguard_groups_from_sql(text)
     hwids = extract_pasarguard_hwids_from_sql(text)
-    return {"jwt_secrets": secrets, "path": path, "user_hwids": hwids, **groups_meta}
+    extras = _extract_pg_extras_from_copy_sql(text)
+    return {
+        "jwt_secrets": secrets,
+        "path": path,
+        "user_hwids": hwids,
+        **groups_meta,
+        **extras,
+    }
 
 
 def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
@@ -2313,7 +2505,13 @@ def extract_pasarguard_meta_from_sqlite(path: Path) -> dict[str, Any]:
         conn.close()
     groups_meta = extract_pasarguard_groups_from_sqlite(path)
     hwids = extract_pasarguard_hwids_from_sqlite(path)
-    return {"jwt_secrets": secrets, "user_hwids": hwids, **groups_meta}
+    extras = _extract_pg_extras_from_sqlite(path)
+    return {
+        "jwt_secrets": secrets,
+        "user_hwids": hwids,
+        **groups_meta,
+        **extras,
+    }
 
 
 def _pg_parse_group_ids_field(raw: Any) -> list[str]:
@@ -2512,6 +2710,588 @@ def extract_pasarguard_groups_from_sqlite(path: Path) -> dict[str, Any]:
         "groups": list(groups_by_id.values()),
         "user_groups": user_groups,
     }
+
+
+# ---------------------------------------------------------------- PG extras: inbounds↔groups, templates, admins, next_plans
+
+_PG_INBOUND_GROUP_TABLES = frozenset({
+    "inbounds_groups_association",
+    "inbounds_groups",
+    "group_inbounds",
+    "inbound_groups",
+})
+
+
+def _pg_is_inbound_group_table(name: str) -> bool:
+    low = str(name or "").lower().split(".")[-1]
+    if low in _PG_INBOUND_GROUP_TABLES:
+        return True
+    return "inbounds_groups" in low and "assoc" in low
+
+
+def _pg_add_group_inbound(bucket: dict[str, list[str]], gid: Any, tag: str) -> None:
+    g = str(gid if gid is not None else "").strip()
+    t = str(tag or "").strip()
+    if not g or not t or g.upper() == "NULL" or t.upper() == "NULL":
+        return
+    lst = bucket.setdefault(g, [])
+    if t not in lst:
+        lst.append(t)
+
+
+def _pg_bool(v: Any, default: bool = False) -> bool:
+    """Postgres COPY bool: t/f/true/false/1/0."""
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("t", "true", "1", "yes", "y", "on"):
+        return True
+    if s in ("f", "false", "0", "no", "n", "off"):
+        return False
+    return bool(v)
+
+
+def _extract_pg_extras_from_copy_sql(text: str) -> dict[str, Any]:
+    """Parse inbounds↔groups, admins, templates, next_plans from pg_dump COPY/INSERT."""
+    inbound_id_to_tag: dict[str, str] = {}
+    group_inbound_ids: dict[str, list[str]] = {}  # gid → [inbound_id]
+    group_inbound_tags: dict[str, list[str]] = {}  # gid → [tag] (direct)
+    admins: dict[str, str] = {}
+    templates: list[dict[str, Any]] = []
+    template_groups: dict[str, list[str]] = {}  # template_id → [group_id]
+    next_plans: dict[str, dict[str, Any]] = {}
+
+    for table, cols, body in _iter_sql_copy_tables(text):
+        low = table.lower().split(".")[-1]
+        col_l = {c.lower(): c for c in cols}
+
+        if low in ("inbounds", "proxyinbounds", "proxy_inbounds"):
+            id_k = col_l.get("id")
+            tag_k = col_l.get("tag")
+            if not id_k or not tag_k:
+                continue
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                iid = str(rec.get(id_k) if rec.get(id_k) is not None else "").strip()
+                tag = str(rec.get(tag_k) or "").strip()
+                if iid and tag:
+                    inbound_id_to_tag[iid] = tag
+
+        elif _pg_is_inbound_group_table(table):
+            gid_k = col_l.get("group_id") or col_l.get("groups_id")
+            iid_k = col_l.get("inbound_id") or col_l.get("inbounds_id")
+            tag_k = col_l.get("inbound_tag") or col_l.get("tag")
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                gid = rec.get(gid_k) if gid_k else None
+                if tag_k and rec.get(tag_k):
+                    _pg_add_group_inbound(group_inbound_tags, gid, str(rec.get(tag_k)))
+                elif iid_k:
+                    iid = str(rec.get(iid_k) if rec.get(iid_k) is not None else "").strip()
+                    if gid is not None and iid:
+                        bucket = group_inbound_ids.setdefault(str(gid).strip(), [])
+                        if iid not in bucket:
+                            bucket.append(iid)
+
+        elif low == "admins":
+            id_k = col_l.get("id")
+            name_k = col_l.get("username")
+            if not id_k or not name_k:
+                continue
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                aid = str(rec.get(id_k) if rec.get(id_k) is not None else "").strip()
+                uname = str(rec.get(name_k) or "").strip()
+                if aid and uname:
+                    admins[aid] = uname
+
+        elif low in ("user_templates", "usertemplates"):
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                tid = str(rec.get(col_l.get("id", "id")) if rec.get(col_l.get("id", "id")) is not None else "").strip()
+                name = str(rec.get(col_l.get("name", "name")) or "").strip()
+                if not tid or not name:
+                    continue
+                templates.append({
+                    "id": tid,
+                    "name": name,
+                    "data_limit": _safe_int(rec.get(col_l["data_limit"]) if "data_limit" in col_l else 0, 0),
+                    "expire_duration": _safe_int(
+                        rec.get(col_l["expire_duration"]) if "expire_duration" in col_l else 0, 0
+                    ),
+                    "hwid_limit": _safe_int(rec.get(col_l["hwid_limit"]) if "hwid_limit" in col_l else 0, 0)
+                    if "hwid_limit" in col_l else None,
+                    "status": str(rec.get(col_l["status"]) if "status" in col_l else "active") or "active",
+                    "on_hold_timeout": _safe_int(
+                        rec.get(col_l["on_hold_timeout"]) if "on_hold_timeout" in col_l else 0, 0
+                    ),
+                    "reset_strategy": str(
+                        rec.get(col_l["data_limit_reset_strategy"])
+                        if "data_limit_reset_strategy" in col_l else ""
+                    ),
+                    "is_disabled": _pg_bool(rec.get(col_l["is_disabled"])) if "is_disabled" in col_l else False,
+                    "group_ids": [],
+                })
+
+        elif low in ("template_group_association", "template_groups", "user_template_groups"):
+            tid_k = (
+                col_l.get("user_template_id")
+                or col_l.get("template_id")
+                or col_l.get("usertemplate_id")
+            )
+            gid_k = col_l.get("group_id") or col_l.get("groups_id")
+            if not tid_k or not gid_k:
+                continue
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                tid = str(rec.get(tid_k) if rec.get(tid_k) is not None else "").strip()
+                gid = str(rec.get(gid_k) if rec.get(gid_k) is not None else "").strip()
+                if tid and gid:
+                    bucket = template_groups.setdefault(tid, [])
+                    if gid not in bucket:
+                        bucket.append(gid)
+
+        elif low in ("next_plans", "next_plan"):
+            uid_k = col_l.get("user_id")
+            if not uid_k:
+                continue
+            for line in body.splitlines():
+                if not line or line == r"\.":
+                    continue
+                raw_fields = line.split("\t")
+                if len(raw_fields) < len(cols):
+                    continue
+                fields = [_parse_pg_copy_field(f) for f in raw_fields[: len(cols)]]
+                rec = {cols[i]: fields[i] for i in range(len(cols))}
+                uid = str(rec.get(uid_k) if rec.get(uid_k) is not None else "").strip()
+                if not uid:
+                    continue
+                next_plans[uid] = {
+                    "data_limit": _safe_int(rec.get(col_l["data_limit"]) if "data_limit" in col_l else 0, 0),
+                    "expire": _safe_int(rec.get(col_l["expire"]) if "expire" in col_l else 0, 0),
+                    "add_remaining_traffic": _pg_bool(
+                        rec.get(col_l["add_remaining_traffic"]) if "add_remaining_traffic" in col_l else False
+                    ),
+                    "user_template_id": (
+                        str(rec.get(col_l["user_template_id"])).strip()
+                        if "user_template_id" in col_l and rec.get(col_l["user_template_id"]) is not None
+                        else None
+                    ),
+                }
+
+    # Resolve inbound ids → tags
+    for gid, iids in group_inbound_ids.items():
+        for iid in iids:
+            tag = inbound_id_to_tag.get(iid) or inbound_id_to_tag.get(str(iid))
+            if tag:
+                _pg_add_group_inbound(group_inbound_tags, gid, tag)
+
+    # Attach group_ids onto templates
+    for t in templates:
+        t["group_ids"] = list(template_groups.get(str(t.get("id") or ""), []) or [])
+
+    return {
+        "group_inbound_tags": group_inbound_tags,
+        "admins": admins,
+        "templates": templates,
+        "next_plans": next_plans,
+        "inbound_tags": list({t for tags in group_inbound_tags.values() for t in tags}),
+    }
+
+
+def _extract_pg_extras_from_sqlite(path: Path) -> dict[str, Any]:
+    inbound_id_to_tag: dict[str, str] = {}
+    group_inbound_tags: dict[str, list[str]] = {}
+    admins: dict[str, str] = {}
+    templates: list[dict[str, Any]] = []
+    template_groups: dict[str, list[str]] = {}
+    next_plans: dict[str, dict[str, Any]] = {}
+    conn = sqlite3.connect(str(path))
+    try:
+        tables = {
+            r[0].lower()
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        ib_table = next((t for t in ("inbounds", "proxyinbounds", "proxy_inbounds") if t in tables), "")
+        if ib_table:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{ib_table}")').fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            if "id" in col_l and "tag" in col_l:
+                for row in conn.execute(f'SELECT * FROM "{ib_table}"'):
+                    rec = {cols[i]: row[i] for i in range(len(cols))}
+                    iid = str(rec.get(col_l["id"]) if rec.get(col_l["id"]) is not None else "").strip()
+                    tag = str(rec.get(col_l["tag"]) or "").strip()
+                    if iid and tag:
+                        inbound_id_to_tag[iid] = tag
+
+        for jtable in sorted(t for t in tables if _pg_is_inbound_group_table(t)):
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{jtable}")').fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            gid_c = col_l.get("group_id") or col_l.get("groups_id")
+            iid_c = col_l.get("inbound_id") or col_l.get("inbounds_id")
+            tag_c = col_l.get("inbound_tag") or col_l.get("tag")
+            if not gid_c:
+                continue
+            for row in conn.execute(f'SELECT * FROM "{jtable}"'):
+                rec = {cols[i]: row[i] for i in range(len(cols))}
+                gid = rec.get(gid_c)
+                if tag_c and rec.get(tag_c):
+                    _pg_add_group_inbound(group_inbound_tags, gid, str(rec.get(tag_c)))
+                elif iid_c:
+                    iid = str(rec.get(iid_c) if rec.get(iid_c) is not None else "").strip()
+                    tag = inbound_id_to_tag.get(iid) or ""
+                    if tag:
+                        _pg_add_group_inbound(group_inbound_tags, gid, tag)
+
+        if "admins" in tables:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(admins)").fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            if "id" in col_l and "username" in col_l:
+                for row in conn.execute("SELECT * FROM admins"):
+                    rec = {cols[i]: row[i] for i in range(len(cols))}
+                    aid = str(rec.get(col_l["id"]) if rec.get(col_l["id"]) is not None else "").strip()
+                    uname = str(rec.get(col_l["username"]) or "").strip()
+                    if aid and uname:
+                        admins[aid] = uname
+
+        ttable = next((t for t in ("user_templates", "usertemplates") if t in tables), "")
+        if ttable:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{ttable}")').fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            for row in conn.execute(f'SELECT * FROM "{ttable}"'):
+                rec = {cols[i]: row[i] for i in range(len(cols))}
+                tid = str(rec.get(col_l["id"]) if "id" in col_l and rec.get(col_l["id"]) is not None else "").strip()
+                name = str(rec.get(col_l["name"]) if "name" in col_l else "").strip()
+                if not tid or not name:
+                    continue
+                templates.append({
+                    "id": tid,
+                    "name": name,
+                    "data_limit": _safe_int(rec.get(col_l["data_limit"]) if "data_limit" in col_l else 0, 0),
+                    "expire_duration": _safe_int(
+                        rec.get(col_l["expire_duration"]) if "expire_duration" in col_l else 0, 0
+                    ),
+                    "hwid_limit": _safe_int(rec.get(col_l["hwid_limit"]) if "hwid_limit" in col_l else 0, 0)
+                    if "hwid_limit" in col_l else None,
+                    "status": str(rec.get(col_l["status"]) if "status" in col_l else "active") or "active",
+                    "on_hold_timeout": _safe_int(
+                        rec.get(col_l["on_hold_timeout"]) if "on_hold_timeout" in col_l else 0, 0
+                    ),
+                    "reset_strategy": str(
+                        rec.get(col_l["data_limit_reset_strategy"])
+                        if "data_limit_reset_strategy" in col_l else ""
+                    ),
+                    "is_disabled": _pg_bool(rec.get(col_l["is_disabled"])) if "is_disabled" in col_l else False,
+                    "group_ids": [],
+                })
+
+        for jtable in sorted(
+            t for t in tables
+            if t in ("template_group_association", "template_groups", "user_template_groups")
+            or ("template" in t and "group" in t and "assoc" in t)
+        ):
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{jtable}")').fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            tid_c = col_l.get("user_template_id") or col_l.get("template_id") or col_l.get("usertemplate_id")
+            gid_c = col_l.get("group_id") or col_l.get("groups_id")
+            if not tid_c or not gid_c:
+                continue
+            for row in conn.execute(f'SELECT * FROM "{jtable}"'):
+                rec = {cols[i]: row[i] for i in range(len(cols))}
+                tid = str(rec.get(tid_c) if rec.get(tid_c) is not None else "").strip()
+                gid = str(rec.get(gid_c) if rec.get(gid_c) is not None else "").strip()
+                if tid and gid:
+                    bucket = template_groups.setdefault(tid, [])
+                    if gid not in bucket:
+                        bucket.append(gid)
+
+        ntable = next((t for t in ("next_plans", "next_plan") if t in tables), "")
+        if ntable:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{ntable}")').fetchall()]
+            col_l = {c.lower(): c for c in cols}
+            if "user_id" in col_l:
+                for row in conn.execute(f'SELECT * FROM "{ntable}"'):
+                    rec = {cols[i]: row[i] for i in range(len(cols))}
+                    uid = str(rec.get(col_l["user_id"]) if rec.get(col_l["user_id"]) is not None else "").strip()
+                    if not uid:
+                        continue
+                    next_plans[uid] = {
+                        "data_limit": _safe_int(rec.get(col_l["data_limit"]) if "data_limit" in col_l else 0, 0),
+                        "expire": _safe_int(rec.get(col_l["expire"]) if "expire" in col_l else 0, 0),
+                        "add_remaining_traffic": _pg_bool(
+                            rec.get(col_l["add_remaining_traffic"]) if "add_remaining_traffic" in col_l else False
+                        ),
+                        "user_template_id": (
+                            str(rec.get(col_l["user_template_id"])).strip()
+                            if "user_template_id" in col_l and rec.get(col_l["user_template_id"]) is not None
+                            else None
+                        ),
+                    }
+    finally:
+        conn.close()
+
+    for t in templates:
+        t["group_ids"] = list(template_groups.get(str(t.get("id") or ""), []) or [])
+
+    return {
+        "group_inbound_tags": group_inbound_tags,
+        "admins": admins,
+        "templates": templates,
+        "next_plans": next_plans,
+        "inbound_tags": list({t for tags in group_inbound_tags.values() for t in tags}),
+    }
+
+
+def _merge_pg_extras(dst: dict[str, Any], src: dict[str, Any] | None) -> None:
+    if not src:
+        return
+    # group_inbound_tags
+    git = dst.setdefault("group_inbound_tags", {})
+    for gid, tags in (src.get("group_inbound_tags") or {}).items():
+        bucket = git.setdefault(str(gid), [])
+        for t in tags or []:
+            if t and t not in bucket:
+                bucket.append(t)
+    # admins
+    adm = dst.setdefault("admins", {})
+    for aid, name in (src.get("admins") or {}).items():
+        if aid and name:
+            adm[str(aid)] = str(name)
+    # templates (by id)
+    by_id = {str(t.get("id")): t for t in dst.setdefault("templates", []) if isinstance(t, dict)}
+    for t in src.get("templates") or []:
+        if not isinstance(t, dict) or not t.get("id"):
+            continue
+        tid = str(t["id"])
+        if tid in by_id:
+            # merge group_ids
+            eg = list(by_id[tid].get("group_ids") or [])
+            for g in t.get("group_ids") or []:
+                if g not in eg:
+                    eg.append(g)
+            by_id[tid]["group_ids"] = eg
+        else:
+            dst["templates"].append(t)
+            by_id[tid] = t
+    # next_plans
+    np = dst.setdefault("next_plans", {})
+    for uid, plan in (src.get("next_plans") or {}).items():
+        if uid and isinstance(plan, dict):
+            np[str(uid)] = plan
+
+
+def _attach_pasarguard_extras_to_users(
+    users: list[NormalizedUser],
+    *,
+    admins: dict[str, str] | None = None,
+    next_plans: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    adm = {str(k): str(v) for k, v in (admins or {}).items()}
+    plans = {str(k): v for k, v in (next_plans or {}).items() if isinstance(v, dict)}
+    for u in users:
+        if not isinstance(u.extra, dict):
+            u.extra = {}
+        uid = str(u.source_id or (u.extra or {}).get("id") or "").strip()
+        aid = str((u.extra or {}).get("admin_id") or "").strip()
+        if aid and not u.extra.get("admin"):
+            name = adm.get(aid) or adm.get(str(_safe_int(aid, 0))) or ""
+            if name:
+                u.extra["admin"] = name
+        if uid and uid in plans and not u.extra.get("next_plan"):
+            plan = plans[uid]
+            u.extra["next_plan"] = plan
+            if int(plan.get("expire") or 0) > 0 and not u.extra.get("duration_days"):
+                u.extra["duration_days"] = max(1, int(round(int(plan["expire"]) / 86400)))
+            u.extra["on_expire"] = u.extra.get("on_expire") or "renew"
+            u.extra["renew_on_reset"] = True
+
+
+def apply_pasarguard_group_cores(
+    store: dict,
+    *,
+    groups: list[dict[str, Any]] | None,
+    group_inbound_tags: dict[str, list[str]] | None,
+    name_to_gid: dict[str, str] | None = None,
+) -> int:
+    """Map PG group inbound tags → L2X cores covering those tags. Returns groups updated."""
+    if not group_inbound_tags:
+        return 0
+    by_id_name: dict[str, str] = {}
+    for g in groups or []:
+        if not isinstance(g, dict) or g.get("id") is None:
+            continue
+        name = str(g.get("name") or "").strip()
+        if not name:
+            continue
+        by_id_name[str(g["id"])] = name
+        try:
+            by_id_name[str(int(float(str(g["id"]))))] = name
+        except (TypeError, ValueError):
+            pass
+    mapping = dict(name_to_gid or {})
+    if not mapping:
+        mapping = {
+            str(g.get("name") or "").strip(): str(g.get("id") or "")
+            for g in (store.get("groups") or [])
+            if isinstance(g, dict) and str(g.get("name") or "").strip()
+        }
+    updated = 0
+    for gid, tags in (group_inbound_tags or {}).items():
+        name = by_id_name.get(str(gid)) or by_id_name.get(str(_safe_int(gid, 0))) or ""
+        if not name:
+            continue
+        l2x_gid = mapping.get(name) or ""
+        if not l2x_gid:
+            for kn, kv in mapping.items():
+                if kn.lower() == name.lower():
+                    l2x_gid = kv
+                    break
+        g = xray.get_group(store, l2x_gid) if l2x_gid else None
+        if not g:
+            continue
+        cores = xray._core_ids_covering_inbound_tags(store, list(tags or []))
+        if not cores:
+            # Keep tags for later / display even if cores missing
+            if tags and not g.get("inbounds"):
+                g["inbounds"] = list(tags)
+                g["ib_mode"] = "select"
+                updated += 1
+            continue
+        existing = [c for c in (g.get("cores") or []) if c]
+        changed = False
+        for c in cores:
+            if c not in existing:
+                existing.append(c)
+                changed = True
+        if changed or g.get("core_mode") != "select":
+            g["core_mode"] = "select"
+            g["cores"] = existing
+            g["inbounds"] = xray._inbound_tags_for_core_ids(store, existing)
+            g["ib_mode"] = "select"
+            updated += 1
+    return updated
+
+
+def ensure_pasarguard_templates(
+    store: dict,
+    templates: list[dict[str, Any]] | None,
+    *,
+    groups: list[dict[str, Any]] | None = None,
+    group_inbound_tags: dict[str, list[str]] | None = None,
+    name_to_gid: dict[str, str] | None = None,
+) -> int:
+    """Create L2X groups from PG user templates (presets). Returns created count."""
+    if not templates:
+        return 0
+    by_id_name = {
+        str(g.get("id")): str(g.get("name") or "").strip()
+        for g in (groups or [])
+        if isinstance(g, dict) and g.get("id") is not None and str(g.get("name") or "").strip()
+    }
+    git = {str(k): list(v or []) for k, v in (group_inbound_tags or {}).items()}
+    created = 0
+    catalog: list[dict[str, Any]] = []
+    for t in templates:
+        if not isinstance(t, dict) or t.get("is_disabled"):
+            continue
+        raw_name = str(t.get("name") or "").strip()
+        if not raw_name:
+            continue
+        name = f"Шаблон: {raw_name}"
+        tags: list[str] = []
+        for gid in t.get("group_ids") or []:
+            tags.extend(git.get(str(gid)) or [])
+            # also via group name → if tags keyed somehow — skip
+        # Dedup tags
+        seen: set[str] = set()
+        uniq_tags = []
+        for tag in tags:
+            if tag and tag not in seen:
+                seen.add(tag)
+                uniq_tags.append(tag)
+        dur = _safe_int(t.get("expire_duration"), 0)
+        days = max(0, int(round(dur / 86400))) if dur > 0 else 0
+        limit_gb = bytes_to_limit_gb(_safe_int(t.get("data_limit"), 0))
+        bits = [f"шаблон PG «{raw_name}»"]
+        if limit_gb:
+            bits.append(f"лимит {limit_gb:g} GB")
+        if days:
+            bits.append(f"{days} дн")
+        if str(t.get("status") or "").lower() == "on_hold":
+            bits.append("on_hold→отложенный старт")
+        comment = "; ".join(bits)
+        catalog.append({
+            "id": f"tmpl:{t.get('id')}",
+            "name": name,
+            "comment": comment,
+            "_tmpl_tags": uniq_tags,
+            "_tmpl": t,
+        })
+    if not catalog:
+        return 0
+    before = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
+    # Reuse ensure_pasarguard_groups for name create
+    mapping = ensure_pasarguard_groups(store, [{"id": c["id"], "name": c["name"]} for c in catalog])
+    after = {str(g.get("id") or "") for g in (store.get("groups") or []) if isinstance(g, dict)}
+    created = len(after - before)
+    # Apply comments + cores
+    for c in catalog:
+        gid = mapping.get(c["name"]) or ""
+        g = xray.get_group(store, gid) if gid else None
+        if not g:
+            continue
+        if c.get("comment") and (not g.get("comment") or "шаблон PG" not in str(g.get("comment") or "")):
+            g["comment"] = c["comment"]
+        tags = list(c.get("_tmpl_tags") or [])
+        if tags:
+            cores = xray._core_ids_covering_inbound_tags(store, tags)
+            if cores:
+                existing = [x for x in (g.get("cores") or []) if x]
+                for cid in cores:
+                    if cid not in existing:
+                        existing.append(cid)
+                g["core_mode"] = "select"
+                g["cores"] = existing
+                g["inbounds"] = xray._inbound_tags_for_core_ids(store, existing)
+                g["ib_mode"] = "select"
+            elif tags:
+                g["inbounds"] = tags
+                g["ib_mode"] = "select"
+        if name_to_gid is not None:
+            name_to_gid[c["name"]] = str(g.get("id") or "")
+    return created
 
 
 def _ug_lookup(user_groups: dict[str, list[str]], uid: str) -> list[str]:
@@ -2720,6 +3500,10 @@ def _finalize_pasarguard_users(
     groups: list[dict[str, Any]] | None = None,
     user_groups: dict[str, list[str]] | None = None,
     user_hwids: dict[str, list[dict[str, Any]]] | None = None,
+    group_inbound_tags: dict[str, list[str]] | None = None,
+    admins: dict[str, str] | None = None,
+    templates: list[dict[str, Any]] | None = None,
+    next_plans: dict[str, dict[str, Any]] | None = None,
 ) -> list[NormalizedUser]:
     global LAST_SOURCE_META
     secrets = [s for s in (jwt_secrets or []) if s]
@@ -2731,8 +3515,23 @@ def _finalize_pasarguard_users(
     g_list = list(groups or [])
     ug = dict(user_groups or {})
     uh = dict(user_hwids or {})
+    git = {str(k): list(v or []) for k, v in (group_inbound_tags or {}).items()}
+    adm = {str(k): str(v) for k, v in (admins or {}).items() if k and v}
+    tmpls = [t for t in (templates or []) if isinstance(t, dict)]
+    plans = {str(k): v for k, v in (next_plans or {}).items() if isinstance(v, dict)}
+    # Preserve extras already in LAST_SOURCE_META (merged while scanning archive)
+    prev = LAST_SOURCE_META or {}
+    if not git and prev.get("group_inbound_tags"):
+        git = {str(k): list(v or []) for k, v in (prev.get("group_inbound_tags") or {}).items()}
+    if not adm and prev.get("admins"):
+        adm = {str(k): str(v) for k, v in (prev.get("admins") or {}).items() if k and v}
+    if not tmpls and prev.get("templates"):
+        tmpls = [t for t in (prev.get("templates") or []) if isinstance(t, dict)]
+    if not plans and prev.get("next_plans"):
+        plans = {str(k): v for k, v in (prev.get("next_plans") or {}).items() if isinstance(v, dict)}
     _attach_pasarguard_groups_to_users(users, groups=g_list, user_groups=ug)
     _attach_pasarguard_hwids_to_users(users, uh)
+    _attach_pasarguard_extras_to_users(users, admins=adm, next_plans=plans)
     # Ensure group catalog includes names only present on users
     known = {str(g.get("name") or "").strip().lower() for g in g_list}
     for u in users:
@@ -2743,6 +3542,8 @@ def _finalize_pasarguard_users(
                 known.add(name.lower())
     hwid_devices = sum(len((u.extra or {}).get("hwids") or []) for u in users)
     hwid_limited = sum(1 for u in users if int((u.extra or {}).get("limit_hwid") or 0) > 0)
+    on_hold_n = sum(1 for u in users if (u.extra or {}).get("start_on_first_use"))
+    next_plan_n = sum(1 for u in users if (u.extra or {}).get("next_plan"))
     LAST_SOURCE_META = {
         **(LAST_SOURCE_META or {}),
         "source": "pasarguard",
@@ -2754,8 +3555,16 @@ def _finalize_pasarguard_users(
         "groups": g_list,
         "user_groups": ug,
         "user_hwids": uh,
+        "group_inbound_tags": git,
+        "admins": adm,
+        "templates": tmpls,
+        "next_plans": plans,
         "hwid_devices": hwid_devices,
         "hwid_limited": hwid_limited,
+        "on_hold_users": on_hold_n,
+        "next_plan_users": next_plan_n,
+        "group_inbound_links": sum(len(v) for v in git.values()),
+        "templates_count": len(tmpls),
         "sub_tokens_minted": sum(1 for u in users if u.sub_token and "." in u.sub_token),
         "note": note or (
             "JWT secret imported — старые PasarGuard-ссылки принимаются панелью"
@@ -2774,6 +3583,12 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
     all_groups: list[dict[str, Any]] = []
     all_user_groups: dict[str, list[str]] = {}
     all_user_hwids: dict[str, list[dict[str, Any]]] = {}
+    all_extras: dict[str, Any] = {
+        "group_inbound_tags": {},
+        "admins": {},
+        "templates": [],
+        "next_plans": {},
+    }
     path_hint = ""
     port_hint = 0
     tls_hint = False
@@ -2809,6 +3624,7 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                 bucket.append(d)
                 if h:
                     seen.add(h)
+        _merge_pg_extras(all_extras, meta)
 
     for name, content in ordered:
         low = name.lower()
@@ -2857,6 +3673,10 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
         groups=all_groups,
         user_groups=all_user_groups,
         user_hwids=all_user_hwids,
+        group_inbound_tags=all_extras.get("group_inbound_tags") or {},
+        admins=all_extras.get("admins") or {},
+        templates=all_extras.get("templates") or [],
+        next_plans=all_extras.get("next_plans") or {},
     )
     for name, content in ordered:
         if _pg_member_priority(name, content) >= 100:
@@ -2876,6 +3696,10 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                         fin_kw["groups"] = all_groups
                         fin_kw["user_groups"] = all_user_groups
                         fin_kw["user_hwids"] = all_user_hwids
+                        fin_kw["group_inbound_tags"] = all_extras.get("group_inbound_tags") or {}
+                        fin_kw["admins"] = all_extras.get("admins") or {}
+                        fin_kw["templates"] = all_extras.get("templates") or []
+                        fin_kw["next_plans"] = all_extras.get("next_plans") or {}
                     users = _parse_pg_sqlite(path)
                 finally:
                     path.unlink(missing_ok=True)
@@ -2895,6 +3719,10 @@ def parse_pasarguard_backup(raw: bytes) -> list[NormalizedUser]:
                     fin_kw["groups"] = all_groups
                     fin_kw["user_groups"] = all_user_groups
                     fin_kw["user_hwids"] = all_user_hwids
+                    fin_kw["group_inbound_tags"] = all_extras.get("group_inbound_tags") or {}
+                    fin_kw["admins"] = all_extras.get("admins") or {}
+                    fin_kw["templates"] = all_extras.get("templates") or []
+                    fin_kw["next_plans"] = all_extras.get("next_plans") or {}
                 users = _parse_users_sql_dump(text)
                 if users:
                     return _finalize_pasarguard_users(users, **fin_kw)

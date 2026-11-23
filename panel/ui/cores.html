@@ -33,7 +33,7 @@
 <form class="card" method="post" action="{{ bp }}/cores/add" style="max-width:640px">
   <h3>Новое ядро</h3>
   <div class="row">
-    <div style="flex:2"><label class="f">Название</label><input name="name" placeholder="EU Direct / FI Reality" required></div>
+    <div style="flex:2"><label class="f">Название <span class="req">*</span></label><input name="name" placeholder="EU Direct / FI Reality" required aria-required="true"></div>
     <div style="flex:2"><label class="f">Комментарий</label><input name="remark" placeholder="опционально"></div>
   </div>
   <div class="mt">{{ m.check('clone_master', True, 'Скопировать текущие настройки с мастера') }}</div>
