@@ -45,6 +45,8 @@ import ops
 import protocols as P
 import doh as doh_mod
 import masterdns as masterdns_mod
+import cheburcheck as tspu_mod
+import conn_analytics as conn_analytics
 import settings_history as shist
 import sysmon
 import tgbot
@@ -82,6 +84,10 @@ STORE_ERR = ""
 # In-memory store cache: avoid re-parsing store.json (~4MB) on every request.
 _STORE_MEM: dict | None = None
 _STORE_MEM_GEN = 0
+# st_mtime of store.json that _STORE_MEM was loaded from / last written.
+# Dual-slot (live+next) share one file; without this, a stale RAM copy can
+# overwrite settings.tg.enabled after the sibling (or an ops script) changed it.
+_STORE_FILE_MTIME: float = 0.0
 _SAVE_SEQ = 0
 _LAST_TRAFFIC_FLUSH = 0.0
 # Traffic/watchdog flushes to disk at most this often (seconds). RAM is always updated.
@@ -183,6 +189,8 @@ def default_settings() -> dict:
             # When True, /agent/manage may mutate this host even if role=master (default off).
             "allow_master_manage": False,
         },
+        # Cheburcheck.ru — TSPU / RKN block status for node domains
+        "tspu": tspu_mod.default_settings(),
         "panel_update": {"auto_check": True, "interval_hours": 12},
         # max_conn_per_ip: iptables connlimit on :443 (0 = off). XHTTP/xmux needs hundreds of sockets.
         "iplimit": {"ban_minutes": 30, "max_conn_per_ip": 256},
@@ -241,6 +249,7 @@ def _ensure_settings(store: dict) -> dict:
             ipl["max_conn_per_ip"] = 256
         ipl["_xhttp_conn_cap"] = 1
     masterdns_mod.ensure_settings(store)
+    tspu_mod.ensure_settings(store)
     return s
 
 
@@ -329,10 +338,18 @@ def _read_store_json(path: Path) -> dict:
     return data
 
 
+def _store_disk_mtime() -> float:
+    try:
+        return float(STORE.stat().st_mtime) if STORE.exists() else 0.0
+    except OSError:
+        return 0.0
+
+
 def _invalidate_store_cache() -> None:
-    global _STORE_MEM, _STORE_MEM_GEN
+    global _STORE_MEM, _STORE_MEM_GEN, _STORE_FILE_MTIME
     _STORE_MEM = None
     _STORE_MEM_GEN += 1
+    _STORE_FILE_MTIME = 0.0
 
 
 def _normalize_store(data: dict) -> bool:
@@ -414,10 +431,14 @@ def _load_store_from_disk() -> tuple[dict, bool]:
 
 
 def _load_store() -> dict:
-    global STORE_OK, STORE_ERR, _STORE_MEM
+    global STORE_OK, STORE_ERR, _STORE_MEM, _STORE_FILE_MTIME
     with STORE_LOCK:
         if _STORE_MEM is not None and STORE_OK:
-            return _STORE_MEM
+            disk_mt = _store_disk_mtime()
+            # Sibling process / external writer updated store.json — drop stale RAM.
+            if disk_mt <= float(_STORE_FILE_MTIME or 0.0) + 1e-9:
+                return _STORE_MEM
+            _STORE_MEM = None
         data, loaded_ok = _load_store_from_disk()
         dirty = _normalize_store(data)
         # Never write an empty/default store over a corrupt file.
@@ -425,6 +446,14 @@ def _load_store() -> dict:
             _save_store(data, _already_locked=True)
         else:
             _STORE_MEM = data
+            _STORE_FILE_MTIME = _store_disk_mtime()
+            # Keep SETTINGS_CACHE in sync after a foreign reload (tg enabled, etc.)
+            try:
+                if SETTINGS_CACHE:
+                    SETTINGS_CACHE.clear()
+                    SETTINGS_CACHE.update(data.get("settings") or {})
+            except Exception:
+                pass
         return data
 
 
@@ -446,7 +475,7 @@ def _save_store(
         raise RuntimeError(f"store read-only: {STORE_ERR or 'corrupt'}")
 
     def _do_save() -> None:
-        global _STORE_MEM, _STORE_MEM_GEN, _SAVE_SEQ, _LAST_TRAFFIC_FLUSH
+        global _STORE_MEM, _STORE_MEM_GEN, _SAVE_SEQ, _LAST_TRAFFIC_FLUSH, _STORE_FILE_MTIME
         _STORE_MEM = data
         _STORE_MEM_GEN += 1
         now = time.time()
@@ -478,6 +507,7 @@ def _save_store(
         except OSError:
             pass
         os.replace(tmp, STORE)
+        _STORE_FILE_MTIME = _store_disk_mtime()
 
         # PostgreSQL: blob only on mutate/full; relational sync ONLY on kind=full
         if kind_l in ("mutate", "full"):
@@ -1392,7 +1422,12 @@ _expiry_notified: dict[str, str] = {}
 
 
 def _bot_settings() -> dict:
-    return (SETTINGS_CACHE or _refresh_settings_cache()).get("tg") or {}
+    # Read live store so dual-slot / disk updates to enabled|token|proxy apply
+    # without waiting for SETTINGS_CACHE refresh (never auto-toggle flags here).
+    try:
+        return ((_load_store().get("settings") or {}).get("tg")) or {}
+    except Exception:
+        return (SETTINGS_CACHE or _refresh_settings_cache()).get("tg") or {}
 
 
 def _tg_report() -> str:
@@ -1586,9 +1621,24 @@ def _tg_restart_xray() -> str:
 
 
 def _bot_should_poll() -> bool:
-    """Only the master long-polls Telegram — avoids 409 Conflict when several nodes share a token."""
+    """Only the *active* master slot talks to Telegram.
+
+    Dual-slot (live :8090 + next :8091) both run as master; if both use the same
+    bot token, Telegram returns 429 and the bot looks dead. Detect slot via cgroup
+    (PORT env is not always set on the live unit).
+    """
     try:
-        return nodes_mod.is_master(_load_store())
+        if not nodes_mod.is_master(_load_store()):
+            return False
+    except Exception:
+        pass
+    try:
+        active = ops.active_panel_unit()
+        cg = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        if active == "l2xpanel-next":
+            return "l2xpanel-next.service" in cg
+        # live slot: in l2xpanel.service but not the next unit
+        return "l2xpanel.service" in cg and "l2xpanel-next.service" not in cg
     except Exception:
         return True
 
@@ -1691,6 +1741,30 @@ def _tg_node_events(events: list[dict]) -> None:
             _tg_admin(
                 f"🖥 Нода <b>{name}</b>: {tgbot.escape(e.get('detail') or 'изменение')}{suffix}",
                 flag="notify_nodes",
+            )
+
+
+def _tg_tspu_events(events: list[dict]) -> None:
+    """Telegram on Cheburcheck block/unblock of a node domain."""
+    for e in events or []:
+        typ = e.get("type")
+        name = tgbot.escape(e.get("name") or "node")
+        domain = tgbot.escape(e.get("domain") or "")
+        detail = tgbot.escape(e.get("detail") or "")
+        link = tspu_mod.check_url(e.get("domain") or "")
+        link_line = f'\n<a href="{tgbot.escape(link)}">cheburcheck</a>' if link else ""
+        if typ == "tspu_blocked":
+            extra = f"\n{detail}" if detail else ""
+            _tg_admin(
+                f"🚫 TSPU: нода <b>{name}</b> — домен заблокирован\n"
+                f"<code>{domain}</code>{extra}{link_line}",
+                flag="notify_tspu",
+            )
+        elif typ == "tspu_unblocked":
+            _tg_admin(
+                f"✅ TSPU: нода <b>{name}</b> — домен снова доступен\n"
+                f"<code>{domain}</code>{link_line}",
+                flag="notify_tspu",
             )
 
 
@@ -1804,6 +1878,7 @@ def _expiry_warnings(store: dict) -> None:
 
 
 _LAST_QUOTA_DIRECT_PUSH = 0.0
+_LAST_QUOTA_PUSH_HAD_FAIL = False
 _LAST_TRAFFIC_DIRECT_PUSH = 0.0
 # Agent-side: revision of the last clients payload pulled from master (change detection)
 _PULLED_CLIENTS_REV = ""
@@ -1811,7 +1886,57 @@ _DIRECT_SYNC_LOCK = threading.Lock()
 _DIRECT_SYNC_PENDING = ""
 _DIRECT_SYNC_THREAD: threading.Thread | None = None
 # Fast apply for client fan-out. Heavy provision keeps longer timeouts.
-DIRECT_PUSH_TIMEOUT = int(os.environ.get("L2XPANEL_DIRECT_PUSH_TIMEOUT", "8"))
+DIRECT_PUSH_TIMEOUT = int(os.environ.get("L2XPANEL_DIRECT_PUSH_TIMEOUT", "15"))
+# Telegram: don't spam the same Clients API failure every watchdog cycle.
+_CLIENTS_API_TG_AT: dict[str, float] = {}
+_CLIENTS_API_TG_OK: dict[str, bool] = {}
+CLIENTS_API_TG_COOLDOWN = int(os.environ.get("L2XPANEL_CLIENTS_API_TG_COOLDOWN", "1800"))  # 30 min
+
+
+def _tg_clients_api_notify(
+    name: str,
+    label: str,
+    *,
+    ok: bool,
+    error: str = "",
+    prev_ok: bool = True,
+) -> None:
+    """Notify on Clients API result with debounce (ok→fail once, then ≤1×/cooldown; fail→ok once)."""
+    key = str(name or "?").strip() or "?"
+    now = time.time()
+    if ok:
+        was_bad = _CLIENTS_API_TG_OK.get(key) is False
+        _CLIENTS_API_TG_OK[key] = True
+        if was_bad:
+            _tg_admin(
+                f"✅ Clients API <b>{tgbot.escape(key)}</b> восстановлен",
+                flag="notify_nodes",
+            )
+        return
+    _CLIENTS_API_TG_OK[key] = False
+    last = float(_CLIENTS_API_TG_AT.get(key) or 0)
+    # First break after success, or periodic reminder while still down.
+    if prev_ok or (now - last) >= max(60, CLIENTS_API_TG_COOLDOWN):
+        _CLIENTS_API_TG_AT[key] = now
+        _tg_admin(
+            f"❌ Clients API <b>{tgbot.escape(key)}</b>: "
+            f"{tgbot.escape(str(error or 'fail'))}\n"
+            f"<i>{tgbot.escape(label)}</i>",
+            flag="notify_nodes",
+        )
+
+
+def _quota_reassert_interval(store: dict) -> float:
+    """Backoff reassert when a Direct node is timing out — avoids TG/API spam every minute."""
+    if _LAST_QUOTA_PUSH_HAD_FAIL:
+        return 300.0  # 5 min after a failed push
+    for node in nodes_mod.client_sync_nodes(store):
+        if node.get("last_ok"):
+            continue
+        err = str(node.get("last_error") or "").lower()
+        if "timed out" in err or "timeout" in err or "clients api fail" in err:
+            return 300.0
+    return 90.0
 
 
 def _push_direct_nodes_clients(
@@ -1823,13 +1948,16 @@ def _push_direct_nodes_clients(
     wait: bool = False,
 ) -> None:
     """Push clients to all nodes that sync users (Direct / mirror / sync_clients)."""
-    global _LAST_QUOTA_DIRECT_PUSH
+    global _LAST_QUOTA_DIRECT_PUSH, _LAST_QUOTA_PUSH_HAD_FAIL
     store = store or _load_store()
     if not nodes_mod.is_master(store):
         return
     host = public_host()
     skip = {str(x) for x in (exclude_ids or set()) if x}
     timeout = int(timeout if timeout is not None else DIRECT_PUSH_TIMEOUT)
+    # Background quota pushes: give Direct nodes a bit more time (tunnel/WSS latency).
+    if str(reason or "").startswith("quota"):
+        timeout = max(timeout, 15)
     jobs: list[tuple[str, str]] = []
     for node in nodes_mod.client_sync_nodes(store):
         nid = str(node.get("id") or "")
@@ -1840,12 +1968,18 @@ def _push_direct_nodes_clients(
     if not jobs:
         return
 
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
     def _one(nid: str, label: str) -> None:
         try:
             # Limits/expiry/enable: lightweight clients+groups push (hot-apply on agent)
-            _node_push_job(nid, label, host, timeout=timeout, clients_only=True)
+            res = _node_push_job(nid, label, host, timeout=timeout, clients_only=True)
+            with results_lock:
+                results.append(bool((res or {}).get("ok")))
         except Exception:
-            pass
+            with results_lock:
+                results.append(False)
 
     threads = [
         threading.Thread(target=_one, args=(nid, label), daemon=True, name=f"node-push-{nid[:8]}")
@@ -1857,6 +1991,14 @@ def _push_direct_nodes_clients(
     if wait:
         for t in threads:
             t.join(timeout=max(1, timeout) + 3)
+        if results:
+            _LAST_QUOTA_PUSH_HAD_FAIL = not all(results)
+        else:
+            # join timed out before workers reported — treat as soft fail for backoff
+            _LAST_QUOTA_PUSH_HAD_FAIL = True
+    else:
+        # Fire-and-forget: clear fail flag optimistically; next wait=True cycle will correct.
+        pass
 
 
 _CLIENT_SYNC_GEN = 0
@@ -1976,6 +2118,10 @@ def _watchdog_cycle() -> None:
             xray.enforce_conn_limits(store)
         except Exception:
             pass
+        try:
+            conn_analytics.record_online_sample(store, ONLINE)
+        except Exception:
+            pass
         limited_now = any(
             isinstance(c, dict) and not xray.client_access_ok(c)
             for c in (store.get("clients") or [])
@@ -1992,10 +2138,13 @@ def _watchdog_cycle() -> None:
         # Drop limited/expired clients from Direct nodes (they dial the node, not master)
         try:
             if need_apply:
-                _push_direct_nodes_clients(store, reason="quota")
-            elif limited_now and (time.time() - float(_LAST_QUOTA_DIRECT_PUSH or 0)) > 60:
-                # Re-assert if a prior push failed while flags were already set
-                _push_direct_nodes_clients(store, reason="quota-reassert")
+                _push_direct_nodes_clients(store, reason="quota", wait=True)
+            elif limited_now and (
+                time.time() - float(_LAST_QUOTA_DIRECT_PUSH or 0)
+            ) > _quota_reassert_interval(store):
+                # Re-assert if a prior push failed while flags were already set.
+                # Interval backs off to 5 min when a node is timing out (avoids TG spam).
+                _push_direct_nodes_clients(store, reason="quota-reassert", wait=True)
         except Exception:
             pass
 
@@ -2571,7 +2720,13 @@ def _history_loop() -> None:
     while not _stop.wait(60):
         try:
             HISTORY.sample(online=len(ONLINE))
-            OB_STATS.sample(_ob_totals(_load_store()))
+            store = _load_store()
+            OB_STATS.sample(_ob_totals(store))
+            try:
+                conn_analytics.resolve_pending_geo(budget=8)
+                conn_analytics.ingest_access_log(max_lines=3000)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2739,7 +2894,7 @@ def _startup():
     threading.Thread(target=_bg_pihole_dns_port, name="pihole-dns-port", daemon=True).start()
     for target in (_sync_xray_config, _watchdog_loop, _conn_prune_loop, _history_loop, _xray_update_loop,
                    _panel_update_loop, _geo_update_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
-                   _agent_pull_loop, _tg_backup_loop):
+                   _agent_pull_loop, _tg_backup_loop, _tspu_loop):
         threading.Thread(target=target, daemon=True).start()
     BOT.start()
     _sync_servers()
@@ -2980,6 +3135,18 @@ def _sub_response(request: Request, token: str) -> Response:
             if c:
                 c["hwids"] = client.get("hwids") or []
                 _save_store(st)
+    # Successful machine-readable sub → OS/app/city×inbound analytics
+    try:
+        ua_raw = request.headers.get("user-agent") or ""
+        os_hdr = request.headers.get("x-device-os") or ""
+        conn_analytics.record_sub_hit(
+            store, client,
+            ip=_client_ip(request),
+            ua=ua_raw,
+            os_name=os_hdr,
+        )
+    except Exception:
+        pass
     filename = re.sub(r"[^A-Za-z0-9_.-]", "_", client["email"])
     extras = {"fragment": s.get("json_fragment"), "noise": s.get("json_noise"), "mux": s.get("json_mux")}
     doh_cfg = store["settings"].get("doh") or {}
@@ -3257,9 +3424,29 @@ def dashboard(request: Request):
         "down": sum(int(i["traffic"].get("down") or 0) for i in store["inbounds"]),
     }
     top = sorted(clients, key=xray.client_used_bytes, reverse=True)[:5]
+    try:
+        conn = conn_analytics.dashboard_snapshot(store, days=7)
+    except Exception:
+        conn = {"os": [], "apps": [], "cities": [], "inbounds": [], "nodes": [],
+                "city_inbound": [], "city_node": [], "visits_city_inbound": [],
+                "access_log": False, "hwid_devices": 0, "apps_without_ua": 0,
+                "sub_hits": 0, "online_hits": 0, "days": 7, "updated_at": ""}
     return page(request, "dashboard.html", active="dashboard", snap=snap, xs=xray.xray_status(), stats=stats,
                 top=top, online=ONLINE, panel_uptime=int(time.time() - STARTED_AT),
-                sub_running=SUB_SERVER.running, bbr=ops.bbr_status(), ob=_outbound_usage(store))
+                sub_running=SUB_SERVER.running, bbr=ops.bbr_status(), ob=_outbound_usage(store),
+                conn=conn)
+
+
+@app.get("/api/conn-analytics")
+def api_conn_analytics(request: Request):
+    if not _user(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    days = max(1, min(45, _int(request.query_params.get("days"), 7)))
+    store = _load_store()
+    try:
+        return JSONResponse(conn_analytics.dashboard_snapshot(store, days=days))
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)[:200]}, status_code=500)
 
 
 def _sparkline(values: list[float], w: int = 120, h: int = 28) -> str:
@@ -6826,7 +7013,8 @@ def doh_page(request: Request):
     }
     return page(request, "doh.html", active="doh", doh=cfg, status=st, doh_clients=clients,
                 public_host=public_host(), pihole_link=link, pihole_session=pihole_session,
-                pihole_open=f"{base_path()}/pihole/admin/", pihole_dash=dash)
+                pihole_open=f"{base_path()}/pihole/admin/", pihole_dash=dash,
+                jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:6])
 
 
 @app.get("/doh/stats")
@@ -6914,6 +7102,34 @@ def doh_stop(request: Request):
         _tg_change("🛡 Pi-hole остановлен")
     flash(request, "Pi-hole остановлен" if res.get("ok") else f"stop: {res.get('error')}",
           "info" if res.get("ok") else "error")
+    return go("/doh")
+
+
+@app.post("/doh/update")
+def doh_update(request: Request):
+    """Pull latest pihole/pihole image and recreate the container (keeps gravity / lists)."""
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    pwd = str((store["settings"].get("doh") or {}).get("pihole_password") or "")
+
+    def do_upd():
+        res = doh_mod.update_pihole(password=pwd)
+        if res.get("ok"):
+            before = tgbot.escape(res.get("version_before") or "?")
+            after = tgbot.escape(res.get("version_after") or "?")
+            note = " (без смены версии — уже latest)" if not res.get("changed") else ""
+            _tg_change(f"🛡 Pi-hole обновлён: {before} → <b>{after}</b>{note}")
+        else:
+            _tg_change(f"❌ Pi-hole update: {tgbot.escape(res.get('error') or 'fail')}")
+        return res
+
+    ops.start_job("pihole-update", do_upd)
+    flash(
+        request,
+        "Обновление Pi-hole запущено (docker pull + recreate). Через минуту обновите страницу — версия в блоке «Статус».",
+        "info",
+    )
     return go("/doh")
 
 
@@ -7508,6 +7724,17 @@ async def settings_save(request: Request):
                 request.session["_new_agent_token"] = new_tok
             elif not ns.get("agent_token_hash"):
                 _set_agent_token(ns, ns["agent_token"])
+        elif section == "tspu":
+            cfg = tspu_mod.ensure_settings(store)
+            cfg["enabled"] = form.get("enabled") == "1"
+            cfg["interval_min"] = tspu_mod.normalize_interval(form.get("interval_min"))
+            cfg["use_probe"] = form.get("use_probe") == "1"
+            new_tok = str(form.get("api_token") or "").strip()
+            # Empty password-style field keeps previous token
+            if new_tok:
+                cfg["api_token"] = new_tok
+            elif form.get("clear_api_token") == "1":
+                cfg["api_token"] = ""
         elif section == "tg":
             tg = s["tg"]
             new_token = str(form.get("token") or "").strip()
@@ -7558,6 +7785,7 @@ async def settings_save(request: Request):
                 "notify_login": form.get("notify_login") == "1", "notify_quota": form.get("notify_quota") == "1",
                 "notify_iplimit": form.get("notify_iplimit") == "1",
                 "notify_nodes": form.get("notify_nodes") == "1",
+                "notify_tspu": form.get("notify_tspu") == "1",
                 "notify_changes": form.get("notify_changes") == "1",
                 "notify_updates": form.get("notify_updates") == "1",
                 "notify_outbounds": form.get("notify_outbounds") == "1",
@@ -8490,6 +8718,49 @@ def _nodes_sync_loop() -> None:
             return
 
 
+_TSPU_LOCK = threading.Lock()
+
+
+def _tspu_cycle(*, force: bool = False) -> list[dict]:
+    """Run Cheburcheck for node domains; persist + return block/unblock events."""
+    if not _TSPU_LOCK.acquire(blocking=False):
+        return []
+    try:
+        events: list[dict] = []
+        with STORE_LOCK:
+            store = _load_store()
+            if not nodes_mod.is_master(store):
+                return []
+            events = tspu_mod.run_cycle(store, force=force)
+            if STORE_OK:
+                # status fields only — skip settings_versions history spam
+                _save_store(store, kind="mutate", _already_locked=True)
+        if events:
+            _tg_tspu_events(events)
+        return events
+    except Exception:
+        return []
+    finally:
+        _TSPU_LOCK.release()
+
+
+def _tspu_loop() -> None:
+    """Periodic Cheburcheck / TSPU status for node domains (interval from settings.tspu)."""
+    if _stop.wait(90):
+        return
+    while True:
+        try:
+            store = _load_store()
+            if nodes_mod.is_master(store):
+                cfg = tspu_mod.ensure_settings(store)
+                if tspu_mod.due(cfg):
+                    _tspu_cycle(force=False)
+        except Exception:
+            pass
+        if _stop.wait(60):
+            return
+
+
 _MASTER_XRAY_CACHE: dict[str, Any] = {"at": 0.0, "version": ""}
 
 
@@ -8517,16 +8788,22 @@ def nodes_page(request: Request):
         nodes_mod.ensure_list(store)
         nodes_mod.agent_token(store)
         cores_mod.ensure_cores(store)
+        tspu_mod.ensure_settings(store)
     store = _load_store()
     running = NODES_JOB.get("id")
     cores = list(store.get("cores") or [])
     core_names = {c.get("id"): c.get("name") or c.get("id") for c in cores if c.get("id")}
+    tspu_cfg = tspu_mod.ensure_settings(store)
     return page(request, "nodes.html", active="nodes", items=store["nodes"],
                 ns=store["settings"].get("nodes") or {},
                 is_master=nodes_mod.is_master(store),
                 master_version=panel_version(),
                 master_xray=_cached_master_xray(),
                 sync_intervals=nodes_mod.SYNC_INTERVAL_CHOICES,
+                tspu=tspu_cfg,
+                tspu_intervals=tspu_mod.INTERVAL_CHOICES,
+                tspu_interval_label=tspu_mod.interval_label(tspu_cfg.get("interval_min")),
+                tspu_check_url=tspu_mod.check_url,
                 tunnel_profiles=nodes_mod.TUNNEL_PROFILES,
                 cores=cores,
                 core_names=core_names,
@@ -8534,6 +8811,45 @@ def nodes_page(request: Request):
                 update_queue=node_update_queue_snapshot(),
                 jobs=sorted(ops.JOBS.items(), key=lambda kv: -kv[1]["started"])[:8],
                 job_running=bool(running and ops.JOBS.get(running, {}).get("status") == "running"))
+
+
+@app.post("/nodes/tspu/check")
+def nodes_tspu_check(request: Request):
+    """Manual Cheburcheck run for all node domains."""
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "TSPU-проверка только на master", "warn")
+        return go("/nodes")
+
+    def do_check():
+        ev = _tspu_cycle(force=True)
+        return {"ok": True, "changes": len(ev or [])}
+
+    NODES_JOB["id"] = ops.start_job("tspu-check", do_check)
+    flash(request, "Проверка TSPU запущена (cheburcheck.ru)", "info")
+    return go("/nodes")
+
+
+@app.post("/nodes/tspu/settings")
+async def nodes_tspu_settings(request: Request):
+    """Inline schedule / enable from Nodes page."""
+    if redir := _require(request):
+        return redir
+    form = await request.form()
+    with mutate(history_section="tspu", history_note="tspu schedule") as store:
+        cfg = tspu_mod.ensure_settings(store)
+        # Checkboxes absent when unchecked — treat missing as False
+        cfg["enabled"] = form.get("enabled") == "1"
+        cfg["use_probe"] = form.get("use_probe") == "1"
+        cfg["interval_min"] = tspu_mod.normalize_interval(form.get("interval_min"))
+        new_tok = str(form.get("api_token") or "").strip()
+        if new_tok:
+            cfg["api_token"] = new_tok
+        if form.get("clear_api_token") == "1":
+            cfg["api_token"] = ""
+    flash(request, "Расписание TSPU сохранено", "info")
+    return go("/nodes")
 
 
 @app.get("/cores", response_class=HTMLResponse)
@@ -9267,11 +9583,21 @@ async def cores_action(core_id: str, action: str, request: Request):
             flash(request, "Ядро удалено", "info")
             return go("/cores")
         elif action == "save":
-            # checkbox fields absent when unchecked
+            # Partial forms omit log/online checkboxes. Forcing "0" when absent
+            # silently set statsUserOnline=false on every core save → Online: 0.
             data = {k: form.get(k) for k in form.keys()}
-            data["stats_user_online"] = "1" if form.get("stats_user_online") else "0"
-            data["access_log"] = "1" if form.get("access_log") else "0"
-            data["dns_log"] = "1" if form.get("dns_log") else "0"
+            if form.get("xray_flags_form") or "stats_user_online" in form:
+                data["stats_user_online"] = "1" if form.get("stats_user_online") else "0"
+            else:
+                data.pop("stats_user_online", None)
+            if "access_log" in form:
+                data["access_log"] = "1" if form.get("access_log") else "0"
+            else:
+                data.pop("access_log", None)
+            if "dns_log" in form:
+                data["dns_log"] = "1" if form.get("dns_log") else "0"
+            else:
+                data.pop("dns_log", None)
             was_inherit = bool(core.get("inherit_master"))
             data["inherit_master"] = "1" if form.get("inherit_master") else "0"
             if form.get("sub_custom_json_form"):
@@ -10027,12 +10353,13 @@ def _node_push_job(
                 break
         ok = bool(res.get("ok"))
         log = f"{label}: clients API {'OK' if ok else res.get('error') or 'fail'}"
-        if not ok:
-            _tg_admin(
-                f"❌ Clients API <b>{tgbot.escape(name)}</b>: {tgbot.escape(str(res.get('error') or 'fail'))}\n"
-                f"<i>{tgbot.escape(label)}</i>",
-                flag="notify_nodes",
-            )
+        _tg_clients_api_notify(
+            name,
+            label,
+            ok=ok,
+            error=str(res.get("error") or "fail"),
+            prev_ok=prev_ok,
+        )
         return {"ok": ok, "log": log, "error": "" if ok else str(res.get("error") or ""), "warnings": []}
     res = nodes_mod.push(node_snap, payload, master_host=host, timeout=push_timeout)
     warns = list(res.get("warnings") or [])

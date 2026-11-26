@@ -10,7 +10,7 @@
 {%- endmacro %}
 {% block content %}
 <div class="tabs">
-  {% for k, l in [('panel', t('Панель')), ('sub', t('Подписки')), ('tg', 'Telegram'), ('webhooks', 'Webhooks'), ('nodes', 'Nodes agent'), ('masterdns', 'MasterDNS'), ('security', t('Безопасность')), ('api', 'API'), ('certs', t('Сертификаты')), ('backup', t('Бэкап')), ('system', t('Система')), ('iplimit', 'IP limit')] %}
+  {% for k, l in [('panel', t('Панель')), ('sub', t('Подписки')), ('tg', 'Telegram'), ('webhooks', 'Webhooks'), ('nodes', 'Nodes agent'), ('tspu', 'TSPU'), ('security', t('Безопасность')), ('api', 'API'), ('certs', t('Сертификаты')), ('backup', t('Бэкап')), ('system', t('Система')), ('iplimit', 'IP limit')] %}
   <a href="?tab={{ k }}" class="{% if tab == k %}active{% endif %}">{{ l }}</a>
   {% endfor %}
   <a href="{{ bp }}/settings/versions" class="{% if tab == 'versions' %}active{% endif %}">Версии</a>
@@ -196,6 +196,31 @@
   <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
 </form>
 
+{% elif tab == 'tspu' %}{% set tc = s.tspu if s.tspu is defined else {} %}
+<form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
+  <input type="hidden" name="section" value="tspu">
+  {{ m.check('enabled', tc.enabled if tc.enabled is defined else True, 'Автопроверка доменов нод (Cheburcheck)') }}
+  <label class="f">Интервал проверки</label>
+  <select name="interval_min" style="max-width:12rem">
+    {% for mins, label in [(0,'выкл'),(15,'15 мин'),(30,'30 мин'),(60,'1 ч'),(180,'3 ч'),(360,'6 ч'),(720,'12 ч'),(1440,'24 ч')] %}
+    <option value="{{ mins }}" {% if (tc.interval_min or 60)|int == mins %}selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  {{ m.check('use_probe', tc.use_probe if tc.use_probe is defined else True, 'Динамический probe (ТСПУ/SNI) — нужен API-токен') }}
+  <label class="f">API-токен Cheburcheck (опционально)</label>
+  <input name="api_token" type="password" autocomplete="off" placeholder="{% if tc.api_token %}•••• сохранён (пусто = не менять){% else %}Bearer для /api/v1/probe{% endif %}" style="max-width:420px">
+  {{ m.check('clear_api_token', False, 'Сбросить API-токен') }}
+  <div class="hint">
+    Без токена проверяются только <b>публичные списки</b> блокировок (<code>GET /api/v1/check</code>).
+    С токеном дополнительно читается SSE <code>/probe</code> — вердикты <code>tspu_block</code>, <code>sni_block</code> и др.
+    Токен: <a href="https://cheburcheck.ru/kb/api" target="_blank" rel="noopener">документация API</a>.
+    Уведомления о смене статуса — в Telegram → «TSPU: блокировка / разблокировка».
+    Колонка TSPU и кнопка «Проверить сейчас» — на странице Nodes.
+  </div>
+  {% if tc.last_run_at %}<div class="dim small mt">Последний запуск: {{ tc.last_run_at }}{% if tc.last_error %} · <span class="badge warn" title="{{ tc.last_error }}">ошибки</span>{% endif %}</div>{% endif %}
+  <div class="actions mt"><button class="btn">{{ t('Сохранить') }}</button></div>
+</form>
+
 {% elif tab == 'tg' %}{% set tg = s.tg %}
 <form class="card" method="post" action="{{ bp }}/settings/save" style="max-width:820px">
   <input type="hidden" name="section" value="tg">
@@ -212,6 +237,7 @@
   {{ m.check('notify_quota', tg.notify_quota, 'Истечение срока / исчерпание трафика / авто-сброс') }}
   {{ m.check('notify_iplimit', tg.notify_iplimit, 'Блокировки по лимиту IP') }}
   {{ m.check('notify_nodes', tg.notify_nodes if tg.notify_nodes is defined else True, 'Ноды: online/offline, sync, update, provision, promote, любые изменения') }}
+  {{ m.check('notify_tspu', tg.notify_tspu if tg.notify_tspu is defined else True, 'TSPU: блокировка / разблокировка домена ноды (Cheburcheck)') }}
   {{ m.check('notify_outbounds', tg.notify_outbounds if tg.notify_outbounds is defined else True, 'Outbounds: disconnect / connect и высокие потери пакетов') }}
   {{ m.check('notify_changes', tg.notify_changes if tg.notify_changes is defined else True, 'Изменения: кто (логин+IP) и что сделал — клиенты, inbounds, outbounds, settings, DoH…') }}
   {{ m.check('notify_updates', tg.notify_updates if tg.notify_updates is defined else True, 'Обновления: новая версия Xray или панели на GitHub') }}

@@ -5,6 +5,7 @@
 {% block page_title %}DoH / Pi-hole{% endblock %}
 {% block page_sub %}DNS-over-HTTPS через nginx :443 → панель → Pi-hole. Персональные URL для клиентов.{% endblock %}
 {% block content %}
+{% include "_jobs.html" %}
 {% set q = (pihole_dash.queries if pihole_dash else {}) or {} %}
 {% set cl = (pihole_dash.clients if pihole_dash else {}) or {} %}
 {% set gr = (pihole_dash.gravity if pihole_dash else {}) or {} %}
@@ -119,13 +120,25 @@
         <div class="dim small mono">{{ status.upstream }}</div></div>
       <div><span class="badge {% if status.docker %}ok{% endif %}">docker {{ 'есть' if status.docker else 'нет' }}</span>
         <div class="dim small">compose {{ 'да' if status.compose_present else 'нет' }}</div></div>
+      <div>
+        <span class="badge {% if status.pihole_running %}ok{% else %}{% if status.compose_present %}warn{% endif %}{% endif %}">
+          Pi-hole {% if status.pihole_running %}online{% elif status.compose_present %}offline{% else %}—{% endif %}
+        </span>
+        <div class="dim small mono" title="{{ (status.pihole_version_detail.raw if status.pihole_version_detail is defined else '') or '' }}">
+          {{ status.pihole_version or 'версия неизвестна' }}
+        </div>
+      </div>
     </div>
     {% if status.error %}<div class="hint" style="color:var(--danger)">{{ status.error }}</div>{% endif %}
     <div class="actions mt">
       <form method="post" action="{{ bp }}/doh/install" onsubmit="return confirm('Установить Pi-hole в docker на 127.0.0.1:5353 (DNS) / :8089 (web)? Порт 53 остаётся для MasterDNS. Если Docker нет — он будет установлен автоматически.')"><button class="btn">Установить Pi-hole</button></form>
+      <form method="post" action="{{ bp }}/doh/update"
+            onsubmit="return confirm('Обновить Pi-hole до latest?\nБудет docker pull pihole/pihole:latest и recreate контейнера.\nСписки gravity и настройки сохранятся.')">
+        <button class="btn" {% if not status.compose_present or not status.docker %}disabled title="Сначала установите Pi-hole"{% endif %}>Обновить Pi-hole</button>
+      </form>
       <form method="post" action="{{ bp }}/doh/stop"><button class="btn ghost">Остановить</button></form>
     </div>
-    <div class="hint mt">DNS Pi-hole на хосте: <code>127.0.0.1:{{ doh.upstream_port or 5353 }}</code> (не :53 — он для MasterDNS). Web UI: <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code>.</div>
+    <div class="hint mt">DNS Pi-hole на хосте: <code>127.0.0.1:{{ doh.upstream_port or 5353 }}</code> (не :53 — он для MasterDNS). Web UI: <code>http://{{ doh.pihole_web or '127.0.0.1:8089' }}/admin</code>. Обновление тянет образ <code>pihole/pihole:latest</code> и пересоздаёт контейнер (volumes на месте).</div>
   </div>
 </div>
 

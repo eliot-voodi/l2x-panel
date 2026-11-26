@@ -45,6 +45,13 @@ def ensure_list(store: dict) -> list[dict]:
         # Full standby copy of master (clients/outbounds/routes/…) while still acting as outbound
         n.setdefault("mirror", False)
         n.setdefault("domain", "")
+        # Cheburcheck / TSPU status for node domain (filled by panel background loop)
+        n.setdefault("tspu_status", "")
+        n.setdefault("tspu_blocked", None)
+        n.setdefault("tspu_detail", "")
+        n.setdefault("tspu_checked_at", "")
+        n.setdefault("tspu_error", "")
+        n.setdefault("tspu_verdicts", [])
         n.setdefault("ssh_user", "")
         n.setdefault("ssh_port", 22)
         n.setdefault("ssh_hostkey_fp", "")

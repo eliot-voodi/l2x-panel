@@ -1,0 +1,6 @@
+v2.4.2: dashboard analytics, Online fix, MasterDNS sidebar
+
+- Dashboard OS/app/city/inbound pies + city→inbound; chart Y-axis
+- Fix Online zero: stats_user_online no longer wiped on core save; traffic fallback
+- MasterDNS out of Settings tabs; remains under Сеть sidebar
+- Core edit: statsUserOnline checkbox; Pi-hole update / TSPU / multi-node sub extras

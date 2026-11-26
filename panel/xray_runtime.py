@@ -2822,37 +2822,92 @@ def _subscription_should_dial_node(node: dict | None) -> bool:
 
 
 def _direct_node_host_for_inbound(store: dict, ib: dict, master_hosts: set[str]) -> tuple[str, dict | None, dict | None]:
-    """If inbound belongs to a node core clients should dial, return (node_domain, remapped_ib, node).
+    """Best single dial target for an inbound (compat / template helper).
 
-    Subscription must dial the node (e.g. ``buh.ro0t.dev`` / ``am.ro0t.dev``),
-    not the panel host (``web.ro0t.dev``). NAT/tunnel bridge nodes keep the master domain.
+    Prefer ``_dial_targets_for_inbound`` when building subscriptions — several nodes
+    may share one core and must all appear in JSON/links.
+    """
+    targets = _dial_targets_for_inbound(store, ib, master_hosts)
+    if not targets:
+        return "", None, None
+    # Prefer a real node host over the empty «use panel host» fallback
+    for host, remapped, node in targets:
+        if host:
+            return host, remapped, node
+    return targets[0]
+
+
+def _dial_targets_for_inbound(
+    store: dict, ib: dict, master_hosts: set[str],
+) -> list[tuple[str, dict | None, dict | None]]:
+    """All (host, remapped_ib, node) clients should dial for this inbound.
+
+    When several nodes share the inbound's core, every enabled dialable node is
+    returned so the subscription JSON/links list all addresses and the client
+    can pick / load-balance across servers.
     """
     try:
         import nodes as nodes_mod
     except Exception:
-        return "", None, None
-    # Explicit share_host that is already a non-master domain wins.
+        return [("", None, None)]
     try:
         import front as front_mod
         explicit = front_mod.normalize_host(ib.get("share_host") or "")
     except Exception:
         explicit = str(ib.get("share_host") or "").strip().lower()
+
+    cid = _core_id_for_inbound(store, ib)
+    nodes = _nodes_for_core_id(store, cid)
+    targets: list[tuple[str, dict | None, dict | None]] = []
+    seen_hosts: set[str] = set()
+
+    for node in nodes:
+        if not isinstance(node, dict) or not node.get("enabled", True):
+            continue
+        # Skip known-offline nodes so the client does not hammer dead servers
+        if node.get("online") is False:
+            continue
+        if not _subscription_should_dial_node(node):
+            continue
+        dom = nodes_mod.node_public_domain(node) or ""
+        if not dom or dom in master_hosts:
+            continue
+        if dom in seen_hosts:
+            continue
+        seen_hosts.add(dom)
+        remapped = None
+        try:
+            remapped_list = nodes_mod.remap_inbounds_for_host(
+                [ib], new_host=dom, old_hosts=master_hosts,
+            )
+            remapped = remapped_list[0] if remapped_list else None
+        except Exception:
+            remapped = None
+        targets.append((dom, remapped, node))
+
+    if targets:
+        targets.sort(key=lambda t: (
+            str((t[2] or {}).get("name") or "").lower(),
+            t[0],
+        ))
+        return targets
+
+    # No multi-node dial targets: keep legacy explicit share_host / single-node behaviour
     node = _node_for_inbound_core(store, ib)
     if explicit and explicit not in master_hosts:
-        return explicit, None, node
-
-    if not _subscription_should_dial_node(node):
-        return "", None, node
-    dom = nodes_mod.node_public_domain(node) or ""
-    if not dom or dom in master_hosts:
-        return "", None, node
-    try:
-        remapped = nodes_mod.remap_inbounds_for_host(
-            [ib], new_host=dom, old_hosts=master_hosts,
-        )
-        return dom, (remapped[0] if remapped else None), node
-    except Exception:
-        return dom, None, node
+        return [(explicit, None, node)]
+    if _subscription_should_dial_node(node):
+        dom = nodes_mod.node_public_domain(node) or ""
+        if dom and dom not in master_hosts:
+            try:
+                remapped_list = nodes_mod.remap_inbounds_for_host(
+                    [ib], new_host=dom, old_hosts=master_hosts,
+                )
+                return [(dom, (remapped_list[0] if remapped_list else None), node)]
+            except Exception:
+                return [(dom, None, node)]
+    # Empty host → caller uses panel public host
+    return [("", None, None)]
 
 
 def _direct_ident_for_tag(client: dict, tag: str, *, label: str = "") -> dict:
@@ -2900,103 +2955,136 @@ def client_endpoints(
     # Several identities from one inbound (or several inbounds) → append outbound label
     multi_idents = multi or any(len(client_identities(store, client, i)) > 1 for i in ibs)
     for ib in ibs:
-        core_host, core_ib, core_node = _direct_node_host_for_inbound(store, ib, master_hosts)
-        ib_base = core_ib or ib
-        core_tag = ""
-        if core_node is not None and nodes_mod is not None:
-            try:
-                core_tag = nodes_mod.node_outbound_tag(core_node)
-            except Exception:
-                core_tag = ""
-        for ident in client_identities(store, client, ib):
-            if ident["main"]:
-                ob = client_default_outbound(store, client)
-                if ob == NONE_TAG:
-                    continue
-                # Balancers are routing-only — never emit a balancer profile to the user.
-                if balancer_by_tag(store, ob):
-                    ob = "direct"
-                if ob != "direct" and not tag_allowed_for_client(store, client, ob):
-                    continue
-                if ob != "direct" and not outbound_ok_for_sub(store, ob):
-                    continue
-                remark = subscription_profile_remark(
-                    store, client, ib,
-                    outbound_tag=ob,
-                    quota_suffix=tag_quota_suffix(client, ob),
-                    # Main profile: inbound name only (even for Direct node)
-                    with_outbound=False,
-                )
-                dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
-                # Node-owned inbound: dial the node with the BASE client UUID.
-                # Nodes always have it (email~node_* may be missing until the agent
-                # rebuilds identities) — this is what makes sub profiles work.
-                if core_host:
-                    ident_use = {
-                        "uuid": client["uuid"],
-                        "email": client["email"],
-                        "password": client.get("password") or P.derived_password(client["uuid"]),
-                        "main": True,
-                        "tag": core_tag or "",
-                        "label": outbound_label(store, core_tag) if core_tag else "",
-                    }
-                elif ob and ob != "direct" and _is_direct_connect_tag(store, ob):
-                    # Master inbound remapped to a Direct outbound host
-                    ident_use = _direct_ident_for_tag(
-                        client, ob, label=outbound_label(store, ob),
-                    )
-                else:
-                    ident_use = ident
-            else:
-                tag = str(ident.get("tag") or "")
-                # Balancers never appear as separate subscription profiles.
-                if balancer_by_tag(store, tag):
-                    continue
-                if tag in pool_hidden:
-                    continue
-                remark = subscription_profile_remark(
-                    store, client, ib,
-                    outbound_tag=tag,
-                    outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
-                    quota_suffix=tag_quota_suffix(client, tag),
-                    with_outbound=True,
-                )
-                dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
-                ident_use = ident
-            # Direct node inbound MUST advertise the node domain (never master).
-            # Only fall back to outbound Direct host when the inbound itself is master's.
-            host_use = core_host or dc_host or host
-            ib_use = ib_base
-            remap_to = core_host or dc_host
-            if remap_to and nodes_mod is not None:
+        dial_targets = _dial_targets_for_inbound(store, ib, master_hosts)
+        multi_nodes = sum(1 for h, _, _ in dial_targets if h) > 1
+        for core_host, core_ib, core_node in dial_targets:
+            ib_base = core_ib or ib
+            core_tag = ""
+            node_label = ""
+            if core_node is not None and nodes_mod is not None:
                 try:
-                    remapped = nodes_mod.remap_inbounds_for_host(
-                        [ib_base], new_host=remap_to, old_hosts=master_hosts,
-                    )
-                    if remapped:
-                        ib_use = remapped[0]
+                    core_tag = nodes_mod.node_outbound_tag(core_node)
                 except Exception:
-                    ib_use = ib_base
-            # Belt-and-suspenders: endpoint_for prefers share_host over host arg.
-            if remap_to and isinstance(ib_use, dict):
-                ib_use = dict(ib_use)
-                ib_use["share_host"] = remap_to
-            ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
-            if ep:
-                if remap_to:
-                    ep["address"] = remap_to
-                ep["_core_id"] = _core_id_for_inbound(store, ib) or ""
-                ep["_inbound_tag"] = str(ib.get("tag") or "")
-                _apply_cosmetic_path(store, client, ib_use, ep)
-                eps.extend(P._apply_external_proxy(ep, ib_use))
+                    core_tag = ""
+                try:
+                    node_label = str(
+                        nodes_mod.node_user_title(core_node)
+                        or core_node.get("name")
+                        or core_host
+                        or ""
+                    ).strip()
+                except Exception:
+                    node_label = str(core_node.get("name") or core_host or "").strip()
+            for ident in client_identities(store, client, ib):
+                if ident["main"]:
+                    ob = client_default_outbound(store, client)
+                    if ob == NONE_TAG:
+                        continue
+                    # Balancers are routing-only — never emit a balancer profile to the user.
+                    if balancer_by_tag(store, ob):
+                        ob = "direct"
+                    if ob != "direct" and not tag_allowed_for_client(store, client, ob):
+                        continue
+                    if ob != "direct" and not outbound_ok_for_sub(store, ob):
+                        continue
+                    remark = subscription_profile_remark(
+                        store, client, ib,
+                        outbound_tag=ob,
+                        quota_suffix=tag_quota_suffix(client, ob),
+                        # Main profile: inbound name only (even for Direct node)
+                        with_outbound=False,
+                    )
+                    # Several nodes on one core → disambiguate by node title in links
+                    if multi_nodes and node_label:
+                        remark = f"{remark} · {node_label}"
+                    dc_host, _dc_node = _direct_connect_endpoint_host(store, ob)
+                    # Node-owned inbound: dial the node with the BASE client UUID.
+                    # Nodes always have it (email~node_* may be missing until the agent
+                    # rebuilds identities) — this is what makes sub profiles work.
+                    if core_host:
+                        ident_use = {
+                            "uuid": client["uuid"],
+                            "email": client["email"],
+                            "password": client.get("password") or P.derived_password(client["uuid"]),
+                            "main": True,
+                            "tag": core_tag or "",
+                            "label": outbound_label(store, core_tag) if core_tag else "",
+                        }
+                    elif ob and ob != "direct" and _is_direct_connect_tag(store, ob):
+                        # Master inbound remapped to a Direct outbound host
+                        ident_use = _direct_ident_for_tag(
+                            client, ob, label=outbound_label(store, ob),
+                        )
+                    else:
+                        ident_use = ident
+                else:
+                    tag = str(ident.get("tag") or "")
+                    # Balancers never appear as separate subscription profiles.
+                    if balancer_by_tag(store, tag):
+                        continue
+                    if tag in pool_hidden:
+                        continue
+                    remark = subscription_profile_remark(
+                        store, client, ib,
+                        outbound_tag=tag,
+                        outbound_label_text=str(ident.get("label") or outbound_label(store, tag)),
+                        quota_suffix=tag_quota_suffix(client, tag),
+                        with_outbound=True,
+                    )
+                    if multi_nodes and node_label:
+                        remark = f"{remark} · {node_label}"
+                    dc_host, _dc_node = _direct_connect_endpoint_host(store, tag)
+                    ident_use = ident
+                # Direct node inbound MUST advertise the node domain (never master).
+                # Only fall back to outbound Direct host when the inbound itself is master's.
+                host_use = core_host or dc_host or host
+                ib_use = ib_base
+                remap_to = core_host or dc_host
+                if remap_to and nodes_mod is not None:
+                    try:
+                        remapped = nodes_mod.remap_inbounds_for_host(
+                            [ib_base], new_host=remap_to, old_hosts=master_hosts,
+                        )
+                        if remapped:
+                            ib_use = remapped[0]
+                    except Exception:
+                        ib_use = ib_base
+                # Belt-and-suspenders: endpoint_for prefers share_host over host arg.
+                if remap_to and isinstance(ib_use, dict):
+                    ib_use = dict(ib_use)
+                    ib_use["share_host"] = remap_to
+                ep = P.endpoint_for(ib_use, ident_use, host_use, remark)
+                if ep:
+                    if remap_to:
+                        ep["address"] = remap_to
+                    ep["_core_id"] = _core_id_for_inbound(store, ib) or ""
+                    ib_tag = str(ib.get("tag") or "")
+                    # Distinct outbound tags per node so balancers can load-share
+                    if multi_nodes and node_label:
+                        slug = re.sub(r"[^A-Za-z0-9]+", "", node_label)[:16] or "node"
+                        ep["_inbound_tag"] = f"{ib_tag}-{slug}" if ib_tag else slug
+                    else:
+                        ep["_inbound_tag"] = ib_tag
+                    if core_node is not None:
+                        ep["_node_id"] = str(core_node.get("id") or "")
+                        ep["_node_name"] = node_label or str(core_node.get("name") or "")
+                    _apply_cosmetic_path(store, client, ib_use, ep)
+                    eps.extend(P._apply_external_proxy(ep, ib_use))
     return eps
 
 
-def _json_profile_group_key(ep: dict, default_host: str = "") -> tuple[str, str]:
-    """Group subscription endpoints into one client profile: (core_id, connect_host)."""
-    cid = str(ep.get("_core_id") or "")
+def _json_profile_group_key(ep: dict, default_host: str = "") -> str:
+    """Group subscription endpoints into one client profile per core.
+
+    Several nodes sharing one core → all their addresses land in the same JSON
+    profile (outbounds); Happ/Xray balancers pick among them. Without a core id,
+    fall back to connect host so unrelated master inbounds stay separate.
+    """
+    cid = str(ep.get("_core_id") or "").strip()
+    if cid:
+        return f"core:{cid}"
     host = str(ep.get("address") or default_host or "").strip()
-    return cid, host
+    return f"host:{host}"
 
 
 def _client_endpoints_for_core_custom(
@@ -3064,10 +3152,10 @@ def client_json_subscription_profiles(
 ) -> list | dict:
     """Build ``?format=json`` payload.
 
-    Default: **one Ascella-style profile per core/node** — all inbounds of that core
-    become outbounds with leastLoad/ping failover (user sees one config, device picks).
+    Default: **one Ascella-style profile per core** — all inbounds × all nodes of
+    that core become outbounds with leastLoad/ping failover (device picks a server).
 
-    Custom JSON on a core replaces auto-generation for that core/node.
+    Custom JSON on a core replaces auto-generation for that core.
     ``flat=1`` → one profile per endpoint (legacy).
     """
     if not client_access_ok(client):
@@ -3097,15 +3185,26 @@ def client_json_subscription_profiles(
             for e in all_eps
         ]
 
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[str, list[dict]] = {}
     for e in all_eps:
         groups.setdefault(_json_profile_group_key(e, default_host), []).append(e)
 
     profiles: list[dict] = []
     any_custom = False
-    for (cid, host), eps in groups.items():
+    for gkey, eps in groups.items():
         if not eps:
             continue
+        cid = ""
+        if gkey.startswith("core:"):
+            cid = gkey[5:]
+        host = str((eps[0] or {}).get("address") or default_host or "").strip()
+        # Prefer a stable host for {{host}} placeholders when several nodes share the core
+        hosts_in_group = sorted({
+            str(e.get("address") or "").strip()
+            for e in eps if str(e.get("address") or "").strip()
+        })
+        if hosts_in_group:
+            host = hosts_in_group[0]
         core = cores_mod.core_by_id(store, cid) if (cid and cores_mod) else None
         title = core_sub_remark(core if isinstance(core, dict) else None, eps, fallback=remarks or "L2X")
 
@@ -3114,10 +3213,10 @@ def client_json_subscription_profiles(
             tmpl = str(core.get("sub_custom_json_template") or "").strip()
         if tmpl:
             any_custom = True
-            # Always dial ALL core inbounds (Ascella cascade). Client checkboxes only
-            # decide whether this core appears in the sub — not which transports are listed.
+            # Always dial ALL core inbounds × ALL nodes (Ascella cascade / load-share).
+            # Client checkboxes only decide whether this core appears in the sub.
             full_eps = _client_endpoints_for_core_custom(
-                store, client, core, host or default_host,
+                store, client, core, default_host,
             ) or list(eps)
             auto_obs: list[dict] = []
             auto_cfg: dict = {}
@@ -4118,6 +4217,15 @@ def build_config(store: dict) -> dict:
     patch = xs.get("template_patch") or {}
     if patch:
         cfg = deep_merge(cfg, patch)
+    # Honor xray_settings.stats_user_online even when template_patch omitted policy
+    if "stats_user_online" in xs:
+        try:
+            levels = cfg.setdefault("policy", {}).setdefault("levels", {})
+            lvl0 = levels.setdefault("0", {})
+            if isinstance(lvl0, dict):
+                lvl0["statsUserOnline"] = bool(xs.get("stats_user_online"))
+        except Exception:
+            pass
     # Legacy reverse{} is rejected by current Xray — never emit it (even via template patch)
     cfg.pop("reverse", None)
     return cfg
@@ -5210,6 +5318,43 @@ def update_online(store: dict, online: dict[str, dict[str, int]]) -> dict[str, l
             if len(log) > 50:
                 for ip in sorted(log, key=lambda i: log[i])[:-50]:
                     log.pop(ip, None)
+
+    # Fallback: Direct agents report traffic (updates last_online) even when
+    # statsUserOnline IP lists are empty (policy was off / no reconnect yet).
+    # Count those clients as online so the Dashboard is not stuck at 0.
+    grace = 180
+    for client in store.get("clients") or []:
+        if not isinstance(client, dict):
+            continue
+        base = str(client.get("email") or "")
+        if not base or base in result:
+            continue
+        lo = str(client.get("last_online") or "")
+        if not lo:
+            continue
+        try:
+            ts = datetime.fromisoformat(lo.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if (now - ts).total_seconds() > grace:
+                continue
+        except Exception:
+            continue
+        hist = client.get("ips") if isinstance(client.get("ips"), dict) else {}
+        recent_ips: list[str] = []
+        for ip, when in hist.items():
+            try:
+                wt = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+                if wt.tzinfo is None:
+                    wt = wt.replace(tzinfo=timezone.utc)
+                if (now - wt).total_seconds() <= 3600:
+                    recent_ips.append(str(ip))
+            except Exception:
+                continue
+        if not recent_ips and hist:
+            # last known IPs (timestamps may be older than grace)
+            recent_ips = sorted(hist, key=lambda i: str(hist.get(i) or ""), reverse=True)[:5]
+        result[base] = recent_ips[:10]
     return result
 
 

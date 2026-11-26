@@ -20,14 +20,15 @@
   .nodes-desk.table-wrap { overflow: visible }
   .nodes-desk table { table-layout: fixed; width: 100% }
   .nodes-desk th, .nodes-desk td { padding: .4rem .45rem; vertical-align: top; font-size: .82rem }
-  .nodes-desk th:nth-child(1), .nodes-desk td:nth-child(1) { width: 8.5rem }
-  .nodes-desk th:nth-child(2), .nodes-desk td:nth-child(2) { width: 9.5rem }
-  .nodes-desk th:nth-child(3), .nodes-desk td:nth-child(3) { width: 8rem }
-  .nodes-desk th:nth-child(4), .nodes-desk td:nth-child(4) { width: 6.5rem }
-  .nodes-desk th:nth-child(5), .nodes-desk td:nth-child(5) { width: 9.5rem }
-  .nodes-desk th:nth-child(6), .nodes-desk td:nth-child(6) { width: 3.5rem }
-  .nodes-desk th:nth-child(7), .nodes-desk td:nth-child(7) { width: 5rem }
-  .nodes-desk th:nth-child(8), .nodes-desk td:nth-child(8) { width: 6.5rem }
+  .nodes-desk th:nth-child(1), .nodes-desk td:nth-child(1) { width: 8rem }
+  .nodes-desk th:nth-child(2), .nodes-desk td:nth-child(2) { width: 8.5rem }
+  .nodes-desk th:nth-child(3), .nodes-desk td:nth-child(3) { width: 5.2rem }
+  .nodes-desk th:nth-child(4), .nodes-desk td:nth-child(4) { width: 7.5rem }
+  .nodes-desk th:nth-child(5), .nodes-desk td:nth-child(5) { width: 5.8rem }
+  .nodes-desk th:nth-child(6), .nodes-desk td:nth-child(6) { width: 8.5rem }
+  .nodes-desk th:nth-child(7), .nodes-desk td:nth-child(7) { width: 3.2rem }
+  .nodes-desk th:nth-child(8), .nodes-desk td:nth-child(8) { width: 4.5rem }
+  .nodes-desk th:nth-child(9), .nodes-desk td:nth-child(9) { width: 6rem }
   .nodes-desk .badge { font-size: .68rem; padding: .1rem .35rem; margin: 0 .1rem .15rem 0; display: inline-block }
   .nodes-desk .nd-tags { display: flex; flex-wrap: wrap; gap: .15rem; max-height: 2.6rem; overflow: hidden }
   .nodes-desk .nd-sync-msg {
@@ -194,12 +195,48 @@
   {% endif %}
 </details>
 
+{% set tspu_cfg = tspu if tspu is defined else {} %}
+<details class="card nodes-uq" {% if tspu_cfg.enabled %}open{% endif %}>
+  <summary>
+    TSPU / Cheburcheck
+    {% if tspu_cfg.enabled %}<span class="badge ok">{{ tspu_interval_label if tspu_interval_label is defined else ((tspu_cfg.interval_min or 0) ~ ' мин') }}</span>
+    {% else %}<span class="badge">выкл</span>{% endif %}
+    {% if tspu_cfg.last_run_at %}<span class="dim small">· {{ fmt_dt(tspu_cfg.last_run_at) }}</span>{% endif %}
+  </summary>
+  <div class="hint mt">Автопроверка доменов нод через <a href="https://cheburcheck.ru/" target="_blank" rel="noopener">cheburcheck.ru</a>
+    (списки блокировок; с API-токеном — ещё динамический probe: ТСПУ/SNI).
+    При смене статуса — уведомление в Telegram (настройка <code>notify_tspu</code>).
+  </div>
+  <form method="post" action="{{ bp }}/nodes/tspu/settings" class="row mt" style="gap:.75rem;align-items:end;flex-wrap:wrap">
+    <label class="check" style="margin:0"><input type="checkbox" name="enabled" value="1" {% if tspu_cfg.enabled %}checked{% endif %}> Включено</label>
+    <div>
+      <label class="f">Интервал</label>
+      <select name="interval_min">
+        {% for mins, label in (tspu_intervals or []) %}
+        <option value="{{ mins }}" {% if (tspu_cfg.interval_min or 0)|int == mins %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <label class="check" style="margin:0" title="Нужен API-токен cheburcheck"><input type="checkbox" name="use_probe" value="1" {% if tspu_cfg.use_probe is not defined or tspu_cfg.use_probe %}checked{% endif %}> Probe (ТСПУ)</label>
+    <div style="flex:1;min-width:12rem">
+      <label class="f">API-токен (опц.)</label>
+      <input type="password" name="api_token" autocomplete="new-password" placeholder="{% if tspu_cfg.api_token %}•••• сохранён{% else %}Bearer для /probe{% endif %}">
+    </div>
+    <label class="check" style="margin:0"><input type="checkbox" name="clear_api_token" value="1"> Сбросить токен</label>
+    <button class="btn sm">Сохранить</button>
+  </form>
+  <div class="actions mt">
+    <form method="post" action="{{ bp }}/nodes/tspu/check"><button class="btn ghost sm" {% if job_running %}disabled{% endif %}>Проверить сейчас</button></form>
+    {% if tspu_cfg.last_error %}<span class="badge warn" title="{{ tspu_cfg.last_error }}">ошибки</span>{% endif %}
+  </div>
+</details>
+
 <div class="card" style="padding:0">
   {# —— Desktop —— #}
   <div class="table-wrap nodes-desktop nodes-desk">
   <table>
     <thead><tr>
-      <th>Нода</th><th>Domain</th><th>Ядро</th><th>Версия</th><th>Outbound</th><th>Зерк.</th><th>Статус</th><th>Sync</th><th class="right">{{ t('Действия') }}</th>
+      <th>Нода</th><th>Domain</th><th>TSPU</th><th>Ядро</th><th>Версия</th><th>Outbound</th><th>Зерк.</th><th>Статус</th><th>Sync</th><th class="right">{{ t('Действия') }}</th>
     </tr></thead>
     <tbody>
     {% for n in items %}
@@ -219,6 +256,22 @@
         <td class="small">
           <span class="mono" title="{{ n.domain or n.url }}">{{ n.domain or n.url }}</span>
           {% if n.base_path %}<div class="dim mono">/{{ n.base_path }}/</div>{% endif %}
+        </td>
+        <td class="small">
+          {% set _dom = n.domain or n.url or '' %}
+          {% if not _dom %}<span class="dim">—</span>
+          {% elif n.tspu_status == 'blocked' %}
+            <a class="badge err" href="{{ tspu_check_url(_dom) if tspu_check_url is defined else ('https://cheburcheck.ru/check?target=' ~ _dom) }}"
+               target="_blank" rel="noopener" title="{{ n.tspu_detail or 'blocked' }}{% if n.tspu_checked_at %} · {{ fmt_dt(n.tspu_checked_at) }}{% endif %}">блок</a>
+            {% if n.tspu_detail %}<div class="dim" style="font-size:.65rem;max-width:5rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ n.tspu_detail }}">{{ n.tspu_detail }}</div>{% endif %}
+          {% elif n.tspu_status == 'ok' %}
+            <a class="badge ok" href="{{ tspu_check_url(_dom) if tspu_check_url is defined else ('https://cheburcheck.ru/check?target=' ~ _dom) }}"
+               target="_blank" rel="noopener" title="свободен{% if n.tspu_checked_at %} · {{ fmt_dt(n.tspu_checked_at) }}{% endif %}">ок</a>
+          {% elif n.tspu_status == 'error' %}
+            <span class="badge warn" title="{{ n.tspu_error or 'ошибка проверки' }}">?</span>
+          {% else %}
+            <span class="dim" title="ещё не проверялось">—</span>
+          {% endif %}
         </td>
         <td class="small">
           <form method="post" action="{{ bp }}/nodes/{{ n.id }}/core" title="Конфигурация ядра">
@@ -345,7 +398,7 @@
         </td>
       </tr>
     {% else %}
-      <tr><td colspan="9" class="empty">Нод пока нет — установите первую по SSH ниже</td></tr>
+      <tr><td colspan="10" class="empty">Нод пока нет — установите первую по SSH ниже</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -375,6 +428,7 @@
             <div><span class="lbl">ID</span><span class="val mono">{{ n.id[:8] }}</span></div>
             <div><span class="lbl">У пользователя</span><span class="val">{{ n.user_title or n.name }}</span></div>
             <div><span class="lbl">Domain</span><span class="val mono">{{ n.domain or n.url }}{% if n.base_path %}/{{ n.base_path }}/{% endif %}</span></div>
+            <div><span class="lbl">TSPU</span><span class="val">{% if n.tspu_status == 'blocked' %}<a class="badge err" href="{{ tspu_check_url(n.domain or n.url) if tspu_check_url is defined else '#' }}" target="_blank" rel="noopener">блок</a> {{ n.tspu_detail or '' }}{% elif n.tspu_status == 'ok' %}<a class="badge ok" href="{{ tspu_check_url(n.domain or n.url) if tspu_check_url is defined else '#' }}" target="_blank" rel="noopener">ок</a>{% elif n.tspu_status == 'error' %}<span class="badge warn" title="{{ n.tspu_error }}">?</span>{% else %}—{% endif %}</span></div>
             <div><span class="lbl">Ядро</span><span class="val">{{ (core_names or {}).get(n.core_id) or n.core_id or '—' }}</span></div>
             <div><span class="lbl">Панель</span><span class="val">{% if n.panel_version %}<span {% if master_version and n.panel_version != master_version %}class="badge warn"{% endif %}>{{ n.panel_version }}</span>{% else %}?{% endif %}</span></div>
             <div><span class="lbl">Xray</span><span class="val">{% if n.xray_version %}<span {% if n.xray_available %}class="badge warn"{% endif %}>{{ n.xray_version }}</span>{% if n.xray_available and n.xray_latest %} → {{ n.xray_latest }}{% endif %}{% else %}?{% endif %}</span></div>

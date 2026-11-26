@@ -91,6 +91,11 @@
     <div class="mt">
       {{ m.check('inherit_master', core.inherit_master, 'Наследует мастер (live). Снимите, чтобы править срезы отдельно.') }}
     </div>
+    <input type="hidden" name="xray_flags_form" value="1">
+    <div class="mt">
+      {{ m.check('stats_user_online', (core.xray_settings or {}).get('stats_user_online', True), 'Онлайн клиентов (statsUserOnline) — IP в Дашборде / лимит IP') }}
+    </div>
+    <div class="hint">Без этой галочки Direct-ноды не отдают online IP → на Дашборде «Онлайн: 0».</div>
     <div class="actions mt"><button class="btn ghost">Сохранить профиль</button></div>
   </form>
 

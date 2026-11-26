@@ -69,6 +69,7 @@ def default_settings() -> dict:
         "notify_expire_days": 3,
         "notify_iplimit": True,
         "notify_nodes": True,      # online/offline, sync, update, provision, promote, changes
+        "notify_tspu": True,       # node domain blocked/unblocked (Cheburcheck / TSPU)
         "notify_changes": True,    # clients, inbounds, outbounds, DoH, settings
         "notify_updates": True,    # new Xray core / panel releases on GitHub
         "notify_outbounds": True,  # outbound connect/disconnect + high packet loss
@@ -245,12 +246,46 @@ class Bot:
         self._username: str = ""
         self._username_checked: float = 0.0
         self._webhook_cleared = False
+        # Telegram flood-wait: block ALL Bot API calls until this unix ts.
+        self._flood_until = 0.0
+        self._api_lock = threading.Lock()
 
     # ------------------------------------------------------------ transport
     def _opener(self) -> urllib.request.OpenerDirector:
         return build_opener(self.get_settings())
 
+    def _note_flood(self, retry_after: int) -> None:
+        # Pad a few extra seconds — Telegram often extends the window if we retry on the edge.
+        wait = max(int(retry_after or 0), 0) + 8
+        if wait <= 8:
+            return
+        until = time.time() + wait
+        if until > self._flood_until:
+            self._flood_until = until
+            log.warning("telegram flood-wait %ss (until %.0f)", wait, until)
+
     def _call(self, method: str, params: dict | None = None, timeout: int = 30) -> dict:
+        # Dual-slot / standby: only the active master may touch Telegram API.
+        # Otherwise two local uvicorn processes share a token → permanent 429.
+        try:
+            if not self.should_poll():
+                return {"ok": False, "error": "inactive panel slot (skip Telegram API)"}
+        except Exception:
+            pass
+        with self._api_lock:
+            return self._call_locked(method, params, timeout)
+
+    def _call_locked(self, method: str, params: dict | None = None, timeout: int = 30) -> dict:
+        now = time.time()
+        if now < self._flood_until:
+            left = max(int(self._flood_until - now), 1)
+            return {
+                "ok": False,
+                "error": f"Too Many Requests: retry after {left}",
+                "status": 429,
+                "description": f"Too Many Requests: retry after {left}",
+                "retry_after": left,
+            }
         s = self.get_settings()
         if not s.get("token"):
             return {"ok": False, "error": "no token"}
@@ -276,7 +311,23 @@ class Bot:
             except json.JSONDecodeError:
                 parsed = {}
             err = str(parsed.get("description") or body or f"HTTP {exc.code}")
-            return {"ok": False, "error": err, "status": exc.code, "description": err}
+            retry_after = 0
+            try:
+                retry_after = int(((parsed.get("parameters") or {}) if isinstance(parsed, dict) else {}).get("retry_after") or 0)
+            except (TypeError, ValueError):
+                retry_after = 0
+            if not retry_after and exc.code == 429:
+                # "Too Many Requests: retry after N"
+                import re as _re
+                m = _re.search(r"retry after\s+(\d+)", err, _re.I)
+                if m:
+                    retry_after = int(m.group(1))
+            if retry_after > 0:
+                self._note_flood(retry_after)
+            out = {"ok": False, "error": err, "status": exc.code, "description": err}
+            if retry_after > 0:
+                out["retry_after"] = retry_after
+            return out
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
@@ -333,6 +384,14 @@ class Bot:
 
     def send_document(self, filename: str, blob: bytes, caption: str = "", chat_id: str | int | None = None) -> bool:
         """Send a document to admin chat(s). Returns True if at least one delivery succeeded."""
+        try:
+            if not self.should_poll():
+                return False
+        except Exception:
+            pass
+        if time.time() < self._flood_until:
+            log.warning("sendDocument skipped: flood-wait %.0fs", max(self._flood_until - time.time(), 0))
+            return False
         s = self.get_settings()
         if not s.get("enabled") or not s.get("token"):
             return False
@@ -363,10 +422,18 @@ class Bot:
                 if parsed.get("ok"):
                     ok_any = True
                 else:
-                    log.warning(
-                        "sendDocument failed chat=%s: %s",
-                        cid, parsed.get("description") or parsed.get("error") or raw[:200],
-                    )
+                    err = parsed.get("description") or parsed.get("error") or raw[:200]
+                    log.warning("sendDocument failed chat=%s: %s", cid, err)
+                    try:
+                        ra = int(((parsed.get("parameters") or {}) if isinstance(parsed, dict) else {}).get("retry_after") or 0)
+                    except (TypeError, ValueError):
+                        ra = 0
+                    if ra:
+                        self._note_flood(ra)
+            except urllib.error.HTTPError as exc:
+                log.warning("sendDocument failed chat=%s: %s", cid, exc)
+                if int(getattr(exc, "code", 0) or 0) == 429:
+                    self._note_flood(30)
             except Exception as exc:  # noqa: BLE001
                 log.warning("sendDocument failed chat=%s: %s", cid, exc)
         return ok_any
@@ -408,8 +475,20 @@ class Bot:
         if res.get("ok") or "Webhook is already deleted" in str(res.get("description") or ""):
             self._webhook_cleared = True
             log.info("telegram webhook cleared for long-polling")
+            return
+        err = res.get("error") or res.get("description") or ""
+        log.warning("deleteWebhook: %s", err)
+        # Respect Telegram flood-wait — do not spin deleteWebhook every loop iteration.
+        wait = int(res.get("retry_after") or 0)
+        if wait <= 0 and "retry after" in str(err).lower():
+            import re as _re
+            m = _re.search(r"retry after\s+(\d+)", str(err), _re.I)
+            if m:
+                wait = int(m.group(1))
+        if wait > 0:
+            self._stop.wait(min(wait, 120))
         else:
-            log.warning("deleteWebhook: %s", res.get("error") or res.get("description"))
+            self._stop.wait(5)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -433,6 +512,11 @@ class Bot:
                 # Another process is polling this token — back off
                 log.warning("getUpdates 409 Conflict — another poller has this token")
                 self._stop.wait(15)
+                continue
+            if res.get("status") == 429 or res.get("retry_after"):
+                wait = max(int(res.get("retry_after") or 5), 5)
+                log.warning("getUpdates 429 — sleep %ss", wait)
+                self._stop.wait(wait)
                 continue
             for upd in res.get("result") or []:
                 self._offset = int(upd.get("update_id") or 0) + 1

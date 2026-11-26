@@ -351,12 +351,10 @@ def store_view_for_node(store: dict, node: dict) -> dict:
         # Apply online stats preference from core even when inheriting
         if isinstance(core.get("xray_settings"), dict) and "stats_user_online" in (core.get("xray_settings") or {}):
             xs["stats_user_online"] = core["xray_settings"].get("stats_user_online", True)
-        cfg = core.get("config") if isinstance(core.get("config"), dict) else {}
-        if cfg:
-            core_tmp = {**core, "xray_settings": xs}
-            out["xray_settings"] = merge_core_xray_settings(core_tmp)
-        else:
-            out["xray_settings"] = xs
+        # Always merge so policy.statsUserOnline follows the core flag (even without
+        # PasarGuard config overlay). Skipping merge left agents on whatever default
+        # was last pushed — and a False flag never reached policy.
+        out["xray_settings"] = merge_core_xray_settings({**core, "xray_settings": xs})
         return out
     out["inbounds"] = mark_fallback_inbounds(
         apply_exclude_inbounds(copy.deepcopy(core.get("inbounds") or []), core), core

@@ -322,6 +322,83 @@ def top_doh_clients(limit: int = 10) -> list[dict]:
     return rows[: max(1, min(50, int(limit or 10)))]
 
 
+def pihole_version() -> dict:
+    """Installed Pi-hole / FTL / Web versions from the running container (or image id)."""
+    out: dict = {
+        "ok": False,
+        "core": "",
+        "ftl": "",
+        "web": "",
+        "image": "",
+        "summary": "",
+        "running": False,
+    }
+    if not shutil.which("docker"):
+        out["error"] = "docker не установлен"
+        return out
+    running = _pihole_running()
+    out["running"] = running
+    img = _run(
+        ["docker", "inspect", "-f", "{{.Config.Image}}|{{.Image}}", "l2x-pihole"],
+        timeout=15,
+    )
+    if img.get("ok"):
+        parts = (img.get("stdout") or "").strip().split("|", 1)
+        out["image"] = (parts[0] or "").strip()
+        if len(parts) > 1 and parts[1].strip().startswith("sha256:"):
+            out["image_id"] = parts[1].strip()[:19]
+    if not running:
+        out["error"] = "контейнер l2x-pihole не запущен"
+        if out.get("image"):
+            out["summary"] = out["image"]
+        return out
+    # ``pihole -v`` → Core / FTL / Web (or "Pi-hole version is v…")
+    ver = _run(["docker", "exec", "l2x-pihole", "pihole", "-v"], timeout=30)
+    text = ((ver.get("stdout") or "") + "\n" + (ver.get("stderr") or "")).strip()
+    if ver.get("ok") and text:
+        out["ok"] = True
+        for line in text.splitlines():
+            low = line.lower().strip()
+            if not low:
+                continue
+            # "Pi-hole version is v5.18.2 (Latest: …)" → core
+            m = re.search(
+                r"(?:pi-?hole|core)\s+version\s+is\s+(v?[\w.+-]+)", low,
+            )
+            if m:
+                out["core"] = m.group(1)
+                continue
+            m = re.search(r"ftl\s+version\s+is\s+(v?[\w.+-]+)", low)
+            if m:
+                out["ftl"] = m.group(1)
+                continue
+            m = re.search(r"web\s+version\s+is\s+(v?[\w.+-]+)", low)
+            if m:
+                out["web"] = m.group(1)
+                continue
+            # Older: "Core version is v…" / "FTL version is …"
+            m = re.search(r"^(core|ftl|web)[:\s]+(v?[\w.+-]+)", low)
+            if m:
+                out[m.group(1)] = m.group(2)
+        bits = []
+        if out["core"]:
+            bits.append(f"Core {out['core']}")
+        if out["ftl"]:
+            bits.append(f"FTL {out['ftl']}")
+        if out["web"]:
+            bits.append(f"Web {out['web']}")
+        out["summary"] = " · ".join(bits) if bits else text.splitlines()[0][:120]
+        out["raw"] = text[:800]
+        return out
+    # Fallback: image tag only
+    if out.get("image"):
+        out["ok"] = True
+        out["summary"] = out["image"]
+        return out
+    out["error"] = (ver.get("stderr") or ver.get("stdout") or "не удалось прочитать версию")[:300]
+    return out
+
+
 def status(cfg: dict | None = None) -> dict:
     cfg = {**default_settings(), **(cfg or {})}
     up = str(cfg.get("upstream") or "127.0.0.1")
@@ -337,6 +414,7 @@ def status(cfg: dict | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
     compose = COMPOSE_DIR / "docker-compose.yml"
+    ver = pihole_version()
     return {
         "enabled": bool(cfg.get("enabled")),
         "upstream": f"{up}:{port}",
@@ -346,6 +424,9 @@ def status(cfg: dict | None = None) -> dict:
         "compose_present": compose.is_file(),
         "pihole_web": cfg.get("pihole_web") or "",
         "path_prefix": normalize_prefix(cfg.get("path_prefix") or "doh"),
+        "pihole_running": bool(ver.get("running")),
+        "pihole_version": ver.get("summary") or "",
+        "pihole_version_detail": ver,
     }
 
 
@@ -691,6 +772,112 @@ def stop_pihole() -> dict:
         if r["ok"]:
             return {"ok": True, "log": r["stdout"]}
     return {"ok": False, "error": r.get("stderr") or "down failed"}
+
+
+def update_pihole(*, password: str = "") -> dict:
+    """Pull ``pihole/pihole:latest`` and recreate the container (keep volumes / gravity).
+
+    Re-applies admin password after recreate when known. Returns before/after versions.
+    """
+    before = pihole_version()
+    yml = COMPOSE_DIR / "docker-compose.yml"
+    if not yml.is_file():
+        return {"ok": False, "error": "Pi-hole не установлен (нет compose)", "before": before}
+    if not shutil.which("docker"):
+        return {"ok": False, "error": "docker не установлен", "before": before}
+
+    # Resolve admin password: explicit arg → store caller → .env (do not invent one)
+    pwd = str(password or "").strip()
+    if not pwd:
+        try:
+            env = (COMPOSE_DIR / ".env").read_text(encoding="utf-8")
+            for line in env.splitlines():
+                if line.startswith("PIHOLE_PASSWORD="):
+                    raw = line.split("=", 1)[1].strip()
+                    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                        raw = raw[1:-1]
+                    pwd = raw
+                    break
+        except Exception:
+            pwd = ""
+
+    # Refresh compose template (ports) without wiping a known password
+    if pwd:
+        write_compose(password=pwd)
+    else:
+        # Keep existing .env; only refresh yml from template
+        COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
+        (COMPOSE_DIR / "docker-compose.yml").write_text(COMPOSE_YML, encoding="utf-8")
+    try:
+        ensure_pihole_dns_host_port(recreate=False)
+    except Exception:
+        pass
+
+    base = _compose_base()
+    if not base:
+        return {"ok": False, "error": "docker compose недоступен", "before": before}
+
+    pull = _run([*base, "pull", "pihole"], timeout=360, cwd=str(COMPOSE_DIR))
+    if not pull.get("ok"):
+        return {
+            "ok": False,
+            "error": (pull.get("stderr") or pull.get("stdout") or "docker pull failed").strip()[:500],
+            "before": before,
+            "log": ((pull.get("stdout") or "") + (pull.get("stderr") or ""))[-2000:],
+        }
+
+    up = _run(
+        [*base, "up", "-d", "--force-recreate", "pihole"],
+        timeout=180,
+        cwd=str(COMPOSE_DIR),
+    )
+    if not up.get("ok"):
+        return {
+            "ok": False,
+            "error": (up.get("stderr") or up.get("stdout") or "up failed").strip()[:500],
+            "before": before,
+            "log": ((up.get("stdout") or "") + (up.get("stderr") or ""))[-2000:],
+        }
+
+    for _ in range(20):
+        if _pihole_running():
+            break
+        time.sleep(1)
+    else:
+        return {
+            "ok": False,
+            "error": "контейнер не поднялся после обновления",
+            "before": before,
+            "log": ((up.get("stdout") or "") + (up.get("stderr") or ""))[-1500:],
+        }
+
+    # Give FTL a moment, then restore admin password if we have one
+    time.sleep(2)
+    pwd_log = ""
+    if pwd:
+        sp = set_pihole_password(pwd, update_env=True)
+        if not sp.get("ok"):
+            # Version update succeeded; password restore is best-effort
+            pwd_log = f"пароль не применён: {sp.get('error') or 'fail'}"
+        else:
+            pwd_log = "пароль восстановлен"
+
+    after = pihole_version()
+    changed = (before.get("summary") or "") != (after.get("summary") or "")
+    log_bits = [
+        (pull.get("stdout") or "").strip()[-800:],
+        (up.get("stdout") or "").strip()[-400:],
+        pwd_log,
+    ]
+    return {
+        "ok": True,
+        "before": before,
+        "after": after,
+        "changed": changed,
+        "version_before": before.get("summary") or "?",
+        "version_after": after.get("summary") or "?",
+        "log": "\n".join(x for x in log_bits if x)[-2000:],
+    }
 
 
 def dns_servers_for_client(doh_https: str, *, in_tunnel: bool) -> dict:
