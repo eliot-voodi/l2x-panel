@@ -3208,12 +3208,14 @@ def client_json_subscription_profiles(
         core = cores_mod.core_by_id(store, cid) if (cid and cores_mod) else None
         title = core_sub_remark(core if isinstance(core, dict) else None, eps, fallback=remarks or "L2X")
 
+        use_cascade = True if not isinstance(core, dict) else bool(core.get("cascade", True))
+
         tmpl = ""
         if isinstance(core, dict) and core.get("sub_custom_json"):
             tmpl = str(core.get("sub_custom_json_template") or "").strip()
         if tmpl:
             any_custom = True
-            # Always dial ALL core inbounds × ALL nodes (Ascella cascade / load-share).
+            # Dial ALL core inbounds × ALL nodes (Ascella cascade / load-share).
             # Client checkboxes only decide whether this core appears in the sub.
             full_eps = _client_endpoints_for_core_custom(
                 store, client, core, default_host,
@@ -3221,10 +3223,18 @@ def client_json_subscription_profiles(
             auto_obs: list[dict] = []
             auto_cfg: dict = {}
             try:
-                auto_cfg = P.xray_unified_client_config(
-                    full_eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
-                )
-                auto_cfg = merge_core_routing_into_client_cfg(auto_cfg, core)
+                if use_cascade:
+                    auto_cfg = P.xray_unified_client_config(
+                        full_eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
+                    )
+                    auto_cfg = merge_core_routing_into_client_cfg(auto_cfg, core)
+                else:
+                    # Cascade off: inbound outbounds only, no LOOP — still map client→direct
+                    auto_cfg = P.xray_unified_client_config(
+                        full_eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
+                    )
+                    auto_cfg = _strip_cascade_balancers(auto_cfg)
+                    auto_cfg = merge_core_routing_into_client_cfg(auto_cfg, core)
                 auto_obs = [
                     o for o in (auto_cfg.get("outbounds") or [])
                     if isinstance(o, dict) and o.get("protocol") not in ("freedom", "blackhole", "dns", "loopback")
@@ -3263,10 +3273,21 @@ def client_json_subscription_profiles(
             continue
 
         try:
-            cfg = P.xray_unified_client_config(
-                eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
-            )
-            profiles.append(merge_core_routing_into_client_cfg(cfg, core if isinstance(core, dict) else None))
+            if use_cascade:
+                cfg = P.xray_unified_client_config(
+                    eps, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel, remarks=title,
+                )
+                profiles.append(merge_core_routing_into_client_cfg(cfg, core if isinstance(core, dict) else None))
+            else:
+                # Cascade off: one profile per inbound endpoint (classic multi-link JSON)
+                for e in eps:
+                    try:
+                        one = P.xray_client_config(e, extras, doh_url=doh_url, doh_in_tunnel=doh_in_tunnel)
+                        profiles.append(
+                            merge_core_routing_into_client_cfg(one, core if isinstance(core, dict) else None)
+                        )
+                    except Exception:
+                        pass
         except Exception:
             for e in eps:
                 try:
@@ -3423,6 +3444,54 @@ def _client_rules_from_core_route(r: dict, *, proxy_tags: list[str], balancer_ta
             rule["ruleTag"] = tag_base if len(arms) == 1 else f"{tag_base}_{i + 1}"[:64]
         out.append(rule)
     return out
+
+
+def _strip_cascade_balancers(cfg: dict) -> dict:
+    """Remove Ascella LOOP/REROUTE cascade; one leastLoad balancer over all inbound tags."""
+    if not isinstance(cfg, dict):
+        return cfg
+    outs = [o for o in (cfg.get("outbounds") or []) if isinstance(o, dict)]
+    proxy_tags = [
+        str(o.get("tag") or "")
+        for o in outs
+        if o.get("protocol") not in ("freedom", "blackhole", "dns", "loopback")
+        and o.get("tag")
+    ]
+    outs = [o for o in outs if o.get("protocol") != "loopback"]
+    cfg["outbounds"] = outs
+    routing = cfg.setdefault("routing", {})
+    if not isinstance(routing, dict):
+        routing = {}
+        cfg["routing"] = routing
+    rules = []
+    for r in (routing.get("rules") or []):
+        if not isinstance(r, dict):
+            continue
+        ibs = r.get("inboundTag")
+        if isinstance(ibs, list) and any(str(t).startswith("REROUTE") for t in ibs):
+            continue
+        # Drop old catch-all balancer — rebuild below
+        if (
+            r.get("balancerTag")
+            and not r.get("domain") and not r.get("ip") and not r.get("protocol")
+            and not r.get("port")
+            and r.get("network") in ("tcp,udp", "tcp", "udp", None, "")
+            and not ibs
+        ):
+            continue
+        rules.append(r)
+    if proxy_tags:
+        routing["balancers"] = [{
+            "tag": "BAL-1",
+            "selector": list(proxy_tags),
+            "fallbackTag": proxy_tags[0],
+            "strategy": {"type": "leastLoad", "settings": {"expected": 1}},
+        }]
+        rules.append({"type": "field", "network": "tcp,udp", "balancerTag": "BAL-1"})
+    else:
+        routing["balancers"] = []
+    routing["rules"] = rules
+    return cfg
 
 
 def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:

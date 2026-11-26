@@ -226,6 +226,15 @@
     <h3 style="margin:0">Исходящие</h3>
     <button type="button" class="btn sm js-ob-add">{{ ic.icon('plus') }}Добавить</button>
   </div>
+  <form class="card" method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/cascade"
+        style="margin-bottom:.75rem;padding:.85rem 1rem;max-width:920px">
+    {{ m.check('cascade', core.cascade if core.cascade is defined else True, 'Каскад') }}
+    <div class="hint mt" style="margin-bottom:.5rem">
+      Если включён — в клиентском JSON только <b>inbound</b> (Ascella cascade / LOOP),
+      вся маршрутизация через него. Правила с outbound <code>client</code> → <b>direct</b> на устройстве.
+    </div>
+    <button class="btn sm" type="submit">Сохранить</button>
+  </form>
   <div class="card" style="padding:0">
     <div class="table-wrap">
       <table>
@@ -236,12 +245,15 @@
             <td class="mono"><b>{{ o.tag }}</b>{% if o.remark %}<div class="dim small">{{ o.remark }}</div>{% endif %}</td>
             <td><span class="badge">{{ o.kind or (o.config or {}).protocol or 'custom' }}</span>
               {% if o.in_sub %}<span class="badge ok">sub</span>{% endif %}
+              {% if o.kind == 'node' %}<span class="badge">нода</span>{% endif %}
             </td>
             <td>{% if o.enabled is not defined or o.enabled %}<span class="badge ok">on</span>{% else %}<span class="badge">off</span>{% endif %}</td>
             <td>
               <div class="actions" style="justify-content:flex-end">
+                {% if o.kind != 'node' %}
                 <button type="button" class="btn ghost icon js-ob-edit" title="Изменить"
                         data-tag="{{ o.tag }}">{{ ic.icon('edit') }}</button>
+                {% endif %}
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/sub">
                   <input type="hidden" name="tag" value="{{ o.tag }}">
                   <button class="btn ghost icon" title="В подписке">{{ ic.icon('link') }}</button>
@@ -250,11 +262,13 @@
                   <input type="hidden" name="tag" value="{{ o.tag }}">
                   <button class="btn ghost icon" title="Вкл/выкл">{{ ic.icon('power') }}</button>
                 </form>
+                {% if o.kind != 'node' %}
                 <form method="post" action="{{ bp }}/cores/{{ core.id }}/panel/outbounds/delete"
                       onsubmit="return confirm('Удалить {{ o.tag }}?')">
                   <input type="hidden" name="tag" value="{{ o.tag }}">
                   <button class="btn danger icon">{{ ic.icon('trash') }}</button>
                 </form>
+                {% endif %}
               </div>
             </td>
           </tr>
@@ -265,7 +279,7 @@
       </table>
     </div>
   </div>
-  <div class="hint">Новый outbound создаётся выключенным. Затем <b>Применить</b>.</div>
+  <div class="hint">Конфиги нод добавляются автоматически <b>выключенными</b> — включайте вручную. Новый custom outbound тоже выключен. Затем <b>Применить</b>.</div>
 </section>
 
 {# ===================== ROUTING ===================== #}
@@ -437,8 +451,8 @@
     <h3>JSON-подписка для этого ядра</h3>
     <div class="hint">
       В подписке (Happ / <code>?format=json</code>) каждое ядро — <b>один профиль</b>.
-      Генерация (и кнопка <b>Применить</b>): все inbound → outbounds + <b>Ascella cascade</b>
-      (LOOP/REROUTE / leastLoad) + правила с outbound <code>client</code> → обход VPN.
+      При включённом <b>Каскад</b> (вкладка Исходящие): только inbound → outbounds + Ascella cascade
+      (LOOP/REROUTE / leastLoad); правила с outbound <code>client</code> → <b>direct</b> на устройстве.
       <code>subjectSelector</code> = теги inbound. Happ JSON обновляется автоматически.
     </div>
     <div class="actions mt">

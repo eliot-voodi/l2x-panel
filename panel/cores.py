@@ -130,6 +130,7 @@ def snapshot_from_master(store: dict, *, name: str = "Default", remark: str = ""
         "config": {},
         "sub_custom_json": False,
         "sub_custom_json_template": "",
+        "cascade": True,
         "inbounds": _filter_inbounds(store.get("inbounds")),
         "outbounds_custom": _filter_outbounds(store.get("outbounds_custom")),
         "routes": copy.deepcopy(store.get("routes") or []),
@@ -174,6 +175,10 @@ def ensure_cores(store: dict) -> list[dict]:
         if not isinstance(c.get("sub_custom_json_template"), str):
             c["sub_custom_json_template"] = str(c.get("sub_custom_json_template") or "")
         c["sub_custom_json"] = bool(c.get("sub_custom_json"))
+        if "cascade" not in c:
+            c["cascade"] = True
+        else:
+            c["cascade"] = bool(c.get("cascade"))
         c["exclude_inbound_tags"] = parse_tag_set(c.get("exclude_inbound_tags"))
         c["fallbacks_inbound_tags"] = parse_tag_set(c.get("fallbacks_inbound_tags"))
         if not isinstance(c.get("config"), dict):
@@ -418,6 +423,7 @@ def create_core(
             "config": {},
             "sub_custom_json": False,
             "sub_custom_json_template": "",
+            "cascade": True,
             **_empty_slices(),
             "created_at": now_iso(),
             "updated_at": now_iso(),

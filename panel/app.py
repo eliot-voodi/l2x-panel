@@ -5956,6 +5956,15 @@ def outbound_action(tag: str, action: str, request: Request):
                 clone_error = "Outbound не найден"
             elif action == "toggle":
                 o["enabled"] = not o.get("enabled", True)
+                if o.get("kind") == "node" and o.get("node_id"):
+                    n = next(
+                        (x for x in (store.get("nodes") or []) if x.get("id") == o.get("node_id")),
+                        None,
+                    )
+                    if n is not None:
+                        if o["enabled"]:
+                            n["as_outbound"] = True
+                        nodes_mod.upsert_node_outbound(store, n)
             elif action == "sub":
                 o["in_sub"] = not o.get("in_sub", True)
                 # Subscription flag only — Xray dial set unchanged
@@ -5969,11 +5978,14 @@ def outbound_action(tag: str, action: str, request: Request):
                 except Exception as exc:  # noqa: BLE001
                     clone_error = str(exc)
             elif action == "delete":
-                used = [c["email"] for c in store["clients"] if c.get("outbound") == tag]
-                if used:
-                    clone_error = f"{tag} используется клиентами: {', '.join(used)}"
+                if o.get("kind") == "node":
+                    clone_error = "Outbound ноды нельзя удалить — выключите ноду"
                 else:
-                    store["outbounds_custom"].remove(o)
+                    used = [c["email"] for c in store["clients"] if c.get("outbound") == tag]
+                    if used:
+                        clone_error = f"{tag} используется клиентами: {', '.join(used)}"
+                    else:
+                        store["outbounds_custom"].remove(o)
             else:
                 clone_error = "Неизвестное действие"
     ob_back = _core_editor_back(request, "outbounds") or "/outbounds"
@@ -8907,6 +8919,11 @@ def core_edit_page(core_id: str, request: Request):
         if not core:
             flash(request, "Ядро не найдено", "error")
             return go("/cores")
+        # Auto-list every enabled node as a disabled outbound (manual enable only)
+        try:
+            nodes_mod.sync_all_node_outbounds(store)
+        except Exception:
+            pass
         # Scope session for optional deep links; UI stays on this page
         if core.get("inherit_master"):
             request.session.pop(cores_mod.EDIT_CORE_SESSION, None)
@@ -8946,6 +8963,19 @@ def core_edit_page(core_id: str, request: Request):
     ]
     route_clients = xray.route_picker_clients(view)
     route_source_ips = xray.route_picker_source_ips(view)
+    # Node outbounds live on master; snapshot cores still show them in Исходящие
+    preview_outs = list(view.get("outbounds_custom") or [])
+    if not core.get("inherit_master"):
+        master_nodes = [
+            o for o in (store.get("outbounds_custom") or [])
+            if isinstance(o, dict) and o.get("kind") == "node"
+        ]
+        seen_tags = {str(o.get("tag") or "") for o in preview_outs if o.get("tag")}
+        for o in master_nodes:
+            t = str(o.get("tag") or "")
+            if t and t not in seen_tags:
+                preview_outs.append(o)
+                seen_tags.add(t)
     return page(
         request, "core_edit.html", active="nodes",
         core=core,
@@ -8960,7 +8990,7 @@ def core_edit_page(core_id: str, request: Request):
         core_tab=tab,
         core_tabs=CORE_EDITOR_TABS,
         preview_inbounds=preview_ibs,
-        preview_outbounds=list(view.get("outbounds_custom") or []),
+        preview_outbounds=preview_outs,
         preview_routes=list(view.get("routes") or []),
         preview_balancers=bals,
         preview_dns=dns,
@@ -9103,6 +9133,37 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
             return go("/cores")
         inherit = bool(core.get("inherit_master"))
         target_id = "" if inherit else core_id
+        # Cascade is core metadata (not a network slice)
+        if tab == "outbounds" and action == "cascade":
+            core["cascade"] = str(form.get("cascade") or "") in ("1", "true", "on", "yes")
+            core["updated_at"] = cores_mod.now_iso()
+            flash(request, f"Каскад: {'вкл' if core['cascade'] else 'выкл'}", "info")
+            return go(back)
+        # Node outbounds always on master — handle here when editing a snapshot core
+        if tab == "outbounds" and action in ("toggle", "delete", "sub") and not inherit:
+            tag0 = str(form.get("tag") or "").strip()
+            nodes_mod.sync_all_node_outbounds(store)
+            mo = store.setdefault("outbounds_custom", [])
+            o0 = next((x for x in mo if str(x.get("tag") or "") == tag0), None)
+            if o0 and o0.get("kind") == "node":
+                if action == "toggle":
+                    o0["enabled"] = not o0.get("enabled", True)
+                    if o0.get("node_id"):
+                        n0 = next(
+                            (x for x in (store.get("nodes") or []) if x.get("id") == o0.get("node_id")),
+                            None,
+                        )
+                        if n0 is not None:
+                            if o0["enabled"]:
+                                n0["as_outbound"] = True
+                            nodes_mod.upsert_node_outbound(store, n0)
+                    flash(request, f"{tag0}: {'вкл' if o0['enabled'] else 'выкл'}", "info")
+                elif action == "delete":
+                    flash(request, "Outbound ноды нельзя удалить — выключите ноду", "error")
+                else:
+                    o0["in_sub"] = not o0.get("in_sub", True)
+                    flash(request, f"{tag0}: подписка {'вкл' if o0.get('in_sub', True) else 'выкл'}", "info")
+                return go(back)
 
     # Re-enter mutate with correct slice target
     with mutate(edit_core_id=target_id, history_section="cores", history_note=f"panel {tab}/{action}") as store:
@@ -9173,8 +9234,20 @@ async def cores_panel_action(core_id: str, tab: str, action: str, request: Reque
                     return go(back)
                 if action == "toggle":
                     o["enabled"] = not o.get("enabled", True)
+                    if o.get("kind") == "node" and o.get("node_id"):
+                        n = next(
+                            (x for x in (store.get("nodes") or []) if x.get("id") == o.get("node_id")),
+                            None,
+                        )
+                        if n is not None:
+                            if o["enabled"]:
+                                n["as_outbound"] = True
+                            nodes_mod.upsert_node_outbound(store, n)
                     flash(request, f"{tag}: {'вкл' if o['enabled'] else 'выкл'}", "info")
                 elif action == "delete":
+                    if o.get("kind") == "node":
+                        flash(request, "Outbound ноды нельзя удалить — выключите ноду", "error")
+                        return go(back)
                     # In-place mutate — reassignment would lose the core slice alias
                     outs[:] = [x for x in outs if str(x.get("tag") or "") != tag]
                     flash(request, f"{tag} удалён", "info")

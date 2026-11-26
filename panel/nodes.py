@@ -1882,17 +1882,64 @@ def node_outbound_config(node: dict) -> dict:
     }
 
 
+def classify_node_egress(node: dict | None) -> str:
+    """Egress class for outbound listing: ``l2x_udp`` | ``reverse`` | ``direct`` | ``bridge``.
+
+    Unlike ``uses_l2x_tunnel`` / ``uses_direct_connect``, does **not** require
+    ``as_outbound`` — every enabled node appears in Исходящие (disabled until
+    enabled manually). Read-only: does not mutate ``tunnel_mode``.
+    """
+    if not isinstance(node, dict) or not node.get("enabled", True):
+        return ""
+    mode = str(node.get("tunnel_mode") or "").strip()
+    if mode == "l2x_udp":
+        return "l2x_udp"
+    if mode in ("xray_reverse", "bridge", "off", "direct"):
+        if mode == "xray_reverse" or node.get("nat") or node.get("rv_mode"):
+            return "reverse"
+        if node.get("direct_connect"):
+            return "direct"
+        return "bridge"
+    # Empty mode — same sticky rules as uses_l2x_tunnel (without writes)
+    if node.get("rv_uuid") or node.get("rv_mode"):
+        return "reverse"
+    if str(node.get("tunnel_node_id") or "").strip() and not str(node.get("token") or "").strip():
+        return "l2x_udp"
+    if node.get("nat"):
+        return "l2x_udp"
+    if node.get("direct_connect"):
+        return "direct"
+    return "bridge"
+
+
 def upsert_node_outbound(store: dict, node: dict) -> None:
-    """Keep outbounds_custom in sync when node.as_outbound is enabled."""
+    """Sync node → outbounds_custom for every enabled node.
+
+    New entries are created **disabled** (and ``in_sub=False``); manual toggle
+    enables them. Sync refreshes config/remark but preserves ``enabled`` / ``in_sub``.
+    ``as_outbound`` still gates live tunnel/bridge plumbing; enabling an outbound
+    in the UI should set ``as_outbound`` (see core/outbounds toggle).
+    """
     customs = store.setdefault("outbounds_custom", [])
     tag = node_outbound_tag(node)
     existing = next((o for o in customs if o.get("tag") == tag or o.get("node_id") == node.get("id")), None)
-    if not node.get("as_outbound") or not node.get("enabled", True):
+    if not node.get("enabled", True):
         if existing:
             customs.remove(existing)
         return
+
+    kind = classify_node_egress(node)
+    if not kind:
+        return
+
+    # Live reverse/tunnel/bridge setup only when node is marked as outbound or already enabled
+    plumbing = bool(node.get("as_outbound")) or bool(existing and existing.get("enabled"))
     title = node_user_title(node)
-    if uses_l2x_tunnel(node):
+    prev_enabled = bool(existing.get("enabled")) if existing else False
+    prev_in_sub = bool(existing.get("in_sub")) if existing else False
+    keep_test = existing.get("last_test") if existing else None
+
+    if kind == "l2x_udp":
         entry = {
             "tag": tag,
             "remark": title,
@@ -1900,26 +1947,16 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
             "reverse": False,
             "tunnel": True,
             "node_id": node.get("id"),
-            "enabled": True,
-            "in_sub": True,
+            "enabled": prev_enabled,
+            "in_sub": prev_in_sub,
             "info": "L2X tunnel",
             "country": (node.get("country") or "")[:2].upper(),
             "config": tunnel_node_outbound_config(store, node),
         }
-        if existing:
-            keep = existing.get("last_test")
-            existing.clear()
-            existing.update(entry)
-            # Keep only a successful probe; drop stale reverse-pull failures.
-            if isinstance(keep, dict) and keep.get("ok") is True:
-                existing["last_test"] = keep
-        else:
-            customs.append(entry)
-        return
-    if uses_reverse(node):
-        # Portal tag on master = outbound; master never dials the node
-        ensure_reverse_master(store)
-        ensure_reverse(node)
+    elif kind == "reverse":
+        if plumbing:
+            ensure_reverse_master(store)
+            ensure_reverse(node)
         entry = {
             "tag": tag,
             "remark": title,
@@ -1927,51 +1964,63 @@ def upsert_node_outbound(store: dict, node: dict) -> None:
             "reverse": True,
             "tunnel": False,
             "node_id": node.get("id"),
-            "enabled": True,
-            "in_sub": True,
+            "enabled": prev_enabled,
+            "in_sub": prev_in_sub,
             "info": "NAT" if node.get("nat") else "reverse",
             "country": (node.get("country") or "")[:2].upper(),
             "config": {},
         }
-        if existing:
-            keep = existing.get("last_test")
-            existing.clear()
-            existing.update(entry)
-            if keep:
-                existing["last_test"] = keep
+    else:
+        # bridge or direct
+        if plumbing or kind == "bridge":
+            ensure_bridge(node)
+        domain = (node.get("domain") or "").strip()
+        if not domain:
+            from urllib.parse import urlparse
+            domain = urlparse(node.get("url") or "").hostname or ""
+        if not domain and not existing:
+            # Cannot build dial config yet — keep a stub so the node still appears
+            entry = {
+                "tag": tag,
+                "remark": title,
+                "kind": "node",
+                "node_id": node.get("id"),
+                "direct_connect": kind == "direct",
+                "enabled": prev_enabled,
+                "in_sub": prev_in_sub,
+                "info": "direct" if kind == "direct" else "bridge",
+                "country": (node.get("country") or "")[:2].upper(),
+                "config": existing.get("config") if existing else {},
+            }
         else:
-            customs.append(entry)
-        return
-    ensure_bridge(node)
-    domain = (node.get("domain") or "").strip()
-    if not domain:
-        from urllib.parse import urlparse
-        domain = urlparse(node.get("url") or "").hostname or ""
-    if not domain:
-        return
-    entry = {
-        "tag": tag,
-        "remark": title,
-        "kind": "node",
-        "node_id": node.get("id"),
-        "direct_connect": bool(uses_direct_connect(node)),
-        "enabled": True,
-        "in_sub": True,
-        "info": "direct" if uses_direct_connect(node) else "bridge",
-        "country": (node.get("country") or "")[:2].upper(),
-        "config": node_outbound_config(node),
-    }
+            cfg = {}
+            if domain:
+                cfg = node_outbound_config(node)
+            elif existing:
+                cfg = dict(existing.get("config") or {})
+            entry = {
+                "tag": tag,
+                "remark": title,
+                "kind": "node",
+                "node_id": node.get("id"),
+                "direct_connect": kind == "direct",
+                "enabled": prev_enabled,
+                "in_sub": prev_in_sub,
+                "info": "direct" if kind == "direct" else "bridge",
+                "country": (node.get("country") or "")[:2].upper(),
+                "config": cfg,
+            }
+
     if existing:
-        keep = existing.get("last_test")
         existing.clear()
         existing.update(entry)
-        # Keep a fresh successful probe; drop stale failures when flipping to Direct
-        if uses_direct_connect(node):
-            if isinstance(keep, dict) and keep.get("ok") is True:
-                existing["last_test"] = keep
-        elif isinstance(keep, dict) and keep.get("ok") is True:
-            existing["last_test"] = keep
+        # New sync never forces enable — keep prior flags (already in entry)
+        if isinstance(keep_test, dict) and keep_test.get("ok") is True:
+            existing["last_test"] = keep_test
     else:
+        # Auto-added: always off until the admin enables on Исходящие
+        entry["enabled"] = False
+        entry["in_sub"] = False
         customs.append(entry)
 
 

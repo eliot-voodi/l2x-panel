@@ -1,0 +1,5 @@
+v2.4.5: auto node outbounds (disabled) + Cascade checkbox
+
+All enabled nodes appear under core Исходящие as disabled outbounds;
+enable only manually. Cascade: client JSON = inbound-only Ascella routing;
+routes with outbound client map to direct on device.
