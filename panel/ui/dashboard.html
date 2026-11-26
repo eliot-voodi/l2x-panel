@@ -104,41 +104,6 @@
 
 <div class="grid g2">
   <div class="card">
-    <div class="card-head">
-      <h3>{{ t('Подключения по ОС') }}</h3>
-      <span class="badge" id="conn-os-total">{{ conn.hwid_devices or 0 }}</span>
-    </div>
-    <div class="pie-wrap" id="pie-os"></div>
-  </div>
-  <div class="card">
-    <div class="card-head">
-      <h3>{{ t('Подключения по приложениям') }}</h3>
-      <span class="badge" id="conn-app-total">{% set _apps = (conn.apps or [])|sum(attribute='count') %}{{ _apps }}</span>
-    </div>
-    <div class="pie-wrap" id="pie-apps"></div>
-    <div class="hint" id="conn-apps-hint">{% if conn.apps_without_ua %}{{ conn.apps_without_ua }} устройств без User-Agent (только HWID) — не в диаграмме; появятся после обновления подписки.{% endif %}</div>
-  </div>
-</div>
-
-<div class="grid g2">
-  <div class="card">
-    <div class="card-head">
-      <h3>{{ t('Города клиентов') }}</h3>
-      <span class="badge accent">{{ t('7 дней') }}</span>
-    </div>
-    <div class="pie-wrap" id="pie-cities"></div>
-  </div>
-  <div class="card">
-    <div class="card-head">
-      <h3>{{ t('Inbound') }}</h3>
-      <span class="badge accent">{{ t('7 дней') }}</span>
-    </div>
-    <div class="pie-wrap" id="pie-inbounds"></div>
-  </div>
-</div>
-
-<div class="grid g2">
-  <div class="card">
     <div class="card-head"><h3>CPU / RAM</h3>
       <div class="seg" data-range><a href="#" data-n="60" class="active">1ч</a><a href="#" data-n="360">6ч</a><a href="#" data-n="1440">24ч</a></div>
     </div>
@@ -201,6 +166,41 @@
   </table>
   </div>
   <div class="hint">↑ — байты, которые сервер отправил в сеть через этот выход (загрузка клиентов), ↓ — полученные (скачивание клиентов). Итоги копятся с момента включения статистики и сбрасываются в разделе Outbounds. Скорость «сейчас» — за последний цикл watchdog ({{ ob.points }} минутных точек в истории).</div>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <div class="card-head">
+      <h3>{{ t('Подключения по ОС') }}</h3>
+      <span class="badge" id="conn-os-total">{{ conn.hwid_devices or 0 }}</span>
+    </div>
+    <div class="pie-wrap" id="pie-os"></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <h3>{{ t('Подключения по приложениям') }}</h3>
+      <span class="badge" id="conn-app-total">{% set _apps = (conn.apps or [])|sum(attribute='count') %}{{ _apps }}</span>
+    </div>
+    <div class="pie-wrap" id="pie-apps"></div>
+    <div class="hint" id="conn-apps-hint">{% if conn.apps_without_ua %}{{ conn.apps_without_ua }} устройств без User-Agent (только HWID) — не в диаграмме; появятся после обновления подписки.{% endif %}</div>
+  </div>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <div class="card-head">
+      <h3>{{ t('Города клиентов') }}</h3>
+      <span class="badge accent">{{ t('7 дней') }}</span>
+    </div>
+    <div class="pie-wrap" id="pie-cities"></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <h3>{{ t('Inbound') }}</h3>
+      <span class="badge accent">{{ t('7 дней') }}</span>
+    </div>
+    <div class="pie-wrap" id="pie-inbounds"></div>
+  </div>
 </div>
 
 <div class="grid g2">
