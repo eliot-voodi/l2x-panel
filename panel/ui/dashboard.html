@@ -90,6 +90,16 @@
     display:none; color:var(--text); line-height:1.45;
   }
   .ci-table td.city { font-weight:600 } .ci-table .inbound { font-family:inherit }
+  details.card-fold > summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center;
+    justify-content: space-between; gap: .75rem; flex-wrap: wrap;
+  }
+  details.card-fold > summary::-webkit-details-marker { display: none }
+  details.card-fold > summary::before {
+    content: '▸'; color: var(--dim); font-size: .85rem; margin-right: .15rem;
+  }
+  details.card-fold[open] > summary::before { content: '▾' }
+  details.card-fold > summary h3 { margin: 0; display: inline }
 </style>
 
 <div class="grid g2">
@@ -125,81 +135,6 @@
     </div>
     <div class="pie-wrap" id="pie-inbounds"></div>
   </div>
-</div>
-
-<div class="card">
-  <div class="card-head">
-    <h3>{{ t('Город → Inbound') }}</h3>
-    <span class="small muted" id="conn-meta">
-      {% if conn.access_log %}access.log ✓{% else %}access.log выкл · онлайн + подписки{% endif %}
-      · sub {{ conn.sub_hits or 0 }} · online {{ conn.online_hits or 0 }}
-    </span>
-  </div>
-  <div class="hint" style="margin-top:0;margin-bottom:.75rem">
-    {{ t('Город клиента × наиболее используемый inbound (по трафику панели). Для точного inbound по каждому соединению включите access.log в настройках Xray.') }}
-  </div>
-  <div class="table-wrap">
-    <table class="ci-table" id="tbl-city-inbound">
-      <thead><tr><th>{{ t('Город') }}</th><th>Inbound</th><th class="right">{{ t('События') }}</th><th style="width:28%">%</th></tr></thead>
-      <tbody>
-      {% for r in conn.city_inbound or [] %}
-        <tr>
-          <td class="city">{{ r.city }}</td>
-          <td class="inbound mono small">{{ r.inbound }}</td>
-          <td class="right">{{ r.count }}</td>
-          <td>
-            <div class="small nowrap">{{ r.pct }}%</div>
-            <div class="bar"><span style="width:{{ r.pct }}%"></span></div>
-          </td>
-        </tr>
-      {% else %}
-        <tr><td colspan="4" class="empty">{{ t('Пока нет данных — появятся после онлайн-клиентов или обновления подписки') }}</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% if conn.city_node %}
-  <div class="card-head" style="margin-top:1.1rem"><h3>{{ t('Город → нода') }}</h3><span class="badge">hosts</span></div>
-  <div class="table-wrap">
-    <table class="ci-table" id="tbl-city-node">
-      <thead><tr><th>{{ t('Город') }}</th><th>{{ t('Нода') }}</th><th class="right">{{ t('События') }}</th><th style="width:28%">%</th></tr></thead>
-      <tbody>
-      {% for r in conn.city_node %}
-        <tr>
-          <td class="city">{{ r.city }}</td>
-          <td class="inbound mono small">{{ r.node }}</td>
-          <td class="right">{{ r.count }}</td>
-          <td>
-            <div class="small nowrap">{{ r.pct }}%</div>
-            <div class="bar"><span style="width:{{ r.pct }}%"></span></div>
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% endif %}
-  {% if conn.visits_city_inbound %}
-  <div class="card-head" style="margin-top:1.1rem"><h3>{{ t('Посещения сайтов') }} · город → inbound</h3><span class="badge">access.log</span></div>
-  <div class="table-wrap">
-    <table class="ci-table" id="tbl-visits">
-      <thead><tr><th>{{ t('Город') }}</th><th>Inbound</th><th class="right">{{ t('События') }}</th><th style="width:28%">%</th></tr></thead>
-      <tbody>
-      {% for r in conn.visits_city_inbound %}
-        <tr>
-          <td class="city">{{ r.city }}</td>
-          <td class="inbound mono small">{{ r.inbound }}</td>
-          <td class="right">{{ r.count }}</td>
-          <td>
-            <div class="small nowrap">{{ r.pct }}%</div>
-            <div class="bar"><span style="width:{{ r.pct }}%"></span></div>
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% endif %}
 </div>
 
 <div class="grid g2">
@@ -297,6 +232,81 @@
     <div class="hint mt">Сервер подписок: {% if sub_running %}<span class="badge ok">запущен</span>{% else %}<span class="badge">через основную панель</span>{% endif %}</div>
   </div>
 </div>
+
+<details class="card card-fold">
+  <summary>
+    <h3>{{ t('Город → Inbound') }}</h3>
+    <span class="small muted" id="conn-meta">
+      {% if conn.access_log %}access.log ✓{% else %}access.log выкл · онлайн + подписки{% endif %}
+      · sub {{ conn.sub_hits or 0 }} · online {{ conn.online_hits or 0 }}
+    </span>
+  </summary>
+  <div class="hint" style="margin-top:.75rem;margin-bottom:.75rem">
+    {{ t('Город клиента × наиболее используемый inbound (по трафику панели). Для точного inbound по каждому соединению включите access.log в настройках Xray.') }}
+  </div>
+  <div class="table-wrap">
+    <table class="ci-table" id="tbl-city-inbound">
+      <thead><tr><th>{{ t('Город') }}</th><th>Inbound</th><th class="right">{{ t('События') }}</th><th style="width:28%">%</th></tr></thead>
+      <tbody>
+      {% for r in conn.city_inbound or [] %}
+        <tr>
+          <td class="city">{{ r.city }}</td>
+          <td class="inbound mono small">{{ r.inbound }}</td>
+          <td class="right">{{ r.count }}</td>
+          <td>
+            <div class="small nowrap">{{ r.pct }}%</div>
+            <div class="bar"><span style="width:{{ r.pct }}%"></span></div>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="empty">{{ t('Пока нет данных — появятся после онлайн-клиентов или обновления подписки') }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if conn.city_node %}
+  <div class="card-head" style="margin-top:1.1rem"><h3>{{ t('Город → нода') }}</h3><span class="badge">hosts</span></div>
+  <div class="table-wrap">
+    <table class="ci-table" id="tbl-city-node">
+      <thead><tr><th>{{ t('Город') }}</th><th>{{ t('Нода') }}</th><th class="right">{{ t('События') }}</th><th style="width:28%">%</th></tr></thead>
+      <tbody>
+      {% for r in conn.city_node %}
+        <tr>
+          <td class="city">{{ r.city }}</td>
+          <td class="inbound mono small">{{ r.node }}</td>
+          <td class="right">{{ r.count }}</td>
+          <td>
+            <div class="small nowrap">{{ r.pct }}%</div>
+            <div class="bar"><span style="width:{{ r.pct }}%"></span></div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if conn.visits_city_inbound %}
+  <div class="card-head" style="margin-top:1.1rem"><h3>{{ t('Посещения сайтов') }} · город → inbound</h3><span class="badge">access.log</span></div>
+  <div class="table-wrap">
+    <table class="ci-table" id="tbl-visits">
+      <thead><tr><th>{{ t('Город') }}</th><th>Inbound</th><th class="right">{{ t('События') }}</th><th style="width:28%">%</th></tr></thead>
+      <tbody>
+      {% for r in conn.visits_city_inbound %}
+        <tr>
+          <td class="city">{{ r.city }}</td>
+          <td class="inbound mono small">{{ r.inbound }}</td>
+          <td class="right">{{ r.count }}</td>
+          <td>
+            <div class="small nowrap">{{ r.pct }}%</div>
+            <div class="bar"><span style="width:{{ r.pct }}%"></span></div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</details>
 {% endblock %}
 {% block scripts %}
 <script>

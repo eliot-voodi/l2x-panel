@@ -1,0 +1,3 @@
+v2.4.3: fold city→inbound block to bottom of Dashboard
+
+Collapsible details card; keeps pie charts in place.
