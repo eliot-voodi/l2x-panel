@@ -5,8 +5,9 @@
     <select name="outbound">{% for tag in outbounds %}<option value="{{ tag }}">{{ outbound_label(store, tag) }}</option>{% endfor %}</select></div>
 </div>
 <div class="hint">
-  <b>Client</b> — трафик в Custom JSON / Happ уходит <code>direct</code> (обход VPN на устройстве).
-  На сервере такое правило не применяется.
+  <b>Client</b> — обход VPN на устройстве (<code>direct</code> в Happ). На сервере не применяется.<br>
+  <b>Direct / балансировщик / node_* / custom</b> — выход на <b>сервере</b>: клиент шлёт трафик в туннель,
+  маршрутизацию применяет ядро (не путать с Client).
 </div>
 {{ m.check('enabled', True, 'Включено') }}
 <div class="row">

@@ -364,7 +364,21 @@ def store_view_for_node(store: dict, node: dict) -> dict:
     out["inbounds"] = mark_fallback_inbounds(
         apply_exclude_inbounds(copy.deepcopy(core.get("inbounds") or []), core), core
     )
-    out["outbounds_custom"] = copy.deepcopy(core.get("outbounds_custom") or [])
+    # Core customs + enabled master outbounds (node_* / custom) so routes can
+    # target server-side exits that live on the master list.
+    outs = copy.deepcopy(core.get("outbounds_custom") or [])
+    seen = {str(o.get("tag") or "") for o in outs if isinstance(o, dict) and o.get("tag")}
+    for o in store.get("outbounds_custom") or []:
+        if not isinstance(o, dict):
+            continue
+        tag = str(o.get("tag") or "")
+        if not tag or tag in seen:
+            continue
+        if not o.get("enabled", True):
+            continue
+        outs.append(copy.deepcopy(o))
+        seen.add(tag)
+    out["outbounds_custom"] = outs
     out["routes"] = copy.deepcopy(core.get("routes") or [])
     out["balancers"] = copy.deepcopy(core.get("balancers") or {})
     out["dns"] = copy.deepcopy(core.get("dns") or {})

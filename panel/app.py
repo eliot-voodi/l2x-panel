@@ -8963,19 +8963,28 @@ def core_edit_page(core_id: str, request: Request):
     ]
     route_clients = xray.route_picker_clients(view)
     route_source_ips = xray.route_picker_source_ips(view)
-    # Node outbounds live on master; snapshot cores still show them in Исходящие
+    # Node/custom outbounds live on master; snapshot cores still list them for
+    # Исходящие and for routing Outbound picker (server-side exits).
     preview_outs = list(view.get("outbounds_custom") or [])
-    if not core.get("inherit_master"):
-        master_nodes = [
-            o for o in (store.get("outbounds_custom") or [])
-            if isinstance(o, dict) and o.get("kind") == "node"
-        ]
-        seen_tags = {str(o.get("tag") or "") for o in preview_outs if o.get("tag")}
-        for o in master_nodes:
-            t = str(o.get("tag") or "")
-            if t and t not in seen_tags:
-                preview_outs.append(o)
-                seen_tags.add(t)
+    seen_tags = {str(o.get("tag") or "") for o in preview_outs if o.get("tag")}
+    for o in (store.get("outbounds_custom") or []):
+        if not isinstance(o, dict):
+            continue
+        t = str(o.get("tag") or "")
+        if not t or t in seen_tags:
+            continue
+        # Always overlay master node stubs; also bring other customs missing from snapshot
+        if o.get("kind") == "node" or not core.get("inherit_master"):
+            preview_outs.append(o)
+            seen_tags.add(t)
+    # Store view for route form labels + outbound dropdown (core slices + master outs)
+    route_store = dict(view)
+    route_store["outbounds_custom"] = list(preview_outs)
+    if isinstance(view.get("balancers"), dict) and view.get("balancers"):
+        route_store["balancers"] = view["balancers"]
+    elif isinstance(store.get("balancers"), dict):
+        route_store["balancers"] = store["balancers"]
+    route_ob_tags = xray.all_outbound_tags(route_store)
     return page(
         request, "core_edit.html", active="nodes",
         core=core,
@@ -8996,10 +9005,10 @@ def core_edit_page(core_id: str, request: Request):
         preview_dns=dns,
         preview_xray=xs,
         template_patch_text=patch_text,
-        outbound_tags=xray.all_outbound_tags(view),
-        outbounds=xray.all_outbound_tags(view),
-        view_store=view,
-        store=view,
+        outbound_tags=route_ob_tags,
+        outbounds=route_ob_tags,
+        view_store=route_store,
+        store=route_store,
         route_clients=route_clients,
         route_source_ips=route_source_ips,
         has_applied=bool(core.get("applied_snapshot")),

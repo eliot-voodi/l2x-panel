@@ -1,0 +1,4 @@
+v2.4.6: RU via server routing; show core/master outbounds in route picker
+
+Stop forcing geoip:ru to client direct. Only outbound «client» bypasses VPN.
+Route dropdown on snapshot cores includes master node/custom outbounds.

@@ -1906,12 +1906,15 @@ def xray_unified_client_config(
         {"tag": "dns-out", "protocol": "dns"},
     ])
 
+    # Private only → direct. Do NOT force geoip:ru / category-ru to direct —
+    # RU traffic must stay in the tunnel so server-side routing (core routes /
+    # balancers / node outbounds) can manage it. Explicit bypass = outbound «client».
     rules.extend([
         {"type": "field", "inboundTag": ["socks", "http"], "port": 53, "outboundTag": "dns-out"},
         {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
-        {"type": "field", "domain": ["geosite:private", "geosite:category-ru"], "outboundTag": "direct"},
-        {"type": "field", "ip": ["geoip:private", "geoip:ru"], "outboundTag": "direct"},
+        {"type": "field", "domain": ["geosite:private"], "outboundTag": "direct"},
+        {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
         {"type": "field", "network": "tcp,udp", "balancerTag": "BAL-1"},
     ])
 

@@ -3378,23 +3378,28 @@ def _client_balancers_from_core(core: dict, proxy_tags: list[str]) -> list[dict]
 
 
 def _client_rules_from_core_route(r: dict, *, proxy_tags: list[str], balancer_tags: set[str]) -> list[dict]:
-    """Panel route → client JSON routing rules (``client`` outbound → direct)."""
+    """Panel route → client JSON routing rules.
+
+    Only outbound ``client`` bypasses the VPN (device direct).
+    Everything else (``direct``, ``master``, ``lb_*``, ``node_*``, custom) is a
+    **server-side** exit — client must send traffic through the tunnel (primary
+    cascade balancer / first inbound proxy) so the server can apply the route.
+    """
     if not r.get("enabled", True):
         return []
     target = normalize_outbound_tag(r.get("outbound") or r.get("outbound_tag") or "direct")
     if is_client_bypass_outbound(target):
         dest: dict[str, Any] = {"outboundTag": "direct"}
-    elif target in balancer_tags:
-        dest = {"balancerTag": target}
     elif target == "block":
         dest = {"outboundTag": "block"}
-    elif target == "direct":
-        dest = {"outboundTag": "direct"}
     elif target in proxy_tags:
+        # Rare: route points at an inbound-derived client dial tag
         dest = {"outboundTag": target}
     else:
-        # Server-only outbound (node/custom) — on client send via primary balancer or first proxy
-        if balancer_tags:
+        # Server-side exit (direct / master / balancer / node / custom) → stay in tunnel
+        if "BAL-1" in balancer_tags:
+            dest = {"balancerTag": "BAL-1"}
+        elif balancer_tags:
             dest = {"balancerTag": next(iter(balancer_tags))}
         elif proxy_tags:
             dest = {"outboundTag": proxy_tags[0]}
@@ -3443,6 +3448,58 @@ def _client_rules_from_core_route(r: dict, *, proxy_tags: list[str], balancer_ta
         if tag_base:
             rule["ruleTag"] = tag_base if len(arms) == 1 else f"{tag_base}_{i + 1}"[:64]
         out.append(rule)
+    return out
+
+
+_RU_CLIENT_DIRECT_MARKERS = frozenset({
+    "geosite:category-ru",
+    "geoip:ru",
+    "ext:geoip_ru.dat:ru",
+    "ext:geosite_ru.dat:ru",
+    "ext:geoip_RU.dat:ru",
+    "ext:geosite_RU.dat:ru",
+})
+
+
+def _strip_ru_client_direct(rule: dict) -> dict | None:
+    """Remove RU→direct from client system rules; keep private→direct.
+
+    Returns ``None`` if the rule becomes empty (drop it).
+    """
+    if not isinstance(rule, dict):
+        return None
+    if str(rule.get("outboundTag") or "") != "direct":
+        return rule
+    domains = rule.get("domain")
+    ips = rule.get("ip")
+    if not isinstance(domains, list):
+        domains = [domains] if domains else []
+    if not isinstance(ips, list):
+        ips = [ips] if ips else []
+    keep_d = [
+        d for d in domains
+        if str(d).strip() and str(d).strip().lower() not in {m.lower() for m in _RU_CLIENT_DIRECT_MARKERS}
+        and "category-ru" not in str(d).lower()
+        and not (str(d).lower().startswith("ext:geoip_ru") or str(d).lower().startswith("ext:geosite_ru"))
+    ]
+    keep_i = [
+        ip for ip in ips
+        if str(ip).strip() and str(ip).strip().lower() not in {m.lower() for m in _RU_CLIENT_DIRECT_MARKERS}
+        and "geoip:ru" not in str(ip).lower()
+        and "geoip_ru" not in str(ip).lower()
+    ]
+    # Only rewrite when we actually stripped RU markers
+    stripped = len(keep_d) < len([d for d in domains if d]) or len(keep_i) < len([ip for ip in ips if ip])
+    if not stripped:
+        return rule
+    out = {k: v for k, v in rule.items() if k not in ("domain", "ip")}
+    if keep_d:
+        out["domain"] = keep_d
+    if keep_i:
+        out["ip"] = keep_i
+    if not keep_d and not keep_i:
+        # Pure RU→direct rule — drop entirely
+        return None
     return out
 
 
@@ -3552,7 +3609,8 @@ def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
                 _client_rules_from_core_route(r, proxy_tags=proxy_tags, balancer_tags=bal_tags)
             )
 
-    # Keep cascade REROUTE rules + system rules; drop previous panel ruleTags; keep/rebuild catch-all
+    # Keep cascade REROUTE rules + system rules; drop previous panel ruleTags; keep/rebuild catch-all.
+    # Strip legacy Ascella RU→direct so RU stays in tunnel for server-side routing.
     head: list[dict] = []
     has_catch = False
     for r in old_rules:
@@ -3571,7 +3629,9 @@ def merge_core_routing_into_client_cfg(cfg: dict, core: dict | None) -> dict:
         if is_catch:
             has_catch = True
             continue
-        head.append(r)
+        cleaned = _strip_ru_client_direct(r)
+        if cleaned is not None:
+            head.append(cleaned)
 
     tail: list[dict] = []
     if primary_bal:
