@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_icons.html" as ic %}
+{% block title %}YA.cloud · {{ app_name }}{% endblock %}
+{% block page_title %}YA.cloud{% endblock %}
+{% block page_sub %}Yandex Cloud — автозапуск ВМ (по умолчанию Казахстан){% endblock %}
+{% block content %}
+
+{% if not is_master %}
+<div class="card"><div class="badge warn">Только на master</div></div>
+{% else %}
+
+<div class="card">
+  <div class="flex between" style="flex-wrap:wrap;gap:.75rem;align-items:center">
+    <div>
+      <h3 style="margin:0">Статус</h3>
+      <div class="dim small">Проверка раз в {{ yc.check_interval_sec or 60 }} сек. Если ВМ выключена — включить.</div>
+    </div>
+    <div class="actions" style="flex-wrap:wrap">
+      <form method="post" action="{{ bp }}/yacloud/check"><button class="btn ghost sm">{{ ic.icon('refresh') }} Проверить сейчас</button></form>
+      <form method="post" action="{{ bp }}/yacloud/start" onsubmit="return confirm('Принудительно Start в Yandex Cloud?')">
+        <button class="btn sm">{{ ic.icon('play') }} Start сейчас</button>
+      </form>
+      {% if yc.console %}
+      <a class="btn ghost sm" href="{{ yc.console }}" target="_blank" rel="noopener">Консоль ↗</a>
+      {% endif %}
+    </div>
+  </div>
+  <div class="row mt" style="gap:1.25rem;flex-wrap:wrap">
+    <div>
+      <span class="dim small">Watchdog</span>
+      <div>{% if yc.enabled %}<span class="badge ok">вкл</span>{% else %}<span class="badge">выкл</span>{% endif %}</div>
+    </div>
+    <div>
+      <span class="dim small">ВМ</span>
+      <div class="mono">{{ yc.last_name or yc.instance_name or '—' }}
+        {% if yc.instance_id %}<div class="dim small">{{ yc.instance_id }}</div>{% endif %}
+      </div>
+    </div>
+    <div>
+      <span class="dim small">Статус</span>
+      <div>
+        {% set st = (yc.last_status or '')|upper %}
+        {% if st == 'RUNNING' %}<span class="badge ok">RUNNING</span>
+        {% elif st == 'STOPPED' %}<span class="badge err">STOPPED</span>
+        {% elif st %}<span class="badge warn">{{ st }}</span>
+        {% else %}<span class="badge">нет данных</span>{% endif %}
+      </div>
+    </div>
+    <div>
+      <span class="dim small">Последняя проверка</span>
+      <div class="mono small">{{ yc.last_check_at or '—' }}</div>
+    </div>
+    <div>
+      <span class="dim small">Действие</span>
+      <div class="mono small">{{ yc.last_action or '—' }}
+        {% if yc.last_action_at %}<div class="dim">{{ yc.last_action_at }}</div>{% endif %}
+      </div>
+    </div>
+  </div>
+  {% if yc.last_error %}
+  <div class="badge err mt" style="display:inline-block;max-width:100%;white-space:normal">{{ yc.last_error }}</div>
+  {% endif %}
+</div>
+
+<form class="card mt" method="post" action="{{ bp }}/yacloud/save" style="max-width:920px">
+  <h3>Реквизиты</h3>
+  <div class="hint">
+    Регион по умолчанию — <b>Казахстан</b> (<code>kz.console.yandex.cloud</code>).
+    Нужны права <code>compute.instances.get</code> и <code>compute.instances.start</code> на каталог/ВМ.
+    OAuth: <a href="https://oauth.yandex.com/authorize?response_type=token&amp;client_id=1a6990aa636648e9b2ef855fa7bec2fb" target="_blank" rel="noopener">получить токен</a>
+    (клиент Yandex Cloud). Либо JSON авторизованного ключа сервисного аккаунта.
+  </div>
+
+  <div class="mt">
+    {{ m.check('enabled', yc.enabled, 'Включить watchdog (проверка каждую минуту)') }}
+    {{ m.check('auto_start', yc.auto_start if yc.auto_start is defined else True, 'Автоматически включать выключенную ВМ') }}
+  </div>
+
+  <div class="row mt">
+    <div>
+      <label class="f">Регион</label>
+      <select name="region">
+        {% for key, label in regions %}
+        <option value="{{ key }}" {% if yc.region == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="f">Интервал, сек</label>
+      <input type="number" name="check_interval_sec" min="30" max="3600" value="{{ yc.check_interval_sec or 60 }}">
+    </div>
+  </div>
+
+  <div class="row mt">
+    <div>
+      <label class="f">Folder ID</label>
+      <input name="folder_id" class="mono" value="{{ yc.folder_id or '' }}" placeholder="b1g…">
+    </div>
+    <div>
+      <label class="f">Instance ID</label>
+      <input name="instance_id" class="mono" value="{{ yc.instance_id or '' }}" placeholder="fhm…">
+      <div class="hint">Если пусто — ищем по имени в folder.</div>
+    </div>
+  </div>
+  <div class="mt">
+    <label class="f">Имя ВМ (если нет Instance ID)</label>
+    <input name="instance_name" class="mono" value="{{ yc.instance_name or '' }}" placeholder="my-vm">
+  </div>
+
+  <div class="mt">
+    <label class="f">Авторизация</label>
+    <select name="auth_mode" id="yc-auth-mode" onchange="ycAuthMode()">
+      <option value="oauth" {% if yc.auth_mode != 'sa_key' %}selected{% endif %}>OAuth-токен Яндекса</option>
+      <option value="sa_key" {% if yc.auth_mode == 'sa_key' %}selected{% endif %}>Ключ сервисного аккаунта (JSON)</option>
+    </select>
+  </div>
+
+  <div class="mt" id="yc-oauth-box">
+    <label class="f">OAuth token {% if yc.oauth_token_set %}<span class="badge ok">сохранён</span>{% endif %}</label>
+    <input name="oauth_token" class="mono" type="password" autocomplete="off"
+           placeholder="{% if yc.oauth_token_set %}······ (оставьте пустым, чтобы не менять){% else %}y0_…{% endif %}">
+  </div>
+  <div class="mt" id="yc-sa-box" style="display:none">
+    <label class="f">SA key JSON {% if yc.sa_key_json_set %}<span class="badge ok">сохранён</span>{% endif %}</label>
+    <textarea name="sa_key_json" class="mono" rows="8"
+              placeholder="{% if yc.sa_key_json_set %}Оставьте пустым, чтобы не менять. Иначе вставьте key.json целиком.{% else %}{&#10;  &quot;id&quot;: &quot;…&quot;,&#10;  &quot;service_account_id&quot;: &quot;…&quot;,&#10;  &quot;private_key&quot;: &quot;-----BEGIN PRIVATE KEY-----\\n…&quot;&#10;}{% endif %}"></textarea>
+  </div>
+
+  <div class="actions mt">
+    <button class="btn">Сохранить</button>
+  </div>
+</form>
+
+<script>
+function ycAuthMode() {
+  var m = document.getElementById('yc-auth-mode');
+  var oauth = document.getElementById('yc-oauth-box');
+  var sa = document.getElementById('yc-sa-box');
+  if (!m || !oauth || !sa) return;
+  var isSa = m.value === 'sa_key';
+  oauth.style.display = isSa ? 'none' : 'block';
+  sa.style.display = isSa ? 'block' : 'none';
+}
+ycAuthMode();
+</script>
+{% endif %}
+{% endblock %}

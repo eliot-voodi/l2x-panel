@@ -44,6 +44,7 @@ _REDACT_SEGMENTS = {
     "token", "password", "password_hash", "secret", "api_token", "agent_token",
     "pihole_password", "totp_secret", "private_key", "privatekey", "mldsa65_seed",
     "login_secret", "webhook_secret", "cert_key", "key_file", "sub_token",
+    "oauth_token", "sa_key_json", "iam_token",
     "doh_token", "uuid", "wg_private", "wg_public",
 }
 

@@ -47,6 +47,7 @@ import doh as doh_mod
 import masterdns as masterdns_mod
 import cheburcheck as tspu_mod
 import conn_analytics as conn_analytics
+import yacloud as yacloud_mod
 import settings_history as shist
 import sysmon
 import tgbot
@@ -2488,6 +2489,53 @@ def _watchdog_loop() -> None:
             pass
 
 
+def _yacloud_loop() -> None:
+    """Every ~minute: if YA.cloud VM is STOPPED — start it (Yandex Cloud KZ by default)."""
+    while not _stop.wait(15):
+        try:
+            with STORE_LOCK:
+                store = _load_store()
+                if not STORE_OK or not nodes_mod.is_master(store):
+                    continue
+                yc0 = yacloud_mod.ensure_settings(store)
+                if not yc0.get("enabled"):
+                    continue
+                last = str(yc0.get("last_check_at") or "")
+                interval = max(30, int(yc0.get("check_interval_sec") or 60))
+                due = True
+                if last:
+                    try:
+                        ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        due = (time.time() - ts.timestamp()) >= interval
+                    except Exception:
+                        due = True
+                if not due:
+                    continue
+                # Work on a copy outside the lock (IAM/Compute HTTP can take seconds)
+                yc_work = dict(yc0)
+            stub = {"settings": {"yacloud": yc_work}}
+            yacloud_mod.check_and_start(stub)
+            with STORE_LOCK:
+                st = _load_store()
+                if not STORE_OK:
+                    continue
+                live = yacloud_mod.ensure_settings(st)
+                for k in (
+                    "iam_token", "iam_expires_at", "last_check_at", "last_status", "last_name",
+                    "last_error", "last_action", "last_action_at", "last_http",
+                ):
+                    if k in yc_work:
+                        live[k] = yc_work.get(k)
+                # Persist resolved instance id if UI left it empty
+                if yc_work.get("instance_id") and not str(live.get("instance_id") or "").strip():
+                    live["instance_id"] = yc_work["instance_id"]
+                _save_store(st, kind="traffic")
+        except Exception:
+            pass
+
+
 def _conn_prune_loop() -> None:
     """Every few seconds drop ESTAB :443 peers over max_conn_per_ip (see xray._prune_excess_443)."""
     while not _stop.wait(max(1, CONN_PRUNE_INTERVAL)):
@@ -2892,7 +2940,7 @@ def _startup():
         except Exception:
             pass
     threading.Thread(target=_bg_pihole_dns_port, name="pihole-dns-port", daemon=True).start()
-    for target in (_sync_xray_config, _watchdog_loop, _conn_prune_loop, _history_loop, _xray_update_loop,
+    for target in (_sync_xray_config, _watchdog_loop, _yacloud_loop, _conn_prune_loop, _history_loop, _xray_update_loop,
                    _panel_update_loop, _geo_update_loop, _nodes_sync_loop, _pia_loop, _outbounds_probe_loop,
                    _agent_pull_loop, _tg_backup_loop, _tspu_loop):
         threading.Thread(target=target, daemon=True).start()
@@ -9884,6 +9932,101 @@ async def nodes_xray_update(node_id: str, request: Request):
     else:
         flash(request, f"{name}: {res.get('error') or 'ошибка'}", "error")
     return go("/nodes")
+
+
+@app.get("/yacloud", response_class=HTMLResponse)
+def yacloud_page(request: Request):
+    if redir := _require(request):
+        return redir
+    store = _load_store()
+    yc = yacloud_mod.ensure_settings(store) if nodes_mod.is_master(store) else yacloud_mod.default_settings()
+    regions = [(k, v["label"]) for k, v in yacloud_mod.REGIONS.items()]
+    return page(
+        request, "yacloud.html", active="yacloud",
+        yc=yacloud_mod.public_view(yc),
+        regions=regions,
+        is_master=nodes_mod.is_master(store),
+    )
+
+
+@app.post("/yacloud/save")
+async def yacloud_save(request: Request):
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только master", "error")
+        return go("/yacloud")
+    form = await request.form()
+    with mutate(history_section="yacloud", history_note="save") as store:
+        yc = yacloud_mod.ensure_settings(store)
+        yc["enabled"] = form.get("enabled") == "1"
+        yc["auto_start"] = form.get("auto_start") == "1"
+        region = str(form.get("region") or "kz").strip().lower()
+        yc["region"] = region if region in yacloud_mod.REGIONS else "kz"
+        yc["folder_id"] = str(form.get("folder_id") or "").strip()
+        yc["instance_id"] = str(form.get("instance_id") or "").strip()
+        yc["instance_name"] = str(form.get("instance_name") or "").strip()
+        mode = str(form.get("auth_mode") or "oauth").strip().lower()
+        yc["auth_mode"] = mode if mode in ("oauth", "sa_key") else "oauth"
+        try:
+            yc["check_interval_sec"] = max(30, min(3600, int(form.get("check_interval_sec") or 60)))
+        except Exception:
+            yc["check_interval_sec"] = 60
+        oauth = str(form.get("oauth_token") or "").strip()
+        if oauth:
+            yc["oauth_token"] = oauth
+            yc["iam_token"] = ""
+            yc["iam_expires_at"] = ""
+        sa_raw = str(form.get("sa_key_json") or "").strip()
+        if sa_raw:
+            try:
+                yacloud_mod._parse_sa_key(sa_raw)
+            except Exception as exc:
+                flash(request, f"SA key JSON: {exc}", "error")
+                return go("/yacloud")
+            yc["sa_key_json"] = sa_raw
+            yc["iam_token"] = ""
+            yc["iam_expires_at"] = ""
+        yc["last_error"] = ""
+    flash(request, "YA.cloud сохранён", "info")
+    return go("/yacloud")
+
+
+@app.post("/yacloud/check")
+def yacloud_check(request: Request):
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только master", "error")
+        return go("/yacloud")
+    with mutate(history_section="yacloud", history_note="check") as store:
+        # Temporary enable for manual check even if watchdog off
+        yc = yacloud_mod.ensure_settings(store)
+        was = bool(yc.get("enabled"))
+        yc["enabled"] = True
+        res = yacloud_mod.check_and_start(store, force_start=False)
+        yc["enabled"] = was
+    if res.get("ok"):
+        flash(request, f"Статус: {res.get('status') or '?'} · {res.get('action') or ''}", "info")
+    else:
+        flash(request, res.get("error") or "Ошибка проверки", "error")
+    return go("/yacloud")
+
+
+@app.post("/yacloud/start")
+def yacloud_start(request: Request):
+    if redir := _require(request):
+        return redir
+    if not nodes_mod.is_master(_load_store()):
+        flash(request, "Только master", "error")
+        return go("/yacloud")
+    with mutate(history_section="yacloud", history_note="start") as store:
+        res = yacloud_mod.check_and_start(store, force_start=True)
+    if res.get("ok"):
+        flash(request, f"Start: {res.get('status') or '?'} → {res.get('action') or 'ok'}", "info")
+    else:
+        flash(request, res.get("error") or "Не удалось запустить", "error")
+    return go("/yacloud")
 
 
 @app.get("/settings-node", response_class=HTMLResponse)
