@@ -66,10 +66,13 @@
 <form class="card mt" method="post" action="{{ bp }}/yacloud/save" style="max-width:920px">
   <h3>Реквизиты</h3>
   <div class="hint">
-    Регион по умолчанию — <b>Казахстан</b> (<code>kz.console.yandex.cloud</code>).
-    Нужны права <code>compute.instances.get</code> и <code>compute.instances.start</code> на каталог/ВМ.
-    OAuth: <a href="https://oauth.yandex.com/authorize?response_type=token&amp;client_id=1a6990aa636648e9b2ef855fa7bec2fb" target="_blank" rel="noopener">получить токен</a>
-    (клиент Yandex Cloud). Либо JSON авторизованного ключа сервисного аккаунта.
+    Регион по умолчанию — <b>Казахстан</b> (<a href="https://kz.console.yandex.cloud" target="_blank" rel="noopener">kz.console.yandex.cloud</a>).
+    Для KZ надёжнее <b>ключ сервисного аккаунта</b> из этой же консоли
+    (права <code>compute.admin</code> или <code>compute.instances.get</code> + <code>compute.instances.start</code>).
+    OAuth часто даёт <code>401 not registered</code>, если Яндекс-аккаунт есть только в облаке РФ, а не в KZ.
+    <b>Instance ID</b> достаточно для watchdog; Folder подтянется сам после успешной проверки.
+    OAuth (если аккаунт уже в KZ):
+    <a href="https://oauth.yandex.com/authorize?response_type=token&amp;client_id=1a6990aa636648e9b2ef855fa7bec2fb" target="_blank" rel="noopener">получить токен</a>.
   </div>
 
   <div class="mt">
@@ -94,13 +97,14 @@
 
   <div class="row mt">
     <div>
-      <label class="f">Folder ID</label>
-      <input name="folder_id" class="mono" value="{{ yc.folder_id or '' }}" placeholder="b1g…">
+      <label class="f">Folder ID <span class="dim">(необязательно при Instance ID)</span></label>
+      <input name="folder_id" class="mono" value="{{ yc.folder_id or '' }}" placeholder="из консоли / авто после проверки">
+      <div class="hint">Не путать с ID облака/организации. При успешном Get подставится сам.</div>
     </div>
     <div>
       <label class="f">Instance ID</label>
-      <input name="instance_id" class="mono" value="{{ yc.instance_id or '' }}" placeholder="fhm…">
-      <div class="hint">Если пусто — ищем по имени в folder.</div>
+      <input name="instance_id" class="mono" value="{{ yc.instance_id or '' }}" placeholder="b4ebj…">
+      <div class="hint">Со скрина ВМ: поле «Идентификатор».</div>
     </div>
   </div>
   <div class="mt">
@@ -111,8 +115,8 @@
   <div class="mt">
     <label class="f">Авторизация</label>
     <select name="auth_mode" id="yc-auth-mode" onchange="ycAuthMode()">
-      <option value="oauth" {% if yc.auth_mode != 'sa_key' %}selected{% endif %}>OAuth-токен Яндекса</option>
-      <option value="sa_key" {% if yc.auth_mode == 'sa_key' %}selected{% endif %}>Ключ сервисного аккаунта (JSON)</option>
+      <option value="sa_key" {% if yc.auth_mode != 'oauth' %}selected{% endif %}>Ключ сервисного аккаунта (JSON) — рекомендуется для KZ</option>
+      <option value="oauth" {% if yc.auth_mode == 'oauth' %}selected{% endif %}>OAuth-токен Яндекса</option>
     </select>
   </div>
 

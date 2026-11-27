@@ -2525,8 +2525,9 @@ def _yacloud_loop() -> None:
                 for k in (
                     "iam_token", "iam_expires_at", "last_check_at", "last_status", "last_name",
                     "last_error", "last_action", "last_action_at", "last_http",
+                    "folder_id", "instance_name",
                 ):
-                    if k in yc_work:
+                    if k in yc_work and yc_work.get(k) not in (None, ""):
                         live[k] = yc_work.get(k)
                 # Persist resolved instance id if UI left it empty
                 if yc_work.get("instance_id") and not str(live.get("instance_id") or "").strip():

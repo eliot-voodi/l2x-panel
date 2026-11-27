@@ -43,7 +43,7 @@ def default_settings() -> dict[str, Any]:
         "folder_id": "",
         "instance_id": "",
         "instance_name": "",
-        "auth_mode": "oauth",  # oauth | sa_key
+        "auth_mode": "sa_key",  # sa_key (рекомендуется для KZ) | oauth
         "oauth_token": "",
         "sa_key_json": "",
         "check_interval_sec": 60,
@@ -199,6 +199,31 @@ def _iam_still_valid(yc: dict, *, skew_sec: int = 120) -> bool:
         return False
 
 
+def _format_iam_error(code: int, payload: dict | list | str, *, region: str, mode: str) -> str:
+    msg = ""
+    if isinstance(payload, dict):
+        msg = str(payload.get("message") or payload.get("error") or "")
+    elif payload:
+        msg = str(payload)
+    low = msg.lower()
+    # Typical KZ OAuth failure: Yandex passport OK, but account has no KZ cloud
+    if code == 401 and (
+        "not registered" in low
+        or "does not registered" in low
+        or "не зарегистрирован" in low
+    ):
+        console = region_meta(region).get("console") or "https://kz.console.yandex.cloud"
+        return (
+            f"IAM 401: аккаунт не зарегистрирован в Yandex Cloud ({region}). "
+            f"Зайдите в {console}, создайте облако/платёжный аккаунт, "
+            f"либо используйте ключ сервисного аккаунта из этой же консоли (режим SA key)."
+        )[:420]
+    if code == 401:
+        hint = " Проверьте OAuth/ключ и регион (KZ ≠ RU)." if mode == "oauth" else " Проверьте SA key и регион."
+        return (f"IAM token: HTTP {code} {msg}.{hint}")[:420]
+    return (f"IAM token: HTTP {code} {msg}")[:420]
+
+
 def obtain_iam_token(yc: dict) -> str:
     """Return a valid IAM token, refreshing via OAuth or SA key when needed."""
     if _iam_still_valid(yc):
@@ -218,10 +243,12 @@ def obtain_iam_token(yc: dict) -> str:
         body = {"yandexPassportOauthToken": oauth}
     code, payload = _http_json("POST", url, body=body)
     if code != 200 or not isinstance(payload, dict) or not payload.get("iamToken"):
-        msg = ""
-        if isinstance(payload, dict):
-            msg = str(payload.get("message") or payload.get("error") or payload)
-        raise ValueError(f"IAM token: HTTP {code} {msg}"[:300])
+        # Drop stale cache so next tick retries exchange
+        yc["iam_token"] = ""
+        yc["iam_expires_at"] = ""
+        raise ValueError(
+            _format_iam_error(code, payload, region=str(yc.get("region") or "kz"), mode=mode)
+        )
     yc["iam_token"] = str(payload["iamToken"])
     yc["iam_expires_at"] = str(payload.get("expiresAt") or "")
     return yc["iam_token"]
@@ -311,12 +338,20 @@ def check_and_start(store: dict, *, force_start: bool = False) -> dict:
         inst = get_instance(yc, token, iid)
         status = str(inst.get("status") or "").upper()
         name = str(inst.get("name") or "")
+        folder = str(inst.get("folderId") or inst.get("folder_id") or "").strip()
         result["status"] = status
         result["name"] = name
         yc["last_check_at"] = _now_iso()
         yc["last_status"] = status
         yc["last_name"] = name
         yc["last_error"] = ""
+        # Auto-fill folder / name from live instance (no manual console hunting)
+        if folder:
+            yc["folder_id"] = folder
+        if name and not str(yc.get("instance_name") or "").strip():
+            yc["instance_name"] = name
+        if name:
+            result["name"] = name
 
         need_start = force_start or (
             bool(yc.get("auto_start", True)) and status in STOPPED_STATUSES
