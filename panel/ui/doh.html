@@ -157,7 +157,7 @@
     <label class="f">Ссылка (скопируйте и откройте один раз · {{ (pihole_link.ttl_sec // 60) }} мин)</label>
     <div class="row">
       <input class="mono" id="pihole-link-url" readonly value="{{ pihole_link.url }}">
-      <button type="button" class="btn ghost" onclick="navigator.clipboard.writeText(document.getElementById('pihole-link-url').value)">copy</button>
+      <button type="button" class="btn ghost" data-copy-value="pihole-link-url" onclick="dohCopyFromElement(this, 'pihole-link-url')">copy</button>
       <a class="btn" href="{{ pihole_link.url }}" target="_blank" rel="noopener">Открыть</a>
     </div>
   </div>
@@ -176,7 +176,7 @@
         <td><a href="{{ bp }}/clients/{{ c.email }}/edit">{{ c.email }}</a></td>
         <td>{% if c.in_tunnel %}<span class="badge accent">в туннеле</span>{% else %}<span class="badge">только DoH</span>{% endif %}</td>
         <td class="mono small"><code>{{ c.url }}</code>
-          <button type="button" class="btn ghost sm" onclick="navigator.clipboard.writeText({{ c.url|tojson }})">copy</button></td>
+          <button type="button" class="btn ghost sm" onclick="dohCopyText(this, {{ c.url|tojson }})">copy</button></td>
       </tr>
     {% endfor %}
     </tbody>
@@ -186,6 +186,40 @@
   {% endif %}
 </div>
 <script>
+function dohCopyFeedback(btn, ok) {
+  if (!btn) return;
+  var old = btn.innerHTML;
+  btn.innerHTML = ok ? '✓' : 'ошибка';
+  setTimeout(function () { btn.innerHTML = old; }, 1200);
+}
+function dohCopyText(btn, value) {
+  value = String(value || '');
+  var fallback = function () {
+    var ta = document.createElement('textarea');
+    ta.value = value;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    ta.remove();
+    dohCopyFeedback(btn, ok);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(value).then(function () {
+      dohCopyFeedback(btn, true);
+    }).catch(fallback);
+  } else {
+    fallback();
+  }
+}
+function dohCopyFromElement(btn, id) {
+  var el = document.getElementById(id);
+  dohCopyText(btn, el ? el.value : '');
+}
 (function () {
   var root = document.getElementById('pihole-dash');
   if (!root) return;
