@@ -7058,7 +7058,8 @@ def doh_page(request: Request):
         if not c.get("doh_enabled"):
             continue
         clients.append({
-            "email": c["email"], "token": c.get("doh_token"), "in_tunnel": bool(c.get("doh_in_tunnel")),
+            "email": c["email"], "has_token": bool(c.get("doh_token")),
+            "in_tunnel": bool(c.get("doh_in_tunnel")),
             "url": doh_mod.public_url(store, c),
         })
     link = request.session.pop("pihole_link", None)

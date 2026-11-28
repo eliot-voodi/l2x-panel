@@ -157,7 +157,7 @@
     <label class="f">Ссылка (скопируйте и откройте один раз · {{ (pihole_link.ttl_sec // 60) }} мин)</label>
     <div class="row">
       <input class="mono" id="pihole-link-url" readonly value="{{ pihole_link.url }}">
-      <button type="button" class="btn ghost" data-copy-value="pihole-link-url" onclick="dohCopyFromElement(this, 'pihole-link-url')">copy</button>
+      <button type="button" class="btn ghost" data-copy-source="pihole-link-url" aria-live="polite">copy</button>
       <a class="btn" href="{{ pihole_link.url }}" target="_blank" rel="noopener">Открыть</a>
     </div>
   </div>
@@ -175,8 +175,20 @@
       <tr>
         <td><a href="{{ bp }}/clients/{{ c.email }}/edit">{{ c.email }}</a></td>
         <td>{% if c.in_tunnel %}<span class="badge accent">в туннеле</span>{% else %}<span class="badge">только DoH</span>{% endif %}</td>
-        <td class="mono small"><code>{{ c.url }}</code>
-          <button type="button" class="btn ghost sm" onclick="dohCopyText(this, {{ c.url|tojson }})">copy</button></td>
+        <td>
+          {% if c.url %}
+          <div class="copy">
+            <input class="mono small" id="client-doh-url-{{ loop.index }}" aria-label="DoH URL: {{ c.email }}" readonly value="{{ c.url }}">
+            <button type="button" class="btn ghost sm" data-copy-source="client-doh-url-{{ loop.index }}" aria-live="polite">copy</button>
+          </div>
+          {% elif not doh.enabled %}
+          <span class="dim small">Включите и сохраните DoH в разделе «Сервис»</span>
+          {% elif not c.has_token %}
+          <span class="dim small">Сохраните настройки DoH в карточке клиента, чтобы создать токен</span>
+          {% else %}
+          <span class="dim small">Настройте публичный HTTPS-домен панели</span>
+          {% endif %}
+        </td>
       </tr>
     {% endfor %}
     </tbody>
@@ -186,40 +198,31 @@
   {% endif %}
 </div>
 <script>
-function dohCopyFeedback(btn, ok) {
-  if (!btn) return;
-  var old = btn.innerHTML;
-  btn.innerHTML = ok ? '✓' : 'ошибка';
-  setTimeout(function () { btn.innerHTML = old; }, 1200);
-}
-function dohCopyText(btn, value) {
-  value = String(value || '');
-  var fallback = function () {
-    var ta = document.createElement('textarea');
-    ta.value = value;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    var ok = false;
-    try { ok = document.execCommand('copy'); } catch (e) {}
-    ta.remove();
-    dohCopyFeedback(btn, ok);
-  };
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(value).then(function () {
-      dohCopyFeedback(btn, true);
-    }).catch(fallback);
-  } else {
-    fallback();
-  }
-}
-function dohCopyFromElement(btn, id) {
-  var el = document.getElementById(id);
-  dohCopyText(btn, el ? el.value : '');
-}
+(function () {
+  document.querySelectorAll('button[data-copy-source]').forEach(function (btn) {
+    var resetTimer;
+    btn.addEventListener('click', async function () {
+      var input = document.getElementById(btn.dataset.copySource);
+      if (!input || !input.value) return;
+      var copied = false;
+      try {
+        if (window.isSecureContext && navigator.clipboard) {
+          await navigator.clipboard.writeText(input.value);
+          copied = true;
+        }
+      } catch (e) {} // Continue with the fallback if clipboard access was denied.
+      if (!copied) {
+        input.focus();
+        input.select();
+        try { copied = document.execCommand('copy'); } catch (e) {}
+        if (copied) btn.focus();
+      }
+      clearTimeout(resetTimer);
+      btn.textContent = copied ? 'Скопировано' : 'Нажмите Ctrl+C / ⌘C';
+      if (copied) resetTimer = setTimeout(function () { btn.textContent = 'copy'; }, 1200);
+    });
+  });
+})();
 (function () {
   var root = document.getElementById('pihole-dash');
   if (!root) return;
